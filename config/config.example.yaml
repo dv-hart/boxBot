@@ -1,0 +1,164 @@
+# boxBot Configuration
+# Copy this file to config.yaml and customize for your setup.
+
+# ── Agent ─────────────────────────────────────────────────────────────
+agent:
+  name: "boxBot"
+  wake_word: "hey box"
+  # Models are set in .env (BOXBOT_MODEL_LARGE, BOXBOT_MODEL_SMALL)
+  # Large model: conversations, reasoning, memory extraction, skill creation
+  # Small model: photo tagging, intent classification, structured extraction,
+  #              wake-word transcript filtering, routine pre-processing
+  # Maximum conversation turns before auto-compaction
+  max_turns: 20
+
+# ── Schedule ──────────────────────────────────────────────────────────
+# The agent's internal planning system (triggers + to-do list).
+# NOT the family calendar — calendar events are managed by skills.
+schedule:
+  # Wake cycle — recurring triggers seeded into the database on first
+  # boot. After first boot, runtime state in data/scheduler/scheduler.db
+  # is authoritative. The agent can modify these at runtime.
+  wake_cycle:
+    - cron: "0 7 * * *"       # 7:00 AM daily
+      description: "Morning briefing"
+      instructions: >
+        Check weather forecast, review to-do list, update displays,
+        prepare daily briefing for household members
+    - cron: "0 12 * * *"      # Noon
+      description: "Midday check"
+      instructions: >
+        Review to-do list for actionable items, check for pending
+        triggers, update displays if data is stale
+    - cron: "0 20 * * *"      # 8:00 PM
+      description: "Evening review"
+      instructions: >
+        Review to-do list, summarize the day's activity, set triggers
+        for tomorrow's tasks, update displays
+
+  # How long the agent stays awake after completing triggered tasks (seconds)
+  idle_timeout: 300
+
+  # Default expiry for person-condition triggers (days).
+  # Triggers with only a person condition expire after this period
+  # if the person is never detected.
+  person_trigger_expiry_days: 7
+
+# ── Display ───────────────────────────────────────────────────────────
+display:
+  # Display rotation interval during idle (seconds)
+  rotation_interval: 30
+  # Displays to rotate through when idle
+  idle_displays:
+    - "picture"
+    - "calendar"
+    - "weather"
+  # Brightness (0.0 - 1.0)
+  brightness: 0.8
+  # Night mode (reduced brightness)
+  night_mode:
+    enabled: true
+    start: "22:00"
+    end: "07:00"
+    brightness: 0.3
+
+# ── Camera ────────────────────────────────────────────────────────────
+camera:
+  resolution: [1280, 720]
+  # Framerate for perception scanning
+  scan_fps: 5
+  # Framerate during active interaction
+  active_fps: 15
+
+# ── Audio ─────────────────────────────────────────────────────────────
+audio:
+  # STT provider: "whisper_api" or "deepgram"
+  stt_provider: "whisper_api"
+  # TTS provider: "elevenlabs" or "anthropic"
+  tts_provider: "elevenlabs"
+  tts_voice: "default"
+  # Speaker volume (0.0 - 1.0)
+  volume: 0.7
+
+# ── Perception ────────────────────────────────────────────────────────
+perception:
+  # Visual ReID matching threshold (cosine similarity)
+  reid_threshold: 0.7
+  # Speaker ID matching threshold
+  speaker_threshold: 0.75
+  # Max representative embeddings per person
+  max_embeddings_per_person: 20
+
+# ── Memory ────────────────────────────────────────────────────────────
+memory:
+  # Max memories to inject into agent context
+  max_context_memories: 15
+  # Importance decay rate per day (multiplied daily)
+  decay_rate: 0.98
+  # Minimum importance to remain in active pool
+  archive_threshold: 0.1
+
+# ── Photos ────────────────────────────────────────────────────────────
+photos:
+  storage_path: "data/photos"
+  # Maximum percentage of disk space for photo storage (0-100).
+  # Measured against the filesystem where storage_path resides.
+  # Includes active and soft-deleted photos.
+  max_storage_percent: 50
+  # Maximum image resolution on ingest [width, height].
+  # Incoming photos are resized to fit within these bounds
+  # (preserving aspect ratio). Saves disk space significantly
+  # for camera captures while remaining well above display resolution.
+  max_image_resolution: [1920, 1080]
+  # Days to retain soft-deleted photos before permanent purge.
+  soft_delete_retention_days: 30
+  slideshow:
+    seconds_per_photo: 15
+    transition: "fade"
+    strategy: "random"    # random, chronological, seasonal
+  backup:
+    enabled: false
+    # provider: "s3"
+    # bucket: "your-bucket-name"
+    # region: "us-east-1"
+
+# ── Sandbox ──────────────────────────────────────────────────────────
+sandbox:
+  # Path to sandbox virtual environment (created by scripts/setup-sandbox.sh)
+  venv_path: "data/sandbox/venv"
+  # OS user for sandbox script execution (created by setup-sandbox.sh)
+  user: "boxbot-sandbox"
+  # Script execution timeout (seconds)
+  timeout: 30
+  # Memory limit per script (MB)
+  memory_limit_mb: 256
+  # Network access for scripts (needed for API calls in skills)
+  allow_network: true
+  # Package install approval timeout (seconds, 0 = no timeout)
+  install_approval_timeout: 300
+  # Channels for package install approval
+  install_approval_channels:
+    - "display"          # tap YES on touchscreen
+    - "whatsapp"         # admin replies YES via WhatsApp
+
+# ── SDK Authoring ────────────────────────────────────────────────────
+# Controls how agent-created skills/displays are handled.
+# The agent creates these through boxbot_sdk (declarative builder),
+# NOT by writing raw code.
+sdk:
+  # Agent-created skills auto-activate (their logic runs sandboxed)
+  auto_activate_skills: true
+  # Agent-created displays require user confirmation before activation
+  # (display code is generated from declarative specs but runs in main process)
+  auto_activate_displays: false
+
+# ── WhatsApp ──────────────────────────────────────────────────────────
+# WhatsApp config is in a separate file: config/whatsapp.yaml
+# See config/whatsapp.example.yaml
+
+# ── Logging ───────────────────────────────────────────────────────────
+logging:
+  level: "INFO"
+  file: "logs/boxbot.log"
+  max_size_mb: 50
+  backup_count: 5

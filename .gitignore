@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets and local config
+.env
+config/config.yaml
+config/whatsapp.yaml
+
+# Local data (never committed)
+data/photos/
+data/embeddings/
+data/memory.db
+data/models/
+data/sandbox/venv/
+data/sandbox/scripts/*
+!data/sandbox/scripts/.gitkeep
+data/sandbox/output/*
+!data/sandbox/output/.gitkeep
+data/sandbox/tmp/*
+!data/sandbox/tmp/.gitkeep
+data/sandbox/installed.txt
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# User-installed plugins (committed examples only)
+skills/*/
+!skills/example_skill/
+displays/*/
+!displays/example_display/

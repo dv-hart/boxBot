@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "boxbot"
+version = "0.1.0"
+description = "An open-source Claude agent in a box — sees, hears, remembers, and helps."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "boxBot Contributors" },
+]
+keywords = ["claude", "agent", "raspberry-pi", "assistant", "ai"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+]
+
+dependencies = [
+    # Core agent
+    "anthropic>=0.40.0",
+    "claude-code-sdk",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+
+    # Hardware
+    "picamera2",
+    "RPi.GPIO",
+
+    # Perception
+    "numpy",
+    "opencv-python-headless",
+    "onnxruntime",
+    "faiss-cpu",
+    "silero-vad",
+
+    # Communication
+    "pyaudio",
+    "httpx",
+
+    # Display
+    "pillow",
+    "pygame",
+
+    # Storage
+    "aiosqlite",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+boxbot = "boxbot.core.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/boxbot"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

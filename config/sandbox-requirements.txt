@@ -1,0 +1,25 @@
+# Sandbox venv pre-installed packages
+# These are available to all agent-written scripts and skill scripts.
+# Additional packages require user approval at runtime.
+
+# boxBot SDK — constrained API for interacting with boxBot internals
+# Installed from src/boxbot/sdk/ (editable, no boxbot dependencies)
+-e ../src/boxbot/sdk
+
+# HTTP & APIs
+requests>=2.31
+httpx>=0.27
+beautifulsoup4>=4.12
+lxml>=5.0
+
+# Data & Computation
+numpy>=1.26
+python-dateutil>=2.9
+pyyaml>=6.0
+
+# Text & Formatting
+jinja2>=3.1
+markdown>=3.5
+
+# Images
+Pillow>=10.0

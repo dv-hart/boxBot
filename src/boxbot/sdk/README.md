@@ -1,0 +1,386 @@
+# sdk/
+
+The boxBot SDK — a constrained, immutable API that agent-written scripts
+import to interact with boxBot internals. This is the **only** interface
+sandbox scripts have to the system.
+
+## Why an SDK?
+
+The agent's primary tool is `execute_script`. Instead of bloating the tool
+list with a dedicated tool for every operation (create display, manage photos,
+manage memory, install packages...), the agent writes Python scripts that
+import from this SDK. This gives us:
+
+1. **Slim tool list** — only 9 always-loaded tools instead of 14+
+2. **Constrained access** — the SDK exposes safe, validated operations;
+   the agent can't bypass them to touch core code
+3. **Composability** — a single script can combine multiple SDK operations
+   (tag a photo AND add it to the slideshow AND save a memory about it)
+4. **Immutability** — the SDK is pre-installed in the sandbox venv;
+   agent scripts cannot modify it
+5. **Extensibility** — new SDK capabilities don't require new tools
+
+## Installation
+
+The SDK is part of the boxBot repo (`src/boxbot/sdk/`) but is installed
+**independently** into the sandbox venv during setup. It has no dependency
+on boxBot internals — only stdlib and packages already in the sandbox.
+
+```bash
+# Done automatically by scripts/setup.sh:
+data/sandbox/venv/bin/pip install -e src/boxbot/sdk/
+```
+
+## How It Works
+
+Agent scripts interact with the SDK's Python API. Under the hood, the SDK
+communicates results back to the main process through structured JSON on
+stdout. The `execute_script` tool separates SDK actions from regular script
+output and applies them.
+
+```
+Agent calls execute_script with:
+┌──────────────────────────────────────────┐
+│  from boxbot_sdk import display          │
+│                                          │
+│  d = display.create("weather_board")     │
+│  d.set_theme("boxbot")                   │
+│  d.data("weather")                       │
+│  header = d.row(padding=24)              │
+│  header.icon("{weather.icon}", size="xl")│
+│  header.text("{weather.temp}°F")         │
+│  d.save()                                │
+└─────────────────┬────────────────────────┘
+                  │
+                  ▼
+SDK emits structured JSON to stdout:
+┌──────────────────────────────────────────┐
+│  {"_sdk": "display.save",               │
+│   "name": "weather_board",              │
+│   "spec": { ... block tree + data ... }}│
+└─────────────────┬────────────────────────┘
+                  │
+                  ▼
+execute_script tool (main process) applies:
+┌──────────────────────────────────────────┐
+│  Validates spec against block schemas    │
+│  Writes to displays/weather_board/       │
+│  Queues user approval for activation     │
+│  Returns confirmation to agent           │
+└──────────────────────────────────────────┘
+```
+
+The agent never writes raw display Python. It composes from the block
+library through the SDK's builder API. The rendering engine draws the
+spec using validated block implementations.
+
+## Modules
+
+### `display` — Display Builder
+
+Create displays through a declarative block system. The agent composes
+layout containers and content blocks into a tree — the rendering engine
+handles all positioning, text wrapping, overflow, and theming. The agent
+describes **what** to show, not **how** to render it.
+
+For the complete block reference, data binding system, theme schema,
+and use case walkthroughs, see [../../docs/display-system.md](../../docs/display-system.md).
+
+```python
+from boxbot_sdk import display
+
+d = display.create("weather_board")
+d.set_theme("boxbot")
+d.data("weather")                     # built-in source, zero config
+
+header = d.row(padding=24, align="center")
+header.icon("{weather.icon}", size="xl")    # icon name from data source
+info = header.column()
+info.text("{weather.temp}°F", size="title", animation="count_up")
+info.text("{weather.condition}", size="body", color="muted")
+
+forecast = d.row(gap=16, padding=[0, 24], align="spread")
+day = forecast.repeat("{weather.forecast}", max=5)
+day_col = day.column(align="center")
+day_col.text("{.day}", size="caption", color="muted")
+day_col.icon("{.icon}", size="sm")
+day_col.text("{.high}°/{.low}°", size="small")
+
+d.preview()    # render to PNG, agent views the image
+d.save()       # emit spec, main process queues for user approval
+```
+
+**Layout containers (7):** `row`, `column`/`stack`, `columns` (with
+ratio-based widths like `[2, 1]`), `card`, `spacer`, `divider`, `repeat`
+
+**Content blocks (13):** `text`, `metric`, `badge`, `list`, `table`,
+`key_value`, `icon`, `emoji`, `image`, `chart` (line/bar/area with
+multi-series), `progress`, `clock` (live), `countdown` (live)
+
+**Composite widgets (2):** `weather_widget`, `calendar_widget`
+
+**Meta blocks (2):** `rotate` (cycle through data items on interval),
+`page_dots`
+
+**Data sources:** Built-in (`weather`, `calendar`, `tasks`, `people`,
+`agent_status`, `clock`) deliver display-ready data including resolved
+icon names and color tokens. Custom sources (`http_json`, `http_text`,
+`memory_query`, `static`) support `fields` with `map` transforms for
+declarative value mapping — no conditional logic needed.
+
+**Themes:** `boxbot` (default), `midnight`, `daylight`, `classic`.
+Community themes are YAML files in `themes/`.
+
+**Preview:** `d.preview()` renders the display to a 1024x600 PNG. The
+agent views the image (multimodal), evaluates the result, and iterates
+before saving.
+
+The agent **cannot** provide arbitrary render code. It composes from
+the block library. The main process renders the spec to pygame using
+validated block implementations.
+
+### `skill` — Skill Builder
+
+Create new skills. The skill's execution logic is a Python script that
+runs in the sandbox.
+
+```python
+from boxbot_sdk import skill
+
+s = skill.create("check_gmail")
+s.description = "Check for unread emails and return summaries"
+s.add_parameter("max_results", type="integer", default=10)
+s.add_parameter("label", type="string", default="INBOX")
+
+# The script that runs when the skill is invoked
+s.set_script('''
+import imaplib
+import email
+import json
+import os
+
+mail = imaplib.IMAP4_SSL("imap.gmail.com")
+mail.login(os.environ["GMAIL_USER"], os.environ["GMAIL_APP_PASSWORD"])
+mail.select(params.get("label", "INBOX"))
+_, data = mail.search(None, "UNSEEN")
+# ... process and print results ...
+''')
+
+# Environment variables this skill needs at runtime
+s.add_env_var("GMAIL_USER", secret=True)
+s.add_env_var("GMAIL_APP_PASSWORD", secret=True)
+
+s.save()  # auto-activates (skill logic is sandboxed)
+```
+
+### `packages` — Package Manager
+
+Request package installation. Triggers user approval flow.
+
+```python
+from boxbot_sdk import packages
+
+# Blocks until user approves or denies
+result = packages.request("google-api-python-client",
+                          reason="Needed for Gmail integration")
+if result.approved:
+    import googleapiclient  # now available
+else:
+    print(f"Denied: {result.reason}")
+```
+
+### `memory` — Memory Store
+
+Read and write memories.
+
+```python
+from boxbot_sdk import memory
+
+# Save a memory
+memory.save(
+    content="Jacob is allergic to peanuts",
+    people=["Jacob"],
+    tags=["health", "allergy"],
+    importance=0.9
+)
+
+# Search memories
+results = memory.search("allergies", people=["Jacob"])
+for m in results:
+    print(f"{m.content} (importance: {m.importance})")
+
+# Delete a memory
+memory.delete(memory_id="abc-123")
+```
+
+### `photos` — Photo Manager
+
+Manage the photo library, tags, slideshow, and soft-delete lifecycle.
+Photo **search** is also available as a direct agent tool
+(`search_photos`) — both use the same backend.
+
+```python
+from boxbot_sdk import photos
+
+# Search (shared backend with search_photos tool)
+results = photos.search(query="beach sunset", tags=["vacation"],
+                        people=["Jacob"], limit=10)
+for p in results:
+    print(f"{p.id}: {p.description} [{', '.join(p.tags)}]")
+
+# Get full details for a photo
+info = photos.get("photo_123")
+print(info.description, info.tags, info.people, info.file_path)
+
+# Update metadata
+photos.update("photo_123",
+              description="Updated description of this photo")
+
+# Set tags (replaces existing tags on the photo)
+photos.set_tags("photo_123", tags=["family", "beach", "summer"])
+
+# Tag people in photos (for unknown persons identified later)
+# person_index refers to the order in photo_people for this photo
+photos.set_person("photo_123", person_index=0, name="Sarah")
+
+# Slideshow management
+photos.add_to_slideshow("photo_123")
+photos.remove_from_slideshow("photo_456")
+
+# Tag library management
+photos.merge_tags("sunsets", into="sunset")   # consolidate synonyms
+photos.rename_tag("vacaction", to="vacation") # fix typos
+photos.delete_tag("obsolete_tag")             # remove unused tag
+
+# Soft delete / restore (30-day retention, configurable)
+photos.delete("photo_123")          # soft delete
+photos.restore("photo_123")         # restore before retention expires
+deleted = photos.list_deleted()     # see soft-deleted photos
+
+# Storage quota info
+info = photos.storage_info()
+print(f"{info.used_gb:.1f} GB / {info.quota_gb:.1f} GB "
+      f"({info.used_percent:.0f}%)")
+```
+
+### `tasks` — Trigger & To-Do Manager
+
+Create and manage triggers (wake conditions) and to-do items. The
+`manage_tasks` tool handles common conversational operations directly.
+This SDK module is for complex multi-step task management within scripts
+— batch operations, conditional logic, or combining task management
+with other SDK calls.
+
+```python
+from boxbot_sdk import tasks
+
+# Point-in-time trigger
+tasks.create_trigger(
+    description="Dentist reminder for Jacob",
+    instructions="Remind Jacob about his dentist appointment at 4pm",
+    fire_at="2026-02-21T15:30:00",
+    for_person="Jacob"
+)
+
+# Timer trigger (max 24h)
+tasks.create_trigger(
+    description="Check for package delivery",
+    instructions="Look outside and check if a package was delivered",
+    fire_after="2h"
+)
+
+# Person trigger
+tasks.create_trigger(
+    description="Tell Jacob about dinner",
+    instructions="Tell Jacob that dinner is at 7pm. Carina asked.",
+    person="Jacob",
+    for_person="Jacob"
+)
+
+# Compound trigger (timer + person, AND logic)
+tasks.create_trigger(
+    description="Remind Jacob about package",
+    instructions="Remind Jacob the Amazon package arrived",
+    fire_after="30m",
+    person="Jacob",
+    for_person="Jacob"
+)
+
+# Recurring trigger
+tasks.create_trigger(
+    description="Morning briefing",
+    instructions="Check weather, review to-do list, update displays",
+    cron="0 7 * * *"
+)
+
+# Create a to-do item
+tasks.create_todo(
+    description="Return library books",
+    notes="Jacob mentioned during breakfast. Books on kitchen counter. "
+          "Due Saturday. Check if the Poe collection has a hold.",
+    for_person="Jacob",
+    due_date="2026-02-22"
+)
+
+# List triggers and to-dos
+for trigger in tasks.list_triggers(status="active"):
+    print(f"Trigger: {trigger.description} [{trigger.status}]")
+
+for todo in tasks.list_todos(status="pending"):
+    print(f"To-do: {todo.description}")
+
+# Get full details (includes notes)
+item = tasks.get("todo_abc123")
+print(item.notes)  # detailed context loaded on demand
+
+# Complete a to-do
+tasks.complete("todo_abc123")
+
+# Cancel a trigger or to-do
+tasks.cancel("trigger_xyz789")
+```
+
+## Security Properties
+
+1. **Immutable** — the SDK is installed in the sandbox venv's site-packages.
+   Agent scripts cannot modify it (site-packages is read-only to scripts)
+2. **Validated** — all inputs are schema-validated before emitting actions.
+   Invalid specs are rejected with clear error messages
+3. **Declarative displays** — the agent describes what to show using
+   building blocks, never writes raw render code that runs in main process
+4. **Approval gates** — `display.save()` queues for user approval,
+   `packages.request()` blocks for user approval
+5. **No core access** — the SDK cannot import from `boxbot.*` (different
+   venv). It communicates only through structured JSON actions
+6. **Auditable** — every SDK action is logged with timestamp and context
+
+## Files
+
+### `__init__.py`
+Package init — exports top-level modules.
+
+### `display.py`
+`DisplayBuilder` class with block-based declarative builder methods.
+
+### `skill.py`
+`SkillBuilder` class for defining skills declaratively.
+
+### `packages.py`
+Package installation request flow.
+
+### `memory.py`
+Memory CRUD operations.
+
+### `photos.py`
+Photo management operations.
+
+### `tasks.py`
+Trigger and to-do management operations.
+
+### `_transport.py`
+Internal module that handles structured JSON output to stdout.
+Not part of the public API.
+
+### `_validators.py`
+Input validation schemas. Ensures all SDK actions are well-formed
+before emitting.

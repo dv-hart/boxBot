@@ -1,0 +1,36 @@
+# WhatsApp Configuration
+# Copy this file to whatsapp.yaml and fill in your credentials.
+# NEVER commit whatsapp.yaml — it contains secrets.
+
+# WhatsApp Business API credentials (from Meta Developer Portal)
+# Access token goes in .env as WHATSAPP_ACCESS_TOKEN
+api:
+  # phone_number_id: "${WHATSAPP_PHONE_NUMBER_ID}"
+  # verify_token: "${WHATSAPP_VERIFY_TOKEN}"
+
+# Webhook configuration
+webhook:
+  # Path for incoming message webhook
+  path: "/webhook/whatsapp"
+  # Port for the webhook listener (the ONLY open network port)
+  port: 8443
+
+# Registration settings
+registration:
+  # Code length (digits)
+  code_length: 6
+  # Code expiry (seconds)
+  code_expiry: 600          # 10 minutes
+  # Max code generations per admin per hour
+  max_codes_per_hour: 3
+  # Failed attempt rate limiting
+  max_attempts_per_window: 5
+  attempt_window: 600       # 10 minutes
+  temp_block_duration: 3600 # 1 hour
+  max_temp_blocks: 3        # permanent block after this many
+  # Log blocked messages (for admin review, no content stored)
+  log_blocked: true
+
+# NOTE: Users are NOT stored in this config file.
+# Users are managed through the registration flow and stored in
+# the local database. See docs/user-registration.md.

@@ -1,0 +1,4 @@
+name: example_skill
+description: "An example skill demonstrating the skill framework structure"
+version: "0.1.0"
+author: "boxBot Contributors"

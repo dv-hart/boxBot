@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "boxbot-sdk"
+version = "0.1.0"
+description = "boxBot SDK — constrained API for agent sandbox scripts"
+requires-python = ">=3.11"
+# No dependencies beyond stdlib — the SDK runs in an isolated sandbox venv
+
+[tool.hatch.build.targets.wheel]
+# Install this directory as the `boxbot_sdk` package.
+# Files at src/boxbot/sdk/*.py become importable as boxbot_sdk.*
+packages = ["boxbot_sdk"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# Map the SDK source files into the boxbot_sdk package directory
+"__init__.py" = "boxbot_sdk/__init__.py"
+"_transport.py" = "boxbot_sdk/_transport.py"
+"_validators.py" = "boxbot_sdk/_validators.py"
+"display.py" = "boxbot_sdk/display.py"
+"skill.py" = "boxbot_sdk/skill.py"
+"packages.py" = "boxbot_sdk/packages.py"
+"memory.py" = "boxbot_sdk/memory.py"
+"photos.py" = "boxbot_sdk/photos.py"
+"tasks.py" = "boxbot_sdk/tasks.py"
+"secrets.py" = "boxbot_sdk/secrets.py"

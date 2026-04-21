@@ -109,6 +109,7 @@ def _overlay_env(data: dict[str, Any]) -> None:
         "WHATSAPP_ACCESS_TOKEN": "whatsapp_access_token",
         "WHATSAPP_PHONE_NUMBER_ID": "whatsapp_phone_number_id",
         "WHATSAPP_VERIFY_TOKEN": "whatsapp_verify_token",
+        "WHATSAPP_APP_SECRET": "whatsapp_app_secret",
         "AWS_ACCESS_KEY_ID": "aws_access_key_id",
         "AWS_SECRET_ACCESS_KEY": "aws_secret_access_key",
         "AWS_S3_BUCKET": "aws_s3_bucket",
@@ -281,6 +282,8 @@ class SandboxConfig(BaseModel):
     timeout: int = 30
     memory_limit_mb: int = 256
     allow_network: bool = True
+    enforce: bool = True
+    seccomp_profile: str = "config/seccomp-sandbox.json"
     install_approval_timeout: int = 300
     install_approval_channels: list[str] = Field(
         default_factory=lambda: ["display", "whatsapp"]
@@ -315,6 +318,7 @@ class ApiKeysConfig(BaseModel):
     whatsapp_access_token: str | None = None
     whatsapp_phone_number_id: str | None = None
     whatsapp_verify_token: str | None = None
+    whatsapp_app_secret: str | None = None
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     aws_s3_bucket: str | None = None
@@ -365,3 +369,20 @@ class BoxBotConfig(BaseModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     api_keys: ApiKeysConfig = Field(default_factory=ApiKeysConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+    @model_validator(mode="after")
+    def validate_production_requirements(self) -> BoxBotConfig:
+        """Validate that production-critical secrets are set when sandbox is enforced.
+
+        When sandbox.enforce is True (the default), the system is assumed to
+        be running in production. Certain secrets must be configured:
+        - WHATSAPP_APP_SECRET for webhook signature validation
+        """
+        if self.sandbox.enforce:
+            if self.api_keys.whatsapp_access_token and not self.api_keys.whatsapp_app_secret:
+                logger.warning(
+                    "WHATSAPP_APP_SECRET is not set but sandbox.enforce is true. "
+                    "Webhook signature validation will be skipped — set "
+                    "WHATSAPP_APP_SECRET in .env for production use."
+                )
+        return self

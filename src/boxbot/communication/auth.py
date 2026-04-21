@@ -551,3 +551,62 @@ class AuthManager:
             )
             row = await cursor.fetchone()
             return row is not None
+
+    # -----------------------------------------------------------------
+    # Database maintenance
+    # -----------------------------------------------------------------
+
+    async def cleanup(self) -> dict[str, int]:
+        """Purge expired registration codes and stale failed attempts.
+
+        Removes:
+        - Used registration codes older than 24 hours
+        - Expired (unused) registration codes older than 24 hours
+        - Failed attempts older than 24 hours
+        - Expired temporary blocks
+
+        Returns:
+            Dict with counts of purged rows per table.
+        """
+        cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+        now = datetime.now().isoformat()
+        purged: dict[str, int] = {}
+
+        async with self._get_db() as db:
+            # Purge old used codes
+            cursor = await db.execute(
+                "DELETE FROM registration_codes "
+                "WHERE used_at IS NOT NULL AND used_at < ?",
+                (cutoff,),
+            )
+            purged["used_codes"] = cursor.rowcount
+
+            # Purge old expired unused codes
+            cursor = await db.execute(
+                "DELETE FROM registration_codes "
+                "WHERE used_by IS NULL AND expires_at < ?",
+                (cutoff,),
+            )
+            purged["expired_codes"] = cursor.rowcount
+
+            # Purge old failed attempts
+            cursor = await db.execute(
+                "DELETE FROM failed_attempts WHERE attempted_at < ?",
+                (cutoff,),
+            )
+            purged["failed_attempts"] = cursor.rowcount
+
+            # Purge expired temporary blocks (not permanent ones)
+            cursor = await db.execute(
+                "DELETE FROM blocks "
+                "WHERE permanent = 0 AND expires_at IS NOT NULL AND expires_at < ?",
+                (now,),
+            )
+            purged["expired_blocks"] = cursor.rowcount
+
+            await db.commit()
+
+        total = sum(purged.values())
+        if total > 0:
+            logger.info("Auth cleanup: purged %d rows — %s", total, purged)
+        return purged

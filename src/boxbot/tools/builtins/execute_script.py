@@ -27,6 +27,24 @@ SDK_ACTION_MARKER = "__BOXBOT_SDK_ACTION__"
 SCRIPTS_DIR = Path("data/sandbox/scripts")
 OUTPUT_DIR = Path("data/sandbox/output")
 
+# Environment variable allowlist — only these are passed to sandbox scripts.
+# All secrets (API keys, tokens, credentials) are excluded by default.
+# The agent can pass additional vars via the env_vars parameter, but those
+# are explicitly chosen per-invocation (e.g., a skill's own API key).
+SAFE_ENV_VARS = frozenset({
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONUNBUFFERED",
+    "TERM",
+})
+
 
 class ExecuteScriptTool(Tool):
     """Run a Python script in the sandbox environment."""
@@ -85,22 +103,54 @@ class ExecuteScriptTool(Tool):
             timeout = config.sandbox.timeout
             sandbox_user = config.sandbox.user
         except RuntimeError:
-            # Config not loaded — use defaults
+            # Config not loaded — use defaults (development mode)
+            config = None
             venv_python = Path("data/sandbox/venv/bin/python3")
             timeout = 30
             sandbox_user = "boxbot-sandbox"
 
-        # Build environment
-        env = os.environ.copy()
-        # Remove sensitive vars
-        for key in ("ANTHROPIC_API_KEY", "WHATSAPP_ACCESS_TOKEN"):
-            env.pop(key, None)
-        # Inject caller-provided env vars
+        # Build environment — allowlist only, no secrets leak through.
+        # Only explicitly safe variables are passed to the sandbox.
+        env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_VARS}
+        # Inject caller-provided env vars (e.g., a skill's own API key)
         env.update(env_vars)
 
-        # Build command — in production this runs as sandbox_user via sudo
-        # For development, run directly with the sandbox venv python
-        cmd = [str(venv_python), str(script_path)]
+        # Build command — in production, run as sandbox user with seccomp
+        enforce = config.sandbox.enforce if config is not None else False
+        if enforce:
+            # Production: privilege-drop via sudo + seccomp via bwrap
+            seccomp_profile = Path(config.sandbox.seccomp_profile)
+            if seccomp_profile.exists():
+                cmd = [
+                    "bwrap",
+                    "--ro-bind", "/", "/",
+                    "--bind", str(SCRIPTS_DIR.resolve()), str(SCRIPTS_DIR.resolve()),
+                    "--bind", str(OUTPUT_DIR.resolve()), str(OUTPUT_DIR.resolve()),
+                    "--seccomp", "3",  # fd 3 for seccomp filter
+                    "--", "sudo", "-u", sandbox_user,
+                    str(venv_python), str(script_path),
+                ]
+                logger.debug(
+                    "Sandbox enforced: sudo -u %s + seccomp", sandbox_user
+                )
+            else:
+                cmd = [
+                    "sudo", "-u", sandbox_user,
+                    str(venv_python), str(script_path),
+                ]
+                logger.warning(
+                    "Seccomp profile not found at %s — running with "
+                    "sudo -u %s only (no seccomp)",
+                    seccomp_profile,
+                    sandbox_user,
+                )
+        else:
+            # Development: run directly without privilege drop
+            logger.warning(
+                "Sandbox enforcement DISABLED (sandbox.enforce=false) — "
+                "script runs as current user without isolation"
+            )
+            cmd = [str(venv_python), str(script_path)]
 
         try:
             proc = await asyncio.create_subprocess_exec(

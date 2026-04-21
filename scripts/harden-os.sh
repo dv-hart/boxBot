@@ -35,7 +35,7 @@ if [[ -z "$REAL_USER" ]]; then
     exit 1
 fi
 
-REAL_HOME=$(eval echo "~$REAL_USER")
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 
 # Webhook port: from environment, or prompt
 WEBHOOK_PORT="${WEBHOOK_PORT:-}"

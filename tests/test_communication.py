@@ -432,3 +432,65 @@ class TestMessageRouter:
             Channel.WHATSAPP, phone, "Let me in"
         )
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Auth Manager — Cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestAuthManagerCleanup:
+    """Test database maintenance / cleanup."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_purges_expired_codes(self, auth_manager):
+        """Expired unused codes older than 24h are removed."""
+        # Create a code that's already expired (expiry in the past)
+        import aiosqlite
+        from datetime import datetime, timedelta
+
+        old_time = (datetime.now() - timedelta(hours=25)).isoformat()
+        old_expiry = (datetime.now() - timedelta(hours=24, minutes=50)).isoformat()
+
+        async with aiosqlite.connect(auth_manager._db_path) as db:
+            await db.execute(
+                "INSERT INTO registration_codes "
+                "(code, created_by, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("999999", "bootstrap", old_time, old_expiry),
+            )
+            await db.commit()
+
+        result = await auth_manager.cleanup()
+        assert result["expired_codes"] >= 1
+
+        # Verify the code was actually removed
+        assert await auth_manager.validate_code("999999") is False
+
+    @pytest.mark.asyncio
+    async def test_cleanup_purges_old_failed_attempts(self, auth_manager):
+        """Failed attempts older than 24h are removed."""
+        import aiosqlite
+        from datetime import datetime, timedelta
+
+        old_time = (datetime.now() - timedelta(hours=25)).isoformat()
+
+        async with aiosqlite.connect(auth_manager._db_path) as db:
+            for _ in range(5):
+                await db.execute(
+                    "INSERT INTO failed_attempts (phone, attempted_at) "
+                    "VALUES (?, ?)",
+                    ("+19998887777", old_time),
+                )
+            await db.commit()
+
+        result = await auth_manager.cleanup()
+        assert result["failed_attempts"] >= 5
+
+    @pytest.mark.asyncio
+    async def test_cleanup_preserves_valid_codes(self, auth_manager):
+        """Active, unexpired codes are not removed."""
+        code = await auth_manager.generate_bootstrap_code()
+        result = await auth_manager.cleanup()
+        # The fresh code should still be valid
+        assert await auth_manager.validate_code(code) is True

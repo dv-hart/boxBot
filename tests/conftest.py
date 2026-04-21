@@ -95,6 +95,7 @@ photos:
   max_storage_percent: 10
 sandbox:
   timeout: 5
+  enforce: false
 models:
   large: test-large
   small: test-small

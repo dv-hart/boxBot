@@ -36,6 +36,14 @@ def collect_response(timeout: int = 30) -> dict:
     Used for operations that need a result from the main process,
     such as packages.request() which blocks until user approval.
 
+    .. note::
+        This function uses ``select.select()`` on stdin, which requires a
+        Unix-like OS (Linux, macOS). It does not work on Windows because
+        ``select`` cannot monitor non-socket file descriptors there. This
+        is fine for the Raspberry Pi target but will raise an error in
+        Windows development environments. Use WSL or a Linux VM for local
+        testing of SDK scripts that call ``collect_response()``.
+
     Args:
         timeout: Maximum seconds to wait for a response.
 
@@ -45,6 +53,7 @@ def collect_response(timeout: int = 30) -> dict:
     Raises:
         TimeoutError: If no response within timeout.
         RuntimeError: If stdin is closed or response is malformed.
+        OSError: On Windows where select() does not support stdin.
     """
     import select
 

@@ -9,6 +9,7 @@ import pytest
 
 from boxbot.tools.base import Tool
 from boxbot.tools.builtins.execute_script import (
+    SAFE_ENV_VARS,
     SDK_ACTION_MARKER,
     ExecuteScriptTool,
     _process_sdk_action,
@@ -184,6 +185,72 @@ class TestExecuteScriptTool:
         result = await _process_sdk_action({"action": "memory.save"})
         assert result["status"] == "processed"
         assert result["action"] == "memory.save"
+
+    def test_safe_env_vars_excludes_secrets(self):
+        """SAFE_ENV_VARS must not include any known secret env vars."""
+        secret_vars = {
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "DEEPGRAM_API_KEY",
+            "ELEVENLABS_API_KEY",
+            "WHATSAPP_ACCESS_TOKEN",
+            "WHATSAPP_VERIFY_TOKEN",
+            "WHATSAPP_APP_SECRET",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        }
+        assert SAFE_ENV_VARS.isdisjoint(secret_vars), (
+            f"SAFE_ENV_VARS must not contain secrets: "
+            f"{SAFE_ENV_VARS & secret_vars}"
+        )
+
+    def test_safe_env_vars_includes_essentials(self):
+        """SAFE_ENV_VARS must include PATH and LANG for basic operation."""
+        assert "PATH" in SAFE_ENV_VARS
+        assert "LANG" in SAFE_ENV_VARS
+
+    @pytest.mark.asyncio
+    async def test_env_allowlist_applied(self, tmp_path):
+        """Verify that only allowlisted env vars reach the subprocess."""
+        tool = ExecuteScriptTool()
+
+        captured_env = {}
+
+        async def fake_subprocess(*args, **kwargs):
+            nonlocal captured_env
+            captured_env = kwargs.get("env", {})
+            proc_mock = AsyncMock()
+            proc_mock.communicate.return_value = (b"ok\n", b"")
+            proc_mock.returncode = 0
+            return proc_mock
+
+        with patch("boxbot.tools.builtins.execute_script.SCRIPTS_DIR", tmp_path / "scripts"):
+            with patch("boxbot.tools.builtins.execute_script.OUTPUT_DIR", tmp_path / "output"):
+                with patch("boxbot.tools.builtins.execute_script.get_config", side_effect=RuntimeError):
+                    with patch.dict("os.environ", {
+                        "PATH": "/usr/bin",
+                        "ANTHROPIC_API_KEY": "sk-secret-key",
+                        "AWS_SECRET_ACCESS_KEY": "aws-secret",
+                        "HOME": "/home/test",
+                        "RANDOM_VAR": "should-not-pass",
+                    }, clear=True):
+                        with patch(
+                            "asyncio.create_subprocess_exec",
+                            side_effect=fake_subprocess,
+                        ):
+                            await tool.execute(
+                                script="print('test')",
+                                description="Env test",
+                            )
+
+        # Allowlisted vars should be present
+        assert captured_env.get("PATH") == "/usr/bin"
+        assert captured_env.get("HOME") == "/home/test"
+        # Secrets must NOT be present
+        assert "ANTHROPIC_API_KEY" not in captured_env
+        assert "AWS_SECRET_ACCESS_KEY" not in captured_env
+        # Non-allowlisted non-secrets must NOT be present
+        assert "RANDOM_VAR" not in captured_env
 
 
 # ---------------------------------------------------------------------------

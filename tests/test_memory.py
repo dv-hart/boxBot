@@ -332,8 +332,25 @@ class TestContainsSecret:
     def test_detects_bearer_token(self):
         assert _contains_secret("Bearer eyJhbGciOiJIUzI1NiIsInR5c") is True
 
+    def test_detects_aws_access_key(self):
+        assert _contains_secret("AWS key is AKIAIOSFODNN7EXAMPLE") is True
+
+    def test_detects_github_token(self):
+        assert _contains_secret("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij") is True
+
+    def test_detects_pem_private_key(self):
+        assert _contains_secret("-----BEGIN RSA PRIVATE KEY-----") is True
+        assert _contains_secret("-----BEGIN EC PRIVATE KEY-----") is True
+
+    def test_detects_slack_token(self):
+        assert _contains_secret("xoxb-1234567890-abcdefghij") is True
+
     def test_normal_text_is_clean(self):
         assert _contains_secret("Jacob likes coffee in the morning") is False
+
+    def test_technical_text_without_secrets_is_clean(self):
+        assert _contains_secret("The API documentation says to use version 3") is False
+        assert _contains_secret("GitHub is a code hosting platform") is False
 
 
 class TestApplySectionUpdate:

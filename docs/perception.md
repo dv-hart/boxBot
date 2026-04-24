@@ -35,14 +35,14 @@ via the separate code-based flow. See
 ├────────────────────────────────────────────────────┤ (no     │
 │  CHECKING                                          │ motion) │
 │  Camera: single full-res frame                     │    │    │
-│  Hailo: YOLOv8n person detection (~12ms)           │    │    │
+│  Hailo: YOLOv5s-personface detection (~26ms)        │    │    │
 │  Result: person? → DETECTED                        │    │    │
 │  Result: not a person → back to DORMANT            │◄───┘    │
 ├────────────────────────────────────────────────────┤         │
 │  ▼ person confirmed                                │         │
 ├────────────────────────────────────────────────────┤         │
 │  DETECTED                                          │         │
-│  Hailo: ReID embedding on person crop(s) (~15ms)   │         │
+│  Hailo: ReID embedding on person crop(s) (<1ms)    │         │
 │  CPU: centroid comparison → tentative label        │         │
 │  Event: person_detected(label, confidence)         │         │
 │  Begin lazy-loading pyannote models (background)   │         │
@@ -104,17 +104,19 @@ person-triggered wake events ("remind Jacob when he walks in").
 
 ### Step 2: Hailo Person Detection
 
-A single full-resolution frame is sent to YOLOv8n on the Hailo. Takes
-~12ms. If no person is found (pet, shadow, lighting change), the system
-returns to DORMANT. If a person is found, bounding boxes are extracted
-and passed to ReID.
+A single full-resolution frame is sent to YOLOv5s-personface on the
+Hailo. Takes ~26ms. If no person is found (pet, shadow, lighting change),
+the system returns to DORMANT. If a person is found, bounding boxes are
+extracted and passed to ReID. Note: YOLOv5s-personface detects both
+person and face classes — face detections are available for future
+face-based ReID but are not used in v1.
 
 **Compute cost at 1 FPS equivalent:**
 ```
-YOLOv8n: ~8.7 GFLOPs per inference
+YOLOv5s-personface: ~7.4 GFLOPs per inference
 Hailo-8L: 13 TOPS capacity
-Utilization: 0.07%
-Inference time: ~12ms per frame
+Utilization: ~0.06%
+Inference time: ~26ms per frame
 Power: ~1.52W (barely above 1.5W idle)
 ```
 
@@ -130,21 +132,21 @@ for 30s → DORMANT).
 
 ### Model
 
-**OSNet-AIN-x1.0** (Omni-Scale Network with Adaptive Instance
-Normalization):
-- 2.2M parameters, 512-dim embeddings
-- Purpose-designed for person ReID
-- Instance normalization handles domain shift (surveillance training
-  data → home environment with varying lighting, angles, clothing)
-- Lightweight — trivial for the Hailo-8L, runs in ~15ms on a crop
-- Compiled from ONNX to HEF for Hailo deployment
+**RepVGG-A0** (person ReID variant):
+- 2.5M parameters, 512-dim embeddings
+- RepVGG architecture: multi-branch training, single-path inference
+  (structural re-parameterization makes it fast on accelerators)
+- Sub-millisecond inference on Hailo-8L (<1ms per crop)
+- 256×128 input resolution (standard person ReID crop size)
+- Pre-compiled HEF: `repvgg_a0_person_reid_512.hef`
 
 **Other options considered:**
 
 | Model | Params | Embedding | Accuracy (Market-1501) | Notes |
 |-------|--------|-----------|----------------------|-------|
 | OSNet-x0.25 | 0.2M | 512-dim | ~73% mAP | Ultralight, lower accuracy |
-| **OSNet-AIN-x1.0** | **2.2M** | **512-dim** | **~86% mAP** | **Selected — best accuracy/size tradeoff, good domain shift handling** |
+| OSNet-AIN-x1.0 | 2.2M | 512-dim | ~86% mAP | Good domain shift handling, but Hailo compilation issues |
+| **RepVGG-A0** | **2.5M** | **512-dim** | **~85% mAP** | **Selected — sub-ms on Hailo, proven HEF available** |
 | MobileNetV3 + ReID head | 5.4M | 512-dim | ~78% mAP | General-purpose backbone, less ReID-optimized |
 | ResNet18 + ReID head | 11M | 512-dim | ~80% mAP | Proven but larger, no ReID-specific design |
 | LightMBN | 3.3M | 1536-dim | ~91% mAP | Upgrade path if accuracy insufficient |
@@ -539,8 +541,8 @@ data/
       2026-02-21/
         {uuid}.jpg       # 100-250px person crops
     models/              # Hailo HEF files
-      yolov8n_person.hef
-      osnet_ain_x1.hef
+      yolov5s_personface_h8l.hef
+      repvgg_a0_person_reid_512.hef
 ```
 
 ## Privacy

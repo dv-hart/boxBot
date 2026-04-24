@@ -11,16 +11,27 @@ Modules:
     photos    — Photo library management
     tasks     — Trigger and to-do management
     secrets   — Write-only secret storage
+    calendar  — Google Calendar read/write
 """
 
-from . import display, skill, packages, memory, photos, tasks, secrets
+from . import (
+    calendar,
+    display,
+    memory,
+    packages,
+    photos,
+    secrets,
+    skill,
+    tasks,
+)
 
 __all__ = [
+    "calendar",
     "display",
-    "skill",
-    "packages",
     "memory",
+    "packages",
     "photos",
-    "tasks",
     "secrets",
+    "skill",
+    "tasks",
 ]

@@ -156,6 +156,13 @@ def _resolve_block(block: Block, data: dict[str, Any],
     if block.block_type == "repeat" and block.children:
         source_binding = block.params.get("source", "")
         items = _resolve_value(source_binding, data, repeat_item, current_item)
+        # Accept bare paths (e.g. "tasks.items") in addition to brace form
+        # ("{tasks.items}"). The brace form would have been resolved above;
+        # fall back to a direct lookup if the value is still a string path.
+        if not isinstance(items, list) and isinstance(source_binding, str):
+            path = source_binding.strip().strip("{}").strip()
+            if path:
+                items = _lookup_binding(path, data, repeat_item, current_item)
         if isinstance(items, list):
             max_items = block.params.get("max")
             if max_items and len(items) > max_items:

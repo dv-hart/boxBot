@@ -17,13 +17,26 @@ import logging
 from boxbot.tools.base import Tool
 from boxbot.tools.builtins.execute_script import ExecuteScriptTool
 from boxbot.tools.builtins.identify_person import IdentifyPersonTool
+from boxbot.tools.builtins.load_skill import LoadSkillTool
 from boxbot.tools.builtins.manage_tasks import ManageTasksTool
 from boxbot.tools.builtins.search_memory import SearchMemoryTool
 from boxbot.tools.builtins.search_photos import SearchPhotosTool
-from boxbot.tools.builtins.send_message import SendMessageTool
-from boxbot.tools.builtins.speak import SpeakTool
 from boxbot.tools.builtins.switch_display import SwitchDisplayTool
 from boxbot.tools.builtins.web_search import WebSearchTool
+
+# All outgoing communication to humans flows through the structured
+# ``outputs`` array of the agent's response (see ``output_dispatcher`` and
+# ``agent._prompt_etiquette``). Each output entry names its recipient and
+# channel explicitly (voice or text), and the dispatcher routes accordingly.
+#
+# ``speak`` and ``send_message`` were previously registered here but are
+# now subsumed by that outputs path:
+# - ``speak(text)``          → ``outputs[{to, channel="voice", content}]``
+# - ``send_message(to,text)``→ ``outputs[{to, channel="text", content}]``
+#
+# The source files under ``builtins/`` remain on disk (for reference and
+# potential future re-wiring), but they are not imported or registered.
+# Tools register only actions that DO things, not speech.
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +46,21 @@ _tools_by_name: dict[str, Tool] | None = None
 
 
 def _load_tools() -> list[Tool]:
-    """Instantiate all built-in tools."""
+    """Instantiate all built-in tools.
+
+    ``speak`` is intentionally absent — speech is produced via structured
+    output (`response_text`) rather than a tool call. See the module
+    docstring note at the top of this file.
+    """
     return [
         ExecuteScriptTool(),
-        SpeakTool(),
         SwitchDisplayTool(),
-        SendMessageTool(),
         IdentifyPersonTool(),
         ManageTasksTool(),
         SearchMemoryTool(),
         SearchPhotosTool(),
         WebSearchTool(),
+        LoadSkillTool(),
     ]
 
 

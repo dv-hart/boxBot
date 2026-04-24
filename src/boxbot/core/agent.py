@@ -1,17 +1,41 @@
-"""Claude Agent SDK integration — the brain of boxBot.
+"""Claude Agent integration — the brain of boxBot.
 
-Wraps the Anthropic Python SDK to orchestrate conversations, dispatch tool
-calls, manage system prompt construction with context injection, and trigger
-post-conversation memory extraction.
+Wraps the Anthropic Python SDK directly (``anthropic.AsyncAnthropic``) to
+orchestrate conversations, dispatch tool calls, manage system prompt
+construction with context injection, and trigger post-conversation memory
+extraction.
 
-The agent subscribes to events on the event bus (wake word, WhatsApp
-messages, trigger fires, person identification) and manages the full
-conversation lifecycle from prompt construction through to memory extraction.
+**Do NOT migrate this to ``claude-agent-sdk`` / ``claude-code-sdk``.** Those
+packages bundle Claude Code and its built-in filesystem/coding tools. boxBot
+is a hardware-facing ambient assistant with bespoke tools (``switch_display``,
+``identify_person``, etc.). See
+``docs/plans/implementation-spec-2026-04-23.md`` §1 for full rationale.
+
+Key design points for this file:
+
+1. **Structured output gate** — every ``messages.create`` call passes
+   ``output_config={"format": {"type": "json_schema", "schema": DECIDE_SCHEMA}}``.
+   The model's final ``end_turn`` text is constrained to a JSON decision
+   object: ``respond`` (bool), ``response_text`` (what to say), ``reason``,
+   ``addressed_to``, ``urgency``, ``silent_context_note``. When
+   ``respond=false`` we stay silent and log the observation; when true we
+   route ``response_text`` directly to the voice session's TTS path.
+
+2. **Prompt caching** — system prompt is a list of text blocks. The static
+   block (persona + etiquette + capabilities + skills index) carries a 1h
+   cache marker; the dynamic block (who's present, time, memories) does
+   not. The last tool definition carries a 1h marker to cache the tools
+   array. A top-level ``cache_control={"type": "ephemeral"}`` enables the
+   5-minute rolling messages cache.
+
+3. **No banned params on Opus 4.7** — we never pass ``temperature``,
+   ``top_p``, ``top_k``, or ``thinking.budget_tokens``. ``max_tokens`` is
+   bumped to 8192 for headroom under the new token accounting.
 
 Usage:
     from boxbot.core.agent import BoxBotAgent
 
-    agent = BoxBotAgent()
+    agent = BoxBotAgent(memory_store)
     await agent.start()
     await agent.handle_conversation(
         channel="voice",
@@ -37,10 +61,17 @@ from boxbot.core.events import (
     ConversationEnded,
     ConversationStarted,
     PersonIdentified,
+    SpeakerIdentified,
+    TranscriptReady,
     TriggerFired,
     WakeWordHeard,
     WhatsAppMessage,
     get_event_bus,
+)
+from boxbot.core.output_dispatcher import (
+    OUTPUT_SCHEMA,
+    dispatch_outputs,
+    parse_output_block,
 )
 from boxbot.core.scheduler import get_status_line
 from boxbot.memory.extraction import extract_memories, process_extraction_result
@@ -57,44 +88,302 @@ logger = logging.getLogger(__name__)
 # Maximum number of API round-trips (tool use loops) per conversation
 _DEFAULT_MAX_TURNS = 20
 
-# Base system prompt — personality, identity, and capabilities overview.
-# Context injections (memories, schedule status, who is present) are
-# appended dynamically at conversation start.
-_BASE_SYSTEM_PROMPT = """\
-You are {name}, an ambient household assistant that lives in an elegant \
-wooden box. You see through a camera, hear through a microphone array, \
-speak through a speaker, and display information on a 7-inch screen. \
-You communicate with your household via voice and WhatsApp.
+# Opus 4.7 needs more headroom than Sonnet 4. Spec §3 mandates 8192.
+_MAX_TOKENS = 8192
 
-You recognise the people around you and proactively help them — relaying \
-messages, managing tasks, controlling displays, and remembering everything \
-important about your household. You are warm, concise, and genuinely useful. \
-You know when to speak up and when to stay quiet.
-
-Your wake word is "{wake_word}".
-
-## Capabilities
-You have 9 always-available tools: execute_script, speak, switch_display, \
-send_message, identify_person, manage_tasks, search_memory, search_photos, \
-and web_search. For complex or infrequent operations, use execute_script to \
-run Python in the sandbox with the boxbot_sdk.
-
-## Guidelines
-- Be concise in voice conversations — no one wants a lecture from a box.
-- Use speak() for voice responses. For WhatsApp, just reply with text.
-- When you learn something important, the memory system captures it \
-  automatically after the conversation ends.
-- You can search your memories at any time with search_memory.
-- Check your to-do list and triggers when waking up on a schedule.
-- For web lookups, use web_search — you never see raw web content directly.
-- Respect privacy: never share one person's information with another \
-  unless it's clearly appropriate (e.g., relaying a message they asked you to).
-"""
+# The structured-output schema is defined in ``output_dispatcher`` so the
+# dispatcher and the agent loop share a single source of truth. Schema
+# mutation invalidates the messages cache — it is pinned at module scope
+# there and imported here.
 
 
 def _generate_conversation_id() -> str:
     """Generate a unique conversation ID."""
     return f"conv_{uuid.uuid4().hex[:12]}"
+
+
+def _render_identity_section(
+    identities: dict[str, dict[str, Any]] | None,
+) -> str:
+    """Render the per-session identity block for the dynamic context.
+
+    Surfaces voice (and, when present, visual) ReID tiers + scores per
+    speaker so the agent can pick the right behavior — address by name on
+    high, verify on medium/low, defer to the onboarding skill on unknown.
+
+    Returns an empty string if there's nothing to render.
+    """
+    if not identities:
+        return ""
+
+    lines: list[str] = []
+    for display_label, info in identities.items():
+        voice_tier = info.get("voice_tier", "unknown")
+        voice_score = info.get("voice_score")
+        visual_tier = info.get("visual_tier")
+        visual_score = info.get("visual_score")
+        person_name = info.get("person_name")
+        source = info.get("source", "unknown")
+
+        voice_bit = f"voice: {voice_tier}"
+        if isinstance(voice_score, (int, float)) and voice_tier != "unknown":
+            voice_bit += f" ({voice_score:.2f})"
+
+        visual_bit = ""
+        if visual_tier:
+            visual_bit = f"   visual: {visual_tier}"
+            if isinstance(visual_score, (int, float)) and visual_tier != "unknown":
+                visual_bit += f" ({visual_score:.2f})"
+
+        # Headline per speaker
+        if person_name and source == "agent_identify":
+            headline = f"- {display_label}  → confirmed as {person_name}"
+        elif person_name and voice_tier == "high":
+            headline = f"- {display_label}  → likely {person_name}"
+        elif person_name and voice_tier in ("medium", "low"):
+            headline = f"- {display_label}  → possibly {person_name}"
+        else:
+            headline = f"- {display_label}  → not recognized"
+
+        lines.append(headline)
+        lines.append(f"    {voice_bit}{visual_bit}")
+
+    guidance = (
+        "\n"
+        "How to address each speaker, based on the tier:\n"
+        "- high (voice ≥0.85 or confirmed): address by name, no hedging.\n"
+        "- medium (voice 0.70-0.85): soft-verify before committing, e.g.\n"
+        "  \"Hey Sarah — correct me if that's wrong?\" or similar. If they\n"
+        "  confirm, call identify_person to pin it. If they correct, call\n"
+        "  identify_person with the corrected name.\n"
+        "- low (voice 0.60-0.70): weak match; don't assume. Ask who they\n"
+        "  are, or load the onboarding skill if they're newly addressing you.\n"
+        "- unknown: treat as a first meeting. Load the `onboarding` skill\n"
+        "  for the procedure — do NOT guess a name."
+    )
+
+    return "## People in this session\n" + "\n".join(lines) + "\n" + guidance
+
+
+# ---------------------------------------------------------------------------
+# System-prompt helpers — each returns a string, composed into blocks below.
+# Keep these FREE of timestamps / UUIDs / anything non-deterministic; the
+# static block is cache-controlled with 1h TTL and will be invalidated by
+# any per-call variability. Dynamic content lives in _prompt_dynamic_context.
+# ---------------------------------------------------------------------------
+
+
+def _prompt_persona(name: str, wake_word: str) -> str:
+    """Return the persona / identity section of the static system prompt."""
+    return (
+        f"You are {name}, an ambient household assistant that lives in an "
+        "elegant wooden box. You see through a camera, hear through a "
+        "microphone array, speak through a speaker, and display information "
+        "on a 7-inch screen. You communicate with your household via voice "
+        "and WhatsApp.\n\n"
+        "You recognise the people around you and proactively help them — "
+        "relaying messages, managing tasks, controlling displays, and "
+        "remembering everything important about your household. You are warm, "
+        "concise, and genuinely useful. You know when to speak up and when "
+        "to stay quiet.\n\n"
+        f"Your wake word is \"{wake_word}\"."
+    )
+
+
+def _prompt_etiquette() -> str:
+    """Return the multi-speaker + output-structure section.
+
+    Every turn the agent emits JSON of shape:
+      {"thought": "...", "outputs": [{"to", "channel", "content"}, ...]}
+
+    Zero outputs = silent turn. One or more outputs = one or more deliveries,
+    each explicit about recipient + medium.
+    """
+    return (
+        "## Every response is structured output\n"
+        "\n"
+        "Every time you respond you emit JSON of this shape:\n"
+        "\n"
+        "    {\n"
+        "      \"thought\": \"private reasoning for this turn\",\n"
+        "      \"outputs\": [\n"
+        "        {\"to\": \"<recipient>\", \"channel\": \"voice\"|\"text\", \"content\": \"...\"}\n"
+        "      ]\n"
+        "    }\n"
+        "\n"
+        "- `thought` is PRIVATE. Never broadcast. Used for your own reasoning\n"
+        "  and for post-conversation memory extraction. Keep it short.\n"
+        "- `outputs` is a LIST. Empty list = silent turn (you noticed but chose\n"
+        "  not to respond). One entry = one delivery. Multiple entries =\n"
+        "  multiple deliveries in a single turn (e.g. reply to the current\n"
+        "  speaker AND text someone else).\n"
+        "- Each output explicitly names its recipient (`to`) and medium\n"
+        "  (`channel`). The system never guesses — your choice is final.\n"
+        "\n"
+        "## Recipient values (`to`)\n"
+        "\n"
+        "- `\"current_speaker\"` — whoever just addressed you in this\n"
+        "  conversation. Resolves to their name at dispatch time.\n"
+        "- `\"room\"` — broadcast voice to anyone physically present.\n"
+        "  Valid only with `channel: \"voice\"`.\n"
+        "- Any registered user's name (e.g. `\"Sarah\"`) — the Registered users\n"
+        "  list in the dynamic context tells you who is reachable and how.\n"
+        "\n"
+        "## Channel values (`channel`)\n"
+        "\n"
+        "- `\"voice\"` — speak through the box speaker (everyone in the room\n"
+        "  hears). Good for replies to people physically at the box and for\n"
+        "  announcements. Does not reach absent people.\n"
+        "- `\"text\"` — send a WhatsApp message to the named user's registered\n"
+        "  phone. Good for replies to text conversations, reaching absent\n"
+        "  household members, and async notifications. Requires `to` be a\n"
+        "  registered user by name.\n"
+        "\n"
+        "## When to emit outputs vs stay silent\n"
+        "\n"
+        "You hear every utterance in the room. Diarization labels each speaker\n"
+        "(e.g. \"[Jacob]: ...\" or \"[Unknown_1]: ...\"). Speakers are labeled\n"
+        "for you; never expose internal labels like SPEAKER_00 to the user.\n"
+        "\n"
+        "Emit outputs when:\n"
+        "- You are directly addressed (\"BB ...\", \"Jarvis ...\", direct question).\n"
+        "- You have an urgent, useful message to deliver (timer fired, a\n"
+        "  correction, a notification someone asked to receive).\n"
+        "- There is a clear action you should take from what was said\n"
+        "  (\"add that to my list\"), in which case you confirm it.\n"
+        "- A trigger fires and you need to deliver whatever it was set up to do.\n"
+        "\n"
+        "Stay silent (outputs: []) when:\n"
+        "- People are talking to each other, not to you.\n"
+        "- They are thinking out loud or processing.\n"
+        "- You already answered and they are confirming among themselves.\n"
+        "\n"
+        "When silent, the transcript still records what was said — memory\n"
+        "extraction runs after the conversation and can pick up ambient facts.\n"
+        "You do not need to explicitly note things you overheard; the system\n"
+        "captures them. Use `thought` for private reasoning, not for notes\n"
+        "about the human conversation.\n"
+        "\n"
+        "When uncertain, prefer silence. When addressed by name, always emit.\n"
+        "\n"
+        "## Scenarios (memorise these patterns)\n"
+        "\n"
+        "- Someone at the box asks you a question you can answer immediately:\n"
+        "    {\"outputs\": [{\"to\":\"current_speaker\",\"channel\":\"voice\",\n"
+        "                   \"content\":\"...\"}]}\n"
+        "\n"
+        "- Someone texted you and you're replying:\n"
+        "    {\"outputs\": [{\"to\":\"current_speaker\",\"channel\":\"text\",\n"
+        "                   \"content\":\"...\"}]}\n"
+        "\n"
+        "- Someone at the box asks you to text their spouse:\n"
+        "    {\"outputs\": [\n"
+        "      {\"to\":\"current_speaker\",\"channel\":\"voice\",\"content\":\"Okay, texting Sarah now.\"},\n"
+        "      {\"to\":\"Sarah\",\"channel\":\"text\",\"content\":\"Jacob says he'll be late.\"}\n"
+        "    ]}\n"
+        "\n"
+        "- Someone texts you asking to be notified later. Set up a trigger via\n"
+        "  manage_tasks, confirm with them, then when the trigger fires, deliver\n"
+        "  whatever they asked for on the channel they originally used:\n"
+        "    turn 1: manage_tasks (person-trigger) tool call\n"
+        "    turn 2: {\"outputs\":[{\"to\":\"current_speaker\",\"channel\":\"text\",\n"
+        "                          \"content\":\"Will do.\"}]}\n"
+        "    later (trigger fires): {\"outputs\":[{\"to\":\"Sarah\",\"channel\":\"text\",\n"
+        "                                         \"content\":\"He's home.\"}]}\n"
+        "\n"
+        "- You need a second to look something up mid-turn: emit an interim\n"
+        "  output BEFORE calling the tool, in the same response:\n"
+        "    content blocks: [{outputs: [{\"to\":\"current_speaker\",\n"
+        "                                 \"channel\":\"voice\",\n"
+        "                                 \"content\":\"One moment.\"}]},\n"
+        "                      tool_use(web_search, ...)]\n"
+        "  Then on the next turn, emit the final answer in a normal outputs\n"
+        "  list. Do not repeat the interim in the final answer.\n"
+        "\n"
+        "- Ambient chat you're not part of:\n"
+        "    {\"thought\":\"they're discussing weekend plans, not me\",\n"
+        "     \"outputs\":[]}\n"
+        "\n"
+        "## Within a responding turn\n"
+    )
+
+
+def _prompt_capabilities() -> str:
+    """Return the capabilities / guidelines section of the static prompt.
+
+    Tool list is narrated here; full schemas go via the ``tools=`` parameter
+    of ``messages.create``. All output to humans flows through the structured
+    ``outputs`` array described in ``_prompt_etiquette``.
+    """
+    return (
+        "## Capabilities\n"
+        "\n"
+        "Always-available tools: execute_script, switch_display, "
+        "identify_person, manage_tasks, search_memory, search_photos, "
+        "web_search, and load_skill. For complex or infrequent operations, "
+        "use execute_script to run Python in the sandbox with the boxbot_sdk.\n"
+        "\n"
+        "Tools DO things; they do not speak. All speech and messaging to\n"
+        "humans goes through the structured `outputs` array of your response\n"
+        "(see the output-structure section above). A tool call might create a\n"
+        "reminder, search memory, switch a display, or run a sandbox script.\n"
+        "The `outputs` array is how you actually reach a person.\n"
+        "\n"
+        "## Guidelines\n"
+        "- Be concise in voice outputs — no one wants a lecture from a box.\n"
+        "- Prefer text for long, detailed information (easier to re-read);\n"
+        "  prefer voice for quick, immediate replies when someone is at the box.\n"
+        "- When you learn something important, memory extraction captures it\n"
+        "  automatically after the conversation ends. Do not repeat facts in\n"
+        "  `thought` — it adds noise.\n"
+        "- You can search your memories at any time with search_memory.\n"
+        "- Check your to-do list and triggers when waking up on a schedule.\n"
+        "- For web lookups, use web_search — you never see raw web content directly.\n"
+        "- For specialised how-tos (e.g. how to use the HAL from a sandbox\n"
+        "  script), consult load_skill for on-demand guidance rather than\n"
+        "  guessing.\n"
+        "- Respect privacy: never share one person's information with another\n"
+        "  unless it's clearly appropriate (e.g., relaying a message they\n"
+        "  asked you to)."
+    )
+
+
+def _prompt_skills_index() -> str:
+    """Return the skills index for the static prompt.
+
+    Skills are loaded from a separate filesystem-based loader
+    (``boxbot.skills.loader``) which is being built by a parallel
+    subagent. We import lazily with a safe fallback so this file does not
+    hard-depend on that module being present yet.
+    """
+    try:
+        from boxbot.skills.loader import get_skill_index  # type: ignore
+    except ImportError:
+        return ""
+    except Exception:
+        # Defensive: any import-time surprise in the loader shouldn't
+        # sink the whole agent.
+        logger.debug("Skill loader import raised; falling back to empty index", exc_info=True)
+        return ""
+
+    try:
+        return get_skill_index() or ""
+    except Exception:
+        logger.debug("get_skill_index() raised; falling back to empty", exc_info=True)
+        return ""
+
+
+def _render_static_system_prompt(name: str, wake_word: str) -> str:
+    """Compose the static (cacheable) portion of the system prompt."""
+    parts: list[str] = [
+        _prompt_persona(name, wake_word),
+        _prompt_etiquette(),
+        _prompt_capabilities(),
+    ]
+    skills = _prompt_skills_index()
+    if skills.strip():
+        parts.append(skills.strip())
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +420,34 @@ class BoxBotAgent:
         # Updated via PersonIdentified event subscription.
         self._present_people: dict[str, datetime] = {}
 
+        # Speaker identity mapping (SPEAKER_XX → person name) from
+        # perception fusion. Updated via SpeakerIdentified events.
+        self._speaker_identities: dict[str, str] = {}
+
+        # Latest per-session identity block from TranscriptReady. Keyed by
+        # display label (e.g. "Speaker A" or "Jacob"). Values include
+        # voice/visual tier + score + source. Rendered into the dynamic
+        # context prompt so the agent can reason about confidence.
+        self._latest_speaker_identities: dict[str, dict[str, Any]] = {}
+
         # Tracks active conversations to prevent overlapping sessions on
         # the same channel.
         self._active_conversations: dict[str, asyncio.Task[None]] = {}
+
+        # Voice-session-scoped conversation history. The voice pipeline
+        # reuses a single conversation_id (e.g. "voice_bc6fb14f74b4") across
+        # utterances until the session ends (silence timeout → SUSPENDED →
+        # END). Each utterance becomes a new agent turn, but we want
+        # continuity — the model should remember what it just said.
+        #
+        # We keep a single slot: the id of the voice session whose history
+        # we are tracking, and the accumulated ``messages`` list from the
+        # most recent agent loop run. When a new TranscriptReady arrives
+        # with the SAME session id, we prepend this history so the model
+        # has context. When it arrives with a DIFFERENT id, the previous
+        # voice session has ended and we reset to a fresh slate.
+        self._current_voice_session_id: str | None = None
+        self._voice_history: list[dict[str, Any]] = []
 
         # Lock to serialise conversation starts (prevents race conditions
         # when multiple events arrive simultaneously).
@@ -178,6 +492,8 @@ class BoxBotAgent:
         bus.subscribe(WhatsAppMessage, self._on_whatsapp_message)
         bus.subscribe(TriggerFired, self._on_trigger_fired)
         bus.subscribe(PersonIdentified, self._on_person_identified)
+        bus.subscribe(SpeakerIdentified, self._on_speaker_identified)
+        bus.subscribe(TranscriptReady, self._on_transcript_ready)
 
         self._running = True
         logger.info("BoxBotAgent started (model: %s)", config.models.large)
@@ -195,6 +511,8 @@ class BoxBotAgent:
         bus.unsubscribe(WhatsAppMessage, self._on_whatsapp_message)
         bus.unsubscribe(TriggerFired, self._on_trigger_fired)
         bus.unsubscribe(PersonIdentified, self._on_person_identified)
+        bus.unsubscribe(SpeakerIdentified, self._on_speaker_identified)
+        bus.unsubscribe(TranscriptReady, self._on_transcript_ready)
 
         # Cancel any active conversations
         for conv_id, task in list(self._active_conversations.items()):
@@ -286,6 +604,79 @@ class BoxBotAgent:
         if event.person_name:
             self._present_people[event.person_name] = datetime.now()
 
+    async def _on_speaker_identified(self, event: SpeakerIdentified) -> None:
+        """Update speaker identity mapping from perception fusion."""
+        if event.person_name and event.speaker_label:
+            self._speaker_identities[event.speaker_label] = event.person_name
+            self._present_people[event.person_name] = datetime.now()
+
+            # Update voice session's identity mapping
+            from boxbot.communication.voice import get_voice_session
+
+            session = get_voice_session()
+            if session is not None:
+                session.update_speaker_identities(
+                    {event.speaker_label: event.person_name}
+                )
+
+    async def _on_transcript_ready(self, event: TranscriptReady) -> None:
+        """Handle an attributed transcript from the voice pipeline.
+
+        Voice utterances are threaded into a continuing agent conversation
+        keyed by the voice session's own conversation_id. The voice pipeline
+        holds that id stable across utterances until the session ends; we
+        preserve the running ``messages`` list in ``_voice_history`` so the
+        agent remembers prior turns. A new voice session id resets the slate.
+        """
+        transcript = event.transcript.strip()
+        if not transcript:
+            return
+
+        # Apply speaker identities to transcript
+        if self._speaker_identities:
+            for label, name in self._speaker_identities.items():
+                transcript = transcript.replace(f"[{label}]:", f"[{name}]:")
+
+        # Capture the per-session identity block (voice-ReID tiers, etc.)
+        # for rendering into the dynamic prompt's identity section.
+        if event.speaker_identities:
+            self._latest_speaker_identities = dict(event.speaker_identities)
+
+        voice_session_id = event.conversation_id
+        logger.info(
+            "Transcript ready (voice_session=%s): %s",
+            voice_session_id,
+            transcript[:100],
+        )
+
+        # Continuity check: same voice session → keep history; new session
+        # → drop prior history, fresh conversation.
+        if voice_session_id != self._current_voice_session_id:
+            if self._current_voice_session_id is not None:
+                logger.info(
+                    "Voice session changed (%s → %s); resetting history",
+                    self._current_voice_session_id, voice_session_id,
+                )
+            self._current_voice_session_id = voice_session_id
+            self._voice_history = []
+
+        prior_history = (
+            list(self._voice_history) if self._voice_history else None
+        )
+
+        # Determine the speaker from the transcript (best effort)
+        person_name = self._get_most_recent_person()
+
+        await self._start_conversation_task(
+            channel="voice",
+            initial_message=transcript,
+            person_name=person_name,
+            context={
+                "voice_conversation_id": voice_session_id,
+                "prior_history": prior_history,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Conversation management
     # ------------------------------------------------------------------
@@ -353,8 +744,8 @@ class BoxBotAgent:
 
         This is the core conversation lifecycle:
         1. Emit ConversationStarted event
-        2. Build the system prompt with all context injections
-        3. Run the agent loop (model calls + tool dispatch)
+        2. Build the structured system prompt (static + dynamic blocks)
+        3. Run the agent loop (model calls + tool dispatch + decision parse)
         4. Emit ConversationEnded event
         5. Trigger post-conversation memory extraction
         """
@@ -387,27 +778,44 @@ class BoxBotAgent:
         summary = ""
 
         try:
-            # 2. Build the system prompt
-            system_prompt = await self._build_system_prompt(
+            # 2. Build the structured system prompt (two blocks)
+            system_prompt_blocks = await self._build_system_prompt_blocks(
                 person_name=person_name,
                 channel=channel,
                 context=context,
-            )
-
-            # 3. Inject relevant memories based on who is speaking and what they said
-            memory_block = await self._inject_memories(
-                person_name=person_name,
                 initial_message=initial_message,
             )
-            if memory_block:
-                system_prompt += f"\n\n{memory_block}"
 
-            # 4. Run the agent loop
+            # Continuity: for voice conversations we may have accumulated
+            # history from prior utterances in the same voice session.
+            prior_history: list[dict[str, Any]] | None = None
+            if context is not None:
+                raw_prior = context.get("prior_history")
+                if isinstance(raw_prior, list) and raw_prior:
+                    prior_history = raw_prior
+
+            # 3. Run the agent loop
             messages, turn_count = await self._agent_loop(
-                system_prompt=system_prompt,
+                conversation_id=conversation_id,
+                channel=channel,
+                system_prompt_blocks=system_prompt_blocks,
                 initial_message=initial_message,
+                person_name=person_name,
                 max_turns=config.agent.max_turns,
+                prior_history=prior_history,
             )
+
+            # Persist the updated history so the NEXT utterance in this
+            # voice session picks it up. Guard on session id — if a new
+            # voice session has already started between start and finish
+            # we don't clobber it.
+            if (
+                channel == "voice"
+                and context is not None
+                and context.get("voice_conversation_id")
+                == self._current_voice_session_id
+            ):
+                self._voice_history = list(messages)
 
             # Extract a rough summary from the last assistant message
             summary = self._extract_summary(messages)
@@ -422,6 +830,9 @@ class BoxBotAgent:
             )
             summary = "(conversation ended with error)"
         finally:
+            # Clear speaker identities at end of conversation
+            self._speaker_identities.clear()
+
             # 5. Emit end event
             await bus.publish(
                 ConversationEnded(
@@ -458,10 +869,6 @@ class BoxBotAgent:
         (e.g., from tests or future subsystems). For event-driven
         conversations, the agent subscribes to events directly.
 
-        Builds the system prompt with context injection, runs the
-        agent loop with tools, handles multiple turns, and triggers
-        memory extraction at the end.
-
         Args:
             channel: Conversation channel — "voice", "whatsapp", or "trigger".
             initial_message: The first user message or trigger instructions.
@@ -481,73 +888,143 @@ class BoxBotAgent:
     # System prompt construction
     # ------------------------------------------------------------------
 
-    async def _build_system_prompt(
+    async def _build_system_prompt_blocks(
         self,
         person_name: str | None,
         channel: str,
-        context: dict[str, Any] | None = None,
-    ) -> str:
-        """Build the full system prompt with all context injections.
+        context: dict[str, Any] | None,
+        initial_message: str,
+    ) -> list[dict[str, Any]]:
+        """Build the two-block system prompt for ``messages.create``.
 
-        The system prompt is assembled from:
-        1. Base personality and capability description
-        2. System memory (always-loaded household facts / standing instructions)
-        3. Current context block (time, day, who is present, channel)
-        4. Scheduler status line (to-do count, active trigger count)
-        5. Trigger context (if this is a trigger-initiated conversation)
+        Block 1 — static content (persona, etiquette, capabilities, skills
+        index) with a 1h ephemeral cache marker. Stable across turns.
 
-        Memory injection (relevant fact memories) is handled separately
-        by _inject_memories() and appended after this method returns.
-
-        Args:
-            person_name: The identified speaker, if known.
-            channel: Conversation channel.
-            context: Additional context (trigger details, etc.).
+        Block 2 — dynamic content (who is present, time, schedule status,
+        injected memories, trigger context) WITHOUT a cache marker so it
+        can vary without invalidating the static prefix.
 
         Returns:
-            The assembled system prompt string.
+            The list of content blocks ready to pass as ``system=`` to the
+            Anthropic messages API.
         """
         config = get_config()
 
-        # 1. Base prompt with agent identity
-        prompt = _BASE_SYSTEM_PROMPT.format(
+        static_text = _render_static_system_prompt(
             name=config.agent.name,
             wake_word=config.agent.wake_word,
         )
 
-        # 2. System memory
+        dynamic_text = await self._prompt_dynamic_context(
+            person_name=person_name,
+            channel=channel,
+            context=context,
+            initial_message=initial_message,
+        )
+
+        blocks: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": static_text,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+            {
+                "type": "text",
+                "text": dynamic_text,
+                # No cache_control — this varies per conversation.
+            },
+        ]
+        return blocks
+
+    async def _prompt_dynamic_context(
+        self,
+        person_name: str | None,
+        channel: str,
+        context: dict[str, Any] | None,
+        initial_message: str,
+    ) -> str:
+        """Build the dynamic (non-cached) portion of the system prompt.
+
+        Includes:
+        - System memory (always-loaded household facts) — strictly speaking
+          slow-moving, but updated post-conversation, so lives here.
+        - Current time / day / channel.
+        - Who is present (from perception).
+        - Scheduler status line (todo/trigger counts).
+        - Trigger context (if this is a trigger-initiated conversation).
+        - Injected fact memories for this speaker + initial utterance.
+        """
+        sections: list[str] = []
+
+        # System memory
         system_memory = await self._read_system_memory()
         if system_memory.strip():
-            prompt += f"\n## System Memory\n{system_memory}\n"
+            sections.append(f"## System Memory\n{system_memory}")
 
-        # 3. Current context
+        # Current context lines
         now = datetime.now()
         context_lines = [
             f"Current time: {now.strftime('%H:%M')}",
             f"Day: {now.strftime('%A, %B %d, %Y')}",
             f"Channel: {channel}",
         ]
-
         if person_name:
             context_lines.append(f"Speaking with: {person_name}")
-
-        # Who else is present (from perception, excluding the speaker)
-        present = self._get_present_people(exclude=person_name)
+        present = self._get_present_people_with_status(exclude=person_name)
         if present:
             context_lines.append(f"Also present: {', '.join(present)}")
+        sections.append(
+            "## Current Context\n"
+            + "\n".join(f"- {line}" for line in context_lines)
+        )
 
-        prompt += "\n## Current Context\n" + "\n".join(
-            f"- {line}" for line in context_lines
-        ) + "\n"
+        # Per-session identity block (voice + visual ReID tiers). Lets the
+        # agent decide when to address by name (high), verify (medium/low),
+        # or load the onboarding skill (unknown).
+        identity_section = _render_identity_section(
+            self._latest_speaker_identities
+        )
+        if identity_section:
+            sections.append(identity_section)
 
-        # 4. Scheduler status
+        # Registered users the agent can address in `outputs[].to`. Names
+        # (not phone numbers) are what the agent sees; the dispatcher
+        # resolves names to numbers via AuthManager at delivery time.
+        try:
+            from boxbot.communication.auth import get_auth_manager
+            auth = get_auth_manager()
+            if auth is not None:
+                users = await auth.list_users()
+                if users:
+                    user_lines = [
+                        f"- {u.name}"
+                        + (" (admin)" if u.role == "admin" else "")
+                        for u in users
+                    ]
+                    sections.append(
+                        "## Registered users\n"
+                        "You can reach any of these people via `outputs` "
+                        "(voice if they're at the box, text for WhatsApp).\n"
+                        + "\n".join(user_lines)
+                    )
+                else:
+                    sections.append(
+                        "## Registered users\n"
+                        "No users are registered yet. You cannot deliver "
+                        "`channel: \"text\"` outputs until someone registers."
+                    )
+        except Exception:
+            logger.debug("Could not list registered users for prompt", exc_info=True)
+
+        # Scheduler status
         try:
             status_line = await get_status_line()
-            prompt += f"\n{status_line}\n"
+            if status_line and status_line.strip():
+                sections.append(status_line.strip())
         except Exception:
             logger.debug("Could not fetch scheduler status line")
 
-        # 5. Trigger context (for trigger-initiated conversations)
+        # Trigger details (trigger-initiated conversations)
         if context and channel == "trigger":
             trigger_lines = []
             if context.get("trigger_description"):
@@ -561,11 +1038,20 @@ class BoxBotAgent:
                     f"Linked to-do item: {context['todo_id']}"
                 )
             if trigger_lines:
-                prompt += "\n## Trigger Details\n" + "\n".join(
-                    f"- {line}" for line in trigger_lines
-                ) + "\n"
+                sections.append(
+                    "## Trigger Details\n"
+                    + "\n".join(f"- {line}" for line in trigger_lines)
+                )
 
-        return prompt
+        # Injected memories
+        memory_block = await self._inject_memories(
+            person_name=person_name,
+            initial_message=initial_message,
+        )
+        if memory_block and memory_block.strip():
+            sections.append(memory_block.strip())
+
+        return "\n\n".join(sections)
 
     async def _read_system_memory(self) -> str:
         """Read the current system memory file.
@@ -617,38 +1103,64 @@ class BoxBotAgent:
 
     async def _agent_loop(
         self,
-        system_prompt: str,
+        conversation_id: str,
+        channel: str,
+        system_prompt_blocks: list[dict[str, Any]],
         initial_message: str,
+        person_name: str | None,
         max_turns: int = _DEFAULT_MAX_TURNS,
+        prior_history: list[dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Run the core agent conversation loop.
 
-        Sends the system prompt and initial message to the large model,
-        then processes tool calls in a loop until the model produces a
-        final text response or the turn limit is reached.
+        Each ``messages.create`` call carries:
+        - ``output_config.format`` pinning the ``OUTPUT_SCHEMA`` JSON schema
+          (defined in ``output_dispatcher``)
+        - top-level ``cache_control`` for the 5-minute rolling messages cache
+        - a ``tools`` list where the LAST tool holds a 1h cache breakpoint
+        - a two-block ``system`` with a 1h breakpoint on the static block
+
+        Every text block in the response — whether mid-turn alongside a
+        ``tool_use`` block or at ``end_turn`` on its own — is parsed as
+        OUTPUT_SCHEMA JSON, and each entry in ``outputs`` is dispatched
+        immediately. This is how mid-turn "One moment." interims work: the
+        interim text is in the same response as the tool_use; we dispatch
+        the voice output, then run the tool, then loop.
 
         Args:
-            system_prompt: The assembled system prompt.
+            conversation_id: Conversation ID for logging.
+            channel: Active conversation channel (voice / whatsapp / trigger),
+                used for log provenance only — the agent chooses its own
+                delivery channel per output.
+            system_prompt_blocks: Two-block system prompt (static + dynamic).
             initial_message: The first user message.
+            person_name: The speaker currently addressing the agent; resolves
+                the ``to: "current_speaker"`` alias at dispatch time.
             max_turns: Maximum number of API round-trips.
 
         Returns:
-            Tuple of (message_history, turn_count). message_history
-            contains all messages exchanged including tool results.
+            Tuple of (message_history, turn_count).
         """
         assert self._client is not None, "Agent not started"
 
         config = get_config()
         model = config.models.large
 
-        # Build tool definitions for the API
+        # Build tool definitions for the API (last tool carries 1h cache marker)
         tools = get_tools()
         tool_definitions = self._build_tool_definitions(tools)
 
-        # Initialise the message history
-        messages: list[dict[str, Any]] = [
-            {"role": "user", "content": initial_message},
-        ]
+        # Initialise the message history. For voice continuity we seed with
+        # the accumulated history from prior utterances in this voice session
+        # (passed in by ``_run_conversation`` from the voice-history slot).
+        messages: list[dict[str, Any]] = []
+        if prior_history:
+            messages.extend(prior_history)
+            logger.info(
+                "Agent loop seeded with %d prior messages (conv=%s)",
+                len(prior_history), conversation_id,
+            )
+        messages.append({"role": "user", "content": initial_message})
 
         turn_count = 0
 
@@ -656,18 +1168,27 @@ class BoxBotAgent:
             turn_count += 1
 
             try:
+                # IMPORTANT: the exact named kwargs below are the only ones
+                # we pass. No temperature / top_p / top_k / thinking — those
+                # will 400 on Opus 4.7. See spec §3.
                 response = await self._client.messages.create(
                     model=model,
-                    max_tokens=4096,
-                    system=system_prompt,
+                    max_tokens=_MAX_TOKENS,
+                    system=system_prompt_blocks,
                     messages=messages,
                     tools=tool_definitions,
+                    output_config={
+                        "format": {
+                            "type": "json_schema",
+                            "schema": OUTPUT_SCHEMA,
+                        }
+                    },
+                    cache_control={"type": "ephemeral"},
                 )
             except anthropic.APIError as e:
                 logger.error(
                     "Anthropic API error on turn %d: %s", turn_count, e
                 )
-                # Add an error message so extraction still has context
                 messages.append({
                     "role": "assistant",
                     "content": f"(API error: {e})",
@@ -681,9 +1202,49 @@ class BoxBotAgent:
                 "content": assistant_content,
             })
 
-            # Check if the model wants to use tools
-            if response.stop_reason == "tool_use":
-                # Process all tool calls in this response
+            stop_reason = getattr(response, "stop_reason", None)
+
+            # Parse EVERY text block in the response as OUTPUT_SCHEMA JSON and
+            # dispatch each one's outputs immediately. Mid-turn text (emitted
+            # alongside tool_use) dispatches BEFORE tools run. End-turn text
+            # dispatches as the final response. Same parser, same dispatch
+            # path, both cases.
+            for block in getattr(response, "content", []) or []:
+                if getattr(block, "type", None) != "text":
+                    continue
+                raw = getattr(block, "text", "") or ""
+                parsed = parse_output_block(raw)
+                if parsed is None:
+                    # Parse failed under constrained decoding — log; the rest
+                    # of the turn still progresses (tools still run if present).
+                    if raw.strip():
+                        logger.error(
+                            "Could not parse output JSON (conv=%s turn=%d). "
+                            "First 200 chars: %r",
+                            conversation_id, turn_count, raw[:200],
+                        )
+                    continue
+                if parsed.thought:
+                    logger.info(
+                        "agent thought (conv=%s turn=%d): %s",
+                        conversation_id, turn_count, parsed.thought,
+                    )
+                if parsed.outputs:
+                    await dispatch_outputs(
+                        parsed.outputs,
+                        conversation_id=conversation_id,
+                        channel_context=channel,
+                        current_speaker=person_name,
+                    )
+                else:
+                    logger.debug(
+                        "agent turn produced no outputs (conv=%s turn=%d)",
+                        conversation_id, turn_count,
+                    )
+
+            # --- tool_use: outputs have already been dispatched (if any);
+            # now run the tools and feed results back.
+            if stop_reason == "tool_use":
                 tool_results = await self._process_tool_calls(
                     response, tools
                 )
@@ -692,11 +1253,28 @@ class BoxBotAgent:
                         "role": "user",
                         "content": tool_results,
                     })
-                # Continue the loop for the next model turn
                 continue
 
-            # Model produced a final response (stop_reason == "end_turn"
-            # or "max_tokens") — conversation turn is complete
+            # --- refusal: log and stop. No canned voice output — the refusal
+            # text may not be schema-conformant, so we don't speak it. Future
+            # work can dispatch a canned apology via the outputs path if the
+            # refusal rate becomes a UX problem.
+            if stop_reason == "refusal":
+                logger.warning(
+                    "Model returned refusal on turn %d (conv=%s)",
+                    turn_count, conversation_id,
+                )
+                break
+
+            # --- max_tokens: truncated; outputs (if any) were dispatched above.
+            if stop_reason == "max_tokens":
+                logger.error(
+                    "Model hit max_tokens on turn %d (conv=%s) — truncated",
+                    turn_count, conversation_id,
+                )
+                break
+
+            # --- end_turn (and any other terminal reason): we're done.
             break
 
         if turn_count >= max_turns:
@@ -706,14 +1284,19 @@ class BoxBotAgent:
 
         return messages, turn_count
 
+    # ------------------------------------------------------------------
+    # Tool handling
+    # ------------------------------------------------------------------
+
     def _build_tool_definitions(
         self,
         tools: list[Any],
     ) -> list[dict[str, Any]]:
         """Convert boxBot Tool instances to Anthropic API tool definitions.
 
-        Each tool's name, description, and JSON Schema parameters are
-        formatted for the messages API ``tools`` parameter.
+        Attaches a 1h ephemeral ``cache_control`` marker to the LAST tool
+        definition so the entire tools array (+ anything earlier in the
+        render order) caches together. See spec §5.
 
         Args:
             tools: List of Tool instances from the registry.
@@ -721,14 +1304,18 @@ class BoxBotAgent:
         Returns:
             List of tool definition dicts for the API.
         """
-        definitions = []
+        definitions: list[dict[str, Any]] = []
         for tool in tools:
-            definition: dict[str, Any] = {
+            definitions.append({
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.parameters,
+            })
+        if definitions:
+            definitions[-1]["cache_control"] = {
+                "type": "ephemeral",
+                "ttl": "1h",
             }
-            definitions.append(definition)
         return definitions
 
     async def _process_tool_calls(
@@ -740,7 +1327,9 @@ class BoxBotAgent:
 
         Iterates through all tool_use content blocks in the response,
         looks up the corresponding Tool from the registry, calls its
-        execute() method, and collects the results.
+        execute() method, and collects the results. Tool results support
+        either ``str`` (legacy) or ``list[content-block]`` (future image
+        attachments — see spec §10) as their content.
 
         Args:
             response: The Anthropic API response containing tool_use blocks.
@@ -765,25 +1354,25 @@ class BoxBotAgent:
 
             tool = get_tool(tool_name)
             if tool is None:
-                result_text = json.dumps({
+                result_content: Any = json.dumps({
                     "error": f"Unknown tool: {tool_name}",
                 })
                 logger.warning("Unknown tool requested: %s", tool_name)
             else:
                 try:
-                    result_text = await tool.execute(**tool_input)
+                    result_content = await tool.execute(**tool_input)
                 except Exception as e:
                     logger.exception(
                         "Tool %s execution failed", tool_name
                     )
-                    result_text = json.dumps({
+                    result_content = json.dumps({
                         "error": f"Tool execution failed: {e}",
                     })
 
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
-                "content": result_text,
+                "content": result_content,
             })
 
         return tool_results
@@ -945,7 +1534,8 @@ class BoxBotAgent:
     def _extract_summary(messages: list[dict[str, Any]]) -> str:
         """Extract a brief summary from the last assistant text in messages.
 
-        Used for the ConversationEnded event summary field.
+        The assistant text is now a JSON decision object. We pull out the
+        ``response_text`` or ``reason`` for a human-readable summary.
 
         Args:
             messages: The message history.
@@ -953,19 +1543,34 @@ class BoxBotAgent:
         Returns:
             A brief summary string (truncated to 200 chars).
         """
-        # Walk backwards to find the last text from the assistant
         for msg in reversed(messages):
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
+            raw_text: str | None = None
             if isinstance(content, str):
-                return content[:200]
-            if isinstance(content, list):
+                raw_text = content
+            elif isinstance(content, list):
                 for block in reversed(content):
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = block.get("text", "")
                         if text:
-                            return text[:200]
+                            raw_text = text
+                            break
+            if not raw_text:
+                continue
+
+            # Try to parse as decision JSON and extract a human-meaningful field
+            try:
+                parsed = json.loads(raw_text)
+            except (json.JSONDecodeError, TypeError):
+                return raw_text[:200]
+            if isinstance(parsed, dict):
+                if parsed.get("response_text"):
+                    return str(parsed["response_text"])[:200]
+                if parsed.get("reason"):
+                    return str(parsed["reason"])[:200]
+            return raw_text[:200]
         return "(no summary)"
 
     # ------------------------------------------------------------------
@@ -996,6 +1601,35 @@ class BoxBotAgent:
             if elapsed <= window_minutes * 60:
                 present.append(name)
         return sorted(present)
+
+    def _get_present_people_with_status(
+        self,
+        exclude: str | None = None,
+    ) -> list[str]:
+        """Return formatted strings of present people with status.
+
+        Queries the perception pipeline for richer presence data including
+        confirmation status. Falls back to the basic list if the pipeline
+        is not running.
+        """
+        try:
+            from boxbot.perception.pipeline import get_pipeline
+
+            people = get_pipeline().get_present_people()
+            result = []
+            for p in people:
+                name = p.get("name")
+                if name and name != exclude:
+                    if p.get("confidence", 0) > 0.8:
+                        result.append(f"{name} (confirmed)")
+                    else:
+                        result.append(f"{name} (visual)")
+                elif not name:
+                    result.append(f"{p.get('ref', 'unknown')} (new)")
+            return result
+        except (RuntimeError, Exception):
+            # Pipeline not running
+            return self._get_present_people(exclude=exclude)
 
     def _get_most_recent_person(self) -> str | None:
         """Return the name of the most recently seen person.

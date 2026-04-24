@@ -86,6 +86,21 @@ class PersonIdentified(Event):
 
 
 @dataclass(frozen=True)
+class SpeakerIdentified(Event):
+    """Perception pipeline identified a speaker by voice.
+
+    Source: Perception (voice ReID + fusion)
+    Consumers: Agent, Perception
+    """
+
+    speaker_label: str = ""  # "SPEAKER_00" from diarization
+    person_id: str = ""  # matched person UUID
+    person_name: str = ""  # human name
+    confidence: float = 0.0
+    source: str = "voice"  # always "voice"
+
+
+@dataclass(frozen=True)
 class WakeWordHeard(Event):
     """Wake word was detected in the audio stream.
 
@@ -167,6 +182,75 @@ class ConversationEnded(Event):
     person_name: str | None = None
     turn_count: int = 0
     summary: str = ""
+
+
+@dataclass(frozen=True)
+class TranscriptReady(Event):
+    """Attributed transcript ready for agent processing.
+
+    ``speaker_identities`` is a per-session identity block the agent can
+    use to decide how to address each speaker. Keys are the display
+    labels used in ``transcript`` (e.g. ``"Speaker A"``). Each value is
+    a dict with the best current belief about that label::
+
+        {
+          "person_id": "p_...",     # or None if unrecognized
+          "person_name": "Jacob",   # or None if unrecognized
+          "voice_tier": "medium",   # high / medium / low / unknown
+          "voice_score": 0.74,      # raw cosine similarity
+          "visual_tier": "high",    # optional; present if fusion available
+          "visual_score": 0.88,
+          "source": "voice_reid_match" | "agent_identify" | "unknown"
+        }
+
+    Source: Communication (VoiceSession)
+    Consumers: Agent
+    """
+
+    conversation_id: str = ""
+    transcript: str = ""  # "[Speaker A]: What's the weather?"
+    speaker_segments: list = field(default_factory=list)  # raw diarization data
+    speaker_identities: dict[str, dict[str, Any]] = field(default_factory=dict)
+    source: str = "voice"
+
+
+@dataclass(frozen=True)
+class VoiceSessionEnded(Event):
+    """A voice session has fully ended (not just suspended).
+
+    Emitted by :class:`VoiceSession._end_session`. Consumers use this to
+    flush session-scoped state — the enrollment manager commits buffered
+    voice/visual embeddings to their owning person records at this point.
+
+    Source: Communication (VoiceSession)
+    Consumers: Perception (enrollment), Memory (extraction rollups)
+    """
+
+    conversation_id: str = ""
+
+
+@dataclass(frozen=True)
+class AgentSpeaking(Event):
+    """Agent is speaking (TTS playback active).
+
+    Source: Communication (VoiceSession)
+    Consumers: Perception, Display
+    """
+
+    conversation_id: str = ""
+    text: str = ""
+
+
+@dataclass(frozen=True)
+class AgentSpeakingDone(Event):
+    """Agent finished speaking.
+
+    Source: Communication (VoiceSession)
+    Consumers: Perception, Display
+    """
+
+    conversation_id: str = ""
+    interrupted: bool = False
 
 
 @dataclass(frozen=True)

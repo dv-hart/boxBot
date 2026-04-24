@@ -110,9 +110,12 @@ When the agent calls the `execute_script` tool:
 ```
 1. Agent provides Python source code + description
 2. Tool (main process) writes script to data/sandbox/scripts/{uuid}.py
-3. Tool spawns subprocess as the boxbot-sandbox user:
-     data/sandbox/venv/bin/python3 {script_path}
-4. Captures stdout + stderr
+3. Tool builds an allowlist environment (PATH, HOME, LANG, TZ, etc.)
+   — no secrets from .env are inherited
+4. Tool spawns subprocess with privilege drop:
+     sudo -n -u boxbot-sandbox -- data/sandbox/venv/bin/python3 {script_path}
+   (Set BOXBOT_SANDBOX_ENFORCE=0 to disable for development)
+5. Captures stdout + stderr
 5. Parses SDK actions from stdout, applies them in main process
 6. Returns regular output + action results to agent
 7. Cleans up script file
@@ -219,14 +222,18 @@ one independently prevents it.
 
 ### Environment Variables
 
-Sandbox scripts receive a **curated, minimal** set:
-- Specific API keys needed for the current skill (passed explicitly by
-  the tool from encrypted storage, not from .env)
-- `BOXBOT_DATA_DIR` — path to the data directory
-- `BOXBOT_SKILLS_DIR` — path to the skills directory
-- `HOME` set to `data/sandbox/tmp` (not the real home)
-- **Excluded:** `ANTHROPIC_API_KEY`, `WHATSAPP_ACCESS_TOKEN`, and all
-  other boxBot infrastructure keys
+Sandbox scripts receive an **allowlist-only** environment. The parent
+process's environment is NOT inherited — only these safe variables are
+passed through:
+- `PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`
+- `PYTHONPATH`, `VIRTUAL_ENV`, `PYTHONDONTWRITEBYTECODE`, `PYTHONUNBUFFERED`
+- Specific API keys needed for the current skill (passed explicitly via
+  the tool's `env_vars` parameter, not from .env)
+
+All secrets (`ANTHROPIC_API_KEY`, `WHATSAPP_ACCESS_TOKEN`,
+`ELEVENLABS_API_KEY`, AWS keys, etc.) are excluded by default because
+the allowlist does not include them. This is safer than a blocklist,
+which must be updated every time a new secret is added.
 
 ## Package Installation
 

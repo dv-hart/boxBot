@@ -7,9 +7,14 @@ Setup and utility scripts for boxBot.
 ### `setup.sh`
 Full system setup for a fresh Raspberry Pi. Idempotent — safe to re-run:
 - System package installation (SDL2, audio libs, build tools, etc.)
-- Data directory creation (`data/`, `logs/`, `models/`)
+- Data directory creation (`data/`, `data/displays/`, `logs/`, `models/`)
 - Python virtual environment creation (`.venv/`)
 - pip dependency installation (`pip install -e ".[dev]"`)
+- Extra package installation: sounddevice, pyusb, sentence-transformers,
+  openwakeword, elevenlabs, pyannote.audio (torchcodec removed — CUDA
+  incompatible with Pi)
+- System package symlinks into venv: libcamera, pykms, hailo_platform
+  (Pi OS packages with no PyPI equivalent)
 - Config file initialization from templates (won't overwrite existing)
 - Calls `setup-sandbox.sh` to create the sandbox environment
 - Offers to run `harden-os.sh` for OS-level network hardening
@@ -71,3 +76,53 @@ Interactive user enrollment helper:
 - Guides a new user through the enrollment process
 - Captures visual and audio embeddings
 - Adds to person database and optionally to WhatsApp whitelist
+
+### `preview_display.py`
+Render a display spec (JSON or YAML) to a PNG. Runs headless on any
+machine — no HDMI or pygame needed. Uses the same `DisplayRenderer` as
+the live system so previews are pixel-accurate. Fills missing data
+sources with placeholder data.
+
+```bash
+# Render a built-in spec in the default theme
+python3 scripts/preview_display.py --builtin clock -o /tmp/clock.png
+
+# Render a user spec with a theme override
+python3 scripts/preview_display.py displays/morning_brief/display.json \
+    -t midnight -o data/previews/morning_brief_midnight.png
+
+# List available built-ins and themes
+python3 scripts/preview_display.py --list
+```
+
+### `block_gallery.py`
+Render every block type (24 total) across every theme (4 total). Emits
+per-block 1024x600 PNGs for close inspection and a composite contact
+sheet per theme for at-a-glance review. Acts as a visual regression
+baseline — rerun after changes to themes, blocks, or the renderer and
+diff the output.
+
+```bash
+python3 scripts/block_gallery.py
+# outputs → data/previews/gallery/
+```
+
+### `show_on_screen.py`
+Display a PNG (or live-render a spec) fullscreen on the 7" HDMI screen.
+Designed to run on the Pi so you can eyeball real renders during
+iteration. Tries SDL drivers in order (kmsdrm, fbcon, x11, wayland) so
+it works over SSH against a framebuffer console as well as under a
+desktop session.
+
+```bash
+# From dev machine: render locally, copy, and show
+scripts/preview_display.py displays/my_display/display.json -o /tmp/d.png
+scp /tmp/d.png jhart@192.168.0.10:/tmp/d.png
+ssh jhart@192.168.0.10 "python3 ~/boxBot/scripts/show_on_screen.py /tmp/d.png"
+
+# Or render in-place on the Pi (matches live fonts/paths)
+ssh jhart@192.168.0.10 "python3 ~/boxBot/scripts/show_on_screen.py \
+    --spec ~/boxBot/displays/morning_brief/display.json -t boxbot"
+```
+Controls: `q`/`Esc` quit, `r` re-render, `1`-`4` swap themes
+(boxbot/midnight/daylight/classic).

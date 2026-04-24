@@ -582,25 +582,14 @@ def parse_block(data: dict[str, Any]) -> Block:
 
 
 def _construct_block(cls: type[Block], params: dict[str, Any]) -> Block:
-    """Construct a Block subclass from a params dict.
-
-    Maps JSON param names to dataclass field names, handling the
-    chart type→chart_type rename and other mismatches.
-    """
+    """Construct a Block subclass from a params dict."""
     import dataclasses
 
-    # Get the field names for this block class
     field_names = {f.name for f in dataclasses.fields(cls)}
-
-    # Special mappings: JSON key → Python field name
-    key_map = {
-        "type": "chart_type",  # chart block uses 'type' in JSON for chart type
-    }
 
     kwargs: dict[str, Any] = {}
     for k, v in params.items():
-        mapped = key_map.get(k, k)
-        if mapped in field_names and mapped not in ("block_type", "children", "params"):
-            kwargs[mapped] = v
+        if k in field_names and k not in ("block_type", "children", "params"):
+            kwargs[k] = v
 
     return cls(**kwargs)

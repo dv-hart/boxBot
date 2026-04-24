@@ -61,6 +61,9 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|token|secret|password|credential)\s*[:=]"),
     re.compile(r"sk-[a-zA-Z0-9]{20,}"),
     re.compile(r"(?i)bearer\s+[a-zA-Z0-9._\-]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),                     # AWS access keys
+    re.compile(r"gh[ps]_[a-zA-Z0-9]{36,}"),               # GitHub tokens
+    re.compile(r"-----BEGIN [A-Z ]*?KEY-----"),            # PEM private keys
 ]
 
 

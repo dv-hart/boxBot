@@ -109,6 +109,7 @@ def _overlay_env(data: dict[str, Any]) -> None:
         "WHATSAPP_ACCESS_TOKEN": "whatsapp_access_token",
         "WHATSAPP_PHONE_NUMBER_ID": "whatsapp_phone_number_id",
         "WHATSAPP_VERIFY_TOKEN": "whatsapp_verify_token",
+        "WHATSAPP_APP_SECRET": "whatsapp_app_secret",
         "AWS_ACCESS_KEY_ID": "aws_access_key_id",
         "AWS_SECRET_ACCESS_KEY": "aws_secret_access_key",
         "AWS_S3_BUCKET": "aws_s3_bucket",
@@ -212,21 +213,160 @@ class CameraConfig(BaseModel):
         return self
 
 
-class AudioConfig(BaseModel):
-    """Audio input/output settings."""
+class HardwareCameraConfig(BaseModel):
+    """Camera hardware-level settings (rotation, stream resolutions)."""
 
-    stt_provider: str = "whisper_api"
-    tts_provider: str = "elevenlabs"
-    tts_voice: str = "default"
-    volume: float = 0.7
+    rotation: int = 180
+    lores_resolution: list[int] = Field(default_factory=lambda: [320, 240])
+    photo_resolution: list[int] = Field(default_factory=lambda: [4608, 2592])
+
+
+class HardwareHailoConfig(BaseModel):
+    """Hailo NPU configuration (model paths, preloading)."""
+
+    models: dict[str, str] = Field(default_factory=lambda: {
+        "yolo": "/usr/share/hailo-models/yolov5s_personface_h8l.hef",
+        "reid": "data/perception/models/repvgg_a0_person_reid_512.hef",
+    })
+    preload_models: bool = True
+
+
+class HardwareMicrophoneConfig(BaseModel):
+    """Microphone hardware settings (ReSpeaker 4-Mic Array)."""
+
+    device_name: str = "ReSpeaker"
+    sample_rate: int = 16000
+    capture_channels: int = 6
+    output_channel: int = 0  # ch 0 = processed/beamformed
+    chunk_duration_ms: int = 64  # ~1024 frames at 16kHz
+    doa_enabled: bool = True
+    led_brightness: float = 0.5
+
+
+class HardwareSpeakerConfig(BaseModel):
+    """Speaker hardware settings."""
+
+    device_name: str = "boxbot_speaker"
+    sample_rate: int = 24000
+    default_volume: float = 1.0
+    # Soft-limited pre-output gain in dB. ElevenLabs TTS output peaks near
+    # 0 dBFS but has ~20 dB crest factor, so raw RMS is well below what the
+    # amp wants. +6 dB with tanh ceiling lifts perceived loudness without
+    # clipping peaks.
+    gain_db: float = 6.0
+
+
+class HardwareConfig(BaseModel):
+    """Hardware abstraction layer configuration."""
+
+    camera: HardwareCameraConfig = Field(default_factory=HardwareCameraConfig)
+    hailo: HardwareHailoConfig = Field(default_factory=HardwareHailoConfig)
+    microphone: HardwareMicrophoneConfig = Field(default_factory=HardwareMicrophoneConfig)
+    speaker: HardwareSpeakerConfig = Field(default_factory=HardwareSpeakerConfig)
+
+
+class WakeWordConfig(BaseModel):
+    """Wake word detection settings."""
+
+    engine: str = "openwakeword"
+    word: str = "hey_jarvis"  # built-in model; swap to "bb" when custom model ready
+    confidence_threshold: float = 0.7
+    model_path: str | None = None  # None = use built-in model
+
+
+class VADConfig(BaseModel):
+    """Voice activity detection settings."""
+
+    threshold: float = 0.5
+    min_speech_duration: int = 250  # ms
+    min_silence_duration: int = 100  # ms
+
+
+class TurnDetectionConfig(BaseModel):
+    """Turn detection / utterance boundary settings."""
+
+    silence_threshold: int = 800  # ms before finalizing utterance
+    max_utterance_duration: int = 60  # seconds hard cap
+    inter_utterance_gap: int = 300  # ms between utterances
+
+
+class BargeInConfig(BaseModel):
+    """Barge-in (interruption) settings during TTS playback."""
+
+    enabled: bool = True
+    ignore_duration: int = 200  # ms
+    fade_duration: int = 200  # ms
+    confirm_duration: int = 400  # ms total
+    fade_volume: float = 0.5
+
+
+class DiarizationConfig(BaseModel):
+    """Speaker diarization settings."""
+
+    engine: str = "pyannote"
+    model: str = "pyannote/speaker-diarization-3.1"
+    embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
+    min_speakers: int = 1
+    max_speakers: int = 6
+    match_threshold: float = 0.65
+
+
+class STTConfig(BaseModel):
+    """Speech-to-text provider settings."""
+
+    provider: str = "elevenlabs"
+    model: str = "scribe_v2"
+    language: str = "en"
+
+
+class TTSConfig(BaseModel):
+    """Text-to-speech provider settings."""
+
+    provider: str = "elevenlabs"
+    voice_id: str = ""  # must be configured
+    model: str = "eleven_turbo_v2_5"
+    stability: float = 0.5
+    similarity_boost: float = 0.75
+    optimize_streaming_latency: int = 3
+
+
+class SessionConfig(BaseModel):
+    """Voice session lifecycle settings."""
+
+    active_timeout: int = 30  # seconds before suspending
+    suspend_timeout: int = 180  # seconds before ending
+    max_session_duration: int = 600
+
+
+class VoiceConfig(BaseModel):
+    """Voice pipeline settings."""
+
+    wake_word: WakeWordConfig = Field(default_factory=WakeWordConfig)
+    vad: VADConfig = Field(default_factory=VADConfig)
+    turn_detection: TurnDetectionConfig = Field(default_factory=TurnDetectionConfig)
+    barge_in: BargeInConfig = Field(default_factory=BargeInConfig)
+    diarization: DiarizationConfig = Field(default_factory=DiarizationConfig)
+    stt: STTConfig = Field(default_factory=STTConfig)
+    tts: TTSConfig = Field(default_factory=TTSConfig)
+    session: SessionConfig = Field(default_factory=SessionConfig)
 
 
 class PerceptionConfig(BaseModel):
-    """Perception pipeline thresholds."""
+    """Perception pipeline thresholds and settings."""
 
-    reid_threshold: float = 0.7
+    motion_threshold: float = 12.0
+    reid_high_threshold: float = 0.85
+    reid_low_threshold: float = 0.60
     speaker_threshold: float = 0.75
-    max_embeddings_per_person: int = 20
+    presence_timeout: int = 30
+    heartbeat_interval: int = 5
+    max_visual_embeddings: int = 200
+    max_voice_embeddings: int = 50
+    crop_retention_days: int = 1
+    crop_retention_days_debug: int = 7
+    doa_forward_angle: int = 0  # ReSpeaker angle that maps to camera center
+    camera_hfov: int = 120  # Pi Camera Module 3 Wide horizontal FOV
+    voice_match_threshold: float = 0.60  # cosine similarity for voice ID
 
 
 class MemoryConfig(BaseModel):
@@ -355,8 +495,9 @@ class BoxBotConfig(BaseModel):
     agent: AgentConfig = Field(default_factory=AgentConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)
+    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
     camera: CameraConfig = Field(default_factory=CameraConfig)
-    audio: AudioConfig = Field(default_factory=AudioConfig)
+    voice: VoiceConfig = Field(default_factory=VoiceConfig)
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     photos: PhotosConfig = Field(default_factory=PhotosConfig)

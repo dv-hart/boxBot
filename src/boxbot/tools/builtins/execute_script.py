@@ -90,17 +90,31 @@ class ExecuteScriptTool(Tool):
             timeout = 30
             sandbox_user = "boxbot-sandbox"
 
-        # Build environment
-        env = os.environ.copy()
-        # Remove sensitive vars
-        for key in ("ANTHROPIC_API_KEY", "WHATSAPP_ACCESS_TOKEN"):
-            env.pop(key, None)
-        # Inject caller-provided env vars
+        # Build environment — allowlist only safe vars, never inherit secrets
+        SAFE_ENV_KEYS = {
+            "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+            "PYTHONPATH", "VIRTUAL_ENV", "PYTHONDONTWRITEBYTECODE",
+            "PYTHONUNBUFFERED",
+        }
+        env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_KEYS}
+        # Inject caller-provided env vars (e.g. service credentials for a
+        # specific skill — the agent decides what to pass explicitly)
         env.update(env_vars)
 
-        # Build command — in production this runs as sandbox_user via sudo
-        # For development, run directly with the sandbox venv python
-        cmd = [str(venv_python), str(script_path)]
+        # Build command — drop privileges to sandbox_user in production
+        enforce_sandbox = os.environ.get("BOXBOT_SANDBOX_ENFORCE", "1") != "0"
+        if enforce_sandbox and sandbox_user:
+            cmd = [
+                "sudo", "-n", "-u", sandbox_user,
+                "--", str(venv_python), str(script_path),
+            ]
+        else:
+            if sandbox_user:
+                logger.warning(
+                    "Sandbox enforcement disabled (BOXBOT_SANDBOX_ENFORCE=0) "
+                    "— script runs as current user"
+                )
+            cmd = [str(venv_python), str(script_path)]
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -193,15 +207,105 @@ async def _process_sdk_action(action: dict[str, Any]) -> dict[str, Any]:
     - skill.create -> skill manager (auto-activate)
     - packages.request -> package approval queue
     - memory.save -> memory store
+    - calendar.* -> Google Calendar integration
     - etc.
 
-    For now, returns a stub acknowledgment.
+    Most action types are still stubbed; calendar actions are fully
+    wired through to the integration module so the agent can read and
+    write Google Calendar end-to-end.
     """
-    action_type = action.get("action", "unknown")
+    action_type = (
+        action.get("action") or action.get("_sdk") or "unknown"
+    )
     logger.info("Processing SDK action: %s", action_type)
+
+    if action_type.startswith("calendar."):
+        return await _handle_calendar_action(action_type, action)
 
     return {
         "action": action_type,
         "status": "processed",
         "message": f"SDK action '{action_type}' acknowledged.",
     }
+
+
+async def _handle_calendar_action(
+    action_type: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Dispatch calendar.* SDK actions to the Google Calendar integration."""
+    from boxbot.integrations import google_calendar as gc
+
+    try:
+        if action_type == "calendar.create_event":
+            event_id = await gc.create_event(
+                summary=payload["summary"],
+                start=payload["start"],
+                end=payload["end"],
+                description=payload.get("description"),
+                location=payload.get("location"),
+                calendar_id=payload.get("calendar_id"),
+                all_day=bool(payload.get("all_day", False)),
+            )
+            return {
+                "action": action_type,
+                "status": "ok",
+                "event_id": event_id,
+            }
+
+        if action_type == "calendar.update_event":
+            ok = await gc.update_event(
+                payload["event_id"],
+                summary=payload.get("summary"),
+                start=payload.get("start"),
+                end=payload.get("end"),
+                description=payload.get("description"),
+                location=payload.get("location"),
+                calendar_id=payload.get("calendar_id"),
+                all_day=bool(payload.get("all_day", False)),
+            )
+            return {"action": action_type, "status": "ok" if ok else "error"}
+
+        if action_type == "calendar.delete_event":
+            ok = await gc.delete_event(
+                payload["event_id"],
+                calendar_id=payload.get("calendar_id"),
+            )
+            return {"action": action_type, "status": "ok" if ok else "error"}
+
+        if action_type == "calendar.list_upcoming_events":
+            events = await gc.list_upcoming_events(
+                max_results=int(payload.get("max_results", 5)),
+                calendar_id=payload.get("calendar_id"),
+            )
+            return {
+                "action": action_type,
+                "status": "ok",
+                "events": events,
+            }
+
+        return {
+            "action": action_type,
+            "status": "error",
+            "error": f"Unknown calendar action: {action_type}",
+        }
+
+    except gc.CalendarNotAuthenticated as e:
+        return {
+            "action": action_type,
+            "status": "error",
+            "error": str(e),
+            "remedy": "Run scripts/calendar_auth.py to grant access.",
+        }
+    except KeyError as e:
+        return {
+            "action": action_type,
+            "status": "error",
+            "error": f"Missing required field: {e}",
+        }
+    except Exception as e:
+        logger.exception("Calendar action %s failed", action_type)
+        return {
+            "action": action_type,
+            "status": "error",
+            "error": str(e),
+        }

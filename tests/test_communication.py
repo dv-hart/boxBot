@@ -196,17 +196,17 @@ class TestWhatsAppWebhook:
     """Test webhook verification and message parsing."""
 
     def test_verify_webhook_success(self):
-        webhook = WhatsAppWebhook(verify_token="my-secret")
+        webhook = WhatsAppWebhook(verify_token="my-secret", app_secret="secret")
         result = webhook.verify_webhook("subscribe", "my-secret", "challenge_123")
         assert result == "challenge_123"
 
     def test_verify_webhook_wrong_token(self):
-        webhook = WhatsAppWebhook(verify_token="my-secret")
+        webhook = WhatsAppWebhook(verify_token="my-secret", app_secret="secret")
         result = webhook.verify_webhook("subscribe", "wrong-token", "challenge_123")
         assert result is None
 
     def test_verify_webhook_wrong_mode(self):
-        webhook = WhatsAppWebhook(verify_token="my-secret")
+        webhook = WhatsAppWebhook(verify_token="my-secret", app_secret="secret")
         result = webhook.verify_webhook("unsubscribe", "my-secret", "challenge_123")
         assert result is None
 
@@ -221,12 +221,12 @@ class TestWhatsAppWebhook:
         webhook = WhatsAppWebhook(verify_token="token", app_secret="secret")
         assert webhook.validate_signature(b"payload", "sha256=invalid") is False
 
-    def test_validate_signature_no_secret_passes(self):
-        webhook = WhatsAppWebhook(verify_token="token")
-        assert webhook.validate_signature(b"payload", "sha256=anything") is True
+    def test_no_secret_raises(self):
+        with pytest.raises(ValueError, match="app_secret is required"):
+            WhatsAppWebhook(verify_token="token", app_secret="")
 
     def test_parse_webhook_text_message(self):
-        webhook = WhatsAppWebhook(verify_token="token")
+        webhook = WhatsAppWebhook(verify_token="token", app_secret="secret")
         payload = {
             "entry": [
                 {
@@ -264,7 +264,7 @@ class TestWhatsAppWebhook:
         assert msg.message_text == "Hello BB"
 
     def test_parse_webhook_image_message(self):
-        webhook = WhatsAppWebhook(verify_token="token")
+        webhook = WhatsAppWebhook(verify_token="token", app_secret="secret")
         payload = {
             "entry": [
                 {
@@ -304,13 +304,13 @@ class TestWhatsAppWebhook:
         assert msg.message_text == "Look at this"
 
     def test_parse_webhook_no_messages(self):
-        webhook = WhatsAppWebhook(verify_token="token")
+        webhook = WhatsAppWebhook(verify_token="token", app_secret="secret")
         payload = {"entry": [{"changes": [{"value": {"messaging_product": "whatsapp"}}]}]}
         messages = webhook.parse_webhook(payload)
         assert messages == []
 
     def test_parse_webhook_empty_payload(self):
-        webhook = WhatsAppWebhook(verify_token="token")
+        webhook = WhatsAppWebhook(verify_token="token", app_secret="secret")
         messages = webhook.parse_webhook({})
         assert messages == []
 
@@ -419,6 +419,38 @@ class TestMessageRouter:
         router = MessageRouter(auth=auth_manager, whatsapp=None)
         result = await router.route_outgoing("Jacob", "Hello")
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_auth_maintenance_purges_expired(self, auth_manager):
+        """run_maintenance cleans up expired codes, old attempts, and expired blocks."""
+        # Create an expired code by backdating it
+        from datetime import datetime, timedelta
+
+        async with auth_manager._get_db() as db:
+            past = (datetime.now() - timedelta(hours=48)).isoformat()
+            await db.execute(
+                "INSERT INTO registration_codes "
+                "(code, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                ("999999", "bootstrap", past, past),
+            )
+            # Old failed attempt
+            old = (datetime.now() - timedelta(days=60)).isoformat()
+            await db.execute(
+                "INSERT INTO failed_attempts (phone, attempted_at) VALUES (?, ?)",
+                ("+10000000000", old),
+            )
+            # Expired temp block
+            await db.execute(
+                "INSERT INTO blocks (phone, blocked_at, permanent, temp_block_count, expires_at) "
+                "VALUES (?, ?, 0, 1, ?)",
+                ("+10000000000", old, past),
+            )
+            await db.commit()
+
+        result = await auth_manager.run_maintenance()
+        assert result["registration_codes"] >= 1
+        assert result["failed_attempts"] >= 1
+        assert result["blocks"] >= 1
 
     @pytest.mark.asyncio
     async def test_blocked_number_is_dropped(self, auth_manager, event_bus):

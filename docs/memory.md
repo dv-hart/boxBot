@@ -533,7 +533,7 @@ perfection.
 | **Size cap** | Updates rejected if total file would exceed ~4 KB |
 | **Version history** | Last 20 versions stored in `system_memory_versions` table. Admin can rollback via command |
 | **Section schema** | Predefined sections (Household, Standing Instructions, Operational Notes). Agent cannot create arbitrary sections or delete the template structure |
-| **No secrets** | Content validated against common patterns (API keys, tokens, passwords). Secrets belong in the SDK secret store, not system memory |
+| **No secrets** | Content validated against secret patterns: generic API key/token/password keywords, OpenAI `sk-` keys, Bearer tokens, AWS access keys (`AKIA...`), GitHub tokens (`ghp_`/`gho_`), and PEM private keys. Secrets belong in the SDK secret store, not system memory |
 
 If the agent writes incorrect information to system memory, the damage
 is bounded (size cap, section structure) and recoverable (version

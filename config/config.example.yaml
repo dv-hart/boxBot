@@ -50,9 +50,8 @@ display:
   rotation_interval: 30
   # Displays to rotate through when idle
   idle_displays:
-    - "picture"
-    - "calendar"
-    - "weather"
+    - "clock"
+    - "weather_simple"
   # Brightness (0.0 - 1.0)
   brightness: 0.8
   # Night mode (reduced brightness)
@@ -62,6 +61,35 @@ display:
     end: "07:00"
     brightness: 0.3
 
+# ── Hardware ──────────────────────────────────────────────────────────
+hardware:
+  camera:
+    # Sensor rotation (degrees, applied by picamera2)
+    rotation: 180
+    # Low-res stream for CPU motion detection [width, height]
+    lores_resolution: [320, 240]
+    # Full-res photo capture resolution [width, height]
+    photo_resolution: [4608, 2592]
+  hailo:
+    # Model paths for Hailo-8L inference
+    models:
+      yolo_person: "/usr/share/hailo-models/yolov5s_personface_h8l.hef"
+      reid_repvgg: "data/perception/models/repvgg_a0_person_reid_512.hef"
+    # Load models into Hailo memory at startup
+    preload_models: true
+  microphone:
+    device_name: "ReSpeaker"
+    sample_rate: 16000
+    capture_channels: 6           # 4 raw mic + 2 processed
+    output_channel: 0             # ch 0 = processed/beamformed
+    chunk_duration_ms: 64         # ~1024 frames at 16kHz
+    doa_enabled: true
+    led_brightness: 0.5
+  speaker:
+    device_name: "hdmi"           # HDMI audio output (use "boxbot_speaker" after ALSA dual-output setup)
+    sample_rate: 24000            # match TTS output
+    default_volume: 0.7
+
 # ── Camera ────────────────────────────────────────────────────────────
 camera:
   resolution: [1280, 720]
@@ -70,24 +98,99 @@ camera:
   # Framerate during active interaction
   active_fps: 15
 
-# ── Audio ─────────────────────────────────────────────────────────────
-audio:
-  # STT provider: "whisper_api" or "deepgram"
-  stt_provider: "whisper_api"
-  # TTS provider: "elevenlabs" or "anthropic"
-  tts_provider: "elevenlabs"
-  tts_voice: "default"
-  # Speaker volume (0.0 - 1.0)
-  volume: 0.7
+# ── Voice ─────────────────────────────────────────────────────────────
+voice:
+  # Wake word detection
+  wake_word:
+    engine: "openwakeword"
+    word: "hey_jarvis"            # built-in model; swap to "bb" for custom
+    confidence_threshold: 0.7
+    # model_path: null            # custom model path (null = use built-in)
+
+  # Voice activity detection (Silero)
+  vad:
+    threshold: 0.5
+    min_speech_duration: 250      # ms
+    min_silence_duration: 100     # ms
+
+  # Turn detection — when an utterance is considered "finished"
+  turn_detection:
+    silence_threshold: 800        # ms of silence before finalizing
+    max_utterance_duration: 60    # seconds hard cap
+    inter_utterance_gap: 300      # ms between utterances
+
+  # Barge-in — graduated yielding when user interrupts TTS
+  barge_in:
+    enabled: true
+    ignore_duration: 200          # ms — continue at full volume
+    fade_duration: 200            # ms — fade to 50%
+    confirm_duration: 400         # ms total — full stop
+    fade_volume: 0.5
+
+  # Speaker diarization (pyannote)
+  diarization:
+    engine: "pyannote"
+    model: "pyannote/speaker-diarization-3.1"
+    embedding_model: "pyannote/wespeaker-voxceleb-resnet34-LM"
+    min_speakers: 1
+    max_speakers: 6
+    match_threshold: 0.65
+
+  # Speech-to-text
+  stt:
+    provider: "elevenlabs"
+    model: "scribe_v2"
+    language: "en"
+
+  # Text-to-speech
+  tts:
+    provider: "elevenlabs"
+    voice_id: ""                  # must be configured
+    model: "eleven_turbo_v2_5"
+    stability: 0.5
+    similarity_boost: 0.75
+    optimize_streaming_latency: 3
+
+  # Voice session lifecycle
+  session:
+    active_timeout: 30            # seconds before suspending
+    suspend_timeout: 180          # seconds before ending
+    max_session_duration: 600
 
 # ── Perception ────────────────────────────────────────────────────────
 perception:
-  # Visual ReID matching threshold (cosine similarity)
-  reid_threshold: 0.7
+  # CPU motion detection sensitivity (uint8 0-255 range).
+  # Lower = more sensitive (triggers on small changes).
+  # Higher = less sensitive (ignores lighting drift, sensor noise).
+  motion_threshold: 12.0
+
+  # Visual ReID confidence tiers (cosine similarity)
+  reid_high_threshold: 0.85       # confident match — can fire triggers
+  reid_low_threshold: 0.60        # tentative match — wait for voice
+
   # Speaker ID matching threshold
   speaker_threshold: 0.75
+
+  # Seconds without person detection before DETECTED → DORMANT
+  presence_timeout: 30
+
+  # YOLO re-check interval in DETECTED state (seconds)
+  heartbeat_interval: 5
+
   # Max representative embeddings per person
-  max_embeddings_per_person: 20
+  max_visual_embeddings: 200
+  max_voice_embeddings: 50
+
+  # Crop image retention for debugging (days)
+  crop_retention_days: 1
+  crop_retention_days_debug: 7
+
+  # DOA-to-camera mapping
+  doa_forward_angle: 0              # ReSpeaker DOA angle → camera center
+  camera_hfov: 120                  # Pi Camera Module 3 Wide horizontal FOV
+
+  # Voice identity matching threshold (cosine similarity, 0.55-0.65 range)
+  voice_match_threshold: 0.60
 
 # ── Memory ────────────────────────────────────────────────────────────
 memory:

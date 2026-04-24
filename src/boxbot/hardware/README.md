@@ -84,7 +84,7 @@ Raspberry Pi AI HAT+ (Hailo-8L, 13 TOPS):
   context manager. Realtime (perception) always preempts batch (photo
   intake). Multi-step sessions hold the lock to prevent interleaving
 - **Model management:** load/unload HEF models, query input/output shapes
-- Both models (YOLOv8n + OSNet) fit in on-chip memory simultaneously
+- Both models (YOLOv5s-personface + RepVGG-A0) fit in on-chip memory simultaneously
 
 ### `buttons.py`
 Adafruit KB2040 (RP2040) input controller — **optional:**

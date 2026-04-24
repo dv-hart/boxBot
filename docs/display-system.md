@@ -877,9 +877,8 @@ cycles through a list of displays during idle/sleep state:
 display:
   rotation_interval: 30
   idle_displays:
-    - "picture"
-    - "calendar"
-    - "weather"
+    - "clock"
+    - "weather_simple"
   brightness: 0.8
   night_mode:
     enabled: true

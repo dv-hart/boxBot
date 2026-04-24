@@ -33,9 +33,15 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Callback signature used by Conversation.record_segment. Imported
+# lazily to avoid a circular dependency — output_dispatcher is imported
+# by agent.py which imports conversation.
+SegmentRecorder = Callable[[Any], None]
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +159,7 @@ async def dispatch_outputs(
     conversation_id: str,
     channel_context: str,
     current_speaker: str | None,
+    segment_recorder: Optional[SegmentRecorder] = None,
 ) -> None:
     """Dispatch each output entry to its appropriate channel.
 
@@ -163,7 +170,14 @@ async def dispatch_outputs(
             used in log messages for provenance.
         current_speaker: The human the agent is addressing by default.
             Used to resolve ``to: "current_speaker"``.
+        segment_recorder: If provided, called with a ``SpokenSegment``
+            BEFORE each delivery so the conversation's interrupt-and-
+            fold logic can see a partial record if the task is cancelled
+            mid-delivery. Optional — non-conversation callers can skip.
     """
+    # Import lazily to avoid circular import with agent -> conversation.
+    from boxbot.core.conversation import SpokenSegment
+
     for i, entry in enumerate(outputs):
         to = str(entry.get("to") or "").strip()
         channel = str(entry.get("channel") or "").strip()
@@ -182,12 +196,28 @@ async def dispatch_outputs(
             resolved_to = current_speaker or "unknown"
 
         if channel == "voice":
-            await _dispatch_voice(
-                to=resolved_to,
-                content=content,
-                conversation_id=conversation_id,
-                channel_context=channel_context,
+            segment = SpokenSegment(
+                channel="voice", to=resolved_to, content=content,
             )
+            if segment_recorder is not None:
+                # Record before dispatch so a cancel mid-TTS still
+                # leaves a trace in conv.pending_segments.
+                try:
+                    segment_recorder(segment)
+                except Exception:
+                    logger.debug("segment_recorder raised", exc_info=True)
+            try:
+                await _dispatch_voice(
+                    to=resolved_to,
+                    content=content,
+                    conversation_id=conversation_id,
+                    channel_context=channel_context,
+                )
+            except BaseException:
+                # Mark the segment interrupted if the delivery was
+                # aborted (CancelledError, KeyboardInterrupt, etc.).
+                segment.interrupted = True
+                raise
         elif channel == "text":
             if resolved_to in ("room", "unknown"):
                 logger.warning(
@@ -197,12 +227,24 @@ async def dispatch_outputs(
                     resolved_to, conversation_id,
                 )
                 continue
-            await _dispatch_text(
-                to=resolved_to,
-                content=content,
-                conversation_id=conversation_id,
-                channel_context=channel_context,
+            segment = SpokenSegment(
+                channel="text", to=resolved_to, content=content,
             )
+            if segment_recorder is not None:
+                try:
+                    segment_recorder(segment)
+                except Exception:
+                    logger.debug("segment_recorder raised", exc_info=True)
+            try:
+                await _dispatch_text(
+                    to=resolved_to,
+                    content=content,
+                    conversation_id=conversation_id,
+                    channel_context=channel_context,
+                )
+            except BaseException:
+                segment.interrupted = True
+                raise
         else:
             logger.warning(
                 "Unknown channel %r in output entry (conv=%s); dropping: %r",

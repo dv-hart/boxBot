@@ -1521,22 +1521,10 @@ class TestVoiceSession:
         assert session._conversation_id.startswith("voice_")
 
     @pytest.mark.asyncio
-    async def test_state_transitions_active_to_suspended(self):
-        from boxbot.communication.voice import VoiceSession, VoiceSessionState
-
-        session, mic, speaker = self._make_session()
-        session._state = VoiceSessionState.ACTIVE
-        session._audio_capture = MagicMock()
-        session._audio_capture.stop = AsyncMock()
-        session._audio_capture.reset = MagicMock()
-        session._conversation_id = "voice_test123"
-
-        await session._suspend_session()
-
-        assert session.state == VoiceSessionState.SUSPENDED
-
-    @pytest.mark.asyncio
-    async def test_state_transitions_to_ended_then_idle(self):
+    async def test_deactivate_stops_audio_capture_and_returns_to_idle(self):
+        """Adapter-model replacement for the old suspend/end flow: one
+        transition, ACTIVE → IDLE, triggered by ConversationEnded or
+        the post-wake-word grace timeout."""
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
 
         session, mic, speaker = self._make_session()
@@ -1547,10 +1535,12 @@ class TestVoiceSession:
         session._vad = MagicMock()
         session._conversation_id = "voice_test123"
 
-        await session._end_session()
+        await session._deactivate_session(reason="test")
 
         assert session.state == VoiceSessionState.IDLE
         assert session._conversation_id == ""
+        session._audio_capture.stop.assert_awaited_once()
+        session._vad.reset.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_activate_session_starts_audio_capture(self):
@@ -1567,36 +1557,48 @@ class TestVoiceSession:
         session._audio_capture.start.assert_awaited_once_with(mic)
 
     @pytest.mark.asyncio
-    async def test_suspend_session_stops_audio_capture(self):
+    async def test_conversation_ended_voice_deactivates_adapter(self):
+        """The adapter subscribes to ConversationEnded and deactivates
+        capture/LED when the room conversation ends (silence or agent-
+        initiated). This replaces the old independent suspend timer."""
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
+        from boxbot.core.events import ConversationEnded
 
         session, mic, speaker = self._make_session()
         session._state = VoiceSessionState.ACTIVE
-        session._audio_capture = MagicMock()
-        session._audio_capture.stop = AsyncMock()
-        session._audio_capture.reset = MagicMock()
-
-        await session._suspend_session()
-
-        session._audio_capture.stop.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_end_session_cleans_up_and_returns_to_idle(self):
-        from boxbot.communication.voice import VoiceSession, VoiceSessionState
-
-        session, mic, speaker = self._make_session()
-        session._state = VoiceSessionState.ACTIVE
+        session._conversation_id = "voice_t"
         session._audio_capture = MagicMock()
         session._audio_capture.stop = AsyncMock()
         session._audio_capture.reset = MagicMock()
         session._vad = MagicMock()
-        session._conversation_id = "voice_test"
 
-        await session._end_session()
+        await session._on_conversation_ended(ConversationEnded(
+            conversation_id="conv_abc",
+            channel="voice",
+        ))
 
         assert session.state == VoiceSessionState.IDLE
-        assert session._conversation_id == ""
-        session._vad.reset.assert_called_once()
+        session._audio_capture.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_conversation_ended_non_voice_does_not_deactivate(self):
+        """WhatsApp/trigger conversation ends must not touch the mic."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+        from boxbot.core.events import ConversationEnded
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        session._conversation_id = "voice_t"
+        session._audio_capture = MagicMock()
+        session._audio_capture.stop = AsyncMock()
+
+        await session._on_conversation_ended(ConversationEnded(
+            conversation_id="conv_wa",
+            channel="whatsapp",
+        ))
+
+        assert session.state == VoiceSessionState.ACTIVE
+        session._audio_capture.stop.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_wake_word_triggers_activation(self):
@@ -1614,21 +1616,45 @@ class TestVoiceSession:
         assert session.state == VoiceSessionState.ACTIVE
 
     @pytest.mark.asyncio
-    async def test_wake_word_reactivates_from_suspended(self):
+    async def test_wake_word_during_active_extends_grace(self):
+        """In the adapter model a second wake word while ACTIVE just
+        refreshes the post-wake-word grace timer — no re-activation."""
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
 
         session, mic, speaker = self._make_session()
-        session._state = VoiceSessionState.SUSPENDED
-        session._vad = MagicMock()
+        session._state = VoiceSessionState.ACTIVE
+        session._conversation_id = "voice_existing"
         session._audio_capture = MagicMock()
         session._audio_capture.start = AsyncMock()
-        session._conversation_id = "voice_existing"
+
+        # Pre-existing grace task (any task will do for the mock).
+        import asyncio as _aio
+        prior = _aio.create_task(_aio.sleep(60))
+        session._active_timeout_task = prior
 
         event = WakeWordHeard(confidence=0.85)
         await session._on_wake_word(event)
 
+        # Give the cancelled task one scheduler tick to settle.
+        try:
+            await prior
+        except _aio.CancelledError:
+            pass
+
         assert session.state == VoiceSessionState.ACTIVE
-        # Same conversation should be resumed (not a new id)
+        assert session._conversation_id == "voice_existing"
+        assert prior.cancelled() or prior.done()
+        # New grace task replaced the prior one — NOT the same object.
+        assert session._active_timeout_task is not prior
+        session._audio_capture.start.assert_not_awaited()
+
+        # Clean up the new grace task so it doesn't leak into other tests.
+        if session._active_timeout_task is not None:
+            session._active_timeout_task.cancel()
+            try:
+                await session._active_timeout_task
+            except _aio.CancelledError:
+                pass
 
     @pytest.mark.asyncio
     async def test_wake_word_ignored_when_already_active(self):
@@ -1769,65 +1795,61 @@ class TestVoiceSession:
         set_voice_session(original)
 
     @pytest.mark.asyncio
-    async def test_active_timeout_triggers_suspension(self):
+    async def test_wake_word_grace_deactivates_if_no_utterance(self):
+        """If the user says the wake word but never speaks, the adapter
+        must deactivate after the grace window so we don't keep the mic
+        hot forever."""
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
-        from boxbot.core.config import SessionConfig
 
-        config = self._make_config(
-            session=SessionConfig(active_timeout=0, suspend_timeout=180)
-        )
-        session, mic, speaker = self._make_session(config=config)
+        session, mic, speaker = self._make_session()
         session._state = VoiceSessionState.ACTIVE
-        session._conversation_id = "voice_test"
-        session._vad = MagicMock()
+        session._conversation_id = "voice_t"
         session._audio_capture = MagicMock()
-        session._audio_capture.start = AsyncMock()
         session._audio_capture.stop = AsyncMock()
         session._audio_capture.reset = MagicMock()
+        session._vad = MagicMock()
 
-        # Set last speech time to the past so elapsed > active_timeout(0)
-        session._last_speech_time = time.monotonic() - 1.0
+        # Shorten the grace window for the test.
+        session._WAKE_WORD_GRACE_SECONDS = 0.05
+        # Drive the loop directly rather than via the timer scheduler.
+        await session._wake_word_grace_loop()
 
-        # Run the timeout loop as a task and give it time to execute
-        task = asyncio.create_task(session._active_timeout_loop())
-        # Sleep slightly longer than the loop's 1.0s interval
-        await asyncio.sleep(1.5)
-
-        assert session.state == VoiceSessionState.SUSPENDED
-
-        session._cancel_timers()
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        assert session.state == VoiceSessionState.IDLE
+        session._audio_capture.stop.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_suspend_timeout_triggers_end(self):
+    async def test_utterance_cancels_wake_word_grace(self):
+        """Once a real utterance arrives the Conversation's silence
+        timeout takes over lifecycle — the adapter-side grace is
+        cancelled so it doesn't race the conversation."""
+        from boxbot.communication.audio_capture import Utterance
+        from boxbot.communication.stt import STTResult
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
-        from boxbot.core.config import SessionConfig
 
-        config = self._make_config(
-            session=SessionConfig(active_timeout=30, suspend_timeout=0)
-        )
-        session, mic, speaker = self._make_session(config=config)
+        session, mic, speaker = self._make_session()
         session._state = VoiceSessionState.ACTIVE
-        session._audio_capture = MagicMock()
-        session._audio_capture.stop = AsyncMock()
-        session._audio_capture.reset = MagicMock()
-        session._vad = MagicMock()
-        session._conversation_id = "voice_test"
+        session._conversation_id = "voice_t"
+        session._stt = MagicMock()
+        session._stt.transcribe = AsyncMock(
+            return_value=STTResult(text="hello", language="en"),
+        )
+        session._diarizer = None
 
-        await session._suspend_session()
-        assert session.state == VoiceSessionState.SUSPENDED
+        import asyncio as _aio
+        grace = _aio.create_task(_aio.sleep(5))
+        session._active_timeout_task = grace
 
-        # Give the timeout loop a chance to run
-        await asyncio.sleep(0.1)
+        utterance = Utterance(
+            audio=b"\x00" * 32000,
+            duration=1.0,
+            sample_rate=16000,
+            timestamp_start=1.0,
+            timestamp_end=2.0,
+        )
+        await session._on_utterance(utterance)
 
-        # With suspend_timeout=0, should have ended -> IDLE
-        assert session.state == VoiceSessionState.IDLE
-
-        session._cancel_timers()
+        assert grace.cancelled() or grace.done()
+        assert session._active_timeout_task is None
 
     def test_build_attributed_transcript_no_diarization(self):
         from boxbot.communication.stt import STTResult

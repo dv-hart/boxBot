@@ -57,6 +57,12 @@ from typing import Any
 import anthropic
 
 from boxbot.core.config import get_config
+from boxbot.core.conversation import (
+    Conversation,
+    ConversationState,
+    GenerationResult,
+    SpokenSegment,
+)
 from boxbot.core.events import (
     ConversationEnded,
     ConversationStarted,
@@ -436,28 +442,22 @@ class BoxBotAgent:
         # context prompt so the agent can reason about confidence.
         self._latest_speaker_identities: dict[str, dict[str, Any]] = {}
 
-        # Tracks active conversations to prevent overlapping sessions on
-        # the same channel.
-        self._active_conversations: dict[str, asyncio.Task[None]] = {}
-
-        # Voice-session-scoped conversation history. The voice pipeline
-        # reuses a single conversation_id (e.g. "voice_bc6fb14f74b4") across
-        # utterances until the session ends (silence timeout → SUSPENDED →
-        # END). Each utterance becomes a new agent turn, but we want
-        # continuity — the model should remember what it just said.
-        #
-        # We keep a single slot: the id of the voice session whose history
-        # we are tracking, and the accumulated ``messages`` list from the
-        # most recent agent loop run. When a new TranscriptReady arrives
-        # with the SAME session id, we prepend this history so the model
-        # has context. When it arrives with a DIFFERENT id, the previous
-        # voice session has ended and we reset to a fresh slate.
+        # Active conversations, keyed by conversation_id. Each
+        # Conversation is its own state machine with its own generation
+        # task; cross-conversation concurrency is natural.
+        self._conversations: dict[str, Conversation] = {}
+        # Lookup by channel identity (e.g. "voice:room",
+        # "whatsapp:+15551234567") so inbound events route to the
+        # right existing conversation, or create one if none exists.
+        self._conversation_by_key: dict[str, str] = {}
+        # Snapshot of the latest voice_session_id so a TranscriptReady
+        # from a fresh voice session ends the prior room conversation
+        # (the voice pipeline owns session lifecycle; the agent owns
+        # conversation lifecycle — they stay in sync via this field).
         self._current_voice_session_id: str | None = None
-        self._voice_history: list[dict[str, Any]] = []
-
-        # Lock to serialise conversation starts (prevents race conditions
-        # when multiple events arrive simultaneously).
-        self._conversation_lock = asyncio.Lock()
+        # Index coordination lock. Held briefly during conversation
+        # creation/lookup; generation itself runs without this lock.
+        self._index_lock = asyncio.Lock()
 
         self._running = False
 
@@ -505,6 +505,7 @@ class BoxBotAgent:
         bus.subscribe(SpeakerIdentified, self._on_speaker_identified)
         bus.subscribe(TranscriptReady, self._on_transcript_ready)
         bus.subscribe(VoiceSessionEnded, self._on_voice_session_ended)
+        bus.subscribe(ConversationEnded, self._on_conversation_ended)
 
         self._running = True
         logger.info("BoxBotAgent started (model: %s)", config.models.large)
@@ -524,16 +525,19 @@ class BoxBotAgent:
         bus.unsubscribe(SpeakerIdentified, self._on_speaker_identified)
         bus.unsubscribe(TranscriptReady, self._on_transcript_ready)
         bus.unsubscribe(VoiceSessionEnded, self._on_voice_session_ended)
+        bus.unsubscribe(ConversationEnded, self._on_conversation_ended)
 
-        # Cancel any active conversations
-        for conv_id, task in list(self._active_conversations.items()):
-            task.cancel()
+        # End any active conversations cleanly.
+        for conv in list(self._conversations.values()):
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            logger.info("Cancelled active conversation: %s", conv_id)
-        self._active_conversations.clear()
+                await conv.end(reason="agent_stop")
+            except Exception:
+                logger.exception(
+                    "Error ending conversation %s during stop",
+                    conv.conversation_id,
+                )
+        self._conversations.clear()
+        self._conversation_by_key.clear()
 
         self._client = None
         logger.info("BoxBotAgent stopped")
@@ -543,44 +547,43 @@ class BoxBotAgent:
     # ------------------------------------------------------------------
 
     async def _on_voice_session_ended(self, event: VoiceSessionEnded) -> None:
-        """Clean up agent state when the voice session ends.
+        """End the room conversation when its voice session ends.
 
-        Prevents the agent from carrying stale history or holding an
-        un-done ``_active_conversations["voice"]`` entry past the end of
-        the voice session that spawned it.
+        The voice pipeline drives session lifecycle (ACTIVE → SUSPENDED
+        → ENDED after silence). When the session fully ends we end the
+        corresponding Conversation so its thread is archived, memory
+        extraction fires, and the next wake word starts fresh.
         """
-        task = self._active_conversations.get("voice")
-        if task is not None and not task.done():
+        async with self._index_lock:
+            conv_id = self._conversation_by_key.get("voice:room")
+            conv = self._conversations.get(conv_id) if conv_id else None
+            self._current_voice_session_id = None
+        if conv is not None:
             logger.info(
-                "Voice session %s ended while agent conversation still "
-                "running — cancelling",
-                event.conversation_id,
+                "Voice session %s ended — ending room conversation %s",
+                event.conversation_id, conv.conversation_id,
             )
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Error cancelling voice conversation task")
-        self._active_conversations.pop("voice", None)
-        self._current_voice_session_id = None
-        self._voice_history = []
+            await conv.end(reason="voice_session_ended")
 
     async def _on_whatsapp_message(self, event: WhatsAppMessage) -> None:
-        """Handle an incoming WhatsApp message — start or continue a conversation."""
+        """Route an inbound WhatsApp message to its per-sender conversation."""
         logger.info(
-            "WhatsApp message from %s, starting conversation",
-            event.sender_name,
+            "WhatsApp message from %s", event.sender_name or event.sender_phone,
         )
         text = event.text or ""
         if event.media_type:
             text = f"[{event.media_type} attached] {text}".strip()
 
-        await self._start_conversation_task(
+        channel_key = f"whatsapp:{event.sender_phone or 'unknown'}"
+        conv = await self._get_or_create_conversation(
             channel="whatsapp",
-            initial_message=text,
-            person_name=event.sender_name or None,
+            channel_key=channel_key,
+            participants={event.sender_name} if event.sender_name else None,
+        )
+        await conv.handle_input(
+            text,
+            speaker_name=event.sender_name or None,
+            source="user",
             context={
                 "sender_phone": event.sender_phone,
                 "media_url": event.media_url,
@@ -589,13 +592,11 @@ class BoxBotAgent:
         )
 
     async def _on_trigger_fired(self, event: TriggerFired) -> None:
-        """Handle a trigger fire — start a trigger-initiated conversation."""
+        """Create a one-shot conversation from a scheduler trigger."""
         logger.info(
             "Trigger fired: %s (%s)",
-            event.trigger_id,
-            event.description,
+            event.trigger_id, event.description,
         )
-        # Build the initial message from the trigger's instructions
         initial_msg = (
             f"[Trigger fired: {event.description}]\n"
             f"Instructions: {event.instructions}"
@@ -603,10 +604,21 @@ class BoxBotAgent:
         if event.todo_id:
             initial_msg += f"\nLinked to-do: {event.todo_id}"
 
-        await self._start_conversation_task(
+        # Triggers get their own unique channel_key so each firing is a
+        # fresh conversation — they don't share context across firings.
+        channel_key = f"trigger:{event.trigger_id}:{_generate_conversation_id()}"
+        conv = await self._get_or_create_conversation(
             channel="trigger",
-            initial_message=initial_msg,
-            person_name=event.for_person,
+            channel_key=channel_key,
+            participants={event.for_person} if event.for_person else None,
+            # Triggers have no follow-up user input so a short timeout
+            # keeps them from lingering after the agent's response.
+            silence_timeout=10.0,
+        )
+        await conv.handle_input(
+            initial_msg,
+            speaker_name=event.for_person,
+            source="trigger",
             context={
                 "trigger_id": event.trigger_id,
                 "trigger_description": event.description,
@@ -637,65 +649,212 @@ class BoxBotAgent:
                 )
 
     async def _on_transcript_ready(self, event: TranscriptReady) -> None:
-        """Handle an attributed transcript from the voice pipeline.
+        """Route a voice transcript into the room's voice conversation.
 
-        Voice utterances are threaded into a continuing agent conversation
-        keyed by the voice session's own conversation_id. The voice pipeline
-        holds that id stable across utterances until the session ends; we
-        preserve the running ``messages`` list in ``_voice_history`` so the
-        agent remembers prior turns. A new voice session id resets the slate.
+        All voice in this room belongs to one Conversation keyed as
+        ``voice:room``. A new voice_session_id signals the prior room
+        conversation is done (the voice pipeline's session ended); we
+        end it and start a fresh one so the new session doesn't inherit
+        stale context.
         """
         transcript = event.transcript.strip()
         if not transcript:
             return
 
-        # Apply speaker identities to transcript
+        # Apply speaker identities to transcript tags.
         if self._speaker_identities:
             for label, name in self._speaker_identities.items():
                 transcript = transcript.replace(f"[{label}]:", f"[{name}]:")
 
-        # Capture the per-session identity block (voice-ReID tiers, etc.)
-        # for rendering into the dynamic prompt's identity section.
         if event.speaker_identities:
             self._latest_speaker_identities = dict(event.speaker_identities)
 
         voice_session_id = event.conversation_id
         logger.info(
             "Transcript ready (voice_session=%s): %s",
-            voice_session_id,
-            transcript[:100],
+            voice_session_id, transcript[:100],
         )
 
-        # Continuity check: same voice session → keep history; new session
-        # → drop prior history, fresh conversation.
-        if voice_session_id != self._current_voice_session_id:
-            if self._current_voice_session_id is not None:
-                logger.info(
-                    "Voice session changed (%s → %s); resetting history",
-                    self._current_voice_session_id, voice_session_id,
+        # If the voice session id changed, end the previous room
+        # conversation before creating a new one.
+        if (
+            self._current_voice_session_id is not None
+            and voice_session_id != self._current_voice_session_id
+        ):
+            logger.info(
+                "Voice session changed (%s → %s); ending previous room "
+                "conversation",
+                self._current_voice_session_id, voice_session_id,
+            )
+            async with self._index_lock:
+                old_conv_id = self._conversation_by_key.pop("voice:room", None)
+                old_conv = (
+                    self._conversations.get(old_conv_id) if old_conv_id else None
                 )
-            self._current_voice_session_id = voice_session_id
-            self._voice_history = []
+            if old_conv is not None:
+                await old_conv.end(reason="voice_session_changed")
+        self._current_voice_session_id = voice_session_id
 
-        prior_history = (
-            list(self._voice_history) if self._voice_history else None
-        )
-
-        # Determine the speaker from the transcript (best effort)
         person_name = self._get_most_recent_person()
-
-        await self._start_conversation_task(
+        participants: set[str] | None = {person_name} if person_name else None
+        conv = await self._get_or_create_conversation(
             channel="voice",
-            initial_message=transcript,
-            person_name=person_name,
+            channel_key="voice:room",
+            participants=participants,
+        )
+        await conv.handle_input(
+            transcript,
+            speaker_name=person_name,
+            source="user",
             context={
-                "voice_conversation_id": voice_session_id,
-                "prior_history": prior_history,
+                "voice_session_id": voice_session_id,
+                "speaker_identities": dict(event.speaker_identities or {}),
             },
         )
 
     # ------------------------------------------------------------------
-    # Conversation management
+    # Conversation index + generation
+    # ------------------------------------------------------------------
+
+    async def _get_or_create_conversation(
+        self,
+        *,
+        channel: str,
+        channel_key: str,
+        participants: set[str] | None = None,
+        silence_timeout: float | None = None,
+    ) -> Conversation:
+        """Look up an existing Conversation by channel key, or create one.
+
+        This is the only place the conversation index is mutated from
+        inbound events. The index itself is a dict of live, non-ended
+        conversations — ended conversations are removed via
+        ``_on_conversation_ended``.
+        """
+        async with self._index_lock:
+            existing_id = self._conversation_by_key.get(channel_key)
+            if existing_id is not None:
+                conv = self._conversations.get(existing_id)
+                if conv is not None and not conv.is_ended:
+                    if participants:
+                        conv.participants.update(participants)
+                    return conv
+                # Stale entry — drop it and create fresh.
+                self._conversation_by_key.pop(channel_key, None)
+                self._conversations.pop(existing_id, None)
+
+            conv_id = _generate_conversation_id()
+            conv = Conversation(
+                conversation_id=conv_id,
+                channel=channel,
+                channel_key=channel_key,
+                generate_fn=self._generate_for_conversation,
+                participants=participants,
+                silence_timeout=silence_timeout,
+            )
+            self._conversations[conv_id] = conv
+            self._conversation_by_key[channel_key] = conv_id
+            logger.info(
+                "Conversation %s created (channel=%s, key=%s)",
+                conv_id, channel, channel_key,
+            )
+            return conv
+
+    async def _on_conversation_ended(self, event: ConversationEnded) -> None:
+        """Remove the conversation from the index and fire memory extraction.
+
+        The Conversation publishes ``ConversationEnded`` from its own
+        ``end()`` method (whether ended by silence timeout, explicit
+        ``end()``, or voice-session-ended). We pop it from both indexes
+        and kick off post-conversation memory extraction on its thread.
+        """
+        conv_id = event.conversation_id
+        async with self._index_lock:
+            conv = self._conversations.pop(conv_id, None)
+            # Remove from channel-key index if this id still owned it.
+            for key, cid in list(self._conversation_by_key.items()):
+                if cid == conv_id:
+                    self._conversation_by_key.pop(key, None)
+                    break
+        if conv is None:
+            return
+
+        # Fire-and-forget memory extraction on the ended thread.
+        if conv.thread and event.turn_count > 0:
+            asyncio.create_task(
+                self._post_conversation(
+                    conversation_id=conv_id,
+                    channel=event.channel,
+                    person_name=event.person_name,
+                    messages=list(conv.thread),
+                ),
+                name=f"extraction-{conv_id}",
+            )
+
+    async def _generate_for_conversation(
+        self, conv: Conversation,
+    ) -> GenerationResult:
+        """Run one agent-loop cycle for a Conversation.
+
+        This is the generate_fn injected into every Conversation. It:
+        1. Builds the two-block system prompt from live state.
+        2. Runs the Claude agent loop using the Conversation's thread
+           as the seed message history.
+        3. Dispatches each output to its channel, recording a
+           ``SpokenSegment`` on the conversation BEFORE the delivery
+           await so interrupt-and-fold sees an accurate partial record.
+        4. Returns the thread additions (everything beyond the thread's
+           prior length) as a GenerationResult.
+        """
+        assert self._client is not None, "Agent not started"
+        if not conv.thread:
+            # Nothing to generate from — should not happen because
+            # handle_input always appends before starting the task.
+            return GenerationResult(completed_cleanly=False)
+
+        # The last thread entry is the fresh user input that triggered
+        # this cycle; everything earlier is prior context.
+        last_user = conv.thread[-1]
+        initial_message = str(last_user.get("content") or "")
+        prior_history = list(conv.thread[:-1]) if len(conv.thread) > 1 else None
+
+        context = conv.current_context
+        person_name = self._get_most_recent_person()
+
+        system_prompt_blocks = await self._build_system_prompt_blocks(
+            person_name=person_name,
+            channel=conv.channel,
+            context=context,
+            initial_message=initial_message,
+        )
+
+        # The agent loop returns the full message history — from
+        # prior_history + initial user + assistant/tool turns produced
+        # this cycle. We'll extract the additions beyond our thread.
+        conv.set_state(ConversationState.THINKING)
+        messages, turn_count = await self._agent_loop(
+            conversation_id=conv.conversation_id,
+            channel=conv.channel,
+            system_prompt_blocks=system_prompt_blocks,
+            initial_message=initial_message,
+            person_name=person_name,
+            max_turns=get_config().agent.max_turns,
+            prior_history=prior_history,
+            segment_recorder=conv.record_segment,
+        )
+
+        additions = messages[len(conv.thread):]
+        summary = self._extract_summary(messages)
+
+        return GenerationResult(
+            thread_additions=additions,
+            turn_count=turn_count,
+            summary=summary,
+            completed_cleanly=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Legacy conversation management (dead after M2; removed in M6)
     # ------------------------------------------------------------------
 
     async def _start_conversation_task(
@@ -1171,6 +1330,7 @@ class BoxBotAgent:
         person_name: str | None,
         max_turns: int = _DEFAULT_MAX_TURNS,
         prior_history: list[dict[str, Any]] | None = None,
+        segment_recorder: Any = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Run the core agent conversation loop.
 
@@ -1296,6 +1456,7 @@ class BoxBotAgent:
                         conversation_id=conversation_id,
                         channel_context=channel,
                         current_speaker=person_name,
+                        segment_recorder=segment_recorder,
                     )
                 else:
                     logger.debug(

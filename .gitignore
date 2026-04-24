@@ -27,6 +27,9 @@ config/whatsapp.yaml
 data/photos/
 data/embeddings/
 data/memory.db
+data/memory/
+data/auth/
+data/perception/
 data/models/
 data/sandbox/venv/
 data/sandbox/scripts/*
@@ -36,6 +39,10 @@ data/sandbox/output/*
 data/sandbox/tmp/*
 !data/sandbox/tmp/.gitkeep
 data/sandbox/installed.txt
+
+# Hailo runtime logs
+hailort*.log
+pyhailort*.log
 
 # Preview renders (scripts/preview_display.py, scripts/block_gallery.py)
 data/previews/

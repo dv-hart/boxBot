@@ -184,6 +184,35 @@ to-do list:
 - Camera frames are processed and discarded — never stored unless the user
   explicitly saves a photo
 
+### 10. One Conversation Abstraction
+The agent sees text, not voice. Voice and WhatsApp are **I/O adapters**
+that produce attributed transcripts and deliver outputs; the agent
+processes conversations independent of transport.
+
+- **`Conversation`** (`src/boxbot/core/conversation.py`) owns the full
+  lifecycle of one logical interaction: its thread of messages, its
+  participants, the I/O channels it covers, the in-flight generation
+  task, and its state (`LISTENING` / `THINKING` / `SPEAKING` / `ENDED`).
+- **Per-conversation serialization, cross-conversation parallelism.**
+  One generation runs at a time within a conversation, but a voice
+  conversation in the room runs fully in parallel with a WhatsApp
+  conversation with a different person. No global conversation lock.
+- **New input cancels in-flight generation.** If a user speaks while
+  the agent is thinking or mid-TTS, the current generation is
+  cancelled, partial delivery is folded into the thread as an
+  interrupted assistant turn, and a fresh generation starts with the
+  updated thread. The model sees what was actually delivered and
+  decides what to do next.
+- **Silence timeout lives on the conversation**, not the voice
+  transport. The voice adapter is a thin layer: wake word activates
+  mic capture, a `ConversationEnded(channel="voice")` event
+  deactivates it. LEDs are a pure function of the voice-room
+  conversation's state — no independent timers drift from the
+  conversation's reality.
+- **Conversation keys:** `voice:room` (one per physical room),
+  `whatsapp:<phone>` (per sender), `trigger:<id>:<uuid>` (one-shot
+  per firing).
+
 ## Architecture Boundaries
 
 ```

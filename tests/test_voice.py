@@ -193,30 +193,57 @@ class TestMicrophone:
         mock_stream.close.assert_called_once()
         assert mic._stream is None
 
-    def test_add_consumer(self):
+    def test_add_consumer_returns_handle(self):
         mic = self._make_mic()
         cb = AsyncMock()
-        mic.add_consumer(cb, "test")
+        handle = mic.add_consumer(cb, "test")
+        assert isinstance(handle, int) and handle > 0
         assert mic.consumer_count == 1
 
-    def test_add_consumer_duplicate_ignored(self):
+    def test_add_consumer_same_callback_gets_distinct_handles(self):
+        # Bound methods accessed twice are not `is`-identical; the API
+        # MUST issue a new handle each time even for the same callable.
         mic = self._make_mic()
         cb = AsyncMock()
-        mic.add_consumer(cb, "test")
-        mic.add_consumer(cb, "test")
-        assert mic.consumer_count == 1
+        h1 = mic.add_consumer(cb, "test")
+        h2 = mic.add_consumer(cb, "test")
+        assert h1 != h2
+        assert mic.consumer_count == 2
 
-    def test_remove_consumer(self):
+    def test_remove_consumer_by_handle(self):
         mic = self._make_mic()
         cb = AsyncMock()
-        mic.add_consumer(cb, "test")
-        mic.remove_consumer(cb)
+        handle = mic.add_consumer(cb, "test")
+        assert mic.remove_consumer(handle) is True
         assert mic.consumer_count == 0
 
-    def test_remove_nonexistent_consumer(self):
+    def test_remove_consumer_unknown_handle_returns_false(self):
+        mic = self._make_mic()
+        assert mic.remove_consumer(99999) is False
+        assert mic.consumer_count == 0
+
+    def test_remove_consumer_is_idempotent_per_handle(self):
         mic = self._make_mic()
         cb = AsyncMock()
-        mic.remove_consumer(cb)  # should not raise
+        handle = mic.add_consumer(cb, "test")
+        assert mic.remove_consumer(handle) is True
+        # Second remove with the same handle is a no-op (returns False).
+        assert mic.remove_consumer(handle) is False
+
+    def test_bound_method_survives_register_remove_cycle(self):
+        # Regression for the stuck-state bug observed 2026-04-24: bound
+        # methods like self._on_audio_chunk are not identity-stable
+        # across accesses. Handle-based removal must still work.
+        class _Consumer:
+            async def on_chunk(self, chunk):  # pragma: no cover - smoke
+                pass
+
+        mic = self._make_mic()
+        c = _Consumer()
+        # Each access of c.on_chunk yields a fresh bound method, so `is`
+        # would have failed. Handles must not rely on identity.
+        handle = mic.add_consumer(c.on_chunk, "consumer")
+        assert mic.remove_consumer(handle) is True
         assert mic.consumer_count == 0
 
     @pytest.mark.asyncio
@@ -245,6 +272,56 @@ class TestMicrophone:
         await mic._dispatch_chunk(chunk)
 
         cb2.assert_awaited_once_with(chunk)
+
+    @pytest.mark.asyncio
+    async def test_watchdog_loop_detects_stall_and_reopens(self):
+        """Regression: sounddevice can silently stall with no exception;
+        the watchdog must detect the stall and force a reopen."""
+        import boxbot.hardware.microphone as mic_mod
+
+        with patch.object(mic_mod, "sd") as mock_sd, \
+                patch.object(mic_mod, "_HAS_SOUNDDEVICE", True):
+            mock_sd.query_devices.return_value = [
+                {"name": "TestRespeaker Array", "max_input_channels": 6}
+            ]
+            streams = []
+            def _make_stream(*a, **k):
+                s = MagicMock()
+                streams.append(s)
+                return s
+            mock_sd.InputStream.side_effect = _make_stream
+
+            mic = self._make_mic()
+            # Simulate a started state without spinning up the real
+            # watchdog — we drive one iteration of the loop by hand.
+            mic._loop = asyncio.get_event_loop()
+            mic._device_index = 0
+            mic._started = True
+            mic._open_stream()
+            # Force staleness.
+            mic._last_chunk_monotonic = time.monotonic() - 60.0
+
+            # Shorten poll interval by patching asyncio.sleep.
+            sleeps = []
+            orig_sleep = asyncio.sleep
+
+            async def _fast_sleep(seconds):
+                sleeps.append(seconds)
+                if len(sleeps) > 1:
+                    # After the watchdog has gone once through the
+                    # stall-handling path, stop the loop.
+                    mic._started = False
+                await orig_sleep(0)
+
+            with patch.object(mic_mod.asyncio, "sleep", _fast_sleep):
+                await mic._watchdog_loop()
+
+            # Original + restart: at least two InputStreams were built.
+            assert mock_sd.InputStream.call_count >= 2
+            streams[0].stop.assert_called()
+            streams[0].close.assert_called()
+            streams[-1].start.assert_called()
+            assert mic._stream_restart_count >= 1
 
     @pytest.mark.asyncio
     async def test_set_led_pattern_changes_current_pattern(self):
@@ -564,6 +641,48 @@ class TestWakeWordDetector:
         assert len(events_received) == 1
         assert events_received[0].confidence == 0.95
         detector._model.reset.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("boxbot.communication.wake_word._resolve_builtin_model",
+           return_value="/fake/hey_jarvis_v0.1.onnx")
+    @patch("boxbot.communication.wake_word.openwakeword")
+    async def test_debounce_suppresses_immediate_repeat_detection(
+        self, mock_oww, _mock_resolve
+    ):
+        """Regression: one spoken wake word can produce 2–3 detections in
+        under a second as the model's prediction decays. Debounce must
+        suppress further publishes within the debounce window."""
+        from boxbot.communication.wake_word import WakeWordDetector
+
+        config = self._make_config(confidence_threshold=0.7)
+        detector = WakeWordDetector(config)
+        mic = MagicMock()
+        await detector.start(mic)
+
+        # First detection above threshold.
+        detector._model.predict.return_value = {"hey_jarvis": 0.95}
+
+        events_received: list = []
+        bus = get_event_bus()
+        async def handler(event: WakeWordHeard):
+            events_received.append(event)
+        bus.subscribe(WakeWordHeard, handler)
+
+        # Three quick detections — only the first should publish.
+        await detector._on_audio_chunk(make_chunk())
+        detector._model.predict.return_value = {"hey_jarvis": 0.86}
+        await detector._on_audio_chunk(make_chunk())
+        detector._model.predict.return_value = {"hey_jarvis": 0.72}
+        await detector._on_audio_chunk(make_chunk())
+
+        assert len(events_received) == 1
+        assert events_received[0].confidence == 0.95
+
+        # After the debounce window, the detector is armed again.
+        detector._suppress_until = 0.0
+        detector._model.predict.return_value = {"hey_jarvis": 0.9}
+        await detector._on_audio_chunk(make_chunk())
+        assert len(events_received) == 2
 
     @pytest.mark.asyncio
     @patch("boxbot.communication.wake_word._resolve_builtin_model",

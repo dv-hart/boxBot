@@ -173,7 +173,12 @@ class Microphone(HardwareModule):
         self._device_index: int | None = None
         self._usb_device: Any = None  # usb.core.Device
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._consumers: list[tuple[AudioConsumer, str]] = []  # (callback, name)
+        # Consumers are keyed by a stable integer handle returned from
+        # add_consumer(). This avoids the bound-method identity pitfall:
+        # ``obj.method is obj.method`` is False, so using the callable
+        # itself as the key silently breaks remove_consumer().
+        self._consumers: list[tuple[int, AudioConsumer, str]] = []
+        self._next_consumer_id: int = 1
         self._animation_task: asyncio.Task[None] | None = None
         self._current_pattern: str = "off"
         self._pattern_params: dict[str, Any] = {}
@@ -182,6 +187,13 @@ class Microphone(HardwareModule):
         # the exception, subsequent failures at DEBUG to avoid log spam
         # when the udev rule is missing or the device is unplugged.
         self._usb_write_failure_count: int = 0
+        # Liveness: the audio-thread callback updates this each chunk;
+        # the watchdog task compares against wall time and restarts the
+        # stream if callbacks stop firing. Prevents the silent-death
+        # failure mode where sounddevice stalls and nothing notices.
+        self._last_chunk_monotonic: float = 0.0
+        self._watchdog_task: asyncio.Task[None] | None = None
+        self._stream_restart_count: int = 0
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -204,15 +216,7 @@ class Microphone(HardwareModule):
 
         # Open audio stream
         try:
-            self._stream = sd.InputStream(
-                samplerate=self._sample_rate,
-                channels=self._capture_channels,
-                dtype="int16",
-                device=self._device_index,
-                blocksize=self._chunk_frames,
-                callback=self._audio_callback,
-            )
-            self._stream.start()
+            self._open_stream()
         except Exception as exc:
             await self._emit_health(HealthStatus.ERROR, str(exc))
             raise HardwareUnavailableError(
@@ -222,6 +226,10 @@ class Microphone(HardwareModule):
         # Start LED animation loop
         self._animation_running = True
         self._animation_task = asyncio.create_task(self._animation_loop())
+
+        # Start stream liveness watchdog
+        self._last_chunk_monotonic = time.monotonic()
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
         # Set initial LED state
         await self.set_led_pattern("idle")
@@ -239,6 +247,15 @@ class Microphone(HardwareModule):
 
     async def stop(self) -> None:
         """Stop audio stream, LED animation, and release USB handle."""
+        # Stop watchdog
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._watchdog_task = None
+
         # Stop animation
         self._animation_running = False
         if self._animation_task is not None:
@@ -253,14 +270,7 @@ class Microphone(HardwareModule):
         self._set_all_leds_raw(_COLOR_OFF)
 
         # Stop audio stream
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                logger.exception("Error stopping audio stream")
-            finally:
-                self._stream = None
+        self._close_stream()
 
         # Release USB
         if self._usb_device is not None:
@@ -275,37 +285,145 @@ class Microphone(HardwareModule):
         self._loop = None
         await self._emit_health(HealthStatus.STOPPED)
 
+    # ── Stream management ─────────────────────────────────────────
+
+    def _open_stream(self) -> None:
+        """Open (or reopen) the sounddevice InputStream.
+
+        Called from start() and from the watchdog when a stalled stream
+        is detected. Runs synchronously — sounddevice start is fast.
+        """
+        self._stream = sd.InputStream(
+            samplerate=self._sample_rate,
+            channels=self._capture_channels,
+            dtype="int16",
+            device=self._device_index,
+            blocksize=self._chunk_frames,
+            callback=self._audio_callback,
+        )
+        self._stream.start()
+
+    def _close_stream(self) -> None:
+        """Stop and close the current stream, swallowing errors."""
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                logger.exception("Error stopping audio stream")
+            finally:
+                self._stream = None
+
+    async def _watchdog_loop(self) -> None:
+        """Monitor the audio stream and restart it if callbacks stall.
+
+        sounddevice has no built-in recovery: if the underlying ALSA/USB
+        stream wedges (hub disconnect, driver glitch), the callback
+        simply stops firing and no exception surfaces. This watchdog
+        compares wall time against the last observed chunk timestamp
+        and forces a reopen if chunks haven't arrived for a while.
+        """
+        # Stall threshold is generous (5s >> any legitimate gap at 64ms
+        # cadence) so we don't fight against brief scheduler hiccups.
+        stall_seconds = 5.0
+        poll_interval = 2.0
+        try:
+            while self._started:
+                await asyncio.sleep(poll_interval)
+                if not self._started:
+                    return
+                elapsed = time.monotonic() - self._last_chunk_monotonic
+                if elapsed < stall_seconds:
+                    continue
+
+                self._stream_restart_count += 1
+                logger.error(
+                    "Audio stream appears stalled (%.1fs since last "
+                    "chunk). Restarting stream (restart #%d).",
+                    elapsed, self._stream_restart_count,
+                )
+                try:
+                    await self._emit_health(
+                        HealthStatus.DEGRADED,
+                        f"audio stream stalled for {elapsed:.1f}s",
+                    )
+                except Exception:
+                    pass
+
+                # Reopen the stream. Do it on the event loop thread —
+                # sounddevice close/open are blocking but fast (<100ms);
+                # running them inline is simpler than juggling an
+                # executor + re-registration.
+                self._close_stream()
+                try:
+                    self._open_stream()
+                    self._last_chunk_monotonic = time.monotonic()
+                    logger.info(
+                        "Audio stream reopened after stall (restart #%d)",
+                        self._stream_restart_count,
+                    )
+                    try:
+                        await self._emit_health(HealthStatus.OK)
+                    except Exception:
+                        pass
+                except Exception:
+                    logger.exception(
+                        "Failed to reopen audio stream after stall; "
+                        "will retry on next watchdog tick",
+                    )
+        except asyncio.CancelledError:
+            return
+
     # ── Consumer fan-out ──────────────────────────────────────────
 
-    def add_consumer(self, callback: AudioConsumer, name: str = "") -> None:
+    def add_consumer(self, callback: AudioConsumer, name: str = "") -> int:
         """Register an async callback to receive audio chunks.
 
         Args:
             callback: Async callable that receives AudioChunk.
             name: Human-readable name for logging.
-        """
-        for existing_cb, _ in self._consumers:
-            if existing_cb is callback:
-                logger.warning("Consumer %s already registered", name)
-                return
-        self._consumers.append((callback, name or repr(callback)))
-        logger.debug("Audio consumer added: %s (total: %d)", name, len(self._consumers))
 
-    def remove_consumer(self, callback: AudioConsumer) -> None:
-        """Remove a previously registered consumer.
+        Returns:
+            A handle id. Pass this to ``remove_consumer`` to unregister.
+            Callers MUST store this id — bound methods are not
+            identity-stable across accesses, so the callable itself is
+            not a reliable key.
+        """
+        handle = self._next_consumer_id
+        self._next_consumer_id += 1
+        display = name or repr(callback)
+        self._consumers.append((handle, callback, display))
+        logger.debug(
+            "Audio consumer added: %s [id=%d] (total: %d)",
+            display, handle, len(self._consumers),
+        )
+        return handle
+
+    def remove_consumer(self, handle: int) -> bool:
+        """Remove a previously registered consumer by handle.
 
         Args:
-            callback: The callback to remove.
+            handle: The integer handle returned from ``add_consumer``.
+
+        Returns:
+            True if a consumer was removed; False if the handle was
+            unknown (caller logic bug — should never happen if handles
+            are stored correctly).
         """
-        for i, (cb, name) in enumerate(self._consumers):
-            if cb is callback:
+        for i, (h, _cb, name) in enumerate(self._consumers):
+            if h == handle:
                 self._consumers.pop(i)
                 logger.debug(
-                    "Audio consumer removed: %s (total: %d)",
-                    name,
-                    len(self._consumers),
+                    "Audio consumer removed: %s [id=%d] (total: %d)",
+                    name, handle, len(self._consumers),
                 )
-                return
+                return True
+        logger.warning(
+            "remove_consumer called with unknown handle %d — consumer "
+            "list unchanged (total: %d)",
+            handle, len(self._consumers),
+        )
+        return False
 
     def _audio_callback(
         self,
@@ -319,6 +437,12 @@ class Microphone(HardwareModule):
         Extracts the configured output channel and dispatches to the
         async event loop via call_soon_threadsafe.
         """
+        # Always stamp liveness, even with no consumers and even on
+        # status-flagged chunks — the watchdog only cares whether the
+        # stream is producing callbacks at all.
+        now = time.monotonic()
+        self._last_chunk_monotonic = now
+
         if status:
             logger.warning("Audio stream status: %s", status)
 
@@ -331,7 +455,7 @@ class Microphone(HardwareModule):
 
         chunk = AudioChunk(
             data=pcm_bytes,
-            timestamp=time.monotonic(),
+            timestamp=now,
             sample_rate=self._sample_rate,
             channels=1,
             frames=frames,
@@ -359,8 +483,11 @@ class Microphone(HardwareModule):
             except Exception:
                 logger.exception("Error in audio consumer %s", name)
 
+        # Snapshot the consumer list: a consumer that unregisters itself
+        # during delivery must not mutate the iterable we're awaiting on.
+        snapshot = list(self._consumers)
         await asyncio.gather(
-            *(_safe_deliver(cb, name, chunk) for cb, name in self._consumers)
+            *(_safe_deliver(cb, name, chunk) for _h, cb, name in snapshot)
         )
 
     # ── LED ring ──────────────────────────────────────────────────

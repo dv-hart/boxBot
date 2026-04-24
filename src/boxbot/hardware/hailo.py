@@ -194,11 +194,18 @@ class Hailo(HardwareModule):
             network_group, format_type=FormatType.FLOAT32
         )
 
-        with InferVStreams(
-            network_group, input_params, output_params
-        ) as pipeline:
-            input_dict = {input_infos[0].name: input_data}
-            output = pipeline.infer(input_dict)
+        # HailoRT 4.x requires an active network group before inference.
+        # Per-call activation (vs. once in start()) is required because
+        # only one network group can be active on a VDevice at a time.
+        # TODO: when concurrent multi-model inference is needed, switch
+        # VDevice to HailoSchedulingAlgorithm.ROUND_ROBIN and drop this —
+        # the scheduler handles activation automatically.
+        with network_group.activate():
+            with InferVStreams(
+                network_group, input_params, output_params
+            ) as pipeline:
+                input_dict = {input_infos[0].name: input_data}
+                output = pipeline.infer(input_dict)
 
         return output
 

@@ -7,6 +7,7 @@ WakeWordHeard events when the configured wake word is detected.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -58,7 +59,16 @@ class WakeWordDetector:
         self._config = config
         self._model: openwakeword.Model | None = None  # type: ignore[name-defined]
         self._microphone: object | None = None
+        # Integer handle from microphone.add_consumer (see AudioCapture for
+        # the rationale — bound methods are not identity-stable).
+        self._consumer_handle: int | None = None
         self._bus = get_event_bus()
+        # Debounce: OpenWakeWord can fire 2–3 detections in quick
+        # succession off a single spoken wake word (observed 2026-04-24:
+        # 0.988, 0.946, 0.728 all within ~1 s). Suppress further hits
+        # for this many seconds after a confirmed detection.
+        self._debounce_seconds: float = 1.5
+        self._suppress_until: float = 0.0
 
     async def start(self, microphone: object) -> None:
         """Load model and register as microphone consumer.
@@ -101,12 +111,15 @@ class WakeWordDetector:
         logger.info("OpenWakeWord model loaded")
 
         # Register as a microphone consumer
-        microphone.add_consumer(self._on_audio_chunk)  # type: ignore[attr-defined]
+        self._consumer_handle = microphone.add_consumer(  # type: ignore[attr-defined]
+            self._on_audio_chunk, name="wake_word",
+        )
 
     async def stop(self) -> None:
         """Unregister from microphone and release model."""
-        if self._microphone is not None:
-            self._microphone.remove_consumer(self._on_audio_chunk)  # type: ignore[attr-defined]
+        if self._microphone is not None and self._consumer_handle is not None:
+            self._microphone.remove_consumer(self._consumer_handle)  # type: ignore[attr-defined]
+            self._consumer_handle = None
             self._microphone = None
 
         self._model = None
@@ -119,6 +132,12 @@ class WakeWordDetector:
         frames internally and returns confidence scores per model.
         """
         if self._model is None:
+            return
+
+        # Debounce window: after a confirmed detection, swallow audio
+        # for ~1.5 s so the tail of the wake word doesn't fire again.
+        now = time.monotonic()
+        if now < self._suppress_until:
             return
 
         # Convert raw PCM bytes to numpy int16 array
@@ -135,6 +154,7 @@ class WakeWordDetector:
                     model_name,
                     confidence,
                 )
+                self._suppress_until = now + self._debounce_seconds
                 await self._bus.publish(
                     WakeWordHeard(confidence=confidence)
                 )

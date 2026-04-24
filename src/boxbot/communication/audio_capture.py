@@ -47,6 +47,11 @@ class AudioCapture:
         self._vad = vad
         self._config = config
         self._microphone: object | None = None
+        # Integer handle returned by microphone.add_consumer. We MUST store
+        # this because bound methods like self._on_audio_chunk are not
+        # identity-stable across accesses, so the handle is the only
+        # reliable key for remove_consumer.
+        self._consumer_handle: int | None = None
         self._callback: Callable[[Utterance], Awaitable[None]] | None = None
 
         # Audio buffer and state
@@ -63,14 +68,20 @@ class AudioCapture:
         Args:
             microphone: Microphone HAL instance with add_consumer/remove_consumer.
         """
+        if self._consumer_handle is not None:
+            logger.debug("AudioCapture already started, skipping re-registration")
+            return
         self._microphone = microphone
-        microphone.add_consumer(self._on_audio_chunk)  # type: ignore[attr-defined]
-        logger.info("AudioCapture started")
+        self._consumer_handle = microphone.add_consumer(  # type: ignore[attr-defined]
+            self._on_audio_chunk, name="audio_capture",
+        )
+        logger.info("AudioCapture started (consumer=%d)", self._consumer_handle)
 
     async def stop(self) -> None:
         """Unregister and release resources."""
-        if self._microphone is not None:
-            self._microphone.remove_consumer(self._on_audio_chunk)  # type: ignore[attr-defined]
+        if self._microphone is not None and self._consumer_handle is not None:
+            self._microphone.remove_consumer(self._consumer_handle)  # type: ignore[attr-defined]
+            self._consumer_handle = None
             self._microphone = None
         self.reset()
         logger.info("AudioCapture stopped")

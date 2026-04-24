@@ -64,7 +64,7 @@ from boxbot.core.events import (
     SpeakerIdentified,
     TranscriptReady,
     TriggerFired,
-    WakeWordHeard,
+    VoiceSessionEnded,
     WhatsAppMessage,
     get_event_bus,
 )
@@ -90,6 +90,12 @@ _DEFAULT_MAX_TURNS = 20
 
 # Opus 4.7 needs more headroom than Sonnet 4. Spec §3 mandates 8192.
 _MAX_TOKENS = 8192
+
+# Upper bound on a single conversation turn (prompt build + agent loop +
+# TTS playback). Protects against hung ElevenLabs streams, stalled Claude
+# connections, or misbehaving tools. 120s is generous — normal turns
+# finish in 3–15s. Anything longer is a bug we want surfaced loudly.
+_CONVERSATION_TIMEOUT_SECONDS = 120.0
 
 # The structured-output schema is defined in ``output_dispatcher`` so the
 # dispatcher and the agent loop share a single source of truth. Schema
@@ -486,14 +492,19 @@ class BoxBotAgent:
             api_key=config.api_keys.anthropic,
         )
 
-        # Subscribe to events that initiate conversations
+        # Subscribe to events that initiate or inform conversations.
+        # Note: WakeWordHeard is intentionally NOT handled here. The
+        # voice pipeline activates the mic on wake word; the agent only
+        # starts a conversation once a real transcript arrives. Handling
+        # wake word here used to spawn a placeholder conversation that
+        # raced with the first real utterance.
         bus = get_event_bus()
-        bus.subscribe(WakeWordHeard, self._on_wake_word)
         bus.subscribe(WhatsAppMessage, self._on_whatsapp_message)
         bus.subscribe(TriggerFired, self._on_trigger_fired)
         bus.subscribe(PersonIdentified, self._on_person_identified)
         bus.subscribe(SpeakerIdentified, self._on_speaker_identified)
         bus.subscribe(TranscriptReady, self._on_transcript_ready)
+        bus.subscribe(VoiceSessionEnded, self._on_voice_session_ended)
 
         self._running = True
         logger.info("BoxBotAgent started (model: %s)", config.models.large)
@@ -507,12 +518,12 @@ class BoxBotAgent:
 
         # Unsubscribe from events
         bus = get_event_bus()
-        bus.unsubscribe(WakeWordHeard, self._on_wake_word)
         bus.unsubscribe(WhatsAppMessage, self._on_whatsapp_message)
         bus.unsubscribe(TriggerFired, self._on_trigger_fired)
         bus.unsubscribe(PersonIdentified, self._on_person_identified)
         bus.unsubscribe(SpeakerIdentified, self._on_speaker_identified)
         bus.unsubscribe(TranscriptReady, self._on_transcript_ready)
+        bus.unsubscribe(VoiceSessionEnded, self._on_voice_session_ended)
 
         # Cancel any active conversations
         for conv_id, task in list(self._active_conversations.items()):
@@ -531,24 +542,30 @@ class BoxBotAgent:
     # Event handlers
     # ------------------------------------------------------------------
 
-    async def _on_wake_word(self, event: WakeWordHeard) -> None:
-        """Handle a wake word detection — start a voice conversation.
+    async def _on_voice_session_ended(self, event: VoiceSessionEnded) -> None:
+        """Clean up agent state when the voice session ends.
 
-        The initial message is empty because the voice pipeline will
-        provide the first utterance after the wake word is confirmed.
-        The perception pipeline will identify who is speaking.
+        Prevents the agent from carrying stale history or holding an
+        un-done ``_active_conversations["voice"]`` entry past the end of
+        the voice session that spawned it.
         """
-        logger.info(
-            "Wake word heard (confidence=%.2f), starting voice conversation",
-            event.confidence,
-        )
-        # Determine who is present from the perception state
-        person = self._get_most_recent_person()
-        await self._start_conversation_task(
-            channel="voice",
-            initial_message="(wake word detected — listening)",
-            person_name=person,
-        )
+        task = self._active_conversations.get("voice")
+        if task is not None and not task.done():
+            logger.info(
+                "Voice session %s ended while agent conversation still "
+                "running — cancelling",
+                event.conversation_id,
+            )
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Error cancelling voice conversation task")
+        self._active_conversations.pop("voice", None)
+        self._current_voice_session_id = None
+        self._voice_history = []
 
     async def _on_whatsapp_message(self, event: WhatsAppMessage) -> None:
         """Handle an incoming WhatsApp message — start or continue a conversation."""
@@ -715,7 +732,7 @@ class BoxBotAgent:
 
             conv_id = _generate_conversation_id()
             task = asyncio.create_task(
-                self._run_conversation(
+                self._run_conversation_with_timeout(
                     conversation_id=conv_id,
                     channel=channel,
                     initial_message=initial_message,
@@ -731,6 +748,50 @@ class BoxBotAgent:
                 self._active_conversations.pop(conv_key, None)
 
             task.add_done_callback(_cleanup)
+
+    async def _run_conversation_with_timeout(
+        self,
+        conversation_id: str,
+        channel: str,
+        initial_message: str,
+        person_name: str | None,
+        context: dict[str, Any] | None,
+    ) -> None:
+        """Wrap `_run_conversation` in an overall timeout.
+
+        Protects the channel slot from hung tasks. On timeout we log
+        loudly and let the done-callback free the slot so the next
+        input can start a fresh conversation.
+        """
+        try:
+            await asyncio.wait_for(
+                self._run_conversation(
+                    conversation_id=conversation_id,
+                    channel=channel,
+                    initial_message=initial_message,
+                    person_name=person_name,
+                    context=context,
+                ),
+                timeout=_CONVERSATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Conversation %s exceeded %.0fs timeout and was force-"
+                "cancelled (channel=%s). Next input will start fresh.",
+                conversation_id,
+                _CONVERSATION_TIMEOUT_SECONDS,
+                channel,
+            )
+            # Best-effort: stop any TTS still playing so the audio path
+            # is audibly released even if the coroutine is stuck.
+            try:
+                from boxbot.communication.voice import get_voice_session
+                session = get_voice_session()
+                if session is not None and session._speaker is not None:
+                    await session._speaker.stop_playback()
+            except Exception:
+                logger.debug("Failed to stop speaker after timeout",
+                             exc_info=True)
 
     async def _run_conversation(
         self,

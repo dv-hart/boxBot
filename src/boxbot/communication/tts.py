@@ -13,10 +13,16 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import AsyncIterator, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
+
+# Hard upper bound on the synthesis + playback pipeline. ElevenLabs
+# normally streams first audio in ~200-400 ms; 20 s is more than enough
+# headroom for long utterances while catching a stalled HTTP stream.
+_TTS_STREAM_TIMEOUT_SECONDS = 20.0
 
 try:
     from elevenlabs import AsyncElevenLabs, VoiceSettings
@@ -48,13 +54,40 @@ class TTSStream:
     async def speak(self, text: str) -> None:
         """Stream TTS audio to speaker.
 
+        Cancellation-safe: if the caller cancels this coroutine (e.g.
+        barge-in, conversation timeout, user interruption), playback is
+        stopped on the speaker and the cancellation is propagated. Also
+        bounds synthesis to ``_TTS_STREAM_TIMEOUT_SECONDS`` so a stalled
+        upstream HTTP connection can't hang the agent.
+
         Args:
             text: Text to synthesize and play.
         """
         self._is_playing = True
         try:
             stream = self._tts.synthesize_stream(text)
-            await self._speaker.play_stream(stream)  # type: ignore[attr-defined]
+            await asyncio.wait_for(
+                self._speaker.play_stream(stream),  # type: ignore[attr-defined]
+                timeout=_TTS_STREAM_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            # Propagate cancellation, but first stop audible output so
+            # we don't keep talking over the user.
+            try:
+                await self._speaker.stop_playback()  # type: ignore[attr-defined]
+            except Exception:
+                logger.debug("stop_playback on cancel failed", exc_info=True)
+            raise
+        except asyncio.TimeoutError:
+            logger.error(
+                "TTS playback exceeded %.0fs — stopping speaker. "
+                "Possible stalled upstream stream.",
+                _TTS_STREAM_TIMEOUT_SECONDS,
+            )
+            try:
+                await self._speaker.stop_playback()  # type: ignore[attr-defined]
+            except Exception:
+                logger.debug("stop_playback on timeout failed", exc_info=True)
         finally:
             self._is_playing = False
 

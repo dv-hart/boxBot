@@ -54,6 +54,9 @@ class BargeInMonitor:
         self._monitoring = False
         self._speech_start: float | None = None
         self._faded = False
+        # Integer handle from microphone.add_consumer (bound-method
+        # identity isn't stable — see AudioCapture for the same pattern).
+        self._consumer_handle: int | None = None
 
     def set_interrupt_callback(
         self, callback: Callable[[], Awaitable[None]]
@@ -70,8 +73,13 @@ class BargeInMonitor:
         self._monitoring = True
         self._speech_start = None
         self._faded = False
-        microphone.add_consumer(self._on_audio_chunk, "barge_in")
-        logger.debug("Barge-in monitor started")
+        if self._consumer_handle is None:
+            self._consumer_handle = microphone.add_consumer(
+                self._on_audio_chunk, name="barge_in",
+            )
+        logger.debug(
+            "Barge-in monitor started (consumer=%s)", self._consumer_handle,
+        )
 
     async def stop(self) -> None:
         """Stop monitoring."""
@@ -82,7 +90,9 @@ class BargeInMonitor:
 
     async def remove_from(self, microphone: Any) -> None:
         """Remove this monitor as a consumer from the microphone."""
-        microphone.remove_consumer(self._on_audio_chunk)
+        if self._consumer_handle is not None:
+            microphone.remove_consumer(self._consumer_handle)
+            self._consumer_handle = None
         self._monitoring = False
 
     async def _on_audio_chunk(self, chunk: AudioChunk) -> None:

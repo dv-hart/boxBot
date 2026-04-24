@@ -74,12 +74,21 @@ def set_voice_session(session: VoiceSession | None) -> None:
 
 
 class VoiceSessionState(Enum):
-    """Voice session lifecycle states."""
+    """Voice adapter hardware-capture state.
+
+    Post-refactor the voice layer is a thin adapter — the IDLE/ACTIVE
+    pair here describes whether the mic is actively producing
+    utterances. Conversation-level state (listening/thinking/speaking)
+    lives on the ``Conversation`` object, not here.
+
+    ENDED and SUSPENDED are retained as aliases for IDLE so older call
+    sites don't crash during migration; M6 removes them.
+    """
 
     IDLE = "idle"
     ACTIVE = "active"
-    SUSPENDED = "suspended"
-    ENDED = "ended"
+    SUSPENDED = "idle"   # deprecated alias
+    ENDED = "idle"       # deprecated alias
 
 
 # ---------------------------------------------------------------------------
@@ -236,8 +245,12 @@ class VoiceSession:
         bus = get_event_bus()
         bus.subscribe(WakeWordHeard, self._on_wake_word)
 
-        from boxbot.core.events import PersonDetected
+        from boxbot.core.events import ConversationEnded, PersonDetected
         bus.subscribe(PersonDetected, self._on_person_detected)
+        # Adapter mirrors the agent's room-conversation lifecycle: when
+        # the voice conversation ends (silence timeout, explicit end,
+        # agent stop), we deactivate mic capture and LEDs.
+        bus.subscribe(ConversationEnded, self._on_conversation_ended)
 
         self._state = VoiceSessionState.IDLE
         set_voice_session(self)
@@ -263,8 +276,9 @@ class VoiceSession:
         bus = get_event_bus()
         bus.unsubscribe(WakeWordHeard, self._on_wake_word)
 
-        from boxbot.core.events import PersonDetected
+        from boxbot.core.events import ConversationEnded, PersonDetected
         bus.unsubscribe(PersonDetected, self._on_person_detected)
+        bus.unsubscribe(ConversationEnded, self._on_conversation_ended)
 
         # Stop components
         if self._wake_word:
@@ -288,98 +302,92 @@ class VoiceSession:
     # State transitions
     # ------------------------------------------------------------------
 
+    # Post-wake-word grace: if no utterance arrives within this many
+    # seconds we deactivate. Guards against false wake-word detections
+    # from draining batteries with a hot mic indefinitely.
+    _WAKE_WORD_GRACE_SECONDS = 12.0
+
     async def _activate_session(
         self, event: WakeWordHeard | None = None
     ) -> None:
-        """Transition from IDLE or SUSPENDED to ACTIVE."""
-        if self._state == VoiceSessionState.ACTIVE:
-            logger.debug("Session already active, ignoring activation")
+        """Turn on audio capture. LED goes to listening.
+
+        Idempotent — calling while ACTIVE just extends the grace timer.
+        """
+        self._last_speech_time = time.monotonic()
+        if self._state is VoiceSessionState.ACTIVE:
+            # Already hot: just refresh the grace timer so another
+            # wake word extends the listening window.
+            self._reset_wake_word_grace_timer()
             return
 
-        prev_state = self._state
         self._state = VoiceSessionState.ACTIVE
-        self._last_speech_time = time.monotonic()
+        self._conversation_id = f"voice_{uuid.uuid4().hex[:12]}"
+        logger.info(
+            "Voice adapter activated (session=%s)", self._conversation_id,
+        )
 
-        if prev_state == VoiceSessionState.IDLE:
-            # New conversation
-            self._conversation_id = f"voice_{uuid.uuid4().hex[:12]}"
-            logger.info(
-                "Voice session activated (new conversation %s)",
-                self._conversation_id,
-            )
-        else:
-            # Resuming from suspended
-            logger.info(
-                "Voice session re-activated (conversation %s)",
-                self._conversation_id,
-            )
-
-        self._cancel_timers()
-
-        # Register audio processing consumers
+        # Register audio processing consumers.
         if self._microphone and self._audio_capture:
             await self._audio_capture.start(self._microphone)
 
-        # Start active timeout monitor
-        self._active_timeout_task = asyncio.create_task(
-            self._active_timeout_loop(),
-            name=f"voice-timeout-{self._conversation_id}",
-        )
+        # Post-wake-word grace — replaces the old active/suspend timer
+        # pair. If a TranscriptReady publishes, the grace is cancelled
+        # and the Conversation's silence_timeout takes over lifecycle.
+        self._reset_wake_word_grace_timer()
 
-        # Set LED pattern
+        # Set LED pattern.
         if self._microphone:
             try:
                 await self._microphone.set_led_pattern("listening")
             except Exception:
                 pass
 
-    async def _suspend_session(self) -> None:
-        """Transition from ACTIVE to SUSPENDED (silence timeout)."""
-        if self._state != VoiceSessionState.ACTIVE:
+    def _reset_wake_word_grace_timer(self) -> None:
+        """Arm (or reset) the post-wake-word no-utterance grace timer."""
+        if self._active_timeout_task is not None:
+            self._active_timeout_task.cancel()
+        self._active_timeout_task = asyncio.create_task(
+            self._wake_word_grace_loop(),
+            name=f"voice-grace-{self._conversation_id}",
+        )
+
+    async def _wake_word_grace_loop(self) -> None:
+        """Deactivate if no utterance arrives within the grace window."""
+        try:
+            await asyncio.sleep(self._WAKE_WORD_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if self._state is VoiceSessionState.ACTIVE:
+            logger.info(
+                "Voice adapter: no utterance within %.0fs grace — "
+                "deactivating",
+                self._WAKE_WORD_GRACE_SECONDS,
+            )
+            await self._deactivate_session(reason="grace_timeout")
+
+    async def _deactivate_session(self, *, reason: str = "external") -> None:
+        """Turn off audio capture, publish VoiceSessionEnded.
+
+        Called when:
+        - A ConversationEnded(channel="voice") arrives (the agent's
+          room conversation has terminated — silence, explicit end, etc.)
+        - The post-wake-word grace window expires with no speech.
+        """
+        if self._state is not VoiceSessionState.ACTIVE:
             return
 
-        self._state = VoiceSessionState.SUSPENDED
+        self._state = VoiceSessionState.IDLE
+        ending_session_id = self._conversation_id
+        self._conversation_id = ""
+
         logger.info(
-            "Voice session suspended (conversation %s)",
-            self._conversation_id,
+            "Voice adapter deactivated (session=%s, reason=%s)",
+            ending_session_id, reason,
         )
 
-        # Remove audio processing consumers (save CPU)
-        if self._audio_capture:
-            await self._audio_capture.stop()
-            self._audio_capture.reset()
-
-        self._cancel_timers()
-
-        # Start suspend timeout
-        self._suspend_timer = asyncio.create_task(
-            self._suspend_timeout_loop(),
-            name=f"voice-suspend-{self._conversation_id}",
-        )
-
-        # Set LED pattern
-        if self._microphone:
-            try:
-                await self._microphone.set_led_pattern("idle")
-            except Exception:
-                pass
-
-    async def _end_session(self) -> None:
-        """Transition to ENDED and return to IDLE."""
-        prev_state = self._state
-        self._state = VoiceSessionState.ENDED
-
-        # Snapshot the conversation id BEFORE we clear it so we can
-        # publish a meaningful VoiceSessionEnded event.
-        ending_conversation_id = self._conversation_id
-
-        if prev_state != VoiceSessionState.IDLE:
-            logger.info(
-                "Voice session ended (conversation %s)",
-                ending_conversation_id,
-            )
-
-        # Clean up
+        # Stop audio capture. The handle-based consumer API (S1) makes
+        # this reliable; no bound-method identity risk.
         if self._audio_capture:
             await self._audio_capture.stop()
             self._audio_capture.reset()
@@ -389,62 +397,67 @@ class VoiceSession:
 
         self._cancel_timers()
 
-        self._conversation_id = ""
-
-        # Clear session-scoped identity state
+        # Clear session-scoped identity state.
         self._speaker_identities.clear()
         self._display_labels.clear()
         self._latest_speaker_identities.clear()
 
-        # Schedule diarizer unload after warm timeout
+        # Warm-unload diarizer after a minute of inactivity.
         if self._diarizer_loaded and self._diarizer:
             self._diarizer_unload_task = asyncio.create_task(
                 self._unload_diarizer_after_timeout(60.0)
             )
 
-        # Set LED pattern
+        # Set LED pattern.
         if self._microphone:
             try:
                 await self._microphone.set_led_pattern("off")
             except Exception:
                 pass
 
-        # Publish VoiceSessionEnded so downstream systems (enrollment,
-        # memory extraction) can flush session-scoped state.
-        if prev_state != VoiceSessionState.IDLE and ending_conversation_id:
+        # Publish VoiceSessionEnded for perception-side enrollment
+        # cleanup. If deactivation was triggered by ConversationEnded,
+        # the agent's handler is idempotent (re-ending an ended conv
+        # is a no-op) so no loop.
+        if ending_session_id:
             try:
                 bus = get_event_bus()
                 await bus.publish(
-                    VoiceSessionEnded(
-                        conversation_id=ending_conversation_id,
-                    )
+                    VoiceSessionEnded(conversation_id=ending_session_id)
                 )
             except Exception:
                 logger.exception(
                     "Failed to publish VoiceSessionEnded for %s",
-                    ending_conversation_id,
+                    ending_session_id,
                 )
-
-        # Return to idle
-        self._state = VoiceSessionState.IDLE
-        logger.debug("Voice session returned to IDLE")
 
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
 
     async def _on_wake_word(self, event: WakeWordHeard) -> None:
-        """Handle wake word detection."""
-        if self._state == VoiceSessionState.IDLE:
-            await self._activate_session(event)
-        elif self._state == VoiceSessionState.SUSPENDED:
-            await self._activate_session(event)
-        # If already ACTIVE, ignore (wake word during conversation)
+        """Handle wake word detection — activate capture or extend grace."""
+        await self._activate_session(event)
+
+    async def _on_conversation_ended(self, event: Any) -> None:
+        """React to ConversationEnded — deactivate capture for voice.
+
+        Only voice-channel conversation ends deactivate capture; whatsapp
+        and trigger conversations don't touch the mic.
+        """
+        if getattr(event, "channel", "") == "voice":
+            await self._deactivate_session(reason="conversation_ended")
 
     async def _on_utterance(self, utterance: Utterance) -> None:
         """Process a finalized utterance: run STT + diarization, publish transcript."""
-        if self._state != VoiceSessionState.ACTIVE:
+        if self._state is not VoiceSessionState.ACTIVE:
             return
+
+        # An utterance arrived — cancel the post-wake-word grace since
+        # the Conversation's silence_timeout will now drive lifecycle.
+        if self._active_timeout_task is not None:
+            self._active_timeout_task.cancel()
+            self._active_timeout_task = None
 
         self._last_speech_time = time.monotonic()
 

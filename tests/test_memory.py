@@ -332,6 +332,18 @@ class TestContainsSecret:
     def test_detects_bearer_token(self):
         assert _contains_secret("Bearer eyJhbGciOiJIUzI1NiIsInR5c") is True
 
+    def test_detects_aws_access_key(self):
+        assert _contains_secret("key is AKIAIOSFODNN7EXAMPLE") is True
+
+    def test_detects_github_token(self):
+        assert _contains_secret("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl") is True
+
+    def test_detects_private_key(self):
+        assert _contains_secret("-----BEGIN RSA PRIVATE KEY-----") is True
+
+    def test_detects_ec_private_key(self):
+        assert _contains_secret("-----BEGIN EC PRIVATE KEY-----") is True
+
     def test_normal_text_is_clean(self):
         assert _contains_secret("Jacob likes coffee in the morning") is False
 

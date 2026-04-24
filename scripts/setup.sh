@@ -167,6 +167,7 @@ DIRECTORIES=(
     "$DATA_DIR/scheduler"
     "$DATA_DIR/memory"
     "$DATA_DIR/photos"
+    "$DATA_DIR/displays"
     "$DATA_DIR/perception/crops"
     "$DATA_DIR/perception/models"
     "$PROJECT_DIR/logs"
@@ -215,9 +216,57 @@ echo ""
 echo "--- Installing Python dependencies ---"
 
 "$VENV_DIR/bin/pip" install -e "$PROJECT_DIR[dev]" --quiet
+
+# Extra packages not in pyproject.toml (hardware drivers, ML)
+"$VENV_DIR/bin/pip" install --quiet \
+    sounddevice \
+    pyusb \
+    sentence-transformers \
+    openwakeword \
+    elevenlabs \
+    pyannote.audio
+
+# torchcodec pulls in CUDA deps that don't work on aarch64 — remove it
+# (sentence_transformers and pyannote work fine without it for text/audio)
+"$VENV_DIR/bin/pip" uninstall -y torchcodec --quiet 2>/dev/null
+
 CHANGES+=("Installed Python dependencies")
 
 echo "Dependencies installed."
+
+# -------------------------------------------------------------------
+# 4b. Link system-only packages into venv
+# -------------------------------------------------------------------
+#
+# libcamera, hailort, and pykms are distributed as Raspberry Pi OS
+# system packages with no PyPI equivalent. We symlink them into the
+# venv so they're importable alongside pip-installed packages.
+
+echo ""
+echo "--- Linking system packages into venv ---"
+
+VENV_SITE=$("$VENV_DIR/bin/python3" -c "import site; print(site.getsitepackages()[0])")
+SYS_SITE="/usr/lib/python3/dist-packages"
+LINKS_CREATED=0
+
+for pkg in libcamera pykms hailo_platform hailo.cpython-*.so hailort-*.egg-info hailo_tappas_core_python_binding-*.dist-info; do
+    for item in "$SYS_SITE"/$pkg; do
+        if [ -e "$item" ]; then
+            base=$(basename "$item")
+            if [ ! -e "$VENV_SITE/$base" ]; then
+                ln -s "$item" "$VENV_SITE/$base"
+                ((LINKS_CREATED++))
+            fi
+        fi
+    done
+done
+
+if [[ $LINKS_CREATED -gt 0 ]]; then
+    echo "Linked $LINKS_CREATED system package(s) into venv."
+    CHANGES+=("Linked $LINKS_CREATED system packages into venv")
+else
+    echo "All system packages already linked."
+fi
 
 # -------------------------------------------------------------------
 # 5. Initialize config files
@@ -310,6 +359,33 @@ if [[ -f "$SCRIPT_DIR/harden-os.sh" ]]; then
     fi
 else
     echo "harden-os.sh not found. Skipping."
+fi
+
+# -------------------------------------------------------------------
+# 8. Install ReSpeaker udev rule
+# -------------------------------------------------------------------
+#
+# Required for pyusb access to ReSpeaker LED/DOA control. Without this,
+# LED writes silently fail with [Errno 13] Access denied (the device
+# node is root-only by default) and the LED ring shows only the XMOS
+# firmware's built-in reactive animation rather than boxBot patterns.
+# See docs/plans/led-state-diagnostic.md for the debugging history.
+
+echo ""
+echo "--- Installing ReSpeaker udev rule ---"
+
+RESPEAKER_UDEV_RULE="/etc/udev/rules.d/60-respeaker.rules"
+if [ ! -f "$RESPEAKER_UDEV_RULE" ]; then
+    echo "Installing $RESPEAKER_UDEV_RULE..."
+    echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="2886", ATTRS{idProduct}=="0018", MODE="0666", GROUP="plugdev"' \
+        | sudo tee "$RESPEAKER_UDEV_RULE" > /dev/null
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+    echo "  udev rule installed and reloaded."
+    echo "  Replug the ReSpeaker (or reboot) if it is currently connected."
+    CHANGES+=("Installed ReSpeaker udev rule at $RESPEAKER_UDEV_RULE")
+else
+    echo "ReSpeaker udev rule already present at $RESPEAKER_UDEV_RULE."
 fi
 
 # -------------------------------------------------------------------

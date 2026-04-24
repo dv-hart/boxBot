@@ -91,55 +91,86 @@ class Rect:
 # ---------------------------------------------------------------------------
 
 
-_font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+# Bundled assets shipped with the package under assets/.
+_ASSETS_DIR = __import__("pathlib").Path(__file__).parent / "assets"
+_FONTS_DIR = _ASSETS_DIR / "fonts"
+_LUCIDE_DIR = _ASSETS_DIR / "lucide"
+
+# Named weight → numeric weight for when a TextBlock specifies weight by name.
+_WEIGHT_NAMES: dict[str, int] = {
+    "thin": 100, "extralight": 200, "light": 300,
+    "regular": 400, "normal": 400,
+    "medium": 500, "semibold": 600, "bold": 700,
+    "extrabold": 800, "black": 900,
+}
+
+
+def _resolve_weight(override: str | int | None, default: int) -> int:
+    """Resolve a text block weight override (name or number) to numeric."""
+    if override is None:
+        return default
+    if isinstance(override, int):
+        return override
+    if isinstance(override, str):
+        return _WEIGHT_NAMES.get(override.lower(), default)
+    return default
+
+_font_cache: dict[tuple[str, int, int], ImageFont.FreeTypeFont] = {}
 
 
 def _get_font(family: str, size: int, weight: int = 400) -> ImageFont.FreeTypeFont:
     """Get a PIL font, caching for reuse.
 
-    Tries to load the specified font family with the given weight. Falls
-    back through several strategies: weight-suffixed name, bare family name,
-    common system paths, and finally the PIL default font.
-
-    Args:
-        family: Font family name (e.g. "Inter").
-        size: Font size in pixels.
-        weight: Font weight (300-800).
-
-    Returns:
-        A PIL FreeType font instance.
+    Lookup order:
+      1. Bundled asset: assets/fonts/<family>-<weight>.ttf
+      2. Font name via fontconfig (e.g. "Inter-Bold")
+      3. Bare family name
+      4. System fallback paths
+      5. PIL default
     """
-    cache_key = (family, size)
+    cache_key = (family, size, weight)
     if cache_key in _font_cache:
         return _font_cache[cache_key]
 
-    font: ImageFont.FreeTypeFont
-    try:
-        # Try loading the font by name with weight suffix
-        weight_name = WEIGHT_MAP.get(weight, "Regular")
-        font_name = f"{family}-{weight_name}"
-        font = ImageFont.truetype(font_name, size)
-    except (OSError, IOError):
+    weight_name = WEIGHT_MAP.get(weight, "Regular")
+    font: ImageFont.FreeTypeFont | None = None
+
+    # 1. Bundled asset
+    bundled = _FONTS_DIR / f"{family}-{weight_name}.ttf"
+    if bundled.is_file():
         try:
-            font = ImageFont.truetype(family, size)
+            font = ImageFont.truetype(str(bundled), size)
         except (OSError, IOError):
+            font = None
+
+    # 2-3. fontconfig / installed
+    if font is None:
+        for candidate in (f"{family}-{weight_name}", family):
             try:
-                # Try common system font paths
-                for path in [
-                    f"/usr/share/fonts/truetype/inter/{family}-{WEIGHT_MAP.get(weight, 'Regular')}.ttf",
-                    f"/usr/share/fonts/truetype/{family.lower()}/{family}-Regular.ttf",
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                ]:
-                    try:
-                        font = ImageFont.truetype(path, size)
-                        break
-                    except (OSError, IOError):
-                        continue
-                else:
-                    font = ImageFont.load_default(size=size)
-            except TypeError:
-                # Older Pillow versions without size parameter on load_default
-                font = ImageFont.load_default()
+                font = ImageFont.truetype(candidate, size)
+                break
+            except (OSError, IOError):
+                continue
+
+    # 4. System fallbacks
+    if font is None:
+        for path in (
+            f"/usr/share/fonts/truetype/inter/{family}-{weight_name}.ttf",
+            f"/usr/share/fonts/truetype/{family.lower()}/{family}-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ):
+            try:
+                font = ImageFont.truetype(path, size)
+                break
+            except (OSError, IOError):
+                continue
+
+    # 5. Last resort
+    if font is None:
+        try:
+            font = ImageFont.load_default(size=size)
+        except TypeError:
+            font = ImageFont.load_default()
 
     _font_cache[cache_key] = font
     return font
@@ -575,23 +606,25 @@ def _render_row(ctx: RenderContext, block: Block, rect: Rect) -> None:
             _render_block(ctx, child, child_rect)
             x += child_width + spread_gap
     else:
-        # Non-spread: divide remaining space among non-spacer children
-        child_width = max(1, available_for_children // n) if n > 0 else 0
+        # start / center / end: pack children at their natural widths. Flex
+        # spacers (spacer with no size) absorb any remaining space so you
+        # can left/right-pack by sprinkling flex spacers.
+        natural_widths = [_estimate_block_width(ctx, c, inner.w) for c in non_spacer]
+        total_natural = sum(natural_widths) + total_gap + fixed_spacer_width
 
-        # Calculate flex spacer width
         flex_space = 0
         if flex_spacer_count > 0:
-            used = child_width * n + fixed_spacer_width + total_gap
-            flex_space = max(0, inner.w - used) // flex_spacer_count
+            flex_space = max(0, inner.w - total_natural) // flex_spacer_count
+            leading = 0
+        else:
+            leading = max(0, inner.w - total_natural)
+            if align == "center":
+                leading //= 2
+            elif align != "end":
+                leading = 0
 
-        x = inner.x
-        if align == "center":
-            total_used = child_width * n + total_gap + fixed_spacer_width
-            x += max(0, (inner.w - total_used) // 2)
-        elif align == "end":
-            total_used = child_width * n + total_gap + fixed_spacer_width
-            x += max(0, inner.w - total_used)
-
+        x = inner.x + leading
+        nw_iter = iter(natural_widths)
         for child in children:
             if child.block_type == "spacer":
                 size = child.params.get("size")
@@ -600,10 +633,9 @@ def _render_row(ctx: RenderContext, block: Block, rect: Rect) -> None:
                 else:
                     x += flex_space
                 continue
-
-            child_rect = Rect(x, inner.y, child_width, inner.h)
-            _render_block(ctx, child, child_rect)
-            x += child_width + gap
+            cw = next(nw_iter)
+            _render_block(ctx, child, Rect(x, inner.y, cw, inner.h))
+            x += cw + gap
 
 
 def _render_column(ctx: RenderContext, block: Block, rect: Rect) -> None:
@@ -767,14 +799,17 @@ def _render_text(ctx: RenderContext, block: Block, rect: Rect) -> None:
     Supports all theme text sizes (title through small), semantic color
     tokens, horizontal alignment, and line-limited truncation with ellipsis.
     """
-    content = str(block.params.get("content", ""))
+    content_raw = block.params.get("content", "")
+    content = "" if content_raw is None else str(content_raw)
     size_name = block.params.get("size", "body")
     color_token = block.params.get("color", "default")
     text_align = block.params.get("align", "left")
     max_lines = block.params.get("max_lines")
+    weight_override = block.params.get("weight")
 
     font_style = ctx.theme.font_style(size_name)
-    font = _get_font(ctx.theme.fonts.family, font_style.size, font_style.weight)
+    weight = _resolve_weight(weight_override, font_style.weight)
+    font = _get_font(ctx.theme.fonts.family, font_style.size, weight)
     color = _resolve_block_color(color_token, ctx)
 
     lines = _wrap_text(content, font, rect.w, max_lines)
@@ -1019,20 +1054,72 @@ def _render_key_value(ctx: RenderContext, block: Block, rect: Rect) -> None:
         y += lh + 8
 
 
-def _render_icon(ctx: RenderContext, block: Block, rect: Rect) -> None:
-    """Render a Lucide icon placeholder.
+_icon_cache: dict[tuple[str, int, tuple[int, int, int]], Image.Image | None] = {}
 
-    Until actual Lucide SVG assets are loaded, renders a circle with
-    the icon name's first letter as a recognizable placeholder.
+
+def _load_lucide_icon(name: str, px: int, color: tuple[int, int, int]) -> Image.Image | None:
+    """Rasterize a bundled Lucide SVG to a PIL image at `px` with `color`.
+
+    Returns None if the icon isn't bundled or cairosvg isn't installed.
+    Results are cached by (name, px, color) for reuse.
     """
-    name = str(block.params.get("name", ""))
+    key = (name, px, color)
+    if key in _icon_cache:
+        return _icon_cache[key]
+
+    path = _LUCIDE_DIR / f"{name}.svg"
+    if not path.is_file():
+        _icon_cache[key] = None
+        return None
+
+    try:
+        import cairosvg
+    except ImportError:
+        _icon_cache[key] = None
+        return None
+
+    try:
+        svg_text = path.read_text()
+        # Lucide strokes use currentColor. Wrap in a container that sets
+        # color so strokes and fills pick up the requested tint.
+        hex_color = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+        svg_text = svg_text.replace("<svg", f'<svg color="{hex_color}"', 1)
+        png_bytes = cairosvg.svg2png(
+            bytestring=svg_text.encode("utf-8"),
+            output_width=px,
+            output_height=px,
+        )
+        import io
+        img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to rasterize Lucide icon '%s'", name)
+        img = None
+
+    _icon_cache[key] = img
+    return img
+
+
+def _render_icon(ctx: RenderContext, block: Block, rect: Rect) -> None:
+    """Render a Lucide icon.
+
+    Loads the named SVG from the bundled asset pack, rasterizes via cairosvg
+    at the requested pixel size, and blits it at the block rect. Falls back
+    to a circled-letter placeholder when the SVG or cairosvg is unavailable.
+    """
+    name_raw = block.params.get("name", "")
+    name = "" if name_raw is None else str(name_raw)
     size_name = block.params.get("size", "md")
     color_token = block.params.get("color")
 
     px = ICON_SIZES.get(size_name, 24)
     color = _resolve_block_color(color_token, ctx, default="text")
 
-    # Placeholder: outlined circle with the icon name's initial
+    icon_img = _load_lucide_icon(name, px, color) if name else None
+    if icon_img is not None:
+        ctx.image.paste(icon_img, (rect.x, rect.y), icon_img)
+        return
+
+    # Fallback: outlined circle with the icon name's initial
     cx = rect.x + px // 2
     cy = rect.y + px // 2
     r = px // 2 - 2
@@ -1055,7 +1142,8 @@ def _render_emoji(ctx: RenderContext, block: Block, rect: Rect) -> None:
     Until Twemoji image assets are loaded, renders the emoji name as
     text. Size options: md, lg, xl.
     """
-    name = str(block.params.get("name", ""))
+    name_raw = block.params.get("name", "")
+    name = "" if name_raw is None else str(name_raw)
     size_name = block.params.get("size", "md")
     px = ICON_SIZES.get(size_name, 24)
 
@@ -1282,8 +1370,16 @@ def _render_chart(ctx: RenderContext, block: Block, rect: Rect) -> None:
         elif chart_type in ("line", "area"):
             if len(points) >= 2:
                 if chart_type == "area":
-                    # Fill under the line with a muted version of the color
-                    muted_fill = tuple(c // 4 for c in color)
+                    # Fill under the line: interpolate between background and
+                    # the series color by fill_opacity. Works correctly on
+                    # both dark and light themes (simple division darkened
+                    # the accent on every bg, which looked muddy on light
+                    # themes and almost-black on dark themes).
+                    bg = ctx.theme.color_rgb("surface")
+                    muted_fill = tuple(
+                        int(bg[i] + (color[i] - bg[i]) * fill_opacity)
+                        for i in range(3)
+                    )
                     fill_points = list(points) + [
                         (points[-1][0], chart_rect.y + chart_rect.h),
                         (points[0][0], chart_rect.y + chart_rect.h),
@@ -1676,7 +1772,8 @@ def _estimate_block_height(
 
     if bt == "text":
         size_name = block.params.get("size", "body")
-        content = str(block.params.get("content", ""))
+        content_raw = block.params.get("content", "")
+        content = "" if content_raw is None else str(content_raw)
         font_style = ctx.theme.font_style(size_name)
         font = _get_font(ctx.theme.fonts.family, font_style.size)
         max_lines = block.params.get("max_lines")
@@ -1816,6 +1913,70 @@ def _estimate_block_height(
 
     # Default fallback
     return 40
+
+
+def _estimate_block_width(
+    ctx: RenderContext,
+    block: Block,
+    available_width: int,
+) -> int:
+    """Estimate the natural width a block needs.
+
+    Used by row layout with align=center/end to cluster children at their
+    content width rather than stretching to equal slots. Conservative —
+    when a block is complex, returns a fraction of the available width.
+    """
+    bt = block.block_type
+
+    if bt == "text":
+        content_raw = block.params.get("content", "")
+        content = "" if content_raw is None else str(content_raw)
+        size_name = block.params.get("size", "body")
+        font_style = ctx.theme.font_style(size_name)
+        weight = _resolve_weight(block.params.get("weight"), font_style.weight)
+        font = _get_font(ctx.theme.fonts.family, font_style.size, weight)
+        # Single-line measurement; wrapping within a centred cluster is rare.
+        w, _ = _measure_text(content, font)
+        return w + 2
+
+    if bt == "badge":
+        text = str(block.params.get("text", ""))
+        font = _get_font(ctx.theme.fonts.family, ctx.theme.fonts.small.size, 600)
+        w, _ = _measure_text(text, font)
+        return w + 24  # padding on each side
+
+    if bt in ("icon", "emoji"):
+        size_name = block.params.get("size", "md")
+        return ICON_SIZES.get(size_name, 24)
+
+    if bt == "clock":
+        size_name = block.params.get("size", "lg")
+        base = CLOCK_SIZES.get(size_name, 56)
+        # Approximate width of "12:34 PM" at that size
+        return int(base * 4.2)
+
+    if bt == "metric":
+        value = str(block.params.get("value", ""))
+        label = str(block.params.get("label", ""))
+        vfont = _get_font(
+            ctx.theme.fonts.family, ctx.theme.fonts.heading.size, 700,
+        )
+        lfont = _get_font(
+            ctx.theme.fonts.family, ctx.theme.fonts.caption.size,
+        )
+        vw, _ = _measure_text(value, vfont)
+        lw, _ = _measure_text(label, lfont)
+        return max(vw, lw) + 8
+
+    if bt == "spacer":
+        return block.params.get("size") or 0
+
+    if bt == "divider":
+        # Mostly used horizontally — tiny when inline
+        return block.params.get("thickness", 1) + 8
+
+    # Complex blocks: give them a sensible share of available width
+    return min(available_width, max(80, available_width // 3))
 
 
 # ---------------------------------------------------------------------------

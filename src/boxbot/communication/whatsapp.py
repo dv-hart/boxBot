@@ -14,7 +14,7 @@ Usage:
     client = WhatsAppClient(access_token="...", phone_number_id="...")
     await client.send_text("+15551234567", "Hello from boxBot!")
 
-    webhook = WhatsAppWebhook(verify_token="my-verify-token")
+    webhook = WhatsAppWebhook(verify_token="my-verify-token", app_secret="my-app-secret")
     messages = webhook.parse_webhook(payload)
 """
 
@@ -33,6 +33,23 @@ logger = logging.getLogger(__name__)
 
 GRAPH_API_VERSION = "v21.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+
+
+# Singleton accessor — set by main during startup, read by the output dispatcher
+# so the agent loop can reach the WhatsApp client without being passed a
+# reference. Mirrors the voice session singleton pattern.
+_whatsapp_client: "WhatsAppClient | None" = None
+
+
+def get_whatsapp_client() -> "WhatsAppClient | None":
+    """Return the process-wide WhatsAppClient instance, or None if unset."""
+    return _whatsapp_client
+
+
+def set_whatsapp_client(client: "WhatsAppClient | None") -> None:
+    """Register the process-wide WhatsAppClient instance."""
+    global _whatsapp_client
+    _whatsapp_client = client
 
 
 @dataclass(frozen=True)
@@ -251,14 +268,19 @@ class WhatsAppWebhook:
         verify_token: The token configured in Meta Developer Portal for
                       webhook GET verification.
         app_secret: The app secret for webhook signature validation.
-                    Optional — if not provided, signature validation is skipped.
+                    Required in production — validates X-Hub-Signature-256 headers.
     """
 
     def __init__(
         self,
         verify_token: str,
-        app_secret: str | None = None,
+        app_secret: str,
     ) -> None:
+        if not app_secret:
+            raise ValueError(
+                "WhatsApp app_secret is required for webhook signature "
+                "validation. Set WHATSAPP_APP_SECRET in .env."
+            )
         self._verify_token = verify_token
         self._app_secret = app_secret
 
@@ -301,10 +323,6 @@ class WhatsAppWebhook:
         Returns:
             True if the signature is valid, False otherwise.
         """
-        if not self._app_secret:
-            logger.warning("App secret not configured, skipping signature validation")
-            return True
-
         if not signature_header:
             return False
 

@@ -13,10 +13,10 @@ design, state machine, and rationale.
 DORMANT ──► Motion Detect (CPU, 5-10 FPS, frame diff)
                     │
                     ▼ motion detected
-CHECKING ──► Person Detection (Hailo, YOLOv8n, ~12ms)
+CHECKING ──► Person Detection (Hailo, YOLOv5s-personface, ~26ms)
                     │
                     ▼ person confirmed
-DETECTED ──► ReID Embedding (Hailo, OSNet-AIN, ~15ms)
+DETECTED ──► ReID Embedding (Hailo, RepVGG-A0, <1ms)
              ──► Centroid Match (CPU) → tentative label
              ──► Lazy-load pyannote
                     │
@@ -49,13 +49,15 @@ CHECKING state when motion exceeds threshold. Configurable sensitivity
 with Gaussian blur pre-filtering to reduce noise.
 
 ### `person_detector.py`
-YOLOv8n person detection running on Hailo. Invoked on-demand when
+YOLOv5s-personface detection running on Hailo. Invoked on-demand when
 motion is detected (not continuously). Returns bounding boxes for
-detected persons. A single inference takes ~12ms.
+detected persons and faces. A single inference takes ~26ms. Face
+detections are available for future face-based ReID.
 
 ### `visual_reid.py`
-OSNet-AIN-x1.0 visual re-identification running on Hailo:
-- Generates 512-dim embedding vectors from person crops
+RepVGG-A0 visual re-identification running on Hailo:
+- Generates 512-dim embedding vectors from person crops (256x128 input)
+- Sub-millisecond inference on Hailo-8L (<1ms per crop)
 - Compares against known centroids using cosine similarity
 - Returns tentative label with confidence score
 - Does NOT write to embedding clouds (see confirmation rule below)
@@ -112,9 +114,10 @@ tool when the agent names or identifies someone:
 
 ### `models/`
 Model files and conversion scripts for Hailo deployment:
-- YOLOv8n person detection (ONNX → HEF)
-- OSNet-AIN-x1.0 ReID (ONNX → HEF)
-- Model download and HEF compilation scripts
+- YOLOv5s-personface detection (`yolov5s_personface_h8l.hef` — pre-compiled,
+  from `/usr/share/hailo-models/`)
+- RepVGG-A0 person ReID (`repvgg_a0_person_reid_512.hef` — 256x128 input,
+  512-dim output)
 - pyannote models are managed by the pyannote library (PyTorch,
   downloaded on first use, cached)
 

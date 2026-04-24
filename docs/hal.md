@@ -465,7 +465,8 @@ and headphone amplifier are already there — less wiring.
 **How ALSA handles it:** A virtual ALSA device (`boxbot_speaker`)
 duplicates the audio stream to both the HDMI output and the ReSpeaker USB
 output simultaneously. The speaker module writes to this single virtual
-device — the duplication is transparent.
+device — the duplication is transparent. Until ALSA dual-output is
+configured, the default speaker device is `hdmi` (direct HDMI audio).
 
 **AEC timing:** The XMOS adaptive filter handles acoustic propagation
 delay (speaker → air → mic, ~5-30ms). The digital path difference between
@@ -865,7 +866,7 @@ class Hailo(HardwareModule):
             async with hailo.inference_session(priority="realtime") as session:
                 boxes = await session.infer("yolo_person", frame)
                 for crop in extract_crops(frame, boxes):
-                    embedding = await session.infer("reid_osnet", crop)
+                    embedding = await session.infer("reid_repvgg", crop)
 
         The session holds the priority lock for its duration, preventing
         interleaving with other priority levels.
@@ -911,8 +912,8 @@ hardware:
   hailo:
     device: "auto"                   # auto-detect Hailo-8L
     models:
-      yolo_person: "data/perception/models/yolov8n_person.hef"
-      reid_osnet: "data/perception/models/osnet_ain_x1.hef"
+      yolo_person: "/usr/share/hailo-models/yolov5s_personface_h8l.hef"
+      reid_repvgg: "data/perception/models/repvgg_a0_person_reid_512.hef"
     preload_models: true             # load models at startup
 ```
 
@@ -926,12 +927,12 @@ hardware:
   inference, the batch inference completes its current frame (inference
   is atomic at the frame level) and then yields. The realtime request
   runs, and the batch resumes after. This adds at most one frame of
-  latency (~12-15ms) to the realtime path.
-- **Memory:** Both YOLOv8n and OSNet-AIN-x1.0 fit comfortably in the
-  Hailo-8L's on-chip memory simultaneously. No model swapping needed.
-- **Compute budget:** YOLOv8n at 1 FPS uses ~0.07% of the 13 TOPS
-  capacity. Even at the perception pipeline's peak (YOLO + multiple
-  ReID crops), utilization stays well under 5%.
+  latency (~26ms) to the realtime path.
+- **Memory:** Both YOLOv5s-personface and RepVGG-A0 fit comfortably in
+  the Hailo-8L's on-chip memory simultaneously. No model swapping needed.
+- **Compute budget:** YOLOv5s-personface at 1 FPS uses ~0.06% of the
+  13 TOPS capacity. Even at the perception pipeline's peak (YOLO +
+  multiple ReID crops), utilization stays well under 5%.
 
 ---
 
@@ -1197,8 +1198,8 @@ hardware:
   hailo:
     device: "auto"
     models:
-      yolo_person: "data/perception/models/yolov8n_person.hef"
-      reid_osnet: "data/perception/models/osnet_ain_x1.hef"
+      yolo_person: "/usr/share/hailo-models/yolov5s_personface_h8l.hef"
+      reid_repvgg: "data/perception/models/repvgg_a0_person_reid_512.hef"
     preload_models: true
 
   buttons:

@@ -44,6 +44,23 @@ DEFAULT_TEMP_BLOCK_DURATION_SECONDS = 3600  # 1 hour
 DEFAULT_MAX_TEMP_BLOCKS = 3
 
 
+# Singleton accessor — set by main during startup, read by the output dispatcher
+# so the agent loop can resolve person-name → phone-number without being passed
+# a reference. Mirrors the voice session singleton pattern.
+_auth_manager: "AuthManager | None" = None
+
+
+def get_auth_manager() -> "AuthManager | None":
+    """Return the process-wide AuthManager instance, or None if unset."""
+    return _auth_manager
+
+
+def set_auth_manager(manager: "AuthManager | None") -> None:
+    """Register the process-wide AuthManager instance."""
+    global _auth_manager
+    _auth_manager = manager
+
+
 @dataclass(frozen=True)
 class User:
     """A registered boxBot user."""
@@ -542,6 +559,48 @@ class AuthManager:
             )
             await db.commit()
             return cursor.rowcount > 0
+
+    async def run_maintenance(self) -> dict[str, int]:
+        """Purge stale auth records: expired codes, old attempts, expired blocks.
+
+        Returns a dict with the number of rows deleted per table.
+        """
+        now = datetime.now()
+        expired_code_cutoff = (now - timedelta(hours=24)).isoformat()
+        old_attempt_cutoff = (now - timedelta(days=30)).isoformat()
+
+        deleted: dict[str, int] = {}
+
+        async with self._get_db() as db:
+            # Expired or used registration codes older than 24h
+            cursor = await db.execute(
+                "DELETE FROM registration_codes "
+                "WHERE expires_at < ? OR (used_at IS NOT NULL AND used_at < ?)",
+                (expired_code_cutoff, expired_code_cutoff),
+            )
+            deleted["registration_codes"] = cursor.rowcount
+
+            # Failed attempts older than 30 days
+            cursor = await db.execute(
+                "DELETE FROM failed_attempts WHERE attempted_at < ?",
+                (old_attempt_cutoff,),
+            )
+            deleted["failed_attempts"] = cursor.rowcount
+
+            # Expired temporary blocks (non-permanent, past expiry)
+            cursor = await db.execute(
+                "DELETE FROM blocks "
+                "WHERE permanent = 0 AND expires_at IS NOT NULL AND expires_at < ?",
+                (now.isoformat(),),
+            )
+            deleted["blocks"] = cursor.rowcount
+
+            await db.commit()
+
+        total = sum(deleted.values())
+        if total:
+            logger.info("Auth maintenance: purged %s", deleted)
+        return deleted
 
     async def has_admins(self) -> bool:
         """Check if any admin users exist."""

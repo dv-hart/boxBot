@@ -187,6 +187,130 @@ def _parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
+async def _init_hal(config: Any) -> dict[str, Any]:
+    """Initialise Hardware Abstraction Layer modules.
+
+    Starts system monitor, Hailo NPU, and camera in dependency order.
+    Returns dict of module name to instance. Failures in individual
+    modules are logged but do not prevent startup (graceful degradation).
+    """
+    modules: dict[str, Any] = {}
+
+    # System monitor (always available)
+    from boxbot.hardware.system import System
+
+    system = System()
+    await system.start()
+    modules["system"] = system
+    logger.info("System monitor started")
+
+    # Hailo NPU
+    try:
+        from boxbot.hardware.hailo import Hailo
+
+        hailo = Hailo(models=config.hardware.hailo.models)
+        await hailo.start()
+        system.register_module(hailo)
+        system.set_hailo_ref(hailo)
+        modules["hailo"] = hailo
+        logger.info("Hailo NPU started")
+    except Exception:
+        logger.warning("Hailo NPU not available — perception will be disabled", exc_info=True)
+
+    # Camera
+    try:
+        from boxbot.hardware.camera import Camera
+
+        camera = Camera(
+            rotation=config.hardware.camera.rotation,
+            main_resolution=tuple(config.camera.resolution),
+            lores_resolution=tuple(config.hardware.camera.lores_resolution),
+            scan_fps=config.camera.scan_fps,
+        )
+        await camera.start()
+        system.register_module(camera)
+        modules["camera"] = camera
+        logger.info("Camera started")
+    except Exception:
+        logger.warning("Camera not available — perception will be disabled", exc_info=True)
+
+    # Microphone (ReSpeaker 4-Mic Array)
+    try:
+        from boxbot.hardware.microphone import Microphone
+
+        microphone = Microphone(config=config.hardware.microphone)
+        await microphone.start()
+        system.register_module(microphone)
+        modules["microphone"] = microphone
+        logger.info("Microphone started")
+    except Exception:
+        logger.warning("Microphone not available — voice pipeline will be disabled", exc_info=True)
+
+    # Speaker (ALSA dual-output)
+    try:
+        from boxbot.hardware.speaker import Speaker
+
+        speaker = Speaker(config=config.hardware.speaker)
+        await speaker.start()
+        system.register_module(speaker)
+        modules["speaker"] = speaker
+        logger.info("Speaker started")
+    except Exception:
+        logger.warning("Speaker not available — TTS will be disabled", exc_info=True)
+
+    return modules
+
+
+async def _stop_hal(modules: dict[str, Any]) -> None:
+    """Stop HAL modules in reverse startup order."""
+    for name in ("screen", "speaker", "microphone", "camera", "hailo", "system"):
+        module = modules.get(name)
+        if module is None:
+            continue
+        try:
+            await module.stop()
+            logger.info("Stopped HAL module: %s", name)
+        except Exception:
+            logger.exception("Error stopping HAL module: %s", name)
+
+
+async def _init_perception(hal_modules: dict[str, Any], config: Any) -> Any | None:
+    """Initialise the perception pipeline if camera and Hailo are available."""
+    camera = hal_modules.get("camera")
+    hailo = hal_modules.get("hailo")
+    microphone = hal_modules.get("microphone")
+
+    if camera is None or hailo is None:
+        logger.warning(
+            "Perception pipeline disabled (camera=%s, hailo=%s)",
+            "ok" if camera else "missing",
+            "ok" if hailo else "missing",
+        )
+        return None
+
+    from boxbot.perception.pipeline import PerceptionPipeline
+
+    pipeline = PerceptionPipeline(
+        camera=camera,
+        hailo=hailo,
+        microphone=microphone,
+        motion_threshold=config.perception.motion_threshold,
+        reid_high_threshold=config.perception.reid_high_threshold,
+        reid_low_threshold=config.perception.reid_low_threshold,
+        presence_timeout=config.perception.presence_timeout,
+        heartbeat_interval=config.perception.heartbeat_interval,
+        scan_fps=config.camera.scan_fps,
+        voice_match_threshold=config.perception.voice_match_threshold,
+        doa_forward_angle=config.perception.doa_forward_angle,
+        camera_hfov=config.perception.camera_hfov,
+        crop_retention_days=config.perception.crop_retention_days,
+        crop_retention_days_debug=config.perception.crop_retention_days_debug,
+    )
+    await pipeline.start()
+    logger.info("Perception pipeline started")
+    return pipeline
+
+
 async def _init_memory_store() -> Any:
     """Initialise and return the MemoryStore."""
     from boxbot.memory.store import MemoryStore
@@ -237,6 +361,37 @@ async def _init_photo_intake(photo_store: Any) -> Any:
     return pipeline
 
 
+async def _init_voice(hal_modules: dict[str, Any], config: Any) -> Any | None:
+    """Initialise the voice pipeline if microphone is available.
+
+    Returns the VoiceSession if initialised, otherwise None.
+    """
+    microphone = hal_modules.get("microphone")
+    speaker = hal_modules.get("speaker")
+
+    if microphone is None:
+        logger.warning("Voice pipeline disabled (microphone not available)")
+        return None
+
+    if speaker is None:
+        logger.warning("Voice pipeline degraded (speaker not available, no TTS)")
+
+    try:
+        from boxbot.communication.voice import VoiceSession
+
+        session = VoiceSession(
+            microphone=microphone,
+            speaker=speaker,
+            config=config.voice,
+        )
+        await session.start()
+        logger.info("Voice pipeline started")
+        return session
+    except Exception:
+        logger.warning("Voice pipeline failed to start", exc_info=True)
+        return None
+
+
 async def _init_communication() -> Any | None:
     """Initialise the communication layer (WhatsApp + message router).
 
@@ -266,6 +421,13 @@ async def _init_communication() -> Any | None:
     auth = AuthManager()
     await auth.init_db()
 
+    # Register singletons so the agent's output dispatcher can reach them
+    # without being passed a direct reference.
+    from boxbot.communication.auth import set_auth_manager
+    from boxbot.communication.whatsapp import set_whatsapp_client
+    set_whatsapp_client(whatsapp)
+    set_auth_manager(auth)
+
     router = MessageRouter(auth=auth, whatsapp=whatsapp)
     logger.info("Communication layer initialised (WhatsApp + router)")
     return router
@@ -274,6 +436,10 @@ async def _init_communication() -> Any | None:
 async def _init_agent(memory_store: Any) -> Any:
     """Initialise and start the BoxBotAgent."""
     from boxbot.core.agent import BoxBotAgent
+    from boxbot.core.agent_state import get_agent_state_tracker
+
+    # Start the state tracker before the agent so it sees the first events
+    await get_agent_state_tracker().start()
 
     agent = BoxBotAgent(memory_store=memory_store)
     await agent.start()
@@ -298,15 +464,19 @@ async def _shutdown(
     """
     logger.info("Shutting down boxBot...")
 
-    # Shutdown order is reverse of initialisation
+    # Shutdown order is reverse of initialisation.
+    # Perception stops before HAL; HAL stops last.
     shutdown_order = [
         "agent",
+        "voice",
         "communication",
         "photo_intake",
+        "perception",
         "display_manager",
         "scheduler",
         "photo_store",
         "memory_store",
+        "hal",
     ]
 
     for name in shutdown_order:
@@ -316,11 +486,17 @@ async def _shutdown(
 
         try:
             if name == "agent":
+                from boxbot.core.agent_state import get_agent_state_tracker
+                await get_agent_state_tracker().stop()
+                await instance.stop()
+            elif name == "voice":
                 await instance.stop()
             elif name == "communication":
                 # MessageRouter does not have a stop method currently
                 pass
             elif name == "photo_intake":
+                await instance.stop()
+            elif name == "perception":
                 await instance.stop()
             elif name == "display_manager":
                 await instance.stop()
@@ -330,6 +506,8 @@ async def _shutdown(
                 await instance.close()
             elif name == "memory_store":
                 await instance.close()
+            elif name == "hal":
+                await _stop_hal(instance)
             logger.info("Stopped %s", name)
         except Exception:
             logger.exception("Error stopping %s", name)
@@ -403,6 +581,10 @@ async def _async_main() -> None:
 
     # 5. Initialise subsystems in dependency order
     try:
+        # HAL — hardware abstraction layer (system, hailo, camera)
+        hal_modules = await _init_hal(config)
+        subsystems["hal"] = hal_modules
+
         # Memory store — foundation for the agent and many other subsystems
         memory_store = await _init_memory_store()
         subsystems["memory_store"] = memory_store
@@ -422,9 +604,34 @@ async def _async_main() -> None:
         # Start idle display rotation
         display_manager.start_rotation()
 
+        # Screen HAL — renders display frames to HDMI via pygame
+        try:
+            from boxbot.hardware.screen import Screen
+
+            screen = Screen(
+                display_manager=display_manager,
+                brightness=config.display.brightness,
+            )
+            await screen.start()
+            hal_modules.get("system") and hal_modules["system"].register_module(screen)
+            subsystems["screen"] = screen
+            logger.info("Screen started")
+        except Exception:
+            logger.warning("Screen not available — display will not render to HDMI", exc_info=True)
+
+        # Perception pipeline — visual detection and re-identification
+        perception = await _init_perception(hal_modules, config)
+        if perception is not None:
+            subsystems["perception"] = perception
+
         # Photo intake — background processing pipeline
         photo_intake = await _init_photo_intake(photo_store)
         subsystems["photo_intake"] = photo_intake
+
+        # Voice pipeline — wake word, VAD, STT, TTS, diarization
+        voice_session = await _init_voice(hal_modules, config)
+        if voice_session is not None:
+            subsystems["voice"] = voice_session
 
         # Communication — WhatsApp client and message routing
         comm_router = await _init_communication()

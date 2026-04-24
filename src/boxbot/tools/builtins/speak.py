@@ -17,14 +17,22 @@ logger = logging.getLogger(__name__)
 
 
 class SpeakTool(Tool):
-    """Say something through the speaker via TTS."""
+    """Say something through the speaker via TTS — for mid-turn interims."""
 
     name = "speak"
     description = (
-        "Say something out loud through the speaker. Use this for proactive "
-        "output when you aren't in an active voice conversation — scheduled "
-        "reminders, greetings when someone is detected, etc. Urgent priority "
-        "interrupts current audio."
+        "Say something aloud IMMEDIATELY. Use this during a turn for brief "
+        "interim acknowledgments while you work — 'One moment', 'Let me check', "
+        "'Looking that up now'. Also use for proactive speech when not in an "
+        "active voice conversation (scheduled reminders, greetings). "
+        "\n\n"
+        "DO NOT use speak() for the final answer to a question — put that in "
+        "the `response_text` field of your end-of-turn decision so the system "
+        "can route it correctly across channels and track it. Calling speak() "
+        "with your final answer causes double-speaking and breaks the silent/"
+        "respond gate. "
+        "\n\n"
+        "Urgent priority interrupts current audio; use sparingly."
     )
     parameters = {
         "type": "object",
@@ -52,13 +60,28 @@ class SpeakTool(Tool):
 
         logger.info("speak [%s]: %s", priority, text[:100])
 
-        # Stub: In production, this sends text to the TTS engine
-        # (ElevenLabs streaming) and plays through the speaker via HAL.
-        # Urgent priority interrupts any current audio playback.
+        # Get the voice session singleton
+        from boxbot.communication.voice import get_voice_session
 
-        return json.dumps({
-            "status": "spoken",
-            "text": text,
-            "priority": priority,
-            "message": "Speech output queued successfully.",
-        })
+        session = get_voice_session()
+
+        if session is None:
+            logger.warning("Voice pipeline not available for speak tool")
+            return json.dumps({
+                "status": "error",
+                "message": "Voice pipeline not available.",
+            })
+
+        try:
+            await session.speak(text, priority=priority)
+            return json.dumps({
+                "status": "spoken",
+                "text": text,
+                "priority": priority,
+            })
+        except Exception as e:
+            logger.exception("speak tool failed")
+            return json.dumps({
+                "status": "error",
+                "message": f"Speech failed: {e}",
+            })

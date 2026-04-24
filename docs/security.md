@@ -67,7 +67,10 @@ the data fetching runs in the sandbox. This prevents privilege confusion
 and keeps the authenticated channel clean.
 
 ### Webhook Security
-- Incoming webhooks validated against WhatsApp's request signature
+- `WHATSAPP_APP_SECRET` is **required** — boxBot will not start the
+  WhatsApp listener without it. Set it in `.env`
+- Incoming webhooks validated against WhatsApp's `X-Hub-Signature-256`
+  header using HMAC-SHA256 with the app secret
 - Forged webhooks rejected (HTTP 403) before any processing
 - Webhook port is the only open listener (required by WhatsApp API)
 

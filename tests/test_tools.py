@@ -60,7 +60,11 @@ class TestToolBaseClass:
 class TestToolRegistry:
     """Test tool discovery and registry functions."""
 
-    def test_get_tools_returns_nine_tools(self):
+    def test_get_tools_count_and_composition(self):
+        """8 tools. All outbound speech/text to humans flows through the
+        structured outputs array (see output_dispatcher). Tools only do
+        things — they don't speak. speak and send_message are subsumed by
+        outputs[channel='voice'] and outputs[channel='text'] respectively."""
         # Reset the singleton to force fresh load
         import boxbot.tools.registry as reg
         reg._tools = None
@@ -68,7 +72,11 @@ class TestToolRegistry:
 
         from boxbot.tools.registry import get_tools
         tools = get_tools()
-        assert len(tools) == 9
+        assert len(tools) == 8
+        names = {t.name for t in tools}
+        assert "speak" not in names  # subsumed by outputs[voice]
+        assert "send_message" not in names  # subsumed by outputs[text]
+        assert "load_skill" in names
 
     def test_get_tools_returns_tool_instances(self):
         from boxbot.tools.registry import get_tools
@@ -99,14 +107,13 @@ class TestToolRegistry:
         names = {t.name for t in get_tools()}
         expected = {
             "execute_script",
-            "speak",
             "switch_display",
-            "send_message",
             "identify_person",
             "manage_tasks",
             "search_memory",
             "search_photos",
             "web_search",
+            "load_skill",
         }
         assert names == expected
 

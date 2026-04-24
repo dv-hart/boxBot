@@ -37,15 +37,30 @@ data/sandbox/tmp/*
 !data/sandbox/tmp/.gitkeep
 data/sandbox/installed.txt
 
+# Preview renders (scripts/preview_display.py, scripts/block_gallery.py)
+data/previews/
+
 # Logs
 logs/
 
 # OS
 .DS_Store
 Thumbs.db
+*:Zone.Identifier
+
+# Session-local tooling state
+.claude/
+
+# Runtime state
+data/scheduler/
+
+# Ad-hoc audio artifacts (test output)
+/*.wav
+/tts_samples/
 
 # User-installed plugins (committed examples only)
 skills/*/
 !skills/example_skill/
 displays/*/
 !displays/example_display/
+data/credentials/

@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""One-time Google Calendar OAuth bootstrap.
+
+Runs the InstalledAppFlow with a local server callback. Saves the
+resulting token to ``data/credentials/google_calendar_token.json`` (or
+the path given by GOOGLE_CALENDAR_TOKEN). The saved token auto-refreshes
+on subsequent use — this script only needs to be run once per device.
+
+Setup:
+    1. In Google Cloud Console, create OAuth 2.0 credentials of type
+       "Desktop app". Download the JSON.
+    2. Save it as ``data/credentials/google_client_secrets.json`` (or
+       set GOOGLE_CALENDAR_CLIENT_SECRETS to its path).
+    3. Run this script. A browser window will open; sign in and grant
+       calendar access.
+
+Usage:
+    python3 scripts/calendar_auth.py [--port 8765] [--no-browser]
+
+After authenticating, both the display calendar source and any
+agent-issued calendar calls will work without further interaction.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+# Ensure the repo's src/ is importable when run from the repo root
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT / "src"))
+
+from boxbot.integrations.google_calendar import (  # noqa: E402
+    SCOPES,
+    _client_secrets_path,
+    _token_path,
+)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--port", type=int, default=8765,
+        help="Local port for OAuth redirect (default: 8765)",
+    )
+    parser.add_argument(
+        "--no-browser", action="store_true",
+        help="Print the auth URL instead of opening a browser (for SSH)",
+    )
+    parser.add_argument(
+        "--manual", action="store_true",
+        help="Manual mode: print URL, then prompt for the redirect URL "
+             "you land on (most reliable for WSL2/SSH).",
+    )
+    args = parser.parse_args()
+
+    secrets_path = _client_secrets_path()
+    token_path = _token_path()
+
+    if not secrets_path.exists():
+        print(f"ERROR: client secrets not found at {secrets_path}")
+        print()
+        print("Create one in Google Cloud Console:")
+        print("  1. https://console.cloud.google.com/apis/credentials")
+        print("  2. Create OAuth client ID → Desktop app")
+        print("  3. Download JSON, save it to the path above")
+        print(f"     (or set GOOGLE_CALENDAR_CLIENT_SECRETS=/your/path)")
+        return 1
+
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError:
+        print(
+            "ERROR: google-auth-oauthlib is not installed. "
+            "Install it with:"
+        )
+        print("  pip install google-auth-oauthlib google-api-python-client")
+        return 1
+
+    if args.manual:
+        # Manual flow: no local server, user pastes redirect URL back.
+        import os as _os
+        _os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+        from google_auth_oauthlib.flow import Flow
+
+        flow = Flow.from_client_secrets_file(
+            str(secrets_path), SCOPES,
+            redirect_uri="http://localhost:8765",
+        )
+        auth_url, _ = flow.authorization_url(
+            access_type="offline", prompt="consent"
+        )
+        print()
+        print("=" * 70)
+        print("Open this URL in any browser, sign in, grant calendar access:")
+        print()
+        print(auth_url)
+        print()
+        print("After granting, your browser will redirect to a URL like:")
+        print("  http://localhost:8765/?state=...&code=...&scope=...")
+        print("(it'll fail to load — that's fine)")
+        print()
+        print("Copy that ENTIRE redirect URL and paste it here:")
+        print("=" * 70)
+        redirect_url = input("Redirect URL: ").strip()
+        if not redirect_url:
+            print("No URL provided.")
+            return 1
+
+        flow.fetch_token(authorization_response=redirect_url)
+        creds = flow.credentials
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(secrets_path), SCOPES
+        )
+        if args.no_browser:
+            creds = flow.run_local_server(
+                port=args.port, open_browser=False, prompt="consent"
+            )
+        else:
+            creds = flow.run_local_server(port=args.port, prompt="consent")
+
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(creds.to_json())
+    print(f"Saved token to {token_path}")
+    print("Calendar integration is ready.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -120,10 +120,12 @@ class ClockSource(DataSource):
 
 
 class WeatherSource(DataSource):
-    """Weather data from the weather skill/API.
+    """Weather data from NOAA api.weather.gov.
 
-    Delivers display-ready data with Lucide icon names.
-    Stub implementation returns placeholder data.
+    Reads ``lat``/``lon`` from the source config or, as a fallback, from
+    the ``BOXBOT_WEATHER_LAT`` / ``BOXBOT_WEATHER_LON`` environment
+    variables. NOAA covers US territory only — outside that, the source
+    falls back to placeholder data with a warning.
     """
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -134,14 +136,45 @@ class WeatherSource(DataSource):
         return self.config.get("refresh", 3600)
 
     async def fetch(self) -> dict[str, Any]:
-        # Stub: return placeholder data until weather skill is connected
-        return _weather_placeholder()
+        import os
+
+        from boxbot.integrations import noaa_weather as wx
+
+        lat = self.config.get("lat")
+        lon = self.config.get("lon")
+        if lat is None or lon is None:
+            lat = os.environ.get("BOXBOT_WEATHER_LAT")
+            lon = os.environ.get("BOXBOT_WEATHER_LON")
+
+        if lat is None or lon is None:
+            logger.debug(
+                "Weather source has no lat/lon configured; using placeholder. "
+                "Set 'lat'/'lon' in the source config or BOXBOT_WEATHER_LAT/LON env vars."
+            )
+            return _weather_placeholder()
+
+        try:
+            data = await wx.fetch_weather(
+                lat=float(lat),
+                lon=float(lon),
+                forecast_days=int(self.config.get("forecast_days", 5)),
+            )
+        except Exception as e:
+            logger.warning("Weather fetch failed: %s", e)
+            return _weather_placeholder()
+
+        if not data:
+            return _weather_placeholder()
+        return data
 
 
 class CalendarSource(DataSource):
-    """Calendar events from the calendar skill.
+    """Calendar events from Google Calendar.
 
-    Stub implementation returns placeholder data.
+    Reads the next ``max_results`` upcoming events via the
+    ``boxbot.integrations.google_calendar`` client. Falls back to the
+    placeholder data (with a debug log) when the OAuth token is missing
+    so previews and first-boot displays still render something useful.
     """
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -152,13 +185,33 @@ class CalendarSource(DataSource):
         return self.config.get("refresh", 300)
 
     async def fetch(self) -> dict[str, Any]:
-        return _calendar_placeholder()
+        from boxbot.integrations import google_calendar as gc
+
+        max_results = int(self.config.get("max_results", 5))
+        calendar_id = self.config.get("calendar_id")
+
+        try:
+            events = await gc.list_upcoming_events(
+                max_results=max_results, calendar_id=calendar_id
+            )
+        except gc.CalendarNotAuthenticated:
+            logger.debug(
+                "Google Calendar not authenticated; using placeholder data. "
+                "Run scripts/calendar_auth.py to connect."
+            )
+            return _calendar_placeholder()
+        except Exception as e:
+            logger.warning("Calendar fetch failed: %s", e)
+            return {"events": []}
+
+        return {"events": events, "count": len(events)}
 
 
 class TasksSource(DataSource):
     """To-do items from the scheduler.
 
-    Stub implementation returns placeholder data.
+    Reads pending to-dos from the scheduler DB. Falls back to empty list
+    if the scheduler is unavailable.
     """
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -169,14 +222,31 @@ class TasksSource(DataSource):
         return self.config.get("refresh", 60)
 
     async def fetch(self) -> dict[str, Any]:
-        return _tasks_placeholder()
+        try:
+            from boxbot.core.scheduler import list_todos
+            todos = await list_todos(status="pending")
+        except Exception as e:
+            logger.warning("Failed to fetch todos: %s", e)
+            return {"items": [], "count": 0}
+
+        items = [
+            {
+                "id": t.get("id"),
+                "description": t.get("description", ""),
+                "due_date": t.get("due_date"),
+                "for_person": t.get("for_person"),
+                "status": t.get("status", "pending"),
+            }
+            for t in todos
+        ]
+        return {"items": items, "count": len(items)}
 
 
 class PeopleSource(DataSource):
     """Currently detected people from the perception pipeline.
 
-    Event-driven — refreshes on person detection events.
-    Stub implementation returns empty.
+    Polls the pipeline's state machine for present people. Falls back
+    to empty data when the perception pipeline is not running.
     """
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -184,16 +254,26 @@ class PeopleSource(DataSource):
 
     @property
     def refresh_interval(self) -> int:
-        return 5  # Low interval; real impl is event-driven
+        return 5  # Low interval; supplements event-driven updates
 
     async def fetch(self) -> dict[str, Any]:
-        return {"present": [], "count": 0}
+        try:
+            from boxbot.perception.pipeline import get_pipeline
+
+            pipeline = get_pipeline()
+            present = pipeline.get_present_people()
+            return {"present": present, "count": len(present)}
+        except RuntimeError:
+            # Pipeline not running
+            return {"present": [], "count": 0}
 
 
 class AgentStatusSource(DataSource):
-    """Agent state (sleeping, listening, thinking, working).
+    """Agent state (sleeping, listening, thinking, speaking).
 
-    Event-driven.
+    Reads from the AgentStateTracker singleton, which subscribes to
+    lifecycle events on the event bus. Falls back to defaults if the
+    tracker has not been started.
     """
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -204,11 +284,16 @@ class AgentStatusSource(DataSource):
         return 5
 
     async def fetch(self) -> dict[str, Any]:
-        return {
-            "state": "sleeping",
-            "last_active": None,
-            "next_wake": None,
-        }
+        try:
+            from boxbot.core.agent_state import get_agent_state_tracker
+            return await get_agent_state_tracker().snapshot()
+        except Exception as e:
+            logger.warning("Failed to fetch agent state: %s", e)
+            return {
+                "state": "sleeping",
+                "last_active": None,
+                "next_wake": None,
+            }
 
 
 # ---------------------------------------------------------------------------

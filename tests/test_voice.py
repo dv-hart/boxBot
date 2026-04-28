@@ -1288,152 +1288,6 @@ class TestDiarization:
 
 
 # ---------------------------------------------------------------------------
-# TestBargeInMonitor
-# ---------------------------------------------------------------------------
-
-
-class TestBargeInMonitor:
-    """Tests for barge-in monitor with mocked VAD and speaker."""
-
-    def _make_config(self, **kwargs):
-        from boxbot.core.config import BargeInConfig
-
-        defaults = dict(
-            enabled=True,
-            ignore_duration=200,
-            fade_duration=200,
-            confirm_duration=400,
-            fade_volume=0.5,
-        )
-        defaults.update(kwargs)
-        return BargeInConfig(**defaults)
-
-    def _make_monitor(self, config=None, vad_prob=0.0):
-        from boxbot.communication.barge_in import BargeInMonitor
-        from boxbot.core.config import VADConfig
-
-        vad = MagicMock()
-        vad._config = VADConfig(threshold=0.5)
-        vad.process_chunk = AsyncMock(return_value=vad_prob)
-
-        speaker = MagicMock()
-        speaker.stop_playback = AsyncMock()
-        speaker.fade_volume = AsyncMock()
-
-        if config is None:
-            config = self._make_config()
-
-        monitor = BargeInMonitor(vad, speaker, config)
-        return monitor, vad, speaker
-
-    @pytest.mark.asyncio
-    async def test_stage1_ignore_no_action(self):
-        monitor, vad, speaker = self._make_monitor(vad_prob=0.8)
-        mic = MagicMock()
-        await monitor.start(mic)
-
-        # Simulate brief speech (< ignore_duration)
-        chunk = make_chunk()
-        await monitor._on_audio_chunk(chunk)
-
-        # No fade, no stop
-        speaker.fade_volume.assert_not_awaited()
-        speaker.stop_playback.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_stage2_fade_after_ignore_duration(self):
-        monitor, vad, speaker = self._make_monitor(vad_prob=0.8)
-        mic = MagicMock()
-        await monitor.start(mic)
-
-        # Set speech start to be 250ms ago (past 200ms ignore_duration)
-        monitor._speech_start = time.monotonic() - 0.25
-
-        chunk = make_chunk()
-        await monitor._on_audio_chunk(chunk)
-
-        speaker.fade_volume.assert_awaited_once_with(0.5, 200)
-
-    @pytest.mark.asyncio
-    async def test_stage3_confirm_stops_playback(self):
-        callback = AsyncMock()
-        monitor, vad, speaker = self._make_monitor(vad_prob=0.8)
-        monitor.set_interrupt_callback(callback)
-        mic = MagicMock()
-        await monitor.start(mic)
-
-        # Set speech start to be 500ms ago (past 400ms confirm_duration)
-        monitor._speech_start = time.monotonic() - 0.5
-
-        chunk = make_chunk()
-        await monitor._on_audio_chunk(chunk)
-
-        speaker.stop_playback.assert_awaited_once()
-        callback.assert_awaited_once()
-        assert monitor._monitoring is False
-
-    @pytest.mark.asyncio
-    async def test_silence_resets_speech_timer(self):
-        monitor, vad, speaker = self._make_monitor(vad_prob=0.8)
-        mic = MagicMock()
-        await monitor.start(mic)
-
-        # Start tracking speech
-        chunk = make_chunk()
-        await monitor._on_audio_chunk(chunk)
-        assert monitor._speech_start is not None
-
-        # Now silence
-        vad.process_chunk.return_value = 0.1
-        chunk2 = make_chunk()
-        await monitor._on_audio_chunk(chunk2)
-        assert monitor._speech_start is None
-
-    @pytest.mark.asyncio
-    async def test_disabled_by_config(self):
-        config = self._make_config(enabled=False)
-        monitor, vad, speaker = self._make_monitor(config=config)
-        mic = MagicMock()
-        await monitor.start(mic)
-
-        # Should not register as consumer
-        mic.add_consumer.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_interrupt_callback_called_on_confirmation(self):
-        callback = AsyncMock()
-        monitor, vad, speaker = self._make_monitor(vad_prob=0.8)
-        monitor.set_interrupt_callback(callback)
-        mic = MagicMock()
-        await monitor.start(mic)
-
-        monitor._speech_start = time.monotonic() - 0.5
-
-        await monitor._on_audio_chunk(make_chunk())
-        callback.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_silence_after_fade_restores_volume(self):
-        monitor, vad, speaker = self._make_monitor(vad_prob=0.8)
-        mic = MagicMock()
-        await monitor.start(mic)
-
-        # Trigger fade
-        monitor._speech_start = time.monotonic() - 0.25
-        await monitor._on_audio_chunk(make_chunk())
-        speaker.fade_volume.assert_awaited_once_with(0.5, 200)
-        assert monitor._faded is True
-
-        # Now silence — should restore volume
-        vad.process_chunk.return_value = 0.1
-        await monitor._on_audio_chunk(make_chunk())
-        assert monitor._faded is False
-        # Second call should be fade back to 1.0
-        assert speaker.fade_volume.await_count == 2
-        speaker.fade_volume.assert_awaited_with(1.0, 200)
-
-
-# ---------------------------------------------------------------------------
 # TestVoiceSession
 # ---------------------------------------------------------------------------
 
@@ -1617,8 +1471,11 @@ class TestVoiceSession:
 
     @pytest.mark.asyncio
     async def test_wake_word_during_active_extends_grace(self):
-        """In the adapter model a second wake word while ACTIVE just
-        refreshes the post-wake-word grace timer — no re-activation."""
+        """A second wake word while ACTIVE refreshes the post-wake-word
+        grace timer and re-attaches audio_capture (idempotent in the
+        underlying ``AudioCapture.start``). In ``wake_word`` barge-in
+        mode the latter is essential — STT detaches during BB's reply
+        and the wake word is the only path back."""
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
 
         session, mic, speaker = self._make_session()
@@ -1646,7 +1503,9 @@ class TestVoiceSession:
         assert prior.cancelled() or prior.done()
         # New grace task replaced the prior one — NOT the same object.
         assert session._active_timeout_task is not prior
-        session._audio_capture.start.assert_not_awaited()
+        # audio_capture.start IS called (idempotent at the AudioCapture
+        # level) so wake-word mode can re-attach STT after BB's reply.
+        session._audio_capture.start.assert_awaited()
 
         # Clean up the new grace task so it doesn't leak into other tests.
         if session._active_timeout_task is not None:
@@ -1665,6 +1524,7 @@ class TestVoiceSession:
         session._conversation_id = "voice_already"
         session._vad = MagicMock()
         session._audio_capture = MagicMock()
+        session._audio_capture.start = AsyncMock()
 
         event = WakeWordHeard(confidence=0.9)
         await session._on_wake_word(event)
@@ -1715,30 +1575,72 @@ class TestVoiceSession:
         assert events_received[0].transcript == "Hello boxbot"
 
     @pytest.mark.asyncio
-    async def test_speak_streams_tts_with_barge_in(self):
+    async def test_speak_detaches_audio_capture_during_tts(self):
+        """``speak()`` detaches STT during TTS so chatter and echo
+        cannot reach the transcript pipeline. After TTS completes
+        naturally, STT is re-attached so the user can continue without
+        re-saying the wake word; only mid-TTS interruption requires
+        the wake word."""
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
 
         session, mic, speaker = self._make_session()
         session._state = VoiceSessionState.ACTIVE
         session._conversation_id = "voice_test"
 
-        # Mock TTS stream
+        # Mock audio_capture and TTS
+        mock_capture = MagicMock()
+        mock_capture.stop = AsyncMock()
+        mock_capture.start = AsyncMock()
+        session._audio_capture = mock_capture
+
         mock_tts_stream = MagicMock()
         mock_tts_stream.speak = AsyncMock()
         session._tts_stream = mock_tts_stream
 
-        # Mock barge-in
-        mock_barge_in = MagicMock()
-        mock_barge_in.start = AsyncMock()
-        mock_barge_in.remove_from = AsyncMock()
-        mock_barge_in._monitoring = True
-        session._barge_in = mock_barge_in
-
         await session.speak("Hello there")
 
         mock_tts_stream.speak.assert_awaited_once_with("Hello there")
-        mock_barge_in.start.assert_awaited_once()
-        mock_barge_in.remove_from.assert_awaited_once()
+        mock_capture.stop.assert_awaited_once()
+        # STT is re-attached on natural completion so the user can
+        # continue the conversation.
+        mock_capture.start.assert_awaited_once_with(mic)
+
+    @pytest.mark.asyncio
+    async def test_wake_word_during_tts_stops_playback(self):
+        """In wake_word mode, a wake-word detection mid-TTS interrupts
+        playback, marks the turn as interrupted, and re-attaches STT."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        session._conversation_id = "voice_speaking"
+        session._audio_capture = MagicMock()
+        session._audio_capture.start = AsyncMock()
+
+        # Speaker reports it's currently playing a TTS chunk.
+        speaker.is_playing = True
+        speaker.stop_playback = AsyncMock()
+
+        events: list = []
+
+        async def _capture_speaking_done(event):
+            events.append(event)
+
+        bus = get_event_bus()
+        from boxbot.core.events import AgentSpeakingDone
+        bus.subscribe(AgentSpeakingDone, _capture_speaking_done)
+        try:
+            await session._on_wake_word(WakeWordHeard(confidence=0.9))
+        finally:
+            bus.unsubscribe(AgentSpeakingDone, _capture_speaking_done)
+
+        speaker.stop_playback.assert_awaited_once()
+        assert session._tts_interrupted is True
+        # STT re-attached so the user's next utterance is captured.
+        session._audio_capture.start.assert_awaited()
+        assert any(e.interrupted for e in events), (
+            f"expected an interrupted=True AgentSpeakingDone, got {events!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_initiate_conversation_activates_and_speaks(self):
@@ -1749,12 +1651,14 @@ class TestVoiceSession:
         session._vad = MagicMock()
         session._audio_capture = MagicMock()
         session._audio_capture.start = AsyncMock()
+        # speak() detaches audio_capture for the duration of TTS
+        # playback and re-attaches it when TTS completes.
+        session._audio_capture.stop = AsyncMock()
 
         # Mock TTS stream
         mock_tts_stream = MagicMock()
         mock_tts_stream.speak = AsyncMock()
         session._tts_stream = mock_tts_stream
-        session._barge_in = None
 
         await session.initiate_conversation("Hello Jacob!", person_name="Jacob")
 
@@ -1907,9 +1811,6 @@ class TestVoiceConfig:
         assert cfg.wake_word.engine == "openwakeword"
         assert cfg.vad.threshold == 0.5
         assert cfg.turn_detection.silence_threshold == 800
-        assert cfg.barge_in.enabled is True
-        assert cfg.barge_in.ignore_duration == 200
-        assert cfg.barge_in.confirm_duration == 400
         assert cfg.stt.provider == "elevenlabs"
         assert cfg.tts.provider == "elevenlabs"
         assert cfg.session.active_timeout == 30

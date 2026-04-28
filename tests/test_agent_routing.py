@@ -30,6 +30,8 @@ from boxbot.core.conversation import (
     SpokenSegment,
 )
 from boxbot.core.events import (
+    AgentSpeaking,
+    AgentSpeakingDone,
     ConversationEnded,
     TranscriptReady,
     TriggerFired,
@@ -78,6 +80,8 @@ async def agent():
     bus.subscribe(TranscriptReady, agent._on_transcript_ready)
     bus.subscribe(VoiceSessionEnded, agent._on_voice_session_ended)
     bus.subscribe(ConversationEnded, agent._on_conversation_ended)
+    bus.subscribe(AgentSpeaking, agent._on_agent_speaking)
+    bus.subscribe(AgentSpeakingDone, agent._on_agent_speaking_done)
     # Replace the Anthropic loop with a stub.
     agent._generate_for_conversation = _make_stub_generate()
     try:
@@ -88,6 +92,8 @@ async def agent():
         bus.unsubscribe(TranscriptReady, agent._on_transcript_ready)
         bus.unsubscribe(VoiceSessionEnded, agent._on_voice_session_ended)
         bus.unsubscribe(ConversationEnded, agent._on_conversation_ended)
+        bus.unsubscribe(AgentSpeaking, agent._on_agent_speaking)
+        bus.unsubscribe(AgentSpeakingDone, agent._on_agent_speaking_done)
 
 
 async def _drain_active(agent) -> None:
@@ -320,3 +326,138 @@ async def test_trigger_fired_creates_unique_conversation(agent):
     assert conv.channel == "trigger"
     # Trigger text was tagged.
     assert conv.thread[0]["content"].startswith("[trigger]")
+
+# ---------------------------------------------------------------------------
+# Speaking-state coordination via AgentSpeaking / AgentSpeakingDone events
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_speaking_event_flips_room_conv_to_speaking(agent):
+    """AgentSpeaking on the bus flips the room conversation into the
+    SPEAKING state so subsequent transcripts get queued instead of
+    cancelling the in-flight generation."""
+    # Hold the generation open so we can observe THINKING → SPEAKING.
+    release = asyncio.Event()
+
+    async def _stuck_gen(conv):
+        # Initial state set by the conversation: THINKING.
+        await release.wait()
+        return GenerationResult(
+            thread_additions=[{"role": "assistant", "content": "ok"}],
+        )
+
+    agent._generate_for_conversation = _stuck_gen
+
+    await agent._on_transcript_ready(TranscriptReady(
+        conversation_id="vs_001",
+        transcript="[Jacob]: hi",
+        source="voice",
+    ))
+    # Let the gen task start.
+    await asyncio.sleep(0)
+    conv = agent._conversations[agent._conversation_by_key["voice:room"]]
+    assert conv.state is ConversationState.THINKING
+
+    # Voice layer publishes AgentSpeaking when speak() begins.
+    await agent._on_agent_speaking(AgentSpeaking(
+        conversation_id="vs_001",
+        text="hi",
+    ))
+    assert conv.state is ConversationState.SPEAKING
+
+    # Stale AgentSpeaking after an interrupt must NOT flip back.
+    conv.set_state(ConversationState.LISTENING)
+    await agent._on_agent_speaking(AgentSpeaking(
+        conversation_id="vs_001",
+        text="stale",
+    ))
+    assert conv.state is ConversationState.LISTENING
+
+    release.set()
+    await _drain_active(agent)
+
+
+@pytest.mark.asyncio
+async def test_agent_speaking_done_interrupted_calls_conv_interrupt(agent):
+    """AgentSpeakingDone(interrupted=True) — published by the wake-word
+    handler when it stops mid-TTS playback — drives the room
+    conversation through interrupt(): partial spoken segment folds in,
+    queued utterances drop, state lands on LISTENING."""
+    started = asyncio.Event()
+
+    async def _gen(conv):
+        if conv.thread[-1]["content"].endswith("hi"):
+            conv.set_state(ConversationState.SPEAKING)
+            conv.record_segment(SpokenSegment(
+                channel="voice", to="room",
+                content="weather looks fine today",
+            ))
+            started.set()
+            await asyncio.sleep(10)
+            return GenerationResult()
+        return GenerationResult(
+            thread_additions=[{"role": "assistant", "content": "new turn"}],
+        )
+
+    agent._generate_for_conversation = _gen
+
+    await agent._on_transcript_ready(TranscriptReady(
+        conversation_id="vs_001",
+        transcript="[Jacob]: hi",
+        source="voice",
+    ))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    conv = agent._conversations[agent._conversation_by_key["voice:room"]]
+    assert conv.state is ConversationState.SPEAKING
+
+    # Background utterance queues during SPEAKING.
+    await conv.handle_input("kid babble", speaker_name="Kid")
+
+    # Wake-word handler publishes the interrupt event.
+    await agent._on_agent_speaking_done(AgentSpeakingDone(
+        conversation_id="vs_001",
+        interrupted=True,
+    ))
+
+    assert conv.state is ConversationState.LISTENING
+    assert conv.is_generating is False
+    roles = [m["role"] for m in conv.thread]
+    # user(hi), assistant(folded interrupted partial). Queued kid
+    # babble was dropped.
+    assert roles == ["user", "assistant"]
+    assert "weather" in conv.thread[1]["content"]
+    assert "interrupted" in conv.thread[1]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_agent_speaking_done_natural_completion_is_noop(agent):
+    """AgentSpeakingDone(interrupted=False) is the natural-completion
+    signal — _run_generation handles state transitions itself; the
+    agent's handler must NOT call interrupt() in this case."""
+    interrupt_calls = 0
+
+    await agent._on_transcript_ready(TranscriptReady(
+        conversation_id="vs_001",
+        transcript="[Jacob]: hi",
+        source="voice",
+    ))
+    await _drain_active(agent)
+    conv = agent._conversations[agent._conversation_by_key["voice:room"]]
+
+    original_interrupt = conv.interrupt
+
+    async def _spy_interrupt():
+        nonlocal interrupt_calls
+        interrupt_calls += 1
+        return await original_interrupt()
+
+    conv.interrupt = _spy_interrupt  # type: ignore[method-assign]
+
+    await agent._on_agent_speaking_done(AgentSpeakingDone(
+        conversation_id="vs_001",
+        interrupted=False,
+    ))
+
+    assert interrupt_calls == 0
+

@@ -24,6 +24,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+from boxbot.core.paths import PERCEPTION_MODELS_DIR, PHOTOS_DIR
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -226,7 +228,7 @@ class HardwareHailoConfig(BaseModel):
 
     models: dict[str, str] = Field(default_factory=lambda: {
         "yolo": "/usr/share/hailo-models/yolov5s_personface_h8l.hef",
-        "reid": "data/perception/models/repvgg_a0_person_reid_512.hef",
+        "reid": str(PERCEPTION_MODELS_DIR / "repvgg_a0_person_reid_512.hef"),
     })
     preload_models: bool = True
 
@@ -254,6 +256,25 @@ class HardwareSpeakerConfig(BaseModel):
     # amp wants. +6 dB with tanh ceiling lifts perceived loudness without
     # clipping peaks.
     gain_db: float = 6.0
+    # AEC reference path: a second OutputStream pointed at the ReSpeaker
+    # USB playback device, fed the same TTS audio resampled to 16 kHz.
+    # The XMOS XVF3000 chip uses this as its echo-cancellation reference
+    # and subtracts it from the mic capture, so BB doesn't hear its own
+    # voice. Set to ``null`` to disable (BB will hear itself).
+    aec_reference_device: str | None = "ReSpeaker"
+    # If true (default), failure to open the AEC reference path is fatal
+    # at boot. Without AEC, BB transcribes its own TTS and feeds it back
+    # as fake user input — conversations derail every time. Refusing to
+    # start is far better than silently degrading. Set to false only on
+    # hardware where you know AEC is handled elsewhere (e.g. an external
+    # echo canceller, or a dev box without a ReSpeaker).
+    aec_required: bool = True
+    # AEC device-discovery retry: USB enumeration on cold boot is
+    # occasionally slow enough that the ReSpeaker isn't in PortAudio's
+    # device list on the first query. Retry a few times with a small
+    # delay before giving up.
+    aec_discovery_retries: int = 5
+    aec_discovery_retry_delay: float = 0.2
 
 
 class HardwareConfig(BaseModel):
@@ -288,16 +309,6 @@ class TurnDetectionConfig(BaseModel):
     silence_threshold: int = 800  # ms before finalizing utterance
     max_utterance_duration: int = 60  # seconds hard cap
     inter_utterance_gap: int = 300  # ms between utterances
-
-
-class BargeInConfig(BaseModel):
-    """Barge-in (interruption) settings during TTS playback."""
-
-    enabled: bool = True
-    ignore_duration: int = 200  # ms
-    fade_duration: int = 200  # ms
-    confirm_duration: int = 400  # ms total
-    fade_volume: float = 0.5
 
 
 class DiarizationConfig(BaseModel):
@@ -344,7 +355,6 @@ class VoiceConfig(BaseModel):
     wake_word: WakeWordConfig = Field(default_factory=WakeWordConfig)
     vad: VADConfig = Field(default_factory=VADConfig)
     turn_detection: TurnDetectionConfig = Field(default_factory=TurnDetectionConfig)
-    barge_in: BargeInConfig = Field(default_factory=BargeInConfig)
     diarization: DiarizationConfig = Field(default_factory=DiarizationConfig)
     stt: STTConfig = Field(default_factory=STTConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
@@ -355,6 +365,17 @@ class PerceptionConfig(BaseModel):
     """Perception pipeline thresholds and settings."""
 
     motion_threshold: float = 12.0
+    # YOLOv5s-personface confidence threshold for person detections.
+    # Empirically the model returns ~0.20 for a desk-mounted camera
+    # showing torso + face only (typical "BB sat on a desk" view), so
+    # the default has to be quite low. Confirmed on hardware:
+    # confidence=0.204 covering ~the full frame for the user at desk
+    # distance, repeated across captures. 0.15 leaves enough margin
+    # below that to catch the signal reliably without dipping into
+    # the noise floor we saw in idle frames (no detections at all,
+    # not low-confidence background hits). Tighter thresholds make
+    # sense for floor-mounted units that see full bodies.
+    person_confidence_threshold: float = 0.15
     reid_high_threshold: float = 0.85
     reid_low_threshold: float = 0.60
     speaker_threshold: float = 0.75
@@ -397,7 +418,7 @@ class PhotoBackupConfig(BaseModel):
 class PhotosConfig(BaseModel):
     """Photo system settings."""
 
-    storage_path: str = "data/photos"
+    storage_path: str = str(PHOTOS_DIR)
     max_storage_percent: int = 50
     max_image_resolution: list[int] = Field(
         default_factory=lambda: [1920, 1080]
@@ -414,9 +435,25 @@ class PhotosConfig(BaseModel):
 
 
 class SandboxConfig(BaseModel):
-    """Sandbox execution settings."""
+    """Sandbox execution settings.
 
-    venv_path: str = "data/sandbox/venv"
+    Sandbox state lives under ``runtime_dir`` — outside the project tree
+    on purpose. Putting it under ``/var/lib`` (or a similar system path)
+    means:
+
+    - The boxbot-sandbox system user doesn't need traverse permission on
+      the operator's home directory just to reach the venv.
+    - The repository can be cloned anywhere by anyone (this is an
+      open-source project) without baking install-specific paths into
+      the codebase.
+
+    Override ``runtime_dir`` in ``config.yaml`` to use a different
+    location (e.g. ``/opt/boxbot-sandbox`` on systems where ``/var/lib``
+    is locked down). Setup script ``scripts/setup-sandbox.sh`` reads the
+    same default and creates the directory tree.
+    """
+
+    runtime_dir: str = "/var/lib/boxbot-sandbox"
     user: str = "boxbot-sandbox"
     timeout: int = 30
     memory_limit_mb: int = 256
@@ -425,6 +462,22 @@ class SandboxConfig(BaseModel):
     install_approval_channels: list[str] = Field(
         default_factory=lambda: ["display", "whatsapp"]
     )
+
+    @property
+    def venv_path(self) -> str:
+        return f"{self.runtime_dir.rstrip('/')}/venv"
+
+    @property
+    def scripts_dir(self) -> str:
+        return f"{self.runtime_dir.rstrip('/')}/scripts"
+
+    @property
+    def output_dir(self) -> str:
+        return f"{self.runtime_dir.rstrip('/')}/output"
+
+    @property
+    def tmp_dir(self) -> str:
+        return f"{self.runtime_dir.rstrip('/')}/tmp"
 
 
 class SDKConfig(BaseModel):

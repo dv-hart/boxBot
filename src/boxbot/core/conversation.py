@@ -12,11 +12,21 @@ conversation state lives here, keyed by conversation id.
 
 Rules
 -----
-- One generation runs at a time per conversation. New user input while
-  a generation is in flight cancels that generation and starts a new
-  one whose thread contains the new input. Tool results and TTS audio
-  already delivered are recorded so the model sees them on the next
-  turn.
+- One generation runs at a time per conversation.
+- New user input during ``THINKING`` cancels the in-flight generation
+  and starts a fresh one whose thread contains the new input. Any TTS
+  segments the cancelled cycle had already delivered are folded into
+  the thread as an interrupted assistant turn so the next cycle sees
+  what the user actually heard.
+- New user input during ``SPEAKING`` is queued, not cancelled. With
+  wake-word-gated barge-in the only way for a user to interrupt TTS
+  is the wake word itself (which calls ``interrupt()``). Transcripts
+  that arrive while BB is speaking are treated as overheard utterances
+  and presented to the agent on its next turn — the agent decides
+  whether they were directed at it or were background chatter.
+- After a generation completes cleanly, any queued inputs are drained
+  into the thread and a fresh generation runs; only when the queue is
+  empty does the conversation settle in ``LISTENING``.
 - Conversations across channels are independent. The room's voice
   conversation and a WhatsApp conversation with Carina run fully in
   parallel — each has its own generation task.
@@ -45,6 +55,14 @@ from boxbot.core.events import (
     ConversationStarted,
     get_event_bus,
 )
+
+# Forward-declared for type hints only; the agent attaches one of these
+# after constructing the Conversation. Keeping the import lazy avoids
+# pulling the tools package from core during static analysis.
+from typing import TYPE_CHECKING  # noqa: E402
+
+if TYPE_CHECKING:
+    from boxbot.tools.sandbox_runner import SandboxRunner
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +185,12 @@ class Conversation:
         # runs. On cancel, the conversation reads this so it can fold
         # interrupted output into the thread before regenerating.
         self._pending_segments: list[SpokenSegment] = []
+        # User messages received while the conversation was SPEAKING.
+        # Drained into the thread when TTS completes so the agent sees
+        # them on its next turn. With wake-word-gated barge-in, this is
+        # how overheard utterances reach the model without forcing a
+        # mid-TTS cancel-and-restart.
+        self._pending_inputs: list[dict[str, Any]] = []
         self._current_turn_started: float = 0.0
 
         # Per-conversation lock: serialises handle_input / end so input
@@ -179,6 +203,13 @@ class Conversation:
         self._last_activity_monotonic: float = time.monotonic()
 
         self._closed = False
+
+        # Per-conversation sandbox process. Attached by the agent after
+        # construction (the agent has the config it needs to spawn one).
+        # ``execute_script`` reads this via the current_conversation
+        # ContextVar to route its scripts through. Stays alive across
+        # turns so Python state (last_image, parsed CSVs) persists.
+        self.sandbox_runner: "SandboxRunner | None" = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -226,14 +257,22 @@ class Conversation:
         source: str = "user",
         context: dict[str, Any] | None = None,
     ) -> None:
-        """Accept new input and (re)drive the generation cycle.
+        """Accept new input and drive (or queue against) the generation cycle.
 
-        - Appends the user message to the thread.
-        - If a generation is in flight, cancels it. Any partial output
-          the generator recorded in ``pending_segments`` is folded into
-          the thread as a synthetic assistant turn marked interrupted
-          so the model sees what was actually delivered.
-        - Starts a fresh generation task.
+        Behaviour depends on the current state:
+
+        - ``IDLE`` / ``LISTENING`` — append the message to the thread
+          and start a fresh generation.
+        - ``THINKING`` — cancel the in-flight generation, fold any
+          partial output into the thread, then append this message and
+          restart. The model sees both the interrupted assistant turn
+          AND the fresh user message in a single cycle, so "oh and..."
+          continuations work naturally.
+        - ``SPEAKING`` — queue the message in ``_pending_inputs``. The
+          generator finishes its TTS uninterrupted; once it returns,
+          the queued messages are drained into the thread and a fresh
+          generation runs. The agent decides whether overheard
+          utterances were directed at it or were background chatter.
 
         Args:
             text: The incoming message text. Must be non-empty after
@@ -266,17 +305,33 @@ class Conversation:
             if speaker_name:
                 self.participants.add(speaker_name)
 
-            # Cancel any in-flight generation. We fold its partial
-            # output into the thread before adding the new user input
-            # so the regenerated turn sees BOTH: the interrupted
+            user_message = self._format_user_message(
+                cleaned, speaker_name=speaker_name, source=source,
+            )
+
+            # SPEAKING: queue without cancelling. The generator will
+            # drain pending inputs after TTS completes.
+            if self._state is ConversationState.SPEAKING:
+                self._pending_inputs.append(user_message)
+                self._reset_silence_timer()
+                self._last_activity_monotonic = time.monotonic()
+                logger.info(
+                    "Conversation %s: queued input during SPEAKING "
+                    "(pending=%d): %s",
+                    self.conversation_id,
+                    len(self._pending_inputs),
+                    cleaned[:60],
+                )
+                return
+
+            # THINKING: cancel the in-flight generation. We fold its
+            # partial output into the thread before adding the new user
+            # input so the regenerated turn sees BOTH: the interrupted
             # assistant output AND the fresh user message.
             if self.is_generating:
                 await self._cancel_and_fold()
 
             # Append new user input to thread.
-            user_message = self._format_user_message(
-                cleaned, speaker_name=speaker_name, source=source,
-            )
             self._thread.append(user_message)
 
             # First input: the conversation becomes active and publishes
@@ -302,6 +357,40 @@ class Conversation:
                 name=f"gen-{self.conversation_id}",
             )
 
+    async def interrupt(self) -> None:
+        """Cancel the in-flight generation and clear queued inputs.
+
+        Called by the wake-word handler when the user re-engages while
+        BB is mid-TTS. Folds any partial spoken output into the thread
+        as an interrupted assistant turn, drops any pending queued
+        utterances (the user's wake word means "forget those, listen
+        to me now"), and transitions to LISTENING so the next utterance
+        starts a fresh generation through the normal handle_input path.
+
+        No-op if the conversation is ENDED or there is no in-flight
+        generation.
+        """
+        async with self._lock:
+            if self._state is ConversationState.ENDED:
+                return
+            if not self.is_generating and not self._pending_inputs:
+                return
+
+            if self.is_generating:
+                await self._cancel_and_fold()
+
+            if self._pending_inputs:
+                logger.info(
+                    "Conversation %s: dropping %d queued input(s) on interrupt",
+                    self.conversation_id,
+                    len(self._pending_inputs),
+                )
+                self._pending_inputs = []
+
+            self._state = ConversationState.LISTENING
+            self._reset_silence_timer()
+            self._last_activity_monotonic = time.monotonic()
+
     # ------------------------------------------------------------------
     # Public API — lifecycle
     # ------------------------------------------------------------------
@@ -325,6 +414,8 @@ class Conversation:
 
             if self.is_generating:
                 await self._cancel_and_fold()
+            # Drop any queued utterances — the conversation is over.
+            self._pending_inputs = []
 
             # Don't cancel the silence timer if we ARE the silence
             # timer — self-cancel would abort the publish_ended below.
@@ -382,49 +473,80 @@ class Conversation:
     # ------------------------------------------------------------------
 
     async def _run_generation(self) -> GenerationResult:
-        """Drive one generate_fn call to completion (or cancellation).
+        """Drive generate_fn to completion, draining queued inputs as needed.
 
-        Returns a GenerationResult summarising the cycle. On successful
-        completion, applies thread_additions to the conversation thread
-        and transitions back to LISTENING. On cancellation, the caller
-        (_cancel_and_fold) handles partial state.
+        Loops until the conversation has nothing left to react to: each
+        ``generate_fn`` call runs one turn; if utterances were queued
+        during SPEAKING (see ``handle_input``), they are appended to
+        the thread and another turn runs. Only when the queue is empty
+        does the conversation settle in ``LISTENING`` and the task
+        return. On cancellation (``handle_input`` during THINKING, or
+        ``interrupt()``), ``_cancel_and_fold`` handles partial state.
         """
-        try:
-            result = await self._generate_fn(self)
-        except asyncio.CancelledError:
-            logger.info(
-                "Conversation %s: generation cancelled after %.2fs",
-                self.conversation_id,
-                time.monotonic() - self._current_turn_started,
-            )
-            raise
-        except Exception:
-            logger.exception(
-                "Conversation %s: generation raised — ending turn",
-                self.conversation_id,
-            )
-            # A broken cycle shouldn't wedge the conversation; flip
-            # back to LISTENING so the next input can try again.
-            if self._state is not ConversationState.ENDED:
-                self._state = ConversationState.LISTENING
+        last_result = GenerationResult(completed_cleanly=False)
+        while True:
+            try:
+                result = await self._generate_fn(self)
+            except asyncio.CancelledError:
+                logger.info(
+                    "Conversation %s: generation cancelled after %.2fs",
+                    self.conversation_id,
+                    time.monotonic() - self._current_turn_started,
+                )
+                raise
+            except Exception:
+                logger.exception(
+                    "Conversation %s: generation raised — ending turn",
+                    self.conversation_id,
+                )
+                # A broken cycle shouldn't wedge the conversation; flip
+                # back to LISTENING so the next input can try again.
+                if self._state is not ConversationState.ENDED:
+                    self._state = ConversationState.LISTENING
+                self._pending_segments = []
+                return GenerationResult(completed_cleanly=False)
+
+            # Normal completion: apply additions and decide whether to
+            # loop (queued inputs) or settle (LISTENING).
+            self._thread.extend(result.thread_additions)
             self._pending_segments = []
-            return GenerationResult(completed_cleanly=False)
+            last_result = result
 
-        # Normal completion: extend the thread and mark ready for the
-        # next input.
-        self._thread.extend(result.thread_additions)
-        self._pending_segments = []
-        if self._state is not ConversationState.ENDED:
-            self._state = ConversationState.LISTENING
+            if self._state is ConversationState.ENDED:
+                return result
 
-        logger.info(
-            "Conversation %s: turn complete (%d additions, %.2fs, state=%s)",
-            self.conversation_id,
-            len(result.thread_additions),
-            time.monotonic() - self._current_turn_started,
-            self._state.value,
-        )
-        return result
+            async with self._lock:
+                if not self._pending_inputs:
+                    self._state = ConversationState.LISTENING
+                    logger.info(
+                        "Conversation %s: turn complete "
+                        "(%d additions, %.2fs, state=%s)",
+                        self.conversation_id,
+                        len(result.thread_additions),
+                        time.monotonic() - self._current_turn_started,
+                        self._state.value,
+                    )
+                    return result
+
+                # Drain queued utterances and run another turn so the
+                # agent gets to respond to (or stay silent about) what
+                # was overheard during SPEAKING.
+                drained = self._pending_inputs
+                self._pending_inputs = []
+                self._thread.extend(drained)
+                self._state = ConversationState.THINKING
+                self._current_turn_started = time.monotonic()
+                logger.info(
+                    "Conversation %s: turn complete, draining %d queued "
+                    "input(s) (%d additions, %.2fs)",
+                    self.conversation_id,
+                    len(drained),
+                    len(result.thread_additions),
+                    time.monotonic() - self._current_turn_started,
+                )
+            # loop: next iteration runs generate_fn again
+        # unreachable
+        return last_result
 
     async def _cancel_and_fold(self) -> None:
         """Cancel the in-flight generation and fold partials into the thread.

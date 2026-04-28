@@ -241,74 +241,39 @@ Backchannels are brief and stop. Interruptions persist. A "yeah" lasts
 200-300ms. "Actually, the doctor called to cancel" continues for
 seconds.
 
-### Graduated Yielding Model
+### Wake-Word-Gated Interruption
 
-The system responds to potential interruption in stages, like a human
-yielding the floor:
+While BB is speaking, the STT/diarization consumer is **detached** from
+the microphone — chatter, residual echo from BB's own voice, and any
+other ambient sound cannot reach the transcript pipeline. The wake
+word is the only path back to a hot mic. This is the v2 model after
+the graduated VAD-based three-stage yielding was retired (see commit
+history): it nullifies the household-chatter problem and removes the
+fragility of AEC-aligned barge-in detection. The trade-off is that
+you cannot cut BB off mid-sentence with raw speech — you say the wake
+word.
 
-```
-BB is speaking (TTS playback active)
-  │
-  Speech detected in mic input
-  (XMOS AEC has subtracted BB's own voice — this is external speech)
-  (Silero VAD confirms it's speech, not residual noise)
-  │
-  ├── 0 to barge_in_ignore (default 200ms):
-  │     BB continues at full volume
-  │     Filters: coughs, phone buzz, chair creak, brief sounds
-  │
-  ├── barge_in_ignore to barge_in_confirm (default 200-400ms):
-  │     BB fades volume to ~50%
-  │     Visual signal: "I hear you, I'm yielding"
-  │     If speech stops → BB resumes full volume (was a backchannel)
-  │
-  ├── After barge_in_confirm (default 400ms+):
-  │     BB stops speaking completely
-  │     System switches to capturing the interrupting speech
-  │     Interrupting speech processed normally (accumulate → STT → agent)
-  │
-  └── Speech stops before barge_in_ignore:
-        BB doesn't react at all (was just noise)
-```
+### After a Wake-Word Interrupt
 
-### Why Volume Fading Matters
+1. The wake-word handler stops TTS playback and publishes
+   `AgentSpeakingDone(interrupted=True)`.
+2. The agent translates that into `Conversation.interrupt()`, which
+   cancels the in-flight generation, folds any partial spoken
+   segments into the thread as an interrupted assistant turn, and
+   drops any utterances that had been queued during SPEAKING (the
+   user has explicitly taken back the floor — overheard chatter is
+   irrelevant to what they are about to say).
+3. The conversation transitions to LISTENING; the next utterance the
+   user speaks runs through the normal `handle_input` path.
 
-When someone starts talking over you, you don't instantly go silent —
-you trail off. If they were just saying "mm-hmm," you pick back up.
-If they persist, you fully yield. This feels natural because it IS how
-humans handle interruption.
+### After Natural TTS Completion
 
-The volume fade at the mid-stage serves as acknowledgment: "I hear you
-and I'm ready to yield if you have something to say." This is a
-deliberate UX choice — it feels responsive without being twitchy.
-
-### After Barge-In
-
-1. BB's current TTS playback stops
-2. The interrupting speech is captured through the normal pipeline
-   (accumulate → silence threshold → diarize + STT)
-3. The agent receives the interruption as a continuation of the
-   conversation: `[Jacob]: Actually, the doctor called to cancel.`
-4. The agent still knows what it was saying (it generated the
-   response), so it can adapt: "Oh, got it. I'll remove the dentist
-   reminder then."
-5. The agent's previous un-spoken text is discarded
-
-### Configuration
-
-```yaml
-voice:
-  barge_in:
-    enabled: true
-    ignore_duration: 200        # ms — ignore speech shorter than this
-    fade_duration: 200          # ms — duration of volume fade stage
-    confirm_duration: 400       # ms — total speech duration to confirm interruption
-    fade_volume: 0.5            # volume level during fade (0.0-1.0)
-```
-
-The `confirm_duration` is the total time from first detected speech to
-full stop. `ignore_duration` + `fade_duration` should not exceed
-`confirm_duration`.
+1. The voice layer publishes `AgentSpeakingDone(interrupted=False)`.
+2. STT is re-attached to the mic so the user can continue without
+   re-saying the wake word.
+3. `_run_generation` either drains anything queued during SPEAKING
+   (overheard utterances the agent should now consider) or settles
+   in LISTENING.
 
 ### XMOS AEC: Why Barge-In Works at All
 
@@ -320,6 +285,79 @@ time. What remains is only external speech.
 This is why we selected a mic array with a dedicated DSP chip rather
 than a simple USB microphone. Barge-in detection with a single mic and
 no AEC would require the speaker to shout over BB — terrible UX.
+
+### AEC Reference Delay Calibration
+
+The XMOS chip can only cancel BB's voice if the reference signal it
+receives (over USB) is **time-aligned** with the speaker output it
+hears coming back through the mics. On the boxBot reference hardware,
+the HDMI playback path has a much deeper buffer than the USB AEC
+reference path, so the XMOS sees the reference tens of milliseconds
+before it actually hears BB. The adaptive filter struggles or fails
+under that misalignment, and BB's own speech bleeds back in as
+phantom user turns.
+
+To fix this, run the calibration script once after any audio-stack
+change (new speaker, ALSA tuning, USB re-plug):
+
+```bash
+python3 scripts/calibrate_aec.py
+```
+
+The script:
+
+1. Opens the speaker with the AEC reference path **disabled** so XMOS
+   doesn't try to subtract anything.
+2. Plays a 1.5 s linear chirp (200 Hz → 6 kHz) through HDMI.
+3. Captures the chirp via the ReSpeaker mic array.
+4. Cross-correlates capture against the known chirp to measure the
+   HDMI playback latency.
+5. Writes the measured offset to
+   ``data/calibration/aec_delay_samples.json``.
+
+On the next boxbot start, ``Speaker._open_aec_reference_stream``
+reads the file and prepends that many samples of silence to every
+chunk it pushes onto the AEC reference queue. Net effect: the XMOS
+chip receives the reference signal at the same wall-clock instant
+the mics capture the speaker's output, so its adaptive filter has
+something it can actually subtract.
+
+Use ``--dry-run`` to measure without persisting, ``--verbose`` for
+debug output, ``--volume`` to scale the chirp amplitude.
+
+### Wake-word-gated STT
+
+Empirically AEC alignment alone is not enough. The XMOS adaptive
+filter is cold-start at the top of every reply (no reference signal =
+no learning), so the first ~1–2 s of TTS leaks past AEC and BB
+transcribes its own voice. Separately, household chatter during BB's
+reply is itself a problem: kids talking over BB get cleanly captured
+and treated as user turns. Timing knobs cannot fix either.
+
+Wake-word-gated STT solves both at once:
+
+1. When ``AgentSpeaking`` fires, the audio_capture consumer
+   (STT/diarization) is **detached** from the microphone. The
+   wake-word consumer stays attached.
+2. While BB is speaking, no mic audio reaches STT. Chatter, residual
+   echo, sneezes, anything: not transcribed. To cut BB off
+   mid-sentence the user says the wake word again, which stops TTS
+   and re-attaches STT.
+3. When TTS completes naturally, STT is re-attached automatically
+   so the user can continue the conversation without re-saying the
+   wake word.
+
+Trade-off: you cannot cut BB off mid-sentence with raw speech — only
+with the wake word. In practice this matches how households actually
+interrupt ("BB, stop"). It also nullifies the chatter problem
+completely.
+
+Implementation: see ``VoiceSession.speak()`` and
+``VoiceSession._on_wake_word`` in
+``src/boxbot/communication/voice.py``. Conversation-side handling
+of overheard utterances queued during SPEAKING and partial-fold on
+interrupt lives in ``Conversation.handle_input`` and
+``Conversation.interrupt`` in ``src/boxbot/core/conversation.py``.
 
 ## Speaker Diarization and Attribution
 
@@ -742,13 +780,10 @@ voice:
     max_utterance_duration: 60   # seconds — hard cap
     inter_utterance_gap: 300     # ms — minimum between utterances
 
-  # Barge-in
-  barge_in:
-    enabled: true
-    ignore_duration: 200         # ms — ignore speech shorter than this
-    fade_duration: 200           # ms — volume fade stage
-    confirm_duration: 400        # ms — total to confirm interruption
-    fade_volume: 0.5             # volume during fade (0.0-1.0)
+  # Interruption is wake-word-only — STT detaches while BB speaks; the
+  # wake word is the only path back to a hot mic mid-reply. STT
+  # automatically re-attaches on natural TTS completion so the user
+  # can continue without re-saying the wake word.
 
   # Speaker diarization
   diarization:
@@ -795,12 +830,11 @@ voice:
 
 ```
 src/boxbot/communication/
-  voice.py          # Session state machine, orchestrates pipeline
+  voice.py          # Voice adapter, orchestrates pipeline
   wake_word.py      # OpenWakeWord integration
   vad.py            # Silero VAD wrapper
   stt.py            # STT provider interface + ElevenLabs Scribe
   tts.py            # TTS provider interface + ElevenLabs
-  barge_in.py       # Graduated yielding monitor
   audio_capture.py  # ReSpeaker audio stream management
   diarization.py    # pyannote integration (shared with perception)
 ```

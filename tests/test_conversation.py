@@ -180,16 +180,17 @@ async def test_new_input_cancels_in_flight_generation():
 
 
 @pytest.mark.asyncio
-async def test_interrupted_partial_tts_is_folded_into_thread():
-    """If TTS had started playing before the interruption, the partial
-    audio must be recorded as an interrupted assistant turn so the next
-    generation sees what the user actually heard."""
+async def test_thinking_interrupt_folds_partial_into_thread():
+    """A new utterance during THINKING (before any TTS has started)
+    cancels the in-flight generation and folds whatever segments the
+    generator had recorded into the thread as an interrupted assistant
+    turn so the next cycle sees what the user actually heard."""
     started = asyncio.Event()
 
     async def gen(conv):
         if conv.thread[-1]["content"].endswith("first"):
-            # Simulate speaking part of a reply, then stalling.
-            conv.set_state(ConversationState.SPEAKING)
+            # Stay in THINKING but record a segment to simulate work
+            # already done in the partial-delivery sense.
             conv.record_segment(SpokenSegment(
                 channel="voice", to="room",
                 content="I was about to say something long",
@@ -213,6 +214,123 @@ async def test_interrupted_partial_tts_is_folded_into_thread():
     assert roles == ["user", "assistant", "user", "assistant"]
     assert "about to say something long" in conv.thread[1]["content"]
     assert "interrupted" in conv.thread[1]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_speaking_state_queues_input_without_cancelling():
+    """During SPEAKING, a new utterance is queued — not cancelled.
+    The generator finishes its TTS uninterrupted; once it returns,
+    the queued message is drained into the thread and a fresh
+    generation runs."""
+    speaking = asyncio.Event()
+    speak_release = asyncio.Event()
+    gen_calls = 0
+
+    async def gen(conv):
+        nonlocal gen_calls
+        gen_calls += 1
+        # First turn: simulate speaking, then wait for release.
+        if conv.thread[-1]["content"].endswith("first"):
+            conv.set_state(ConversationState.SPEAKING)
+            conv.record_segment(SpokenSegment(
+                channel="voice", to="room",
+                content="here is the answer to your first question",
+            ))
+            speaking.set()
+            await speak_release.wait()
+            return GenerationResult(
+                thread_additions=[
+                    {"role": "assistant", "content": "first response"},
+                ],
+            )
+        # Second turn (drained pending): respond to whatever piled up.
+        return GenerationResult(
+            thread_additions=[
+                {"role": "assistant", "content": "ack overheard"},
+            ],
+        )
+
+    conv = _make_conv(gen, silence_timeout=0)
+    await conv.handle_input("first", speaker_name="Jacob")
+    await asyncio.wait_for(speaking.wait(), timeout=1.0)
+    assert conv.state is ConversationState.SPEAKING
+
+    # Queue a stray utterance during SPEAKING. It must NOT cancel.
+    await conv.handle_input("ben 10 alien watch", speaker_name="Kid")
+    assert conv.state is ConversationState.SPEAKING
+    assert conv.is_generating is True
+    # Thread still only has the original "first" — overhead is queued.
+    assert len(conv.thread) == 1
+
+    # Let TTS complete.
+    speak_release.set()
+    await conv._generation_task  # type: ignore[arg-type]
+
+    assert conv.state is ConversationState.LISTENING
+    assert gen_calls == 2  # original + drain pass
+    roles = [m["role"] for m in conv.thread]
+    assert roles == ["user", "assistant", "user", "assistant"]
+    assert conv.thread[0]["content"].endswith("first")
+    assert conv.thread[1]["content"] == "first response"
+    assert "ben 10" in conv.thread[2]["content"]
+    assert conv.thread[3]["content"] == "ack overheard"
+
+
+@pytest.mark.asyncio
+async def test_wake_word_interrupt_folds_partial_and_drops_queue():
+    """``conv.interrupt()`` (the wake-word path) cancels the in-flight
+    generation, folds any partial spoken segments into the thread as an
+    interrupted assistant turn, and drops any utterances that had been
+    queued during SPEAKING. The user has explicitly taken back the
+    floor — overheard chatter from before the interrupt is irrelevant."""
+    speaking = asyncio.Event()
+
+    async def gen(conv):
+        conv.set_state(ConversationState.SPEAKING)
+        conv.record_segment(SpokenSegment(
+            channel="voice", to="room",
+            content="I was about to tell you about the weather",
+        ))
+        speaking.set()
+        await asyncio.sleep(10)  # interrupt() will cancel this
+        return GenerationResult()
+
+    conv = _make_conv(gen, silence_timeout=0)
+    await conv.handle_input("first", speaker_name="Jacob")
+    await asyncio.wait_for(speaking.wait(), timeout=1.0)
+
+    # Background utterance queues during SPEAKING.
+    await conv.handle_input("kid babble", speaker_name="Kid")
+
+    # Wake word fires → interrupt().
+    await conv.interrupt()
+
+    assert conv.state is ConversationState.LISTENING
+    assert conv.is_generating is False
+
+    roles = [m["role"] for m in conv.thread]
+    # Expect: user(first), assistant(interrupted partial). The queued
+    # "kid babble" was dropped; no draining.
+    assert roles == ["user", "assistant"]
+    assert "weather" in conv.thread[1]["content"]
+    assert "interrupted" in conv.thread[1]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_is_noop_when_idle():
+    """interrupt() with no in-flight generation and no queue must
+    be a clean no-op — must not change state or publish events."""
+    async def gen(_conv):
+        return GenerationResult(
+            thread_additions=[{"role": "assistant", "content": "x"}],
+        )
+    conv = _make_conv(gen, silence_timeout=0)
+    await conv.handle_input("hi")
+    await conv._generation_task  # type: ignore[arg-type]
+    assert conv.state is ConversationState.LISTENING
+
+    await conv.interrupt()
+    assert conv.state is ConversationState.LISTENING
 
 
 @pytest.mark.asyncio

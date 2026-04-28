@@ -38,10 +38,12 @@ the full registration flow.
 ## Files
 
 ### `voice.py`
-Session state machine and pipeline orchestrator. Manages the
-conversation lifecycle: IDLE → SESSION ACTIVE → SESSION SUSPENDED →
-SESSION ENDED. Coordinates wake word, VAD, STT, TTS, diarization,
-and barge-in monitoring.
+Voice adapter and pipeline orchestrator. Coordinates wake word, VAD,
+STT, TTS, and diarization. The conversation state machine itself
+lives in `boxbot.core.conversation`; voice is now a thin I/O layer
+that produces transcripts and speaks the agent's outputs. Mid-reply
+interruption is wake-word-gated: STT detaches while BB is speaking
+and the wake word is the only path back.
 
 See [docs/voice-pipeline.md](../../../docs/voice-pipeline.md) for the
 full design.
@@ -66,12 +68,6 @@ AssemblyAI) implement the same `STTProvider` protocol.
 TTS provider interface and ElevenLabs implementation. Supports
 streaming playback — BB starts speaking before the full agent
 response is generated. Manages audio output to the speaker via HAL.
-
-### `barge_in.py`
-Graduated yielding monitor. Runs during TTS playback to detect
-interruption. Three-stage response: ignore (<200ms) → fade volume
-(200-400ms) → full stop (>400ms). Uses AEC-cleaned audio from XMOS
-to isolate external speech from BB's own output.
 
 ### `audio_capture.py`
 ReSpeaker audio stream management. Handles the raw audio interface

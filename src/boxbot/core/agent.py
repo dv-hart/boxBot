@@ -13,13 +13,20 @@ is a hardware-facing ambient assistant with bespoke tools (``switch_display``,
 
 Key design points for this file:
 
-1. **Structured output gate** — every ``messages.create`` call passes
-   ``output_config={"format": {"type": "json_schema", "schema": DECIDE_SCHEMA}}``.
-   The model's final ``end_turn`` text is constrained to a JSON decision
-   object: ``respond`` (bool), ``response_text`` (what to say), ``reason``,
-   ``addressed_to``, ``urgency``, ``silent_context_note``. When
-   ``respond=false`` we stay silent and log the observation; when true we
-   route ``response_text`` directly to the voice session's TTS path.
+1. **Private-by-design text output** — every ``messages.create`` call
+   passes ``output_config={"format": {"type": "json_schema", "schema":
+   INTERNAL_NOTES_SCHEMA}}``. The model's text output is constrained to
+   a private JSON shape: ``thought`` (private reasoning) + optional
+   ``observations`` (ambient facts). By construction nothing in the
+   text reaches a person — it is a labelled scratchpad consumed by
+   logging and post-conversation memory extraction.
+
+   To reach a person, the agent calls the ``message`` tool
+   (``{to, channel, content}``). Multiple calls per turn are allowed
+   and expected: filler-then-tool, voice-to-room plus text-to-spouse,
+   etc. This avoids the "constrained-JSON ends the turn" trap, where a
+   filler dispatched as JSON outputs would terminate the response
+   before any tool ran.
 
 2. **Prompt caching** — system prompt is a list of text blocks. The static
    block (persona + etiquette + capabilities + skills index) carries a 1h
@@ -50,8 +57,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -64,6 +73,8 @@ from boxbot.core.conversation import (
     SpokenSegment,
 )
 from boxbot.core.events import (
+    AgentSpeaking,
+    AgentSpeakingDone,
     ConversationEnded,
     PersonIdentified,
     SpeakerIdentified,
@@ -74,15 +85,16 @@ from boxbot.core.events import (
     get_event_bus,
 )
 from boxbot.core.output_dispatcher import (
-    OUTPUT_SCHEMA,
-    dispatch_outputs,
-    parse_output_block,
+    INTERNAL_NOTES_SCHEMA,
+    parse_internal_notes,
 )
 from boxbot.core.scheduler import get_status_line
 from boxbot.memory.extraction import extract_memories, process_extraction_result
 from boxbot.memory.retrieval import inject_memories
 from boxbot.memory.store import MemoryStore
-from boxbot.tools.registry import get_tool, get_tools
+# Imported lazily inside _dispatch_tools / _process_tool_calls to avoid a
+# circular import: registry → builtins.execute_script → core.config →
+# core/__init__ → core.agent → (back here).
 
 logger = logging.getLogger(__name__)
 
@@ -196,61 +208,65 @@ def _prompt_persona(name: str, wake_word: str) -> str:
 
 
 def _prompt_etiquette() -> str:
-    """Return the multi-speaker + output-structure section.
+    """Return the multi-speaker + delivery-mechanics section.
 
-    Every turn the agent emits JSON of shape:
-      {"thought": "...", "outputs": [{"to", "channel", "content"}, ...]}
-
-    Zero outputs = silent turn. One or more outputs = one or more deliveries,
-    each explicit about recipient + medium.
+    The big idea: the model's text output is PRIVATE (internal notes
+    only). To reach a person, the model must call ``message``.
+    Multiple calls per turn are allowed and expected.
     """
     return (
-        "## Every response is structured output\n"
+        "## Your text output never reaches a person\n"
         "\n"
-        "Every time you respond you emit JSON of this shape:\n"
+        "Every time you respond, your text output is constrained to a private\n"
+        "JSON note shape:\n"
         "\n"
         "    {\n"
         "      \"thought\": \"private reasoning for this turn\",\n"
-        "      \"outputs\": [\n"
-        "        {\"to\": \"<recipient>\", \"channel\": \"voice\"|\"text\", \"content\": \"...\"}\n"
-        "      ]\n"
+        "      \"observations\": [\"things you noticed but didn't act on\", ...]\n"
         "    }\n"
         "\n"
-        "- `thought` is PRIVATE. Never broadcast. Used for your own reasoning\n"
-        "  and for post-conversation memory extraction. Keep it short.\n"
-        "- `outputs` is a LIST. Empty list = silent turn (you noticed but chose\n"
-        "  not to respond). One entry = one delivery. Multiple entries =\n"
-        "  multiple deliveries in a single turn (e.g. reply to the current\n"
-        "  speaker AND text someone else).\n"
-        "- Each output explicitly names its recipient (`to`) and medium\n"
-        "  (`channel`). The system never guesses — your choice is final.\n"
+        "- `thought` is your scratchpad for this turn. Nobody sees it.\n"
+        "- `observations` collects ambient facts you noticed (mood, who's in\n"
+        "  the room, what people are doing, things mentioned in passing).\n"
+        "  Memory extraction reads this after the conversation. Optional.\n"
+        "- Both fields are PRIVATE. The user hears NOTHING from your text\n"
+        "  output. Saying \"Sure, here's the answer...\" in your text does not\n"
+        "  reach anyone.\n"
         "\n"
-        "## Recipient values (`to`)\n"
+        "## To reach a person, call message\n"
         "\n"
-        "- `\"current_speaker\"` — whoever just addressed you in this\n"
-        "  conversation. Resolves to their name at dispatch time.\n"
-        "- `\"room\"` — broadcast voice to anyone physically present.\n"
-        "  Valid only with `channel: \"voice\"`.\n"
-        "- Any registered user's name (e.g. `\"Sarah\"`) — the Registered users\n"
-        "  list in the dynamic context tells you who is reachable and how.\n"
+        "`message(to, channel, content)` is the ONLY way to actually\n"
+        "speak through the box speaker or send a WhatsApp message. Without a\n"
+        "call to it, the user gets silence — no matter what your text said.\n"
         "\n"
-        "## Channel values (`channel`)\n"
+        "Multiple calls per turn are normal and encouraged:\n"
+        "- Interim acknowledgement before a tool call (filler), AND\n"
+        "  the tool call itself, in the same response. Both run, you get\n"
+        "  the tool result, and you call message again with the\n"
+        "  final answer next turn.\n"
+        "- Voice to the room AND text to an absent user, in the same response.\n"
         "\n"
-        "- `\"voice\"` — speak through the box speaker (everyone in the room\n"
-        "  hears). Good for replies to people physically at the box and for\n"
-        "  announcements. Does not reach absent people.\n"
-        "- `\"text\"` — send a WhatsApp message to the named user's registered\n"
-        "  phone. Good for replies to text conversations, reaching absent\n"
-        "  household members, and async notifications. Requires `to` be a\n"
-        "  registered user by name.\n"
+        "Recipient (`to`):\n"
+        "- `\"current_speaker\"` — whoever just addressed you. Resolves at\n"
+        "  dispatch time.\n"
+        "- `\"room\"` — broadcast spoken audio to anyone physically present.\n"
+        "  Speak channel only.\n"
+        "- A registered user's name exactly as listed in the Registered users\n"
+        "  block of the dynamic context (e.g. `\"Sarah\"`).\n"
         "\n"
-        "## When to emit outputs vs stay silent\n"
+        "Channel:\n"
+        "- `\"speak\"` — speak through the box speaker. Everyone in the room\n"
+        "  hears. Does not reach absent people.\n"
+        "- `\"text\"` — WhatsApp message to the named user's phone. Requires\n"
+        "  `to` be a registered user by name. Cannot text \"room\" or unknowns.\n"
+        "\n"
+        "## When to deliver vs stay silent\n"
         "\n"
         "You hear every utterance in the room. Diarization labels each speaker\n"
         "(e.g. \"[Jacob]: ...\" or \"[Unknown_1]: ...\"). Speakers are labeled\n"
         "for you; never expose internal labels like SPEAKER_00 to the user.\n"
         "\n"
-        "Emit outputs when:\n"
+        "Call message when:\n"
         "- You are directly addressed (\"BB ...\", \"Jarvis ...\", direct question).\n"
         "- You have an urgent, useful message to deliver (timer fired, a\n"
         "  correction, a notification someone asked to receive).\n"
@@ -258,7 +274,7 @@ def _prompt_etiquette() -> str:
         "  (\"add that to my list\"), in which case you confirm it.\n"
         "- A trigger fires and you need to deliver whatever it was set up to do.\n"
         "\n"
-        "Stay silent (outputs: []) when:\n"
+        "Stay silent (do NOT call message) when:\n"
         "- People are talking to each other, not to you.\n"
         "- They are thinking out loud or processing.\n"
         "- You already answered and they are confirming among themselves.\n"
@@ -266,48 +282,67 @@ def _prompt_etiquette() -> str:
         "When silent, the transcript still records what was said — memory\n"
         "extraction runs after the conversation and can pick up ambient facts.\n"
         "You do not need to explicitly note things you overheard; the system\n"
-        "captures them. Use `thought` for private reasoning, not for notes\n"
-        "about the human conversation.\n"
+        "captures them. Use `thought` for private reasoning and `observations`\n"
+        "for things worth flagging to memory extraction.\n"
         "\n"
-        "When uncertain, prefer silence. When addressed by name, always emit.\n"
+        "When uncertain, prefer silence. When addressed by name, always deliver.\n"
+        "\n"
+        "## Noisy transcripts and overheard speech\n"
+        "\n"
+        "The transcript you see is best-effort. Things to expect:\n"
+        "- Speech-to-text occasionally produces garbled or nonsensical\n"
+        "  fragments when audio quality is low or someone speaks far from\n"
+        "  the box. Treat these as noise.\n"
+        "- More than one person may be in the room. You will see utterances\n"
+        "  from people who are talking to each other, to a child, to a pet,\n"
+        "  or to the TV — not to you.\n"
+        "- Utterances that arrived while you were speaking are queued and\n"
+        "  delivered to you on the next turn. They are particularly likely\n"
+        "  to be overheard, not addressed to you.\n"
+        "\n"
+        "When you have a clear active task and additional input arrives\n"
+        "that looks unrelated, garbled, or like background chatter, ignore\n"
+        "it and proceed with the original task. When the additional input\n"
+        "is a clear continuation or correction (\"oh, and also...\",\n"
+        "\"wait, make that tomorrow instead\"), incorporate it. The signal\n"
+        "is meaning, not volume — short fragments from kids' shows,\n"
+        "song lyrics, or half-heard side conversations should not change\n"
+        "your course of action. Continuations from the person who gave you\n"
+        "the task usually should.\n"
         "\n"
         "## Scenarios (memorise these patterns)\n"
         "\n"
         "- Someone at the box asks you a question you can answer immediately:\n"
-        "    {\"outputs\": [{\"to\":\"current_speaker\",\"channel\":\"voice\",\n"
-        "                   \"content\":\"...\"}]}\n"
+        "    message(to=\"current_speaker\", channel=\"speak\",\n"
+        "                     content=\"...\")\n"
         "\n"
         "- Someone texted you and you're replying:\n"
-        "    {\"outputs\": [{\"to\":\"current_speaker\",\"channel\":\"text\",\n"
-        "                   \"content\":\"...\"}]}\n"
+        "    message(to=\"current_speaker\", channel=\"text\",\n"
+        "                     content=\"...\")\n"
         "\n"
-        "- Someone at the box asks you to text their spouse:\n"
-        "    {\"outputs\": [\n"
-        "      {\"to\":\"current_speaker\",\"channel\":\"voice\",\"content\":\"Okay, texting Sarah now.\"},\n"
-        "      {\"to\":\"Sarah\",\"channel\":\"text\",\"content\":\"Jacob says he'll be late.\"}\n"
-        "    ]}\n"
+        "- Someone at the box asks you to text their spouse — TWO calls in the\n"
+        "  same response:\n"
+        "    message(to=\"current_speaker\", channel=\"speak\",\n"
+        "                     content=\"Okay, texting Sarah now.\")\n"
+        "    message(to=\"Sarah\", channel=\"text\",\n"
+        "                     content=\"Jacob says he'll be late.\")\n"
         "\n"
-        "- Someone texts you asking to be notified later. Set up a trigger via\n"
-        "  manage_tasks, confirm with them, then when the trigger fires, deliver\n"
-        "  whatever they asked for on the channel they originally used:\n"
-        "    turn 1: manage_tasks (person-trigger) tool call\n"
-        "    turn 2: {\"outputs\":[{\"to\":\"current_speaker\",\"channel\":\"text\",\n"
-        "                          \"content\":\"Will do.\"}]}\n"
-        "    later (trigger fires): {\"outputs\":[{\"to\":\"Sarah\",\"channel\":\"text\",\n"
-        "                                         \"content\":\"He's home.\"}]}\n"
+        "- You need a second to look something up — call message for\n"
+        "  the filler AND the lookup tool in the same response:\n"
+        "    message(to=\"current_speaker\", channel=\"speak\",\n"
+        "                     content=\"Sure thing, let me find that for you.\")\n"
+        "    execute_script(...)   # or web_search, search_memory, etc.\n"
+        "  Both fire. The tool result comes back next turn. You then call\n"
+        "  message once more with the actual answer. Do not repeat\n"
+        "  the filler in the final answer.\n"
         "\n"
-        "- You need a second to look something up mid-turn: emit an interim\n"
-        "  output BEFORE calling the tool, in the same response:\n"
-        "    content blocks: [{outputs: [{\"to\":\"current_speaker\",\n"
-        "                                 \"channel\":\"voice\",\n"
-        "                                 \"content\":\"One moment.\"}]},\n"
-        "                      tool_use(web_search, ...)]\n"
-        "  Then on the next turn, emit the final answer in a normal outputs\n"
-        "  list. Do not repeat the interim in the final answer.\n"
+        "- Someone asks to be notified later: call manage_tasks to set up a\n"
+        "  person-trigger, then message with a confirmation. When the\n"
+        "  trigger fires later, message delivers the message.\n"
         "\n"
-        "- Ambient chat you're not part of:\n"
-        "    {\"thought\":\"they're discussing weekend plans, not me\",\n"
-        "     \"outputs\":[]}\n"
+        "- Ambient chat you're not part of: emit your private thought (e.g.\n"
+        "  observations=[\"Jacob and Sarah are discussing weekend plans\"])\n"
+        "  and DO NOT call message. Silence.\n"
         "\n"
         "## Within a responding turn\n"
     )
@@ -317,27 +352,27 @@ def _prompt_capabilities() -> str:
     """Return the capabilities / guidelines section of the static prompt.
 
     Tool list is narrated here; full schemas go via the ``tools=`` parameter
-    of ``messages.create``. All output to humans flows through the structured
-    ``outputs`` array described in ``_prompt_etiquette``.
+    of ``messages.create``. All speech and messaging to humans flows through
+    the ``message`` tool described in ``_prompt_etiquette``.
     """
     return (
         "## Capabilities\n"
         "\n"
-        "Always-available tools: execute_script, switch_display, "
-        "identify_person, manage_tasks, search_memory, search_photos, "
-        "web_search, and load_skill. For complex or infrequent operations, "
-        "use execute_script to run Python in the sandbox with the boxbot_sdk.\n"
+        "Always-available tools: message, execute_script, "
+        "switch_display, identify_person, manage_tasks, search_memory, "
+        "search_photos, web_search, and load_skill. For complex or "
+        "infrequent operations, use execute_script to run Python in the "
+        "sandbox with the boxbot_sdk.\n"
         "\n"
-        "Tools DO things; they do not speak. All speech and messaging to\n"
-        "humans goes through the structured `outputs` array of your response\n"
-        "(see the output-structure section above). A tool call might create a\n"
-        "reminder, search memory, switch a display, or run a sandbox script.\n"
-        "The `outputs` array is how you actually reach a person.\n"
+        "message is the ONLY tool that reaches a person. The other\n"
+        "tools DO things — create a reminder, search memory, switch a\n"
+        "display, run a sandbox script, look up the web. None of them speak.\n"
+        "Without a message call, the user hears silence.\n"
         "\n"
         "## Guidelines\n"
-        "- Be concise in voice outputs — no one wants a lecture from a box.\n"
+        "- Be concise when speaking — no one wants a lecture from a box.\n"
         "- Prefer text for long, detailed information (easier to re-read);\n"
-        "  prefer voice for quick, immediate replies when someone is at the box.\n"
+        "  prefer speak for quick, immediate replies when someone is at the box.\n"
         "- When you learn something important, memory extraction captures it\n"
         "  automatically after the conversation ends. Do not repeat facts in\n"
         "  `thought` — it adds noise.\n"
@@ -499,6 +534,8 @@ class BoxBotAgent:
         bus.subscribe(TranscriptReady, self._on_transcript_ready)
         bus.subscribe(VoiceSessionEnded, self._on_voice_session_ended)
         bus.subscribe(ConversationEnded, self._on_conversation_ended)
+        bus.subscribe(AgentSpeaking, self._on_agent_speaking)
+        bus.subscribe(AgentSpeakingDone, self._on_agent_speaking_done)
 
         self._running = True
         logger.info("BoxBotAgent started (model: %s)", config.models.large)
@@ -519,6 +556,8 @@ class BoxBotAgent:
         bus.unsubscribe(TranscriptReady, self._on_transcript_ready)
         bus.unsubscribe(VoiceSessionEnded, self._on_voice_session_ended)
         bus.unsubscribe(ConversationEnded, self._on_conversation_ended)
+        bus.unsubscribe(AgentSpeaking, self._on_agent_speaking)
+        bus.unsubscribe(AgentSpeakingDone, self._on_agent_speaking_done)
 
         # End any active conversations cleanly.
         for conv in list(self._conversations.values()):
@@ -705,6 +744,56 @@ class BoxBotAgent:
             },
         )
 
+    def _get_voice_room_conversation(self) -> Conversation | None:
+        """Return the live voice:room conversation, if any."""
+        conv_id = self._conversation_by_key.get("voice:room")
+        if conv_id is None:
+            return None
+        conv = self._conversations.get(conv_id)
+        if conv is None or conv.is_ended:
+            return None
+        return conv
+
+    async def _on_agent_speaking(self, event: AgentSpeaking) -> None:
+        """Mark the room conversation as SPEAKING when TTS begins.
+
+        Voice ``speak()`` publishes this event before streaming TTS.
+        Transitioning to SPEAKING flips ``handle_input`` from
+        cancel-and-combine to queue-overheard-utterances mode, which is
+        what we want while BB is talking.
+        """
+        conv = self._get_voice_room_conversation()
+        if conv is None:
+            return
+        # Only THINKING → SPEAKING is a valid forward transition for
+        # this signal. If the conversation has already been interrupted
+        # or ended, a stale AgentSpeaking from a cancelled task must
+        # not flip it back into SPEAKING.
+        if conv.state is ConversationState.THINKING:
+            conv.set_state(ConversationState.SPEAKING)
+
+    async def _on_agent_speaking_done(self, event: AgentSpeakingDone) -> None:
+        """If TTS was interrupted (wake word during SPEAKING), interrupt
+        the room conversation: cancel the in-flight generation, fold
+        the partial spoken segments into the thread, drop any queued
+        utterances, and transition to LISTENING for the next turn.
+
+        Non-interrupted completion is handled by ``_run_generation``'s
+        normal drain-and-settle path; nothing to do here.
+        """
+        if not event.interrupted:
+            return
+        conv = self._get_voice_room_conversation()
+        if conv is None:
+            return
+        try:
+            await conv.interrupt()
+        except Exception:
+            logger.exception(
+                "Conversation interrupt failed for voice:room (conv=%s)",
+                conv.conversation_id,
+            )
+
     # ------------------------------------------------------------------
     # Conversation index + generation
     # ------------------------------------------------------------------
@@ -751,7 +840,46 @@ class BoxBotAgent:
                 "Conversation %s created (channel=%s, key=%s)",
                 conv_id, channel, channel_key,
             )
+            # Eager-start the per-conversation sandbox runner so the
+            # boot cost (sudo + python + import bb) is hidden behind
+            # wake-word activation rather than charged to the first
+            # execute_script call. Best-effort: failure here just
+            # leaves the runner null, and execute_script falls back to
+            # its per-call subprocess path.
+            self._attach_sandbox_runner(conv)
             return conv
+
+    def _attach_sandbox_runner(self, conv: Conversation) -> None:
+        """Construct + eager-start a SandboxRunner for this conversation."""
+        from boxbot.tools.sandbox_runner import SandboxRunner
+
+        try:
+            cfg = get_config()
+            venv_python = (
+                Path(cfg.sandbox.venv_path) / "bin" / "python3"
+            )
+            timeout = cfg.sandbox.timeout
+            sandbox_user = cfg.sandbox.user
+        except Exception:
+            logger.exception(
+                "Sandbox config unavailable — runner not attached"
+            )
+            return
+        enforce = os.environ.get("BOXBOT_SANDBOX_ENFORCE", "1") != "0"
+        runner = SandboxRunner(
+            venv_python=venv_python,
+            sandbox_user=sandbox_user,
+            enforce_sandbox=enforce,
+            timeout=timeout,
+            label=conv.conversation_id,
+        )
+        conv.sandbox_runner = runner
+        # Kick start in the background so create() doesn't block on
+        # subprocess spawn / sudo prompt resolution.
+        asyncio.create_task(
+            runner.start(),
+            name=f"sandbox-start-{conv.conversation_id}",
+        )
 
     async def _on_conversation_ended(self, event: ConversationEnded) -> None:
         """Remove the conversation from the index and fire memory extraction.
@@ -771,6 +899,15 @@ class BoxBotAgent:
                     break
         if conv is None:
             return
+
+        # Tear down the per-conversation sandbox process. Fire-and-
+        # forget; stop() handles its own timeouts and never raises.
+        if conv.sandbox_runner is not None:
+            asyncio.create_task(
+                conv.sandbox_runner.stop(),
+                name=f"sandbox-stop-{conv_id}",
+            )
+            conv.sandbox_runner = None
 
         # Fire-and-forget memory extraction on the ended thread.
         if conv.thread and event.turn_count > 0:
@@ -833,7 +970,6 @@ class BoxBotAgent:
             person_name=person_name,
             max_turns=get_config().agent.max_turns,
             prior_history=prior_history,
-            segment_recorder=conv.record_segment,
         )
 
         additions = messages[len(conv.thread):]
@@ -1072,33 +1208,34 @@ class BoxBotAgent:
         person_name: str | None,
         max_turns: int = _DEFAULT_MAX_TURNS,
         prior_history: list[dict[str, Any]] | None = None,
-        segment_recorder: Any = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Run the core agent conversation loop.
 
         Each ``messages.create`` call carries:
-        - ``output_config.format`` pinning the ``OUTPUT_SCHEMA`` JSON schema
-          (defined in ``output_dispatcher``)
+        - ``output_config.format`` pinning the ``INTERNAL_NOTES_SCHEMA``
+          (defined in ``output_dispatcher``) — the agent's text output is a
+          private scratchpad of ``thought`` + ``observations``. By design
+          no field reaches a person; deliveries go through the
+          ``message`` tool.
         - top-level ``cache_control`` for the 5-minute rolling messages cache
         - a ``tools`` list where the LAST tool holds a 1h cache breakpoint
         - a two-block ``system`` with a 1h breakpoint on the static block
 
-        Every text block in the response — whether mid-turn alongside a
-        ``tool_use`` block or at ``end_turn`` on its own — is parsed as
-        OUTPUT_SCHEMA JSON, and each entry in ``outputs`` is dispatched
-        immediately. This is how mid-turn "One moment." interims work: the
-        interim text is in the same response as the tool_use; we dispatch
-        the voice output, then run the tool, then loop.
+        Text blocks are parsed as INTERNAL_NOTES_SCHEMA JSON for logging
+        and memory extraction. They never trigger a delivery.
+        ``message`` tool calls (run by ``_process_tool_calls``)
+        are how the agent reaches a person.
 
         Args:
             conversation_id: Conversation ID for logging.
             channel: Active conversation channel (voice / whatsapp / trigger),
                 used for log provenance only — the agent chooses its own
-                delivery channel per output.
+                delivery channel per ``message`` call.
             system_prompt_blocks: Two-block system prompt (static + dynamic).
             initial_message: The first user message.
-            person_name: The speaker currently addressing the agent; resolves
-                the ``to: "current_speaker"`` alias at dispatch time.
+            person_name: The speaker currently addressing the agent. The
+                Conversation provides this to ``message`` via
+                participants when the tool resolves ``current_speaker``.
             max_turns: Maximum number of API round-trips.
 
         Returns:
@@ -1108,6 +1245,8 @@ class BoxBotAgent:
 
         config = get_config()
         model = config.models.large
+
+        from boxbot.tools.registry import get_tools
 
         # Build tool definitions for the API (last tool carries 1h cache marker)
         tools = get_tools()
@@ -1143,7 +1282,7 @@ class BoxBotAgent:
                     output_config={
                         "format": {
                             "type": "json_schema",
-                            "schema": OUTPUT_SCHEMA,
+                            "schema": INTERNAL_NOTES_SCHEMA,
                         }
                     },
                     cache_control={"type": "ephemeral"},
@@ -1167,23 +1306,22 @@ class BoxBotAgent:
 
             stop_reason = getattr(response, "stop_reason", None)
 
-            # Parse EVERY text block in the response as OUTPUT_SCHEMA JSON and
-            # dispatch each one's outputs immediately. Mid-turn text (emitted
-            # alongside tool_use) dispatches BEFORE tools run. End-turn text
-            # dispatches as the final response. Same parser, same dispatch
-            # path, both cases.
+            # Parse EVERY text block in the response as INTERNAL_NOTES_SCHEMA
+            # JSON for logging and memory extraction. Text blocks are PRIVATE
+            # by design — they never trigger deliveries. The agent reaches
+            # people only via message tool calls (handled below).
             for block in getattr(response, "content", []) or []:
                 if getattr(block, "type", None) != "text":
                     continue
                 raw = getattr(block, "text", "") or ""
-                parsed = parse_output_block(raw)
+                parsed = parse_internal_notes(raw)
                 if parsed is None:
                     # Parse failed under constrained decoding — log; the rest
                     # of the turn still progresses (tools still run if present).
                     if raw.strip():
                         logger.error(
-                            "Could not parse output JSON (conv=%s turn=%d). "
-                            "First 200 chars: %r",
+                            "Could not parse internal notes JSON (conv=%s "
+                            "turn=%d). First 200 chars: %r",
                             conversation_id, turn_count, raw[:200],
                         )
                     continue
@@ -1192,25 +1330,18 @@ class BoxBotAgent:
                         "agent thought (conv=%s turn=%d): %s",
                         conversation_id, turn_count, parsed.thought,
                     )
-                if parsed.outputs:
-                    await dispatch_outputs(
-                        parsed.outputs,
-                        conversation_id=conversation_id,
-                        channel_context=channel,
-                        current_speaker=person_name,
-                        segment_recorder=segment_recorder,
-                    )
-                else:
-                    logger.debug(
-                        "agent turn produced no outputs (conv=%s turn=%d)",
+                if parsed.observations:
+                    logger.info(
+                        "agent observations (conv=%s turn=%d): %s",
                         conversation_id, turn_count,
+                        " | ".join(parsed.observations),
                     )
 
             # --- tool_use: outputs have already been dispatched (if any);
             # now run the tools and feed results back.
             if stop_reason == "tool_use":
                 tool_results = await self._process_tool_calls(
-                    response, tools
+                    response, tools, conversation_id=conversation_id,
                 )
                 if tool_results:
                     messages.append({
@@ -1286,6 +1417,8 @@ class BoxBotAgent:
         self,
         response: Any,
         tools: list[Any],
+        *,
+        conversation_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Dispatch tool calls from a model response.
 
@@ -1295,13 +1428,30 @@ class BoxBotAgent:
         either ``str`` (legacy) or ``list[content-block]`` (future image
         attachments — see spec §10) as their content.
 
+        Sets the ``current_conversation`` ContextVar around each tool's
+        ``execute()`` call so tools that need conversation-scoped state
+        (e.g. ``execute_script`` reaching the conversation's long-lived
+        sandbox runner) can find it.
+
         Args:
             response: The Anthropic API response containing tool_use blocks.
             tools: The list of available Tool instances (for reference).
+            conversation_id: ID of the conversation that triggered these
+                tool calls; used to resolve the Conversation for the
+                ContextVar. None disables conversation-scoped routing
+                (tools fall back to per-call behavior).
 
         Returns:
             List of tool_result content blocks to send back to the model.
         """
+        from boxbot.tools.registry import get_tool
+        from boxbot.tools._tool_context import current_conversation
+
+        conv = (
+            self._conversations.get(conversation_id)
+            if conversation_id else None
+        )
+
         tool_results: list[dict[str, Any]] = []
 
         for content_block in response.content:
@@ -1323,6 +1473,7 @@ class BoxBotAgent:
                 })
                 logger.warning("Unknown tool requested: %s", tool_name)
             else:
+                token = current_conversation.set(conv)
                 try:
                     result_content = await tool.execute(**tool_input)
                 except Exception as e:
@@ -1332,6 +1483,8 @@ class BoxBotAgent:
                     result_content = json.dumps({
                         "error": f"Tool execution failed: {e}",
                     })
+                finally:
+                    current_conversation.reset(token)
 
             tool_results.append({
                 "type": "tool_result",
@@ -1444,8 +1597,14 @@ class BoxBotAgent:
     ) -> str:
         """Build a human-readable transcript from message history.
 
-        Converts the structured message list into a labelled transcript
-        suitable for the extraction agent.
+        Renders:
+        - User turns with speaker labels.
+        - Assistant text blocks (private internal notes — thought + observations)
+          as ``[boxBot thought]:`` / ``[boxBot observed]:`` lines so memory
+          extraction sees them but downstream readers know they're private.
+        - ``message`` tool calls as ``[boxBot → <to> via <channel>]:``
+          — these are what the agent actually said.
+        - Other tool calls as ``[boxBot used tool: <name>]``.
 
         Args:
             messages: The message history from the agent loop.
@@ -1483,23 +1642,60 @@ class BoxBotAgent:
                     lines.append(f"[boxBot]: {content}")
                 elif isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                text = block.get("text", "")
-                                if text:
-                                    lines.append(f"[boxBot]: {text}")
-                            elif block.get("type") == "tool_use":
-                                name = block.get("name", "")
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = block.get("type")
+                        if block_type == "text":
+                            text = block.get("text", "")
+                            if not text:
+                                continue
+                            try:
+                                parsed = json.loads(text)
+                            except (json.JSONDecodeError, TypeError):
+                                lines.append(f"[boxBot thought]: {text}")
+                                continue
+                            if isinstance(parsed, dict):
+                                thought = parsed.get("thought")
+                                if thought:
+                                    lines.append(f"[boxBot thought]: {thought}")
+                                obs = parsed.get("observations")
+                                if isinstance(obs, list):
+                                    for entry in obs:
+                                        if isinstance(entry, str) and entry:
+                                            lines.append(
+                                                f"[boxBot observed]: {entry}"
+                                            )
+                            else:
+                                lines.append(f"[boxBot thought]: {text}")
+                        elif block_type == "tool_use":
+                            name = block.get("name", "")
+                            tool_input = block.get("input") or {}
+                            if name == "message":
+                                to = str(tool_input.get("to", "")).strip() or "?"
+                                channel = (
+                                    str(tool_input.get("channel", "")).strip()
+                                    or "?"
+                                )
+                                spoken = (
+                                    str(tool_input.get("content", "")).strip()
+                                )
+                                if spoken:
+                                    lines.append(
+                                        f"[boxBot → {to} via {channel}]: "
+                                        f"{spoken}"
+                                    )
+                            else:
                                 lines.append(f"[boxBot used tool: {name}]")
 
         return "\n".join(lines)
 
     @staticmethod
     def _extract_summary(messages: list[dict[str, Any]]) -> str:
-        """Extract a brief summary from the last assistant text in messages.
+        """Extract a brief summary from the latest assistant turn.
 
-        The assistant text is now a JSON decision object. We pull out the
-        ``response_text`` or ``reason`` for a human-readable summary.
+        Prefers the most recent ``message`` tool call's ``content``
+        (what the agent actually said to a person). Falls back to the
+        ``thought`` field of the assistant's text JSON for silent turns.
 
         Args:
             messages: The message history.
@@ -1511,30 +1707,41 @@ class BoxBotAgent:
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
-            raw_text: str | None = None
-            if isinstance(content, str):
-                raw_text = content
-            elif isinstance(content, list):
-                for block in reversed(content):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "")
-                        if text:
-                            raw_text = text
-                            break
-            if not raw_text:
-                continue
 
-            # Try to parse as decision JSON and extract a human-meaningful field
-            try:
-                parsed = json.loads(raw_text)
-            except (json.JSONDecodeError, TypeError):
-                return raw_text[:200]
-            if isinstance(parsed, dict):
-                if parsed.get("response_text"):
-                    return str(parsed["response_text"])[:200]
-                if parsed.get("reason"):
-                    return str(parsed["reason"])[:200]
-            return raw_text[:200]
+            if isinstance(content, list):
+                # Prefer the latest message tool content as the summary.
+                for block in reversed(content):
+                    if not isinstance(block, dict):
+                        continue
+                    if (
+                        block.get("type") == "tool_use"
+                        and block.get("name") == "message"
+                    ):
+                        tool_input = block.get("input") or {}
+                        spoken = str(tool_input.get("content") or "").strip()
+                        if spoken:
+                            return spoken[:200]
+                # Fall back to the thought field of the text block.
+                for block in reversed(content):
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "text":
+                        continue
+                    text = block.get("text", "")
+                    if not text:
+                        continue
+                    try:
+                        parsed = json.loads(text)
+                    except (json.JSONDecodeError, TypeError):
+                        return text[:200]
+                    if isinstance(parsed, dict):
+                        thought = parsed.get("thought")
+                        if thought:
+                            return str(thought)[:200]
+                    return text[:200]
+            elif isinstance(content, str) and content:
+                return content[:200]
+
         return "(no summary)"
 
     # ------------------------------------------------------------------

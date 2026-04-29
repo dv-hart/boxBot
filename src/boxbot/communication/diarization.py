@@ -237,7 +237,21 @@ class SpeakerDiarizer:
                 lambda: self._embedding_inference(input_data),
             )
 
-            return np.array(embedding)
+            arr = np.array(embedding)
+            # pyannote occasionally returns NaN/Inf vectors for very
+            # short or near-silent segments. A single NaN propagated
+            # into a stored centroid silently breaks all downstream
+            # cosine similarities (NaN poisons the mean). Drop it here
+            # before any downstream code sees it.
+            if not np.all(np.isfinite(arr)):
+                logger.warning(
+                    "Embedding for segment %.2f-%.2f contained NaN/Inf "
+                    "(%d non-finite of %d) — discarding",
+                    start, end,
+                    int((~np.isfinite(arr)).sum()), arr.size,
+                )
+                return None
+            return arr
         except Exception:
             logger.warning(
                 "Failed to extract embedding for segment %.2f-%.2f",

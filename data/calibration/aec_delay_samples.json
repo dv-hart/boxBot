@@ -1,0 +1,19 @@
+{
+  "delay_samples": 2735,
+  "delay_ms": 170.9375,
+  "sample_rate": 16000,
+  "raw_mic_channel": 3,
+  "raw_mic_lag_samples": 17283,
+  "ref_loopback_lag_samples": 17404,
+  "misalignment_samples": -121,
+  "previous_pad_samples": 2856,
+  "channel0_peak": -489.2388000488281,
+  "raw_mic_peak": 32.913246154785156,
+  "measured_at": "2026-04-25T16:01:23.686624+00:00",
+  "chirp": {
+    "duration_s": 1.5,
+    "f0_hz": 200.0,
+    "f1_hz": 6000.0,
+    "volume": 0.7
+  }
+}

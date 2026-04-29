@@ -43,6 +43,7 @@ dependencies = [
     # Communication
     "pyaudio",
     "httpx",
+    "aioboto3>=13.0",
 
     # Display
     "pillow",

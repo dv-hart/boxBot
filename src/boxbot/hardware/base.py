@@ -121,7 +121,27 @@ class SystemHealth:
 
 
 class HardwareUnavailableError(Exception):
-    """Raised when required hardware is not found or not responsive."""
+    """Raised when required hardware is not found or not responsive.
+
+    Soft failure: ``main._init_hal`` catches this per-module and lets the
+    rest of boxbot run in a degraded state. Use this for hardware that
+    can be missing without compromising the agent's correctness — e.g.
+    no camera means no perception, no screen means no display, but BB
+    can still hold a voice conversation.
+    """
+
+
+class HardwareInitFatal(RuntimeError):
+    """Raised when a HAL component fails in a way that cannot be papered
+    over. Deliberately *not* a subclass of :class:`HardwareUnavailableError`
+    so the soft-fail handlers in ``main._init_hal`` cannot swallow it.
+
+    Current trigger: the speaker can't open the AEC reference path, and
+    ``speaker.aec_required`` is true. Without an AEC reference, BB hears
+    its own TTS, transcribes it, and feeds it back as a fake user turn —
+    every conversation derails. That is worse than not booting; refuse
+    to start up rather than silently degrade.
+    """
 
 
 class HardwareModule(ABC):

@@ -131,8 +131,7 @@ def search(query: str, *,
         v.require_list(tags, "tags")
         payload["tags"] = tags
 
-    _transport.emit_action("memory.search", payload)
-    response = _transport.collect_response(timeout=30)
+    response = _transport.request("memory.search", payload, timeout=30)
     results = response.get("results", [])
     return [MemoryRecord(r) for r in results]
 

@@ -196,6 +196,11 @@ async def _init_hal(config: Any) -> dict[str, Any]:
     """
     modules: dict[str, Any] = {}
 
+    # Soft-fail handlers below catch this. Anything else (including the
+    # fatal HardwareInitFatal from the speaker's AEC path) propagates out
+    # of _init_hal and aborts boot — by design.
+    from boxbot.hardware.base import HardwareUnavailableError
+
     # System monitor (always available)
     from boxbot.hardware.system import System
 
@@ -219,7 +224,7 @@ async def _init_hal(config: Any) -> dict[str, Any]:
 
     # Camera
     try:
-        from boxbot.hardware.camera import Camera
+        from boxbot.hardware.camera import Camera, set_camera
 
         camera = Camera(
             rotation=config.hardware.camera.rotation,
@@ -230,9 +235,34 @@ async def _init_hal(config: Any) -> dict[str, Any]:
         await camera.start()
         system.register_module(camera)
         modules["camera"] = camera
+        # Publish for sandbox action handlers (bb.camera.capture etc.)
+        set_camera(camera)
         logger.info("Camera started")
     except Exception:
         logger.warning("Camera not available — perception will be disabled", exc_info=True)
+
+    # Speaker BEFORE microphone. The speaker opens two streams: the
+    # HDMI audible output and the AEC reference path on the ReSpeaker
+    # USB playback channel. Once the microphone has claimed the
+    # ReSpeaker capture side, PortAudio sometimes hides the same
+    # device's output side from query_devices() (USB shared resource
+    # race). Opening the AEC reference *first* avoids that. The speaker
+    # also raises HardwareInitFatal — not a HardwareUnavailableError —
+    # if the AEC path cannot come up and aec_required is true; that
+    # propagates out of this try/except and aborts boot, which is what
+    # we want (BB hearing itself derails every conversation).
+    try:
+        from boxbot.hardware.speaker import Speaker
+
+        speaker = Speaker(config=config.hardware.speaker)
+        await speaker.start()
+        system.register_module(speaker)
+        modules["speaker"] = speaker
+        logger.info("Speaker started")
+    except HardwareUnavailableError:
+        logger.warning(
+            "Speaker not available — TTS will be disabled", exc_info=True
+        )
 
     # Microphone (ReSpeaker 4-Mic Array)
     try:
@@ -243,20 +273,11 @@ async def _init_hal(config: Any) -> dict[str, Any]:
         system.register_module(microphone)
         modules["microphone"] = microphone
         logger.info("Microphone started")
-    except Exception:
-        logger.warning("Microphone not available — voice pipeline will be disabled", exc_info=True)
-
-    # Speaker (ALSA dual-output)
-    try:
-        from boxbot.hardware.speaker import Speaker
-
-        speaker = Speaker(config=config.hardware.speaker)
-        await speaker.start()
-        system.register_module(speaker)
-        modules["speaker"] = speaker
-        logger.info("Speaker started")
-    except Exception:
-        logger.warning("Speaker not available — TTS will be disabled", exc_info=True)
+    except HardwareUnavailableError:
+        logger.warning(
+            "Microphone not available — voice pipeline will be disabled",
+            exc_info=True,
+        )
 
     return modules
 
@@ -305,6 +326,9 @@ async def _init_perception(hal_modules: dict[str, Any], config: Any) -> Any | No
         camera_hfov=config.perception.camera_hfov,
         crop_retention_days=config.perception.crop_retention_days,
         crop_retention_days_debug=config.perception.crop_retention_days_debug,
+        person_confidence_threshold=(
+            config.perception.person_confidence_threshold
+        ),
     )
     await pipeline.start()
     logger.info("Perception pipeline started")
@@ -343,10 +367,13 @@ async def _init_scheduler() -> Any:
 
 async def _init_display_manager() -> Any:
     """Initialise and start the DisplayManager."""
-    from boxbot.displays.manager import DisplayManager
+    from boxbot.displays.manager import DisplayManager, set_display_manager
 
     manager = DisplayManager()
     await manager.start()
+    # Publish for sandbox action handlers (bb.photos.show_on_screen, …)
+    # and the switch_display tool.
+    set_display_manager(manager)
     logger.info("Display manager started")
     return manager
 
@@ -433,6 +460,37 @@ async def _init_communication() -> Any | None:
     return router
 
 
+async def _init_whatsapp_inbound(router: Any) -> Any | None:
+    """Start the SQS-backed WhatsApp webhook poller, if configured.
+
+    Returns the poller if started, otherwise None. Required env:
+    BOXBOT_SQS_QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+    """
+    from boxbot.communication.whatsapp_inbound import WhatsAppInboundPoller
+    from boxbot.core.config import get_config
+
+    config = get_config()
+    queue_url = config.api_keys.whatsapp_sqs_queue_url
+    key = config.api_keys.aws_access_key_id
+    secret = config.api_keys.aws_secret_access_key
+    if not (queue_url and key and secret):
+        logger.info(
+            "WhatsApp SQS poller not configured "
+            "(set BOXBOT_SQS_QUEUE_URL + AWS credentials to enable)"
+        )
+        return None
+
+    poller = WhatsAppInboundPoller(
+        router=router,
+        queue_url=queue_url,
+        region=config.api_keys.aws_region,
+        access_key_id=key,
+        secret_access_key=secret,
+    )
+    await poller.start()
+    return poller
+
+
 async def _init_agent(memory_store: Any) -> Any:
     """Initialise and start the BoxBotAgent."""
     from boxbot.core.agent import BoxBotAgent
@@ -469,6 +527,7 @@ async def _shutdown(
     shutdown_order = [
         "agent",
         "voice",
+        "whatsapp_inbound",
         "communication",
         "photo_intake",
         "perception",
@@ -490,6 +549,8 @@ async def _shutdown(
                 await get_agent_state_tracker().stop()
                 await instance.stop()
             elif name == "voice":
+                await instance.stop()
+            elif name == "whatsapp_inbound":
                 await instance.stop()
             elif name == "communication":
                 # MessageRouter does not have a stop method currently
@@ -637,6 +698,9 @@ async def _async_main() -> None:
         comm_router = await _init_communication()
         if comm_router is not None:
             subsystems["communication"] = comm_router
+            inbound = await _init_whatsapp_inbound(comm_router)
+            if inbound is not None:
+                subsystems["whatsapp_inbound"] = inbound
 
         # Agent — the brain, subscribes to events from all other subsystems
         agent = await _init_agent(memory_store)

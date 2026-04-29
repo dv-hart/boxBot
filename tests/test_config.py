@@ -54,8 +54,10 @@ class TestDefaultConfig:
         assert cfg.camera.resolution == [1280, 720]
 
     def test_default_photos_storage_path(self):
+        from boxbot.core.paths import PHOTOS_DIR
+
         cfg = BoxBotConfig()
-        assert cfg.photos.storage_path == "data/photos"
+        assert cfg.photos.storage_path == str(PHOTOS_DIR)
 
 
 class TestConfigSingleton:

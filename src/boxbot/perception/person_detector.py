@@ -50,6 +50,53 @@ class LetterboxParams:
     pad_y: float
 
 
+def _extract_per_class_detections(
+    outputs: "object",
+) -> list | None:
+    """Pull the inner per-class detection list out of Hailo's output dict.
+
+    The actual structure (confirmed via the one-shot diagnostic on
+    ``yolov5s_personface_h8l``) is:
+
+        {<single key>: [              # outer list = batch dim, len 1
+            [ndarray, ndarray, ...],  # inner list = per-class
+        ]}
+
+    Returns the inner per-class list, or None if the structure doesn't
+    match (in which case the caller skips this frame; the diagnostic
+    dump will already have surfaced the format change).
+    """
+    if not isinstance(outputs, dict) or not outputs:
+        return None
+    raw = next(iter(outputs.values()))
+    if not isinstance(raw, list) or len(raw) == 0:
+        return None
+    batch0 = raw[0]
+    if not isinstance(batch0, list):
+        return None
+    return batch0
+
+
+def _outputs_have_detections(outputs: "object") -> bool:
+    """Return True if any nested ndarray has at least one row.
+
+    Walks the same nested-list shape the diagnostic dump describes;
+    used to delay the one-shot diagnostic until we have a frame with
+    real values to inspect.
+    """
+    if isinstance(outputs, dict):
+        return any(_outputs_have_detections(v) for v in outputs.values())
+    if isinstance(outputs, (list, tuple)):
+        return any(_outputs_have_detections(v) for v in outputs)
+    shape = getattr(outputs, "shape", None)
+    if shape is not None and len(shape) >= 1:
+        try:
+            return int(shape[0]) > 0
+        except Exception:
+            return False
+    return False
+
+
 class PersonDetector:
     """YOLO pre/post-processing for person and face detection.
 
@@ -72,6 +119,11 @@ class PersonDetector:
     ) -> None:
         self._input_size = input_size
         self._confidence_threshold = confidence_threshold
+        # One-shot diagnostic flag: log the actual structure of the
+        # Hailo outputs the very first time postprocess() runs, then
+        # never again (per-frame logging would flood the log at 5 fps).
+        # See ``_log_outputs_diagnostics``.
+        self._diagnostics_logged = False
 
     @property
     def confidence_threshold(self) -> float:
@@ -134,22 +186,26 @@ class PersonDetector:
 
     def postprocess(
         self,
-        outputs: dict[str, np.ndarray],
+        outputs: dict[str, "object"],
         letterbox_params: LetterboxParams,
         original_shape: tuple[int, int],
         frame: np.ndarray | None = None,
     ) -> list[Detection]:
-        """Parse YOLO NMS output and extract detections.
+        """Parse YOLOv5s-personface NMS-on-chip output.
 
-        The on-chip NMS output shape is (2, 5, 80):
-        - Dim 0 (2): class grouping — index 0 = person, index 1 = face
-        - Dim 1 (5): values per detection — x1, y1, x2, y2, confidence
-          (pixel coordinates in 640x640 letterboxed space)
-        - Dim 2 (80): max detections per class
+        Layout confirmed on-device (HailoRT 4.23, ``yolov5s_personface_h8l``):
 
-        NOTE: This interpretation needs on-device verification. The exact
-        output layout may differ depending on the Hailo model compiler
-        configuration.
+            outputs[<single key>] = [
+                [                                  # batch dim, len 1
+                    np.ndarray(shape=(N0, 5)),     # class 0: person
+                    np.ndarray(shape=(N1, 5)),     # class 1: face
+                ]
+            ]
+
+        Each detection row is ``[y_min, x_min, y_max, x_max, score]`` with
+        coordinates **normalized to [0, 1]** in the model's letterboxed
+        input frame (640×640). Per-class arrays contain only valid
+        detections — no zero-padding to a fixed length.
 
         Args:
             outputs: Raw model output dict from HAL inference.
@@ -160,65 +216,67 @@ class PersonDetector:
         Returns:
             List of Detection objects (person class only, above threshold).
         """
-        # Extract the NMS output tensor — try common output names
-        raw = None
-        for key in outputs:
-            tensor = outputs[key]
-            if tensor.shape == (2, 5, 80) or (
-                len(tensor.shape) == 3 and tensor.shape[1] == 5
-            ):
-                raw = tensor
-                break
+        # One-shot diagnostic dump — kept after the postprocessor was
+        # rewritten so future HEF swaps surface a clear "structure
+        # changed" signal in the log instead of silent zero detections.
+        if not self._diagnostics_logged:
+            self._diagnostics_frames_seen = (
+                getattr(self, "_diagnostics_frames_seen", 0) + 1
+            )
+            has_data = _outputs_have_detections(outputs)
+            if has_data or self._diagnostics_frames_seen >= 50:
+                self._log_outputs_diagnostics(outputs)
+                self._diagnostics_logged = True
 
-        if raw is None:
-            # Fall back to the first output
-            raw = next(iter(outputs.values()))
-            if raw.ndim != 3:
-                logger.warning(
-                    "Unexpected YOLO output shape: %s. Expected (2, 5, 80).",
-                    raw.shape,
-                )
-                return []
+        per_class = _extract_per_class_detections(outputs)
+        if per_class is None:
+            return []
 
         orig_h, orig_w = original_shape
         scale = letterbox_params.scale
         pad_x = letterbox_params.pad_x
         pad_y = letterbox_params.pad_y
+        input_h, input_w = self._input_size
 
         detections: list[Detection] = []
 
-        # Iterate over class groups (0=person, 1=face)
-        num_classes = raw.shape[0]
-        for class_id in range(num_classes):
-            class_data = raw[class_id]  # (5, max_detections)
-
-            for det_idx in range(class_data.shape[1]):
-                x1_lb = class_data[0, det_idx]
-                y1_lb = class_data[1, det_idx]
-                x2_lb = class_data[2, det_idx]
-                y2_lb = class_data[3, det_idx]
-                confidence = class_data[4, det_idx]
+        for class_id, class_dets in enumerate(per_class):
+            if class_dets is None:
+                continue
+            shape = getattr(class_dets, "shape", None)
+            if shape is None or len(shape) != 2 or shape[1] < 5 or shape[0] == 0:
+                continue
+            for row in class_dets:
+                y_min_n = float(row[0])
+                x_min_n = float(row[1])
+                y_max_n = float(row[2])
+                x_max_n = float(row[3])
+                confidence = float(row[4])
 
                 if confidence < self._confidence_threshold:
                     continue
 
-                # Skip zero-area detections (padding in NMS output)
-                if x1_lb == 0 and y1_lb == 0 and x2_lb == 0 and y2_lb == 0:
-                    continue
+                # Normalized → letterboxed pixel space (640×640).
+                x1_lb = x_min_n * input_w
+                y1_lb = y_min_n * input_h
+                x2_lb = x_max_n * input_w
+                y2_lb = y_max_n * input_h
 
-                # Remap from letterboxed 640x640 to original image coordinates
+                # Letterboxed → original frame.
                 x1 = int((x1_lb - pad_x) / scale)
                 y1 = int((y1_lb - pad_y) / scale)
                 x2 = int((x2_lb - pad_x) / scale)
                 y2 = int((y2_lb - pad_y) / scale)
 
-                # Clamp to original image bounds
+                # Clamp to original image bounds (the model can return
+                # boxes that bleed slightly outside [0, 1] for subjects
+                # that fill the frame — we saw -0.0149 / 1.0230 in the
+                # diagnostic dump).
                 x1 = max(0, min(x1, orig_w))
                 y1 = max(0, min(y1, orig_h))
                 x2 = max(0, min(x2, orig_w))
                 y2 = max(0, min(y2, orig_h))
 
-                # Skip degenerate boxes
                 if x2 <= x1 or y2 <= y1:
                     continue
 
@@ -229,7 +287,7 @@ class PersonDetector:
                 detections.append(
                     Detection(
                         bbox=(x1, y1, x2, y2),
-                        confidence=float(confidence),
+                        confidence=confidence,
                         class_id=class_id,
                         crop=crop,
                     )
@@ -240,6 +298,86 @@ class PersonDetector:
             d for d in detections if d.class_id == self.PERSON_CLASS
         ]
         return person_detections
+
+    def _log_outputs_diagnostics(
+        self, outputs: dict[str, "object"]
+    ) -> None:
+        """One-shot dump of the Hailo output structure.
+
+        Recurses through nested lists/tuples (HailoRT wraps NMS-on-chip
+        outputs as ``[batch][class][detections]``) until it hits an
+        ndarray or scalar. For each ndarray we log shape, dtype, and
+        the first-row sample so we can read off the field order and
+        coordinate system (normalized vs pixel).
+        """
+        try:
+            lines = ["Hailo perception output structure (one-shot):"]
+            for key, value in outputs.items():
+                lines.append(f"  key={key!r}")
+                self._describe_value(value, indent="    ", lines=lines)
+            logger.warning("\n".join(lines))
+        except Exception:
+            logger.exception(
+                "Failed to log Hailo outputs diagnostics; postprocess will "
+                "still attempt to handle the data."
+            )
+
+    def _describe_value(
+        self,
+        value: "object",
+        *,
+        indent: str,
+        lines: list[str],
+        max_depth: int = 6,
+    ) -> None:
+        """Recursive structural dump of one output value.
+
+        Stops at ``max_depth`` to avoid runaway recursion on
+        pathological inputs. At each list/tuple level we log the
+        length and recurse into each element. At each ndarray we log
+        shape, dtype, and the first-row sample (capped at 8 fields).
+        """
+        if max_depth <= 0:
+            lines.append(f"{indent}<max recursion depth reached>")
+            return
+        if isinstance(value, (list, tuple)):
+            lines.append(
+                f"{indent}type={type(value).__name__} len={len(value)}"
+            )
+            for i, item in enumerate(value):
+                lines.append(f"{indent}[{i}]")
+                self._describe_value(
+                    item,
+                    indent=indent + "  ",
+                    lines=lines,
+                    max_depth=max_depth - 1,
+                )
+            return
+        # ndarray-ish: shape + dtype + sample
+        shape = getattr(value, "shape", None)
+        dtype = getattr(value, "dtype", None)
+        if shape is not None:
+            sample = ""
+            try:
+                arr = np.asarray(value)
+                if arr.size > 0 and arr.ndim >= 1:
+                    flat_first = arr[0]
+                    if hasattr(flat_first, "tolist"):
+                        sample_vals = flat_first.tolist()
+                    else:
+                        sample_vals = [flat_first]
+                    if isinstance(sample_vals, list):
+                        sample_vals = sample_vals[:8]
+                    sample = f" sample[0]={sample_vals}"
+            except Exception:
+                pass
+            lines.append(
+                f"{indent}type={type(value).__name__} "
+                f"shape={shape} dtype={dtype}{sample}"
+            )
+            return
+        # Scalar / other
+        lines.append(f"{indent}type={type(value).__name__} value={value!r}")
 
     def extract_reid_crops(
         self, frame: np.ndarray, detections: list[Detection]

@@ -119,12 +119,21 @@ voice:
     max_utterance_duration: 60    # seconds hard cap
     inter_utterance_gap: 300      # ms between utterances
 
-  # Barge-in — graduated yielding when user interrupts TTS
+  # Barge-in — how the user interrupts BB's speech
+  #
+  # mode: "wake_word" (default) — STT detaches while BB is speaking,
+  #   so chatter and BB's own residual voice can't hit the transcript.
+  #   To interrupt or continue, the user says the wake word again,
+  #   which stops playback and re-attaches STT.
+  # mode: "graduated" — legacy VAD-based three-stage yield (ignore →
+  #   fade → full stop). The ignore/fade/confirm knobs below apply
+  #   only in this mode.
   barge_in:
     enabled: true
-    ignore_duration: 200          # ms — continue at full volume
-    fade_duration: 200            # ms — fade to 50%
-    confirm_duration: 400         # ms total — full stop
+    mode: "wake_word"
+    ignore_duration: 200          # ms — continue at full volume (graduated mode)
+    fade_duration: 200            # ms — fade to 50% (graduated mode)
+    confirm_duration: 400         # ms total — full stop (graduated mode)
     fade_volume: 0.5
 
   # Speaker diarization (pyannote)
@@ -227,8 +236,13 @@ photos:
 
 # ── Sandbox ──────────────────────────────────────────────────────────
 sandbox:
-  # Path to sandbox virtual environment (created by scripts/setup-sandbox.sh)
-  venv_path: "data/sandbox/venv"
+  # Root directory for sandbox state (venv, scripts, output, tmp).
+  # /var/lib/boxbot-sandbox is the default and works on standard Linux
+  # distros — the boxbot-sandbox system user can reach it without needing
+  # traverse permission on the operator's home dir. Override with another
+  # path (e.g. /opt/boxbot-sandbox) by also passing
+  # BOXBOT_SANDBOX_DIR=<path> to scripts/setup-sandbox.sh.
+  runtime_dir: "/var/lib/boxbot-sandbox"
   # OS user for sandbox script execution (created by setup-sandbox.sh)
   user: "boxbot-sandbox"
   # Script execution timeout (seconds)

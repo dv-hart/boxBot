@@ -321,6 +321,84 @@ This is why we selected a mic array with a dedicated DSP chip rather
 than a simple USB microphone. Barge-in detection with a single mic and
 no AEC would require the speaker to shout over BB — terrible UX.
 
+### AEC Reference Delay Calibration
+
+The XMOS chip can only cancel BB's voice if the reference signal it
+receives (over USB) is **time-aligned** with the speaker output it
+hears coming back through the mics. On the boxBot reference hardware,
+the HDMI playback path has a much deeper buffer than the USB AEC
+reference path, so the XMOS sees the reference tens of milliseconds
+before it actually hears BB. The adaptive filter struggles or fails
+under that misalignment, and BB's own speech bleeds back in as
+phantom user turns.
+
+To fix this, run the calibration script once after any audio-stack
+change (new speaker, ALSA tuning, USB re-plug):
+
+```bash
+python3 scripts/calibrate_aec.py
+```
+
+The script:
+
+1. Opens the speaker with the AEC reference path **disabled** so XMOS
+   doesn't try to subtract anything.
+2. Plays a 1.5 s linear chirp (200 Hz → 6 kHz) through HDMI.
+3. Captures the chirp via the ReSpeaker mic array.
+4. Cross-correlates capture against the known chirp to measure the
+   HDMI playback latency.
+5. Writes the measured offset to
+   ``data/calibration/aec_delay_samples.json``.
+
+On the next boxbot start, ``Speaker._open_aec_reference_stream``
+reads the file and prepends that many samples of silence to every
+chunk it pushes onto the AEC reference queue. Net effect: the XMOS
+chip receives the reference signal at the same wall-clock instant
+the mics capture the speaker's output, so its adaptive filter has
+something it can actually subtract.
+
+Use ``--dry-run`` to measure without persisting, ``--verbose`` for
+debug output, ``--volume`` to scale the chirp amplitude.
+
+### Wake-word-gated STT (default)
+
+Empirically AEC alignment alone is not enough. The XMOS adaptive
+filter is cold-start at the top of every reply (no reference signal =
+no learning), so the first ~1–2 s of TTS leaks past AEC and BB
+transcribes its own voice. Separately, household chatter during BB's
+reply is itself a problem: kids talking over BB get cleanly captured
+and treated as user turns. Timing knobs cannot fix either.
+
+The default barge-in mode (``voice.barge_in.mode = "wake_word"``)
+solves both at once:
+
+1. When ``AgentSpeaking`` fires, the audio_capture consumer
+   (STT/diarization) is **detached** from the microphone. The
+   wake-word consumer stays attached.
+2. While BB is speaking — and after, until further notice — no mic
+   audio reaches STT. Chatter, residual echo, sneezes, anything: not
+   transcribed.
+3. To interrupt or to take the next turn, the user says the wake
+   word again. The wake-word handler:
+   - stops TTS playback if BB is still speaking
+   - re-attaches audio_capture
+   - resets the post-wake-word grace timer
+4. The user then speaks normally. Conversation continues.
+
+Trade-off: you cannot cut BB off mid-sentence with raw speech — only
+with the wake word. In practice this matches how households actually
+interrupt ("BB, stop"). It also nullifies the chatter problem
+completely.
+
+The legacy three-stage VAD-based yielding lives on as
+``mode = "graduated"`` for use in environments where the wake-word
+re-engagement model is undesirable, but it requires AEC to be
+tightly aligned and is vulnerable to chatter being transcribed.
+
+Implementation: see ``VoiceSession.speak()`` and
+``VoiceSession._on_wake_word`` in
+``src/boxbot/communication/voice.py``.
+
 ## Speaker Diarization and Attribution
 
 ### Engine: pyannote.audio
@@ -745,10 +823,11 @@ voice:
   # Barge-in
   barge_in:
     enabled: true
-    ignore_duration: 200         # ms — ignore speech shorter than this
-    fade_duration: 200           # ms — volume fade stage
-    confirm_duration: 400        # ms — total to confirm interruption
-    fade_volume: 0.5             # volume during fade (0.0-1.0)
+    mode: "wake_word"            # "wake_word" (default) or "graduated"
+    ignore_duration: 200         # ms — ignore speech shorter than this (graduated)
+    fade_duration: 200           # ms — volume fade stage (graduated)
+    confirm_duration: 400        # ms — total to confirm interruption (graduated)
+    fade_volume: 0.5             # volume during fade (0.0-1.0, graduated)
 
   # Speaker diarization
   diarization:

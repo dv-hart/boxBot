@@ -193,8 +193,7 @@ def list_triggers(*, status: str | None = None) -> list[TriggerRecord]:
         v.validate_one_of(status, "status", v.VALID_TRIGGER_STATUSES)
         payload["status"] = status
 
-    _transport.emit_action("tasks.list_triggers", payload)
-    response = _transport.collect_response(timeout=30)
+    response = _transport.request("tasks.list_triggers", payload, timeout=30)
     results = response.get("results", [])
     return [TriggerRecord(r) for r in results]
 
@@ -240,8 +239,7 @@ def list_todos(*, status: str | None = None) -> list[TodoRecord]:
         v.validate_one_of(status, "status", v.VALID_TODO_STATUSES)
         payload["status"] = status
 
-    _transport.emit_action("tasks.list_todos", payload)
-    response = _transport.collect_response(timeout=30)
+    response = _transport.request("tasks.list_todos", payload, timeout=30)
     results = response.get("results", [])
     return [TodoRecord(r) for r in results]
 
@@ -258,8 +256,7 @@ def get(item_id: str) -> TriggerRecord | TodoRecord:
         TriggerRecord or TodoRecord with full details.
     """
     v.require_str(item_id, "item_id")
-    _transport.emit_action("tasks.get", {"id": item_id})
-    response = _transport.collect_response(timeout=30)
+    response = _transport.request("tasks.get", {"id": item_id}, timeout=30)
     item_type = response.get("item_type", "")
     if item_type == "trigger":
         return TriggerRecord(response)

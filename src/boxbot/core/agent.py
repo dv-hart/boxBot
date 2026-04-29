@@ -50,8 +50,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -82,7 +84,9 @@ from boxbot.core.scheduler import get_status_line
 from boxbot.memory.extraction import extract_memories, process_extraction_result
 from boxbot.memory.retrieval import inject_memories
 from boxbot.memory.store import MemoryStore
-from boxbot.tools.registry import get_tool, get_tools
+# Imported lazily inside _dispatch_tools / _process_tool_calls to avoid a
+# circular import: registry → builtins.execute_script → core.config →
+# core/__init__ → core.agent → (back here).
 
 logger = logging.getLogger(__name__)
 
@@ -751,7 +755,46 @@ class BoxBotAgent:
                 "Conversation %s created (channel=%s, key=%s)",
                 conv_id, channel, channel_key,
             )
+            # Eager-start the per-conversation sandbox runner so the
+            # boot cost (sudo + python + import bb) is hidden behind
+            # wake-word activation rather than charged to the first
+            # execute_script call. Best-effort: failure here just
+            # leaves the runner null, and execute_script falls back to
+            # its per-call subprocess path.
+            self._attach_sandbox_runner(conv)
             return conv
+
+    def _attach_sandbox_runner(self, conv: Conversation) -> None:
+        """Construct + eager-start a SandboxRunner for this conversation."""
+        from boxbot.tools.sandbox_runner import SandboxRunner
+
+        try:
+            cfg = get_config()
+            venv_python = (
+                Path(cfg.sandbox.venv_path) / "bin" / "python3"
+            )
+            timeout = cfg.sandbox.timeout
+            sandbox_user = cfg.sandbox.user
+        except Exception:
+            logger.exception(
+                "Sandbox config unavailable — runner not attached"
+            )
+            return
+        enforce = os.environ.get("BOXBOT_SANDBOX_ENFORCE", "1") != "0"
+        runner = SandboxRunner(
+            venv_python=venv_python,
+            sandbox_user=sandbox_user,
+            enforce_sandbox=enforce,
+            timeout=timeout,
+            label=conv.conversation_id,
+        )
+        conv.sandbox_runner = runner
+        # Kick start in the background so create() doesn't block on
+        # subprocess spawn / sudo prompt resolution.
+        asyncio.create_task(
+            runner.start(),
+            name=f"sandbox-start-{conv.conversation_id}",
+        )
 
     async def _on_conversation_ended(self, event: ConversationEnded) -> None:
         """Remove the conversation from the index and fire memory extraction.
@@ -771,6 +814,15 @@ class BoxBotAgent:
                     break
         if conv is None:
             return
+
+        # Tear down the per-conversation sandbox process. Fire-and-
+        # forget; stop() handles its own timeouts and never raises.
+        if conv.sandbox_runner is not None:
+            asyncio.create_task(
+                conv.sandbox_runner.stop(),
+                name=f"sandbox-stop-{conv_id}",
+            )
+            conv.sandbox_runner = None
 
         # Fire-and-forget memory extraction on the ended thread.
         if conv.thread and event.turn_count > 0:
@@ -1109,6 +1161,8 @@ class BoxBotAgent:
         config = get_config()
         model = config.models.large
 
+        from boxbot.tools.registry import get_tools
+
         # Build tool definitions for the API (last tool carries 1h cache marker)
         tools = get_tools()
         tool_definitions = self._build_tool_definitions(tools)
@@ -1210,7 +1264,7 @@ class BoxBotAgent:
             # now run the tools and feed results back.
             if stop_reason == "tool_use":
                 tool_results = await self._process_tool_calls(
-                    response, tools
+                    response, tools, conversation_id=conversation_id,
                 )
                 if tool_results:
                     messages.append({
@@ -1286,6 +1340,8 @@ class BoxBotAgent:
         self,
         response: Any,
         tools: list[Any],
+        *,
+        conversation_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Dispatch tool calls from a model response.
 
@@ -1295,13 +1351,30 @@ class BoxBotAgent:
         either ``str`` (legacy) or ``list[content-block]`` (future image
         attachments — see spec §10) as their content.
 
+        Sets the ``current_conversation`` ContextVar around each tool's
+        ``execute()`` call so tools that need conversation-scoped state
+        (e.g. ``execute_script`` reaching the conversation's long-lived
+        sandbox runner) can find it.
+
         Args:
             response: The Anthropic API response containing tool_use blocks.
             tools: The list of available Tool instances (for reference).
+            conversation_id: ID of the conversation that triggered these
+                tool calls; used to resolve the Conversation for the
+                ContextVar. None disables conversation-scoped routing
+                (tools fall back to per-call behavior).
 
         Returns:
             List of tool_result content blocks to send back to the model.
         """
+        from boxbot.tools.registry import get_tool
+        from boxbot.tools._tool_context import current_conversation
+
+        conv = (
+            self._conversations.get(conversation_id)
+            if conversation_id else None
+        )
+
         tool_results: list[dict[str, Any]] = []
 
         for content_block in response.content:
@@ -1323,6 +1396,7 @@ class BoxBotAgent:
                 })
                 logger.warning("Unknown tool requested: %s", tool_name)
             else:
+                token = current_conversation.set(conv)
                 try:
                     result_content = await tool.execute(**tool_input)
                 except Exception as e:
@@ -1332,6 +1406,8 @@ class BoxBotAgent:
                     result_content = json.dumps({
                         "error": f"Tool execution failed: {e}",
                     })
+                finally:
+                    current_conversation.reset(token)
 
             tool_results.append({
                 "type": "tool_result",

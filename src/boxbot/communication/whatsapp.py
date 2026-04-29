@@ -339,7 +339,8 @@ class WhatsAppWebhook:
 
         return hmac.compare_digest(expected_sig, computed_sig)
 
-    def parse_webhook(self, payload: dict[str, Any]) -> list[IncomingMessage]:
+    @staticmethod
+    def parse_webhook(payload: dict[str, Any]) -> list[IncomingMessage]:
         """Parse an incoming webhook payload into messages.
 
         The Meta webhook payload has a deeply nested structure:

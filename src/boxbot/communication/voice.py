@@ -133,6 +133,11 @@ class VoiceSession:
         self._active_timeout_task: asyncio.Task[None] | None = None
         self._last_speech_time: float = 0.0
 
+        # Set true when the wake word handler interrupts an in-flight
+        # TTS playback in wake_word mode. ``speak()``'s finally block
+        # checks this so it doesn't double-publish AgentSpeakingDone.
+        self._tts_interrupted: bool = False
+
         # Speaker identity mapping (SPEAKER_XX → person name or display label)
         # Populated from voice ReID matches (high-confidence) + agent
         # identify_person calls via SpeakerIdentified events.
@@ -312,28 +317,30 @@ class VoiceSession:
     ) -> None:
         """Turn on audio capture. LED goes to listening.
 
-        Idempotent — calling while ACTIVE just extends the grace timer.
+        Idempotent — calling while ACTIVE just refreshes the grace timer
+        and ensures audio capture is re-attached. In wake_word barge-in
+        mode the wake word is also the way to re-enable STT after BB
+        finishes a turn (audio_capture is detached during/after speech),
+        so re-attachment must happen on every wake event.
         """
         self._last_speech_time = time.monotonic()
-        if self._state is VoiceSessionState.ACTIVE:
-            # Already hot: just refresh the grace timer so another
-            # wake word extends the listening window.
-            self._reset_wake_word_grace_timer()
-            return
+        was_active = self._state is VoiceSessionState.ACTIVE
 
-        self._state = VoiceSessionState.ACTIVE
-        self._conversation_id = f"voice_{uuid.uuid4().hex[:12]}"
-        logger.info(
-            "Voice adapter activated (session=%s)", self._conversation_id,
-        )
+        if not was_active:
+            self._state = VoiceSessionState.ACTIVE
+            self._conversation_id = f"voice_{uuid.uuid4().hex[:12]}"
+            logger.info(
+                "Voice adapter activated (session=%s)", self._conversation_id,
+            )
 
-        # Register audio processing consumers.
+        # Always (re-)attach the STT/diarization consumer. ``start`` is
+        # idempotent: a no-op if the consumer handle is already live.
         if self._microphone and self._audio_capture:
             await self._audio_capture.start(self._microphone)
 
-        # Post-wake-word grace — replaces the old active/suspend timer
-        # pair. If a TranscriptReady publishes, the grace is cancelled
-        # and the Conversation's silence_timeout takes over lifecycle.
+        # Post-wake-word grace — if a TranscriptReady publishes, the
+        # grace is cancelled and the Conversation's silence_timeout
+        # takes over lifecycle.
         self._reset_wake_word_grace_timer()
 
         # Set LED pattern.
@@ -436,7 +443,31 @@ class VoiceSession:
     # ------------------------------------------------------------------
 
     async def _on_wake_word(self, event: WakeWordHeard) -> None:
-        """Handle wake word detection — activate capture or extend grace."""
+        """Handle wake word detection.
+
+        In ``wake_word`` barge-in mode the wake word is the unified
+        re-engagement signal: if BB is mid-TTS the playback stops, and
+        STT is re-attached either way (it's detached during/after BB's
+        own speech in this mode). In ``graduated`` mode this just
+        activates the session or extends the grace window as before.
+        """
+        if (
+            self._config.barge_in.mode == "wake_word"
+            and self._speaker is not None
+            and self._speaker.is_playing
+        ):
+            logger.info("Wake word during TTS — stopping playback")
+            self._tts_interrupted = True
+            await self._speaker.stop_playback()
+            try:
+                await get_event_bus().publish(
+                    AgentSpeakingDone(
+                        conversation_id=self._conversation_id,
+                        interrupted=True,
+                    )
+                )
+            except Exception:
+                logger.exception("Failed to publish AgentSpeakingDone after wake-word interrupt")
         await self._activate_session(event)
 
     async def _on_conversation_ended(self, event: Any) -> None:
@@ -592,6 +623,16 @@ class VoiceSession:
     async def speak(self, text: str, priority: str = "normal") -> None:
         """Speak text through TTS and the speaker.
 
+        In ``wake_word`` barge-in mode the STT/diarization consumer is
+        detached from the microphone for the duration of TTS playback
+        and *stays detached* afterwards: the wake word is the only way
+        to re-engage the transcript pipeline. This solves both the
+        first-turn echo (no STT to be polluted by AEC residue) and
+        household chatter being transcribed mid-reply.
+
+        In ``graduated`` mode the legacy VAD-based barge-in monitor runs
+        instead.
+
         Args:
             text: The text to speak.
             priority: "normal" or "urgent". Urgent interrupts current audio.
@@ -599,6 +640,9 @@ class VoiceSession:
         if not self._tts_stream or not self._speaker:
             logger.warning("Cannot speak: TTS or speaker not available")
             return
+
+        mode = self._config.barge_in.mode
+        self._tts_interrupted = False
 
         # If urgent and something is already playing, stop it
         if priority == "urgent" and self._speaker.is_playing:
@@ -620,21 +664,37 @@ class VoiceSession:
             )
         )
 
-        # Start barge-in monitoring
-        if self._barge_in and self._microphone:
-            await self._barge_in.start(self._microphone)
+        if mode == "wake_word":
+            # Detach STT/diarization: chatter and BB's residual echo
+            # cannot enter the transcript. The wake word handler is the
+            # only path back to an attached audio_capture.
+            if self._audio_capture is not None:
+                await self._audio_capture.stop()
+        elif mode == "graduated":
+            # Legacy three-stage VAD barge-in.
+            if self._barge_in and self._microphone:
+                await self._barge_in.start(self._microphone)
 
         try:
             await self._tts_stream.speak(text)
         except Exception:
             logger.exception("TTS playback failed")
         finally:
-            # Stop barge-in monitoring
-            if self._barge_in and self._microphone:
-                await self._barge_in.remove_from(self._microphone)
+            if mode == "graduated":
+                if self._barge_in and self._microphone:
+                    await self._barge_in.remove_from(self._microphone)
 
-            # Publish done event (if not already published by barge-in)
-            if not (self._barge_in and not self._barge_in._monitoring):
+            # Publish done event unless an interrupt path already did.
+            # graduated: barge-in's interrupt callback publishes once,
+            # detected via _barge_in._monitoring being False.
+            # wake_word: _on_wake_word sets _tts_interrupted when it
+            # stops playback and publishes the done event itself.
+            already_published = self._tts_interrupted or (
+                mode == "graduated"
+                and self._barge_in is not None
+                and not self._barge_in._monitoring
+            )
+            if not already_published:
                 await bus.publish(
                     AgentSpeakingDone(
                         conversation_id=self._conversation_id,
@@ -642,10 +702,14 @@ class VoiceSession:
                     )
                 )
 
-            # Set LED back to listening if still in active session
+            # In wake_word mode, leave the LED in a quieter "I'm here
+            # but waiting for the wake word" state so the visual cue
+            # matches the actual gating behaviour. In graduated mode
+            # we go back to the bright listening pulse.
             if self._state == VoiceSessionState.ACTIVE and self._microphone:
+                pattern = "idle" if mode == "wake_word" else "listening"
                 try:
-                    await self._microphone.set_led_pattern("listening")
+                    await self._microphone.set_led_pattern(pattern)
                 except Exception:
                     pass
 

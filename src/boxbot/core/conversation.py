@@ -46,6 +46,14 @@ from boxbot.core.events import (
     get_event_bus,
 )
 
+# Forward-declared for type hints only; the agent attaches one of these
+# after constructing the Conversation. Keeping the import lazy avoids
+# pulling the tools package from core during static analysis.
+from typing import TYPE_CHECKING  # noqa: E402
+
+if TYPE_CHECKING:
+    from boxbot.tools.sandbox_runner import SandboxRunner
+
 logger = logging.getLogger(__name__)
 
 
@@ -179,6 +187,13 @@ class Conversation:
         self._last_activity_monotonic: float = time.monotonic()
 
         self._closed = False
+
+        # Per-conversation sandbox process. Attached by the agent after
+        # construction (the agent has the config it needs to spawn one).
+        # ``execute_script`` reads this via the current_conversation
+        # ContextVar to route its scripts through. Stays alive across
+        # turns so Python state (last_image, parsed CSVs) persists.
+        self.sandbox_runner: "SandboxRunner | None" = None
 
     # ------------------------------------------------------------------
     # Properties

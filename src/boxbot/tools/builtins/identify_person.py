@@ -73,7 +73,7 @@ class IdentifyPersonTool(Tool):
         "additionalProperties": False,
     }
 
-    async def execute(self, **kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> Any:
         name: str = kwargs["name"]
         ref: str = kwargs["ref"]
 
@@ -126,7 +126,7 @@ class IdentifyPersonTool(Tool):
             "Recorded '{ref}' as '{name}' (outcome: {outcome}).",
         ).format(name=name, ref=ref, outcome=outcome)
 
-        return json.dumps({
+        body = {
             "status": result.get("status", "ok"),
             "outcome": outcome,
             "name": result.get("name", name),
@@ -136,4 +136,54 @@ class IdentifyPersonTool(Tool):
             "prior_claim_name": result.get("prior_claim_name"),
             "prior_claim_source": result.get("prior_claim_source"),
             "message": message,
-        })
+        }
+
+        # On first-meeting / correction outcomes, attach the speaker's
+        # most recent crop so the agent can look at their face and write
+        # appearance notes into person memory. The crop is already on
+        # disk under data/perception/crops/ (allowlisted for attach).
+        if outcome in ("create", "correct", "rename"):
+            crop_path = _find_latest_crop_for_ref(pipeline, ref)
+            if crop_path is not None:
+                from boxbot.tools._sandbox_actions import build_image_block
+
+                block = build_image_block(crop_path)
+                if block is not None:
+                    body["crop_attached"] = True
+                    body["crop_path"] = str(crop_path)
+                    body["appearance_prompt"] = (
+                        "The speaker's face is attached. Write a short "
+                        "appearance description to bb.workspace (e.g. "
+                        f"notes/people/{name.lower()}.md) and a memory "
+                        "pointer to it so you recognise them later."
+                    )
+                    return [{"type": "text", "text": json.dumps(body)}, block]
+
+        return json.dumps(body)
+
+
+def _find_latest_crop_for_ref(pipeline: Any, ref: str) -> "Path | None":
+    """Locate the most recent crop image for a speaker ref, if any.
+
+    Lives alongside the tool so it can pick up CropManager state either
+    from the pipeline (if it exposes one) or from the on-disk default
+    layout. Kept tolerant — this is a UX enhancement, not a required
+    path, so exceptions degrade gracefully.
+    """
+    from pathlib import Path
+
+    try:
+        mgr = getattr(pipeline, "_crop_manager", None) or getattr(
+            pipeline, "crop_manager", None
+        )
+        if mgr is None:
+            from boxbot.perception.crops import CropManager
+
+            mgr = CropManager()
+        p = mgr.latest_for_ref(ref)
+        if p is None:
+            return None
+        return Path(p)
+    except Exception:
+        logger.debug("crop lookup for ref=%s failed", ref, exc_info=True)
+        return None

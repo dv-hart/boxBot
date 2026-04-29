@@ -21,18 +21,8 @@ class SpeakTool(Tool):
 
     name = "speak"
     description = (
-        "Say something aloud IMMEDIATELY. Use this during a turn for brief "
-        "interim acknowledgments while you work — 'One moment', 'Let me check', "
-        "'Looking that up now'. Also use for proactive speech when not in an "
-        "active voice conversation (scheduled reminders, greetings). "
-        "\n\n"
-        "DO NOT use speak() for the final answer to a question — put that in "
-        "the `response_text` field of your end-of-turn decision so the system "
-        "can route it correctly across channels and track it. Calling speak() "
-        "with your final answer causes double-speaking and breaks the silent/"
-        "respond gate. "
-        "\n\n"
-        "Urgent priority interrupts current audio; use sparingly."
+        "DEPRECATED — use message(to, channel='speak', content) instead. "
+        "Retained on disk for reference; not registered in the active tool list."
     )
     parameters = {
         "type": "object",

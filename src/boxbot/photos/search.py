@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -202,6 +203,114 @@ async def get_photo_detail(store: PhotoStore, photo_id: str) -> PhotoRecord | No
         PhotoRecord with all metadata, tags, and people, or None.
     """
     return await store.get_photo(photo_id)
+
+
+# ---------------------------------------------------------------------------
+# Shared PhotoStore singleton
+# ---------------------------------------------------------------------------
+
+_store_singleton: PhotoStore | None = None
+
+
+async def get_store() -> PhotoStore:
+    """Return a lazily-initialized PhotoStore singleton.
+
+    Both the ``search_photos`` tool and the sandbox ``photos.*`` action
+    handlers share one store instance. ``initialize()`` is called on
+    first access (creates the SQLite schema if needed).
+    """
+    global _store_singleton
+    if _store_singleton is None:
+        store = PhotoStore()
+        await store.initialize()
+        _store_singleton = store
+    return _store_singleton
+
+
+def _record_to_dict(r: PhotoRecord) -> dict[str, Any]:
+    return {
+        "id": r.id,
+        "filename": r.filename,
+        "source": r.source,
+        "sender": r.sender,
+        "description": r.description,
+        "orientation": r.orientation,
+        "width": r.width,
+        "height": r.height,
+        "file_size": r.file_size,
+        "in_slideshow": r.in_slideshow,
+        "created_at": r.created_at,
+        "deleted_at": r.deleted_at,
+        "updated_at": r.updated_at,
+        "tags": list(r.tags),
+        "people": list(r.people),
+    }
+
+
+async def search_photos(
+    *,
+    mode: str = "search",
+    query: str | None = None,
+    photo_id: str | None = None,
+    tags: list[str] | None = None,
+    people: list[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    source: str | None = None,
+    in_slideshow: bool | None = None,
+    include_deleted: bool = False,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """High-level photo search used by both the tool and SDK handlers.
+
+    Modes:
+        - ``search``: returns ``{"results": [{photo_dict, score}, ...]}``
+        - ``get``: returns the photo dict directly, or ``{"error": ...}``
+    """
+    store = await get_store()
+
+    if mode == "get":
+        if not photo_id:
+            return {"error": "photo_id is required for 'get' mode"}
+        record = await get_photo_detail(store, photo_id)
+        if record is None:
+            return {"error": f"photo {photo_id} not found"}
+        return _record_to_dict(record)
+
+    if mode == "search":
+        results = await hybrid_search(
+            store,
+            query=query,
+            tags=tags,
+            people=people,
+            date_from=date_from,
+            date_to=date_to,
+            source=source,
+            in_slideshow=in_slideshow,
+            include_deleted=include_deleted,
+            limit=limit,
+        )
+        return {
+            "results": [
+                {**_record_to_dict(r.photo), "score": round(r.score, 4)}
+                for r in results
+            ]
+        }
+
+    return {"error": f"unknown mode: {mode!r}"}
+
+
+async def resolve_photo_path(photo_id: str) -> Path | None:
+    """Return the absolute filesystem path for a photo, or None if missing."""
+    from boxbot.core.config import get_config
+
+    store = await get_store()
+    record = await store.get_photo(photo_id)
+    if record is None or record.deleted_at:
+        return None
+    config = get_config()
+    storage_path = Path(config.photos.storage_path)
+    return (storage_path / record.filename).resolve()
 
 
 # ---------------------------------------------------------------------------

@@ -25,10 +25,12 @@ from pathlib import Path
 import aiosqlite
 import numpy as np
 
+from boxbot.core.paths import PERCEPTION_DIR
+
 logger = logging.getLogger(__name__)
 
-# Default database location
-DB_DIR = Path("data/perception")
+# Default database location (anchored to project root via paths module)
+DB_DIR = PERCEPTION_DIR
 DB_PATH = DB_DIR / "perception.db"
 
 # Embedding caps per person
@@ -327,13 +329,31 @@ class CloudStore:
     ) -> str:
         """Add a voice embedding to a person's cloud.
 
+        Embeddings containing NaN or Inf are rejected with an empty
+        string return. A single NaN that lands in storage poisons the
+        person's centroid (NaN propagates through ``np.mean``) and
+        silently disables every cosine similarity check for that
+        speaker — so the storage path is the right place to fail
+        loudly rather than trust upstream callers.
+
         Args:
             person_id: Person to add embedding for.
             embedding: Float32 embedding vector (typically 192-dim).
 
         Returns:
-            The generated embedding ID.
+            The generated embedding ID, or ``""`` if the embedding was
+            rejected as non-finite.
         """
+        if embedding is None or not np.all(np.isfinite(embedding)):
+            logger.warning(
+                "Refusing to add non-finite voice embedding for person %s "
+                "(%d non-finite values)",
+                person_id,
+                int((~np.isfinite(embedding)).sum())
+                if embedding is not None else -1,
+            )
+            return ""
+
         db = self._ensure_db()
         emb_id = _generate_id()
         now = _now_iso()
@@ -476,15 +496,37 @@ class CloudStore:
     async def recompute_voice_centroid(self, person_id: str) -> np.ndarray | None:
         """Recompute and store voice centroid from current voice embeddings.
 
+        Non-finite (NaN/Inf) embeddings are filtered out before
+        averaging — a single NaN row would otherwise poison the entire
+        centroid and silently disable downstream similarity checks
+        (this happened in production on 2026-04-26).
+
         Returns:
-            The new centroid, or None if no embeddings exist.
+            The new centroid, or None if no usable embeddings exist.
         """
         embeddings = await self.get_voice_embeddings(person_id)
         if not embeddings:
             return None
 
-        vectors = [emb for _, emb in embeddings]
-        mean = np.mean(vectors, axis=0).astype(np.float32)
+        usable = [emb for _, emb in embeddings if np.all(np.isfinite(emb))]
+        skipped = len(embeddings) - len(usable)
+        if skipped:
+            logger.warning(
+                "Skipped %d non-finite voice embedding(s) for person %s "
+                "during centroid recompute",
+                skipped, person_id,
+            )
+        if not usable:
+            return None
+
+        mean = np.mean(usable, axis=0).astype(np.float32)
+        if not np.all(np.isfinite(mean)):
+            logger.error(
+                "Voice centroid for person %s is non-finite after "
+                "filtering — this should be impossible; aborting update",
+                person_id,
+            )
+            return None
         norm = np.linalg.norm(mean)
         if norm > 0:
             mean = mean / norm

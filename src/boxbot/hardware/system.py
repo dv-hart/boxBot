@@ -1,11 +1,12 @@
-"""System-level monitoring: thermal, memory/disk, and graceful shutdown.
+"""System-level monitoring: thermal, memory/disk, and health aggregation.
 
 Cross-cutting hardware concerns that don't belong to any single device
-module.  Monitors SoC temperature via sysfs, aggregates per-module health,
-and coordinates graceful shutdown on SIGTERM/SIGINT.
+module. Monitors SoC temperature via sysfs and aggregates per-module
+health. Process signals (SIGTERM/SIGINT) are owned by
+:mod:`boxbot.core.main`.
 
 Hardware: Pi 5 SoC, PMIC, thermals
-Interface: sysfs, signals
+Interface: sysfs
 """
 
 from __future__ import annotations
@@ -13,23 +14,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-import signal
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from boxbot.hardware.base import (
     HardwareModule,
     HealthStatus,
-    ShutdownRequested,
     SystemHealth,
     ThermalWarning,
 )
-from boxbot.core.events import get_event_bus
 
 logger = logging.getLogger(__name__)
 
 
 class System(HardwareModule):
-    """Thermal monitoring, health aggregation, and graceful shutdown.
+    """Thermal monitoring and health aggregation.
 
     Always available — does not depend on external hardware beyond the
     Pi 5 SoC itself.
@@ -45,17 +43,14 @@ class System(HardwareModule):
         throttle_temp: float = 80.0,
         critical_temp: float = 85.0,
         poll_interval: float = 30.0,
-        shutdown_timeout: float = 10.0,
     ) -> None:
         super().__init__()
         self._warning_temp = warning_temp
         self._throttle_temp = throttle_temp
         self._critical_temp = critical_temp
         self._poll_interval = poll_interval
-        self._shutdown_timeout = shutdown_timeout
 
         self._monitor_task: asyncio.Task[None] | None = None
-        self._shutdown_handlers: list[tuple[str, Callable[[], Awaitable[None]]]] = []
         self._hal_modules: dict[str, HardwareModule] = {}
         self._hailo_ref: Any = None  # Optional reference to Hailo module for temperature
 
@@ -65,15 +60,14 @@ class System(HardwareModule):
     # ── Lifecycle ──────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Register signal handlers and start thermal monitoring."""
-        loop = asyncio.get_event_loop()
+        """Start thermal monitoring.
 
-        # Register signal handlers for graceful shutdown
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(
-                self._handle_signal(s)
-            ))
-
+        Process-level signal handling lives in :mod:`boxbot.core.main` —
+        this module used to register its own SIGTERM/SIGINT handlers,
+        but that silently overwrote main's handler and the shutdown
+        event was never set, leaving the process running after a
+        SIGTERM. Signals are owned by main now.
+        """
         # Start thermal monitoring background task
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         self._started = True
@@ -178,58 +172,6 @@ class System(HardwareModule):
         except (FileNotFoundError, ValueError, OSError):
             pass
         return 0.0
-
-    # ── Shutdown ───────────────────────────────────────────────────
-
-    def register_shutdown_handler(
-        self,
-        callback: Callable[[], Awaitable[None]],
-        name: str = "",
-    ) -> None:
-        """Register a handler to run on graceful shutdown.
-
-        Handlers run in registration order with a shared timeout.
-        """
-        self._shutdown_handlers.append((name or callback.__qualname__, callback))
-        logger.debug("Registered shutdown handler: %s", name or callback.__qualname__)
-
-    async def _handle_signal(self, sig: signal.Signals) -> None:
-        """Handle SIGTERM/SIGINT for graceful shutdown."""
-        sig_name = sig.name
-        logger.info("Received %s — initiating graceful shutdown", sig_name)
-
-        bus = get_event_bus()
-        await bus.publish(ShutdownRequested(reason="signal"))
-
-        # Run registered shutdown handlers with timeout
-        await self._run_shutdown_handlers()
-
-    async def _run_shutdown_handlers(self) -> None:
-        """Run all registered shutdown handlers with a shared timeout."""
-        if not self._shutdown_handlers:
-            return
-
-        logger.info(
-            "Running %d shutdown handler(s) (timeout=%.0fs)",
-            len(self._shutdown_handlers),
-            self._shutdown_timeout,
-        )
-
-        async def _run_all() -> None:
-            for name, handler in self._shutdown_handlers:
-                try:
-                    logger.debug("Running shutdown handler: %s", name)
-                    await handler()
-                except Exception:
-                    logger.exception("Shutdown handler '%s' failed", name)
-
-        try:
-            await asyncio.wait_for(_run_all(), timeout=self._shutdown_timeout)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Shutdown handlers did not complete within %.0fs timeout",
-                self._shutdown_timeout,
-            )
 
     # ── Thermal monitoring ─────────────────────────────────────────
 

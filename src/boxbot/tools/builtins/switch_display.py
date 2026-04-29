@@ -55,25 +55,31 @@ class SwitchDisplayTool(Tool):
             "switch_display: %s (args=%s)", display_name, list(args.keys())
         )
 
-        # Stub: In production, this tells the display manager to switch
-        # to the named display. The display manager validates the name
-        # against registered displays and passes args through.
+        from boxbot.displays.manager import get_display_manager
 
-        # Stub list of available displays — in production, populated from
-        # the display manager's registry.
-        available_displays = [
-            "clock",
-            "weather",
-            "calendar",
-            "picture",
-            "tasks",
-            "status",
-        ]
+        mgr = get_display_manager()
+        if mgr is None:
+            # Display subsystem isn't running (dev, tests, startup race).
+            # Report rather than pretend success.
+            return json.dumps({
+                "status": "error",
+                "error": "display manager not running",
+                "display_name": display_name,
+                "args": args,
+            })
 
+        available = mgr.list_available() if hasattr(mgr, "list_available") else []
+        if available and display_name not in available:
+            return json.dumps({
+                "status": "error",
+                "error": f"unknown display '{display_name}'",
+                "available_displays": available,
+            })
+
+        ok = await mgr.switch(display_name, args=args)
         return json.dumps({
-            "status": "switched",
+            "status": "ok" if ok else "error",
             "display_name": display_name,
             "args": args,
-            "available_displays": available_displays,
-            "message": f"Display switched to '{display_name}'.",
+            "available_displays": available,
         })

@@ -8,10 +8,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from boxbot.tools.base import Tool
+from boxbot.tools._sandbox_actions import ActionContext, process_action
 from boxbot.tools.builtins.execute_script import (
     SDK_ACTION_MARKER,
     ExecuteScriptTool,
-    _process_sdk_action,
 )
 from boxbot.tools.builtins.manage_tasks import ManageTasksTool
 from boxbot.tools.builtins.search_memory import SearchMemoryTool
@@ -61,10 +61,10 @@ class TestToolRegistry:
     """Test tool discovery and registry functions."""
 
     def test_get_tools_count_and_composition(self):
-        """8 tools. All outbound speech/text to humans flows through the
-        structured outputs array (see output_dispatcher). Tools only do
-        things — they don't speak. speak and send_message are subsumed by
-        outputs[channel='voice'] and outputs[channel='text'] respectively."""
+        """9 tools. All outbound speech/text to humans flows through the
+        ``message`` tool (channel='speak' or 'text'). The other tools DO
+        things — they don't speak. The legacy ``speak`` and ``send_message``
+        files remain on disk for reference but are not registered."""
         # Reset the singleton to force fresh load
         import boxbot.tools.registry as reg
         reg._tools = None
@@ -72,10 +72,11 @@ class TestToolRegistry:
 
         from boxbot.tools.registry import get_tools
         tools = get_tools()
-        assert len(tools) == 8
+        assert len(tools) == 9
         names = {t.name for t in tools}
-        assert "speak" not in names  # subsumed by outputs[voice]
-        assert "send_message" not in names  # subsumed by outputs[text]
+        assert "message" in names  # the only path to a human
+        assert "speak" not in names  # subsumed by message(channel='speak')
+        assert "send_message" not in names  # subsumed by message(channel='text')
         assert "load_skill" in names
 
     def test_get_tools_returns_tool_instances(self):
@@ -106,6 +107,7 @@ class TestToolRegistry:
         from boxbot.tools.registry import get_tools
         names = {t.name for t in get_tools()}
         expected = {
+            "message",
             "execute_script",
             "switch_display",
             "identify_person",
@@ -130,67 +132,50 @@ class TestToolRegistry:
 
 
 class TestExecuteScriptTool:
-    """Test the execute_script tool behavior."""
+    """Test the execute_script tool behaviour.
+
+    End-to-end subprocess flow (streaming IO, sandbox action dispatch,
+    image attachment) is covered by tests/test_workspace.py which runs
+    the real subprocess pipeline. These tests cover schema + the
+    action dispatcher in isolation.
+    """
 
     def test_sdk_action_marker_constant(self):
-        assert SDK_ACTION_MARKER == "__BOXBOT_SDK_ACTION__"
+        # Marker matches the one emitted by boxbot_sdk._transport so the
+        # stream reader can locate JSON payloads unambiguously.
+        assert SDK_ACTION_MARKER == "__BOXBOT_SDK_ACTION__:"
 
-    @pytest.mark.asyncio
-    async def test_execute_captures_stdout(self, tmp_path):
+    def test_schema(self):
         tool = ExecuteScriptTool()
-        with patch("boxbot.tools.builtins.execute_script.SCRIPTS_DIR", tmp_path / "scripts"):
-            with patch("boxbot.tools.builtins.execute_script.OUTPUT_DIR", tmp_path / "output"):
-                with patch("boxbot.tools.builtins.execute_script.get_config", side_effect=RuntimeError):
-                    # Use the system python since sandbox venv doesn't exist
-                    import sys
-                    venv_python = sys.executable
-                    with patch(
-                        "asyncio.create_subprocess_exec",
-                        new_callable=AsyncMock,
-                    ) as mock_proc:
-                        proc_mock = AsyncMock()
-                        proc_mock.communicate.return_value = (b"Hello World\n", b"")
-                        proc_mock.returncode = 0
-                        mock_proc.return_value = proc_mock
-
-                        result_json = await tool.execute(
-                            script='print("Hello World")',
-                            description="Test print",
-                        )
-                        result = json.loads(result_json)
-                        assert result["status"] == "success"
-                        assert result["output"] == "Hello World"
+        schema = tool.to_schema()
+        assert schema["name"] == "execute_script"
+        assert "script" in schema["parameters"]["properties"]
+        assert "description" in schema["parameters"]["properties"]
+        assert schema["parameters"]["required"] == ["script", "description"]
 
     @pytest.mark.asyncio
-    async def test_execute_parses_sdk_actions(self, tmp_path):
-        tool = ExecuteScriptTool()
-        sdk_line = f'{SDK_ACTION_MARKER}{{"action":"memory.save","content":"test"}}'
-        stdout = f"regular output\n{sdk_line}\nmore output\n"
-
-        with patch("boxbot.tools.builtins.execute_script.SCRIPTS_DIR", tmp_path / "scripts"):
-            with patch("boxbot.tools.builtins.execute_script.OUTPUT_DIR", tmp_path / "output"):
-                with patch("boxbot.tools.builtins.execute_script.get_config", side_effect=RuntimeError):
-                    with patch(
-                        "asyncio.create_subprocess_exec",
-                        new_callable=AsyncMock,
-                    ) as mock_proc:
-                        proc_mock = AsyncMock()
-                        proc_mock.communicate.return_value = (stdout.encode(), b"")
-                        proc_mock.returncode = 0
-                        mock_proc.return_value = proc_mock
-
-                        result_json = await tool.execute(
-                            script="...", description="SDK test"
-                        )
-                        result = json.loads(result_json)
-                        assert "sdk_actions" in result
-                        assert len(result["sdk_actions"]) == 1
+    async def test_process_action_unknown_returns_stub(self):
+        ctx = ActionContext()
+        result = await process_action(
+            {"_sdk": "memory.save", "content": "test"}, ctx
+        )
+        # memory.* not yet wired to a real handler, so the dispatcher
+        # acknowledges without failing — keeps the sandbox un-blocked.
+        assert result["status"] == "stub"
+        assert ctx.action_log[-1]["action"] == "memory.save"
 
     @pytest.mark.asyncio
-    async def test_process_sdk_action_returns_ack(self):
-        result = await _process_sdk_action({"action": "memory.save"})
-        assert result["status"] == "processed"
-        assert result["action"] == "memory.save"
+    async def test_process_action_workspace_routes_correctly(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "data" / "agent" / "workspace").mkdir(parents=True)
+
+        ctx = ActionContext()
+        result = await process_action(
+            {"_sdk": "workspace.write", "path": "a.md", "content": "hi"},
+            ctx,
+        )
+        assert result["status"] == "ok"
+        assert result["kind"] == "text"
 
 
 # ---------------------------------------------------------------------------

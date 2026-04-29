@@ -4,6 +4,8 @@ This SDK is the ONLY interface sandbox scripts have to boxBot internals.
 It communicates with the main process through structured JSON on stdout.
 
 Modules:
+    camera    — Capture stills from the Pi camera; images attach to
+                the tool result so the agent sees pixels directly
     display   — Declarative block-based display builder
     skill     — Skill builder for creating agent skills
     packages  — Package installation with user approval
@@ -12,10 +14,14 @@ Modules:
     tasks     — Trigger and to-do management
     secrets   — Write-only secret storage
     calendar  — Google Calendar read/write
+    workspace — Filesystem-backed notebook (read, write, view, search,
+                CSVs). The counterpart to memory: memory recognizes,
+                workspace holds content.
 """
 
 from . import (
     calendar,
+    camera,
     display,
     memory,
     packages,
@@ -23,10 +29,12 @@ from . import (
     secrets,
     skill,
     tasks,
+    workspace,
 )
 
 __all__ = [
     "calendar",
+    "camera",
     "display",
     "memory",
     "packages",
@@ -34,4 +42,5 @@ __all__ = [
     "secrets",
     "skill",
     "tasks",
+    "workspace",
 ]

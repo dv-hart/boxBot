@@ -518,6 +518,10 @@ class Conversation:
             async with self._lock:
                 if not self._pending_inputs:
                     self._state = ConversationState.LISTENING
+                    # Restart the silence countdown from end-of-turn so the
+                    # window is "silence after BB finished," not "silence
+                    # since the user's last input."
+                    self._reset_silence_timer()
                     logger.info(
                         "Conversation %s: turn complete "
                         "(%d additions, %.2fs, state=%s)",

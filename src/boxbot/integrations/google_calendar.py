@@ -33,6 +33,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from boxbot.core.paths import CREDENTIALS_DIR
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-_DEFAULT_CRED_DIR = Path("data/credentials")
+_DEFAULT_CRED_DIR = CREDENTIALS_DIR
 _CLIENT_SECRETS_ENV = "GOOGLE_CALENDAR_CLIENT_SECRETS"
 _TOKEN_PATH_ENV = "GOOGLE_CALENDAR_TOKEN"
 _CALENDAR_ID_ENV = "GOOGLE_CALENDAR_ID"

@@ -37,6 +37,7 @@ import aiosqlite
 
 from boxbot.core.config import BoxBotConfig, get_config
 from boxbot.core.events import PersonIdentified, TriggerFired, get_event_bus
+from boxbot.core.paths import SCHEDULER_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-DB_PATH = Path("data/scheduler/scheduler.db")
+DB_PATH = SCHEDULER_DIR / "scheduler.db"
 
 _TRIGGERS_DDL = """\
 CREATE TABLE IF NOT EXISTS triggers (

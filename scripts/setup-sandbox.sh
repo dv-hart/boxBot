@@ -6,12 +6,25 @@
 # What it does:
 #   1. Creates boxbot-sandbox system user (no login, no home, no shell)
 #   2. Creates boxbot group and adds both users
-#   3. Creates sandbox venv at data/sandbox/venv
+#   3. Creates sandbox venv at $SANDBOX_DIR/venv
 #   4. Installs sandbox packages + boxbot_sdk
 #   5. Pre-compiles bytecode for performance
 #   6. Sets filesystem permissions (OS-level sandbox enforcement)
 #   7. Installs seccomp profile for subprocess blocking
 #   8. Verifies sandbox isolation
+#
+# Sandbox location:
+#   By default the sandbox lives at /var/lib/boxbot-sandbox/. This is
+#   *outside* the project tree on purpose: an open-source project can be
+#   cloned into any user's home directory, and the boxbot-sandbox system
+#   user can't necessarily traverse a 0700 home directory just to reach
+#   the venv. /var/lib is the standard Linux location for application
+#   state and is reachable by all system users.
+#
+#   Override with the BOXBOT_SANDBOX_DIR environment variable, e.g.
+#       BOXBOT_SANDBOX_DIR=/opt/boxbot-sandbox ./scripts/setup-sandbox.sh
+#   Keep the override in sync with the ``sandbox.runtime_dir`` field in
+#   config.yaml.
 #
 # Usage:
 #   Called by setup.sh, or run standalone:
@@ -27,7 +40,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SANDBOX_DIR="$PROJECT_DIR/data/sandbox"
+SANDBOX_DIR="${BOXBOT_SANDBOX_DIR:-/var/lib/boxbot-sandbox}"
 SANDBOX_VENV="$SANDBOX_DIR/venv"
 SANDBOX_USER="boxbot-sandbox"
 SANDBOX_GROUP="boxbot"
@@ -89,7 +102,11 @@ else
 fi
 
 for user in "$REAL_USER" "$SANDBOX_USER"; do
-    if id -nG "$user" 2>/dev/null | grep -qw "$SANDBOX_GROUP"; then
+    # Match the group name as a *whole token* — ``grep -w`` treats
+    # hyphens as word boundaries, so a literal ``boxbot`` would falsely
+    # match a primary group named ``boxbot-sandbox``. Compare the
+    # space-separated group list line-by-line with ``-x`` instead.
+    if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$SANDBOX_GROUP"; then
         echo "$user already in $SANDBOX_GROUP group."
     else
         sudo usermod -aG "$SANDBOX_GROUP" "$user"
@@ -105,14 +122,26 @@ done
 echo ""
 echo "--- Creating sandbox virtual environment ---"
 
+# /var/lib/boxbot-sandbox doesn't exist on a fresh system, and the
+# operator can't create directories there without sudo. Create the
+# parent owned by the operator so the rest of the script can manage it
+# without escalation; the per-subdir owner/perm fixups happen below.
+if [[ ! -d "$SANDBOX_DIR" ]]; then
+    sudo mkdir -p "$SANDBOX_DIR"
+    sudo chown "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_DIR"
+    sudo chmod 750 "$SANDBOX_DIR"
+    echo "Created sandbox root at $SANDBOX_DIR"
+    CHANGES+=("Created sandbox root at $SANDBOX_DIR")
+fi
+
 mkdir -p "$SANDBOX_DIR/output" "$SANDBOX_DIR/tmp" "$SANDBOX_DIR/scripts"
 
 if [[ ! -d "$SANDBOX_VENV" ]]; then
     python3 -m venv "$SANDBOX_VENV"
-    echo "Created sandbox venv."
-    CHANGES+=("Created sandbox venv at data/sandbox/venv/")
+    echo "Created sandbox venv at $SANDBOX_VENV"
+    CHANGES+=("Created sandbox venv at $SANDBOX_VENV")
 else
-    echo "Sandbox venv already exists."
+    echo "Sandbox venv already exists at $SANDBOX_VENV"
 fi
 
 "$SANDBOX_VENV/bin/pip" install --upgrade pip --quiet
@@ -182,19 +211,31 @@ echo "--- Setting filesystem permissions ---"
 
 sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_VENV"
 
+# CRITICAL: ``find -type f`` and ``find -type d`` exclude symlinks, but
+# the bare ``chmod`` calls below need to stay symlink-safe too —
+# ``chmod`` follows symlinks by default, and the venv's python3 is a
+# symlink to /usr/bin/python3.13. A naive ``chmod 750`` on the symlink
+# would silently chmod the *system* Python, breaking it for every user
+# on the box. We skip symlinks (their perms come from the target file,
+# which already has the right system perms).
 find "$SANDBOX_VENV" -type d -exec sudo chmod 750 {} +
 find "$SANDBOX_VENV" -type f -exec sudo chmod 640 {} +
 
-# Python interpreter must be executable by sandbox
-sudo chmod 750 "$SANDBOX_VENV/bin/python3"
-# Also handle the versioned symlink (python3.11, python3.12, etc.)
-for pybin in "$SANDBOX_VENV"/bin/python3.*; do
-    [[ -e "$pybin" ]] && sudo chmod 750 "$pybin"
+# Python interpreter binary inside the venv (real file, not a symlink)
+# must be executable by the sandbox group. The bin/python3 *symlink*
+# inherits its target's perms, so we leave it alone.
+for pybin in "$SANDBOX_VENV"/bin/python3*; do
+    if [[ -f "$pybin" && ! -L "$pybin" ]]; then
+        sudo chmod 750 "$pybin"
+    fi
 done
 
-# pip must NOT be executable by sandbox user
+# pip is a regular shell script with a shebang. Lock to owner-only so
+# the sandbox user cannot install packages.
 for pipbin in "$SANDBOX_VENV"/bin/pip*; do
-    [[ -e "$pipbin" ]] && sudo chmod 700 "$pipbin"
+    if [[ -f "$pipbin" && ! -L "$pipbin" ]]; then
+        sudo chmod 700 "$pipbin"
+    fi
 done
 
 # -- Sandbox working directories: owned by sandbox user --
@@ -350,10 +391,13 @@ verify() {
     if [[ "$expected" == "should_succeed" && "$exit_code" -eq 0 ]] || \
        [[ "$expected" == "should_fail" && "$exit_code" -ne 0 ]]; then
         echo "  ✓ $description"
-        ((VERIFY_PASSED++))
+        # Plain assignment, not ((…++)). With ``set -e`` and the var
+        # starting at 0, the post-increment expression evaluates to 0,
+        # which bash treats as a failed command and aborts the script.
+        VERIFY_PASSED=$((VERIFY_PASSED + 1))
     else
         echo "  ✗ $description"
-        ((VERIFY_FAILED++))
+        VERIFY_FAILED=$((VERIFY_FAILED + 1))
     fi
 }
 
@@ -372,11 +416,19 @@ verify "Sandbox can import requests, numpy" "should_succeed" "$rc"
 # Test 4: Sandbox user can write to output directory
 sudo -u "$SANDBOX_USER" touch "$SANDBOX_DIR/output/.verify_test" &>/dev/null && rc=0 || rc=$?
 rm -f "$SANDBOX_DIR/output/.verify_test" 2>/dev/null
-verify "Sandbox can write to data/sandbox/output/" "should_succeed" "$rc"
+verify "Sandbox can write to $SANDBOX_DIR/output/" "should_succeed" "$rc"
 
-# Test 5: Sandbox user can read config
-sudo -u "$SANDBOX_USER" test -r "$PROJECT_DIR/config/config.example.yaml" &>/dev/null && rc=0 || rc=$?
-verify "Sandbox can read config/" "should_succeed" "$rc"
+# Test 5: Sandbox user CANNOT read project config directly. The
+# project tree often lives under a 0700 home directory (typical Linux
+# default), and the SDK accesses everything via the action protocol
+# over stdin/stdout — there is no scenario where the sandbox needs
+# direct filesystem access to config/. Treat readable config as a
+# misconfiguration to flag.
+if [[ -f "$PROJECT_DIR/config/config.example.yaml" ]]; then
+    sudo -u "$SANDBOX_USER" test -r "$PROJECT_DIR/config/config.example.yaml" \
+        &>/dev/null && rc=0 || rc=$?
+    verify "Sandbox cannot read project config/" "should_fail" "$rc"
+fi
 
 # Test 6: Sandbox user CANNOT read .env
 if [[ -f "$PROJECT_DIR/.env" ]]; then
@@ -440,7 +492,7 @@ echo "  Seccomp:        config/seccomp-sandbox.json"
 echo ""
 echo "  Permission summary:"
 echo "    CAN read:     config/, data/memory/, data/photos/, data/scheduler/"
-echo "    CAN write:    data/sandbox/output/, data/sandbox/tmp/, skills/"
+echo "    CAN write:    $SANDBOX_DIR/output/, $SANDBOX_DIR/tmp/, skills/"
 echo "    CAN execute:  $SANDBOX_VENV/bin/python3"
 echo "    CANNOT read:  .env, src/boxbot/, .git/"
 echo "    CANNOT write: site-packages, venv/"

@@ -30,6 +30,7 @@ from boxbot.core.events import (
     ConversationStarted,
     TranscriptReady,
     TriggerFired,
+    VoiceSessionEnded,
     WakeWordHeard,
     get_event_bus,
 )
@@ -63,6 +64,7 @@ class AgentStateTracker:
         bus.subscribe(AgentSpeaking, self._on_agent_speaking)
         bus.subscribe(AgentSpeakingDone, self._on_agent_speaking_done)
         bus.subscribe(TriggerFired, self._on_trigger_fired)
+        bus.subscribe(VoiceSessionEnded, self._on_voice_session_ended)
         self._running = True
         logger.debug("AgentStateTracker started")
 
@@ -77,6 +79,7 @@ class AgentStateTracker:
         bus.unsubscribe(AgentSpeaking, self._on_agent_speaking)
         bus.unsubscribe(AgentSpeakingDone, self._on_agent_speaking_done)
         bus.unsubscribe(TriggerFired, self._on_trigger_fired)
+        bus.unsubscribe(VoiceSessionEnded, self._on_voice_session_ended)
         self._running = False
 
     @property
@@ -140,6 +143,16 @@ class AgentStateTracker:
     async def _on_trigger_fired(self, event: TriggerFired) -> None:
         self._state = _STATE_THINKING
         self._mark_active()
+
+    async def _on_voice_session_ended(self, event: VoiceSessionEnded) -> None:
+        # Voice adapter went idle (e.g. wake-word grace expired with no
+        # speech). If no Conversation is active we'd otherwise stay stuck
+        # in LISTENING from the WakeWordHeard transition — flip back to
+        # sleeping. When a real conversation is in flight, leave state
+        # alone; ConversationEnded is the authoritative reset.
+        if self._active_conversations == 0:
+            self._state = _STATE_SLEEPING
+            self._mark_active()
 
     def _mark_active(self) -> None:
         self._last_active = datetime.now(timezone.utc)

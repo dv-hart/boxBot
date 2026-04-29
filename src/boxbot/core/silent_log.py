@@ -39,11 +39,13 @@ from typing import Any
 
 import aiosqlite
 
+from boxbot.core.paths import MEMORY_DIR
+
 logger = logging.getLogger(__name__)
 
 # Reuse the memory DB for locality with extraction.
 # Matches boxbot.memory.store.DB_PATH.
-_DB_DIR = Path("data/memory")
+_DB_DIR = MEMORY_DIR
 _DB_PATH = _DB_DIR / "memory.db"
 
 

@@ -1,4 +1,4 @@
-"""Tests for the output dispatcher and OUTPUT_SCHEMA."""
+"""Tests for the output dispatcher and INTERNAL_NOTES_SCHEMA."""
 from __future__ import annotations
 
 import json
@@ -6,9 +6,9 @@ import json
 import pytest
 
 from boxbot.core.output_dispatcher import (
-    OUTPUT_SCHEMA,
+    INTERNAL_NOTES_SCHEMA,
     dispatch_outputs,
-    parse_output_block,
+    parse_internal_notes,
 )
 
 
@@ -17,88 +17,88 @@ from boxbot.core.output_dispatcher import (
 # ---------------------------------------------------------------------------
 
 
-class TestOutputSchema:
-    """OUTPUT_SCHEMA is the single source of truth for the agent's response
-    structure. It must stay stable (changes invalidate the messages cache)."""
+class TestInternalNotesSchema:
+    """INTERNAL_NOTES_SCHEMA pins the agent's text output to a private
+    scratchpad shape. It must stay stable (changes invalidate the messages
+    cache) and must contain NO delivery channel — deliveries go through
+    the message tool, not through this JSON.
+    """
 
     def test_required_top_level_keys(self):
-        assert OUTPUT_SCHEMA["type"] == "object"
-        assert set(OUTPUT_SCHEMA["required"]) == {"thought", "outputs"}
-        assert OUTPUT_SCHEMA["additionalProperties"] is False
+        assert INTERNAL_NOTES_SCHEMA["type"] == "object"
+        assert set(INTERNAL_NOTES_SCHEMA["required"]) == {"thought"}
+        assert INTERNAL_NOTES_SCHEMA["additionalProperties"] is False
 
     def test_thought_is_string(self):
-        assert OUTPUT_SCHEMA["properties"]["thought"]["type"] == "string"
+        assert INTERNAL_NOTES_SCHEMA["properties"]["thought"]["type"] == "string"
 
-    def test_outputs_is_array_of_objects(self):
-        outputs = OUTPUT_SCHEMA["properties"]["outputs"]
-        assert outputs["type"] == "array"
-        assert outputs["items"]["type"] == "object"
+    def test_observations_is_string_array(self):
+        obs = INTERNAL_NOTES_SCHEMA["properties"]["observations"]
+        assert obs["type"] == "array"
+        assert obs["items"]["type"] == "string"
 
-    def test_output_entry_shape(self):
-        item = OUTPUT_SCHEMA["properties"]["outputs"]["items"]
-        assert set(item["required"]) == {"to", "channel", "content"}
-        assert item["additionalProperties"] is False
-        assert item["properties"]["channel"]["enum"] == ["voice", "text"]
+    def test_no_delivery_fields(self):
+        # Hard guarantee: no `outputs`, `response_text`, `to`, `channel`,
+        # `content`, etc. The schema must not provide a delivery path.
+        forbidden = {
+            "outputs", "response_text", "to", "channel", "content", "respond",
+        }
+        assert forbidden.isdisjoint(
+            INTERNAL_NOTES_SCHEMA["properties"].keys()
+        )
 
 
 # ---------------------------------------------------------------------------
-# parse_output_block
+# parse_internal_notes
 # ---------------------------------------------------------------------------
 
 
-class TestParseOutputBlock:
+class TestParseInternalNotes:
 
     def test_well_formed_parse(self):
         raw = json.dumps({
             "thought": "replying",
-            "outputs": [
-                {"to": "current_speaker", "channel": "voice", "content": "hi"},
-            ],
+            "observations": ["Jacob seems tired"],
         })
-        parsed = parse_output_block(raw)
+        parsed = parse_internal_notes(raw)
         assert parsed is not None
         assert parsed.thought == "replying"
-        assert len(parsed.outputs) == 1
-        assert parsed.outputs[0]["channel"] == "voice"
+        assert parsed.observations == ["Jacob seems tired"]
 
-    def test_empty_outputs_is_valid(self):
-        raw = json.dumps({"thought": "not addressed", "outputs": []})
-        parsed = parse_output_block(raw)
+    def test_missing_observations_is_empty(self):
+        raw = json.dumps({"thought": "not addressed"})
+        parsed = parse_internal_notes(raw)
         assert parsed is not None
-        assert parsed.outputs == []
+        assert parsed.thought == "not addressed"
+        assert parsed.observations == []
 
     def test_empty_string_returns_none(self):
-        assert parse_output_block("") is None
-        assert parse_output_block("   ") is None
+        assert parse_internal_notes("") is None
+        assert parse_internal_notes("   ") is None
 
     def test_invalid_json_returns_none(self):
-        assert parse_output_block("{not json") is None
+        assert parse_internal_notes("{not json") is None
 
     def test_non_dict_returns_none(self):
-        assert parse_output_block("[1, 2, 3]") is None
-        assert parse_output_block('"just a string"') is None
+        assert parse_internal_notes("[1, 2, 3]") is None
+        assert parse_internal_notes('"just a string"') is None
 
-    def test_missing_outputs_defaults_to_empty(self):
-        raw = json.dumps({"thought": "hmm"})
-        parsed = parse_output_block(raw)
-        assert parsed is not None
-        assert parsed.outputs == []
-
-    def test_non_dict_entries_in_outputs_are_skipped(self):
+    def test_non_string_observations_are_skipped(self):
         raw = json.dumps({
             "thought": "",
-            "outputs": [
-                "not a dict",
-                {"to": "Jacob", "channel": "voice", "content": "hi"},
-            ],
+            "observations": [42, "kept", None, "also kept"],
         })
-        parsed = parse_output_block(raw)
+        parsed = parse_internal_notes(raw)
         assert parsed is not None
-        assert len(parsed.outputs) == 1
+        assert parsed.observations == ["kept", "also kept"]
 
 
 # ---------------------------------------------------------------------------
 # dispatch_outputs — with mocked voice/whatsapp/auth singletons
+#
+# dispatch_outputs is now invoked from the message tool (one entry
+# per call) and from trigger-fired turns (potentially batched). Its routing
+# behaviour is unchanged from when the agent loop called it directly.
 # ---------------------------------------------------------------------------
 
 

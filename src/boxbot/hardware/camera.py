@@ -26,6 +26,23 @@ from boxbot.hardware.base import (
 logger = logging.getLogger(__name__)
 
 
+# Module-level accessor so sandbox action handlers (and anything else
+# outside the startup closure) can reach the shared Camera instance
+# without a full DI framework. Set once by ``boxbot.core.main``.
+_camera_instance: "Camera | None" = None
+
+
+def get_camera() -> "Camera | None":
+    """Return the running Camera, or None if the HAL is not up yet."""
+    return _camera_instance
+
+
+def set_camera(cam: "Camera | None") -> None:
+    """Publish (or clear) the Camera instance for global access."""
+    global _camera_instance
+    _camera_instance = cam
+
+
 class Camera(HardwareModule):
     """Pi Camera Module 3 Wide NoIR via picamera2.
 

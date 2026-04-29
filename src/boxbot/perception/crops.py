@@ -22,6 +22,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from boxbot.core.paths import PERCEPTION_CROPS_DIR
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,18 +34,21 @@ class CropManager:
     sidecar JSON metadata for each image.
 
     Args:
-        base_path: Root directory for crop storage.
+        base_path: Root directory for crop storage. Defaults to the
+            project-root-anchored data/perception/crops.
         retention_days: Days to retain crops in normal mode.
         debug_retention_days: Days to retain crops in debug mode.
     """
 
     def __init__(
         self,
-        base_path: str = "data/perception/crops",
+        base_path: str | Path | None = None,
         retention_days: int = 1,
         debug_retention_days: int = 7,
     ) -> None:
-        self._base_path = Path(base_path)
+        self._base_path = (
+            Path(base_path) if base_path is not None else PERCEPTION_CROPS_DIR
+        )
         self._retention_days = retention_days
         self._debug_retention_days = debug_retention_days
 
@@ -133,6 +138,57 @@ class CropManager:
         if deleted > 0:
             logger.info("Pruned %d expired crop files", deleted)
         return deleted
+
+    def latest_for_ref(
+        self,
+        ref: str,
+        *,
+        max_age_minutes: int = 30,
+    ) -> Path | None:
+        """Find the most recent crop saved for a given speaker ref.
+
+        Scans today's and yesterday's crop directories for sidecar JSON
+        whose ``ref`` matches. Returns the newest image path, or None
+        if no crop within the age window is found.
+
+        Used by identify_person to attach the speaker's face to the
+        tool result on first-meeting outcomes, so the agent can note
+        appearance details into person memory.
+        """
+        if not self._base_path.exists():
+            return None
+
+        now = datetime.now(timezone.utc)
+        cutoff = now.timestamp() - max_age_minutes * 60
+
+        # Scan today's + yesterday's dirs (crops are tiny, fast to walk)
+        date_dirs: list[Path] = []
+        for delta in (0, 1):
+            d = (now - timedelta(days=delta)).strftime("%Y-%m-%d")
+            p = self._base_path / d
+            if p.exists():
+                date_dirs.append(p)
+
+        best_path: Path | None = None
+        best_mtime = 0.0
+        for date_dir in date_dirs:
+            for meta_path in date_dir.glob("*.json"):
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if meta.get("ref") != ref:
+                    continue
+                img_path = meta_path.with_suffix(".jpg")
+                if not img_path.exists():
+                    continue
+                mtime = img_path.stat().st_mtime
+                if mtime < cutoff:
+                    continue
+                if mtime > best_mtime:
+                    best_mtime = mtime
+                    best_path = img_path
+        return best_path
 
     def get_crop_metadata(self, crop_path: str) -> dict | None:
         """Read sidecar JSON metadata for a crop image.

@@ -143,6 +143,7 @@ class PerceptionPipeline:
         camera_hfov: int = 120,
         crop_retention_days: int = 1,
         crop_retention_days_debug: int = 7,
+        person_confidence_threshold: float = 0.25,
     ) -> None:
         self._camera = camera
         self._hailo = hailo
@@ -154,7 +155,9 @@ class PerceptionPipeline:
 
         # Components (created in start)
         self._motion = MotionDetector(threshold=motion_threshold)
-        self._detector = PersonDetector()
+        self._detector = PersonDetector(
+            confidence_threshold=person_confidence_threshold,
+        )
         self._reid = VisualReID(
             high_threshold=reid_high_threshold,
             low_threshold=reid_low_threshold,
@@ -343,6 +346,16 @@ class PerceptionPipeline:
             return
 
         detections = await self._run_yolo(frame)
+        # Log every CHECKING-state YOLO run (motion-triggered, not the
+        # 5fps scan loop) so we can tune the threshold from real data.
+        # CHECKING runs maybe a few times a second at most while motion
+        # is active and ramps down to nothing during quiet periods, so
+        # this isn't going to flood the log.
+        confs = [round(d.confidence, 3) for d in detections]
+        logger.info(
+            "CHECKING YOLO frame: %d person detections (confidences=%s)",
+            len(detections), confs,
+        )
         new_state = self._state_machine.on_person_detected(detections)
 
         if new_state == PerceptionState.DETECTED:
@@ -595,8 +608,12 @@ class PerceptionPipeline:
             if not people_present:
                 self._motion.reset()
                 _reset_ref_counter()
-                if self._enrollment:
-                    self._enrollment.clear_session()
+                # Do NOT clear enrollment buffers here. The enrollment
+                # session is voice-session scoped and is committed +
+                # cleared by ``_on_voice_session_ended`` / ``commit_session``.
+                # Clearing here drops buffered voice embeddings before the
+                # voice session ends, so identify_person calls within a
+                # conversation never persist their embeddings.
 
     # ── Helpers ────────────────────────────────────────────────────
 

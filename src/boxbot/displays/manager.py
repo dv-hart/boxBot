@@ -28,6 +28,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+
+# Module-level accessor so sandbox action handlers (bb.photos.show_on_screen,
+# bb.display.*) can reach the running DisplayManager without DI plumbing.
+# ``boxbot.core.main`` calls ``set_display_manager`` once at startup.
+_display_manager_instance: "DisplayManager | None" = None
+
+
+def get_display_manager() -> "DisplayManager | None":
+    return _display_manager_instance
+
+
+def set_display_manager(mgr: "DisplayManager | None") -> None:
+    global _display_manager_instance
+    _display_manager_instance = mgr
 import threading
 from pathlib import Path
 from typing import Any
@@ -48,14 +62,15 @@ from boxbot.displays.spec import (
     resolve_bindings,
     validate_spec,
 )
+from boxbot.core.paths import DISPLAYS_DIR, PROJECT_ROOT
 from boxbot.displays.themes import Theme, get_theme
 
 logger = logging.getLogger(__name__)
 
 # Default paths
 _BUILTINS_DIR = Path(__file__).parent / "builtins"
-_USER_DISPLAYS_DIR = Path("displays")
-_AGENT_DISPLAYS_DIR = Path("data/displays")
+_USER_DISPLAYS_DIR = PROJECT_ROOT / "displays"
+_AGENT_DISPLAYS_DIR = DISPLAYS_DIR
 
 
 class DisplayManager:
@@ -714,12 +729,18 @@ class DisplayManager:
         if theme is None:
             return
 
-        # Gather current data from all sources
+        # Gather current data from all sources. Display args are exposed
+        # under the "args" key so blocks can bind to {args.image_ids[0]}
+        # etc. — a way for switch(..., args=...) callers to parameterize
+        # a display (used by the `picture` display for image_ids).
         data = self._data_manager.get_all_data()
+        if self._active_args:
+            data = {**data, "args": dict(self._active_args)}
 
         try:
             # Resolve bindings and render
             resolved = resolve_bindings(spec.root_block, data)
+            _resolve_photo_sources(resolved)
             frame = self._renderer.render_block_tree(resolved, theme, data)
             self._update_frame(frame)
         except Exception:
@@ -907,3 +928,85 @@ class DisplayManager:
             Theme name suitable for nighttime display.
         """
         return "midnight"
+
+
+# ---------------------------------------------------------------------------
+# Photo source pre-resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_photo_sources(block: "Block") -> None:
+    """Walk a resolved block tree and rewrite ``photo:<id>`` image sources.
+
+    After :func:`boxbot.displays.spec.resolve_bindings` runs, ImageBlock
+    sources like ``photo:{args.image_ids[0]}`` are now ``photo:<id>``.
+    The renderer doesn't know how to talk to the photo library, so we
+    resolve each photo id to an absolute file path here and rewrite the
+    block in place. Misses fall through to the renderer's placeholder.
+    """
+    from boxbot.displays.blocks import Block as _Block  # avoid circular
+
+    # Lazy + best-effort: the photo DB may not exist yet on a fresh
+    # install; swallow errors rather than break the whole render.
+    try:
+        from boxbot.core.config import get_config
+        from boxbot.photos.store import PhotoStore
+    except Exception:
+        return
+
+    try:
+        config = get_config()
+    except Exception:
+        return
+
+    storage_path = Path(config.photos.storage_path)
+    db_path = storage_path / "photos.db"
+    if not db_path.exists():
+        return
+
+    # Walk once to collect all photo: ids
+    ids: list[str] = []
+
+    def _collect(b: _Block) -> None:
+        if b.block_type == "image":
+            src = str(b.params.get("source", ""))
+            if src.startswith("photo:"):
+                ids.append(src.split(":", 1)[1])
+        for child in b.children:
+            _collect(child)
+
+    _collect(block)
+    if not ids:
+        return
+
+    import sqlite3
+
+    paths: dict[str, str] = {}
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT id, filename FROM photos "
+                f"WHERE id IN ({placeholders}) AND deleted_at IS NULL",
+                ids,
+            ).fetchall()
+            for r in rows:
+                abs_path = (storage_path / r["filename"]).resolve()
+                if abs_path.exists():
+                    paths[r["id"]] = str(abs_path)
+    except sqlite3.Error as e:
+        logger.warning("photo source resolution failed: %s", e)
+        return
+
+    def _rewrite(b: _Block) -> None:
+        if b.block_type == "image":
+            src = str(b.params.get("source", ""))
+            if src.startswith("photo:"):
+                pid = src.split(":", 1)[1]
+                if pid in paths:
+                    b.params["source"] = paths[pid]
+        for child in b.children:
+            _rewrite(child)
+
+    _rewrite(block)

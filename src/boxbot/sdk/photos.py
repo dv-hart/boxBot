@@ -21,6 +21,16 @@ from typing import Any
 from . import _transport, _validators as v
 
 
+class PhotosError(Exception):
+    """Raised when a photo operation fails on the main process side."""
+
+
+def _check(resp: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(resp, dict) and resp.get("status") == "error":
+        raise PhotosError(resp.get("error", "photo operation failed"))
+    return resp
+
+
 class PhotoRecord:
     """A photo record returned from search or get."""
 
@@ -101,7 +111,7 @@ def search(query: str | None = None, *,
         limit: Maximum results.
 
     Returns:
-        List of PhotoRecord objects.
+        List of PhotoRecord objects sorted by relevance.
     """
     payload: dict[str, Any] = {"limit": limit}
     if query is not None:
@@ -115,10 +125,8 @@ def search(query: str | None = None, *,
         payload["people"] = people
     v.require_int(limit, "limit", min_val=1, max_val=100)
 
-    _transport.emit_action("photos.search", payload)
-    response = _transport.collect_response(timeout=30)
-    results = response.get("results", [])
-    return [PhotoRecord(r) for r in results]
+    resp = _check(_transport.request("photos.search", payload, timeout=30))
+    return [PhotoRecord(r) for r in resp.get("results", [])]
 
 
 def get(photo_id: str) -> PhotoRecord:
@@ -131,9 +139,35 @@ def get(photo_id: str) -> PhotoRecord:
         PhotoRecord with full details.
     """
     v.require_str(photo_id, "photo_id")
-    _transport.emit_action("photos.get", {"id": photo_id})
-    response = _transport.collect_response(timeout=30)
-    return PhotoRecord(response)
+    resp = _check(_transport.request("photos.get", {"id": photo_id}, timeout=30))
+    return PhotoRecord(resp)
+
+
+def view(photo_id: str) -> dict[str, Any]:
+    """Attach a photo's pixels to the tool result so the agent sees it.
+
+    Returns ``{id, filename, kind: "image", attached: True}``. The
+    actual image bytes are delivered as an image content block on the
+    tool result, not as a field in this dict.
+    """
+    v.require_str(photo_id, "photo_id")
+    return _check(_transport.request("photos.view", {"id": photo_id}, timeout=30))
+
+
+def show_on_screen(photo_ids: list[str]) -> dict[str, Any]:
+    """Display one or more photos on the 7\" screen.
+
+    Dispatches through the display manager to the ``picture`` display.
+    The call returns immediately; the display manager handles rendering.
+    """
+    v.require_list(photo_ids, "photo_ids")
+    for pid in photo_ids:
+        v.require_str(pid, "photo_id")
+    return _check(_transport.request(
+        "photos.show_on_screen",
+        {"photo_ids": photo_ids},
+        timeout=10,
+    ))
 
 
 # --- Metadata updates ---
@@ -278,8 +312,7 @@ def list_deleted() -> list[PhotoRecord]:
     Returns:
         List of PhotoRecord objects that are soft-deleted.
     """
-    _transport.emit_action("photos.list_deleted", {})
-    response = _transport.collect_response(timeout=30)
+    response = _transport.request("photos.list_deleted", {}, timeout=30)
     results = response.get("results", [])
     return [PhotoRecord(r) for r in results]
 
@@ -292,6 +325,5 @@ def storage_info() -> StorageInfo:
     Returns:
         StorageInfo with usage and quota details.
     """
-    _transport.emit_action("photos.storage_info", {})
-    response = _transport.collect_response(timeout=30)
+    response = _transport.request("photos.storage_info", {}, timeout=30)
     return StorageInfo(response)

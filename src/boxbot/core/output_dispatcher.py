@@ -1,31 +1,42 @@
-"""Output dispatcher — route the agent's structured outputs to real channels.
+"""Output dispatcher — route deliveries to real channels.
 
-The agent emits structured JSON per turn matching ``OUTPUT_SCHEMA``:
+The agent reaches humans by calling the ``message`` tool, NOT
+by emitting text. Every text token the agent generates is constrained to
+the private ``INTERNAL_NOTES_SCHEMA`` JSON shape — internal scratchpad
+only, never broadcast.
 
-    {
-      "thought": "private reasoning",
-      "outputs": [
-        {"to": "<person|'current_speaker'|'room'>",
-         "channel": "voice" | "text",
-         "content": "..."}
-      ]
-    }
+This module owns:
 
-This module parses such JSON blocks and dispatches each output entry:
+- ``INTERNAL_NOTES_SCHEMA`` — the JSON shape pinned to every
+  ``messages.create`` call via ``output_config.format``. It has no
+  delivery channel: it is the agent's labelled scratchpad of private
+  thoughts and observations. By construction, no field's content can
+  reach a person.
+
+- ``parse_internal_notes`` — parse one structured-output text block into
+  a ``ParsedNotes`` (thought + observations) for logging and memory
+  extraction.
+
+- ``dispatch_outputs`` — invoked by the ``message`` tool (and
+  by trigger-fired turns) to deliver one or more ``{to, channel, content}``
+  entries through voice TTS or WhatsApp.
+
+Routing:
 
 - ``channel == "voice"`` → speak through the active voice session's TTS
-  (the box speaker). ``to`` is semantic — the audience is whoever is in the
-  room; we log the intended addressee for audit.
+  (the box speaker). ``to`` is semantic — the audience is whoever is in
+  the room; we log the intended addressee for audit.
 - ``channel == "text"`` → resolve ``to`` (a name, or ``"current_speaker"``)
   to a registered user's phone number via the AuthManager, then send via
   the WhatsApp client.
 
-Invalid combinations (e.g. ``to: "room"`` with ``channel: "text"``, or an
-unknown name with ``channel: "text"``) are logged and dropped. The agent
-learns from the prompt + dispatcher warnings; the run does not crash.
+Invalid combinations (e.g. ``to: "room"`` with ``channel: "text"``, or
+an unknown name with ``channel: "text"``) are logged and dropped. The
+agent learns from the tool description + dispatcher warnings; the run
+does not crash.
 
-The dispatcher is stateless; all dependencies come from module singletons
-that ``main.py`` sets up at boot (``get_voice_session``,
+The dispatcher is stateless; all dependencies come from module
+singletons that ``main.py`` sets up at boot (``get_voice_session``,
 ``get_whatsapp_client``, ``get_auth_manager``).
 """
 
@@ -46,58 +57,38 @@ SegmentRecorder = Callable[[Any], None]
 
 # ---------------------------------------------------------------------------
 # Schema — pinned via ``output_config.format`` on every messages.create call
+#
+# The schema has NO delivery channel by design. Its sole job is to occupy
+# the model's text-output slot with a private scratchpad shape, removing
+# the trained "respond as plain text to the user" affordance. To reach a
+# human, the agent MUST call the ``message`` tool.
 # ---------------------------------------------------------------------------
 
-OUTPUT_SCHEMA: dict[str, Any] = {
+INTERNAL_NOTES_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "thought": {
             "type": "string",
             "description": (
-                "Short private reasoning for this turn. Never broadcast. "
-                "Used for post-conversation memory extraction and logs."
+                "Private notes for yourself. NEVER reaches anyone. "
+                "Use for your own reasoning and for post-conversation "
+                "memory extraction. To actually speak or text someone, "
+                "call the message tool — that is the only "
+                "channel that reaches a person."
             ),
         },
-        "outputs": {
+        "observations": {
             "type": "array",
+            "items": {"type": "string"},
             "description": (
-                "Zero or more messages to deliver. Empty array = silent turn "
-                "(you noticed something but do not wish to respond)."
+                "Anything you noticed but chose not to act on right now "
+                "(ambient facts, mood, who is in the room, what people "
+                "are doing). PRIVATE — feeds memory extraction only. "
+                "Never reaches anyone."
             ),
-            "items": {
-                "type": "object",
-                "properties": {
-                    "to": {
-                        "type": "string",
-                        "description": (
-                            "Recipient identifier. Use \"current_speaker\" "
-                            "for whoever addressed you most recently in this "
-                            "conversation. Use \"room\" to broadcast voice to "
-                            "anyone physically present (voice channel only). "
-                            "Otherwise use a registered user's name exactly "
-                            "as it appears in the Registered users list."
-                        ),
-                    },
-                    "channel": {
-                        "enum": ["voice", "text"],
-                        "description": (
-                            "Delivery medium. \"voice\" plays TTS through "
-                            "the box speaker (everyone in the room hears). "
-                            "\"text\" sends a WhatsApp message to the "
-                            "named user's registered phone."
-                        ),
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The exact words to deliver.",
-                    },
-                },
-                "required": ["to", "channel", "content"],
-                "additionalProperties": False,
-            },
         },
     },
-    "required": ["thought", "outputs"],
+    "required": ["thought"],
     "additionalProperties": False,
 }
 
@@ -107,19 +98,24 @@ OUTPUT_SCHEMA: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
-class ParsedBlock:
-    """Result of parsing one agent text block as a structured output."""
+class ParsedNotes:
+    """Result of parsing one agent text block as internal notes."""
 
-    __slots__ = ("thought", "outputs", "raw")
+    __slots__ = ("thought", "observations", "raw")
 
-    def __init__(self, thought: str, outputs: list[dict[str, Any]], raw: str):
+    def __init__(
+        self,
+        thought: str,
+        observations: list[str],
+        raw: str,
+    ) -> None:
         self.thought = thought
-        self.outputs = outputs
+        self.observations = observations
         self.raw = raw
 
 
-def parse_output_block(raw_text: str) -> ParsedBlock | None:
-    """Parse a JSON text block emitted by the agent into a ParsedBlock.
+def parse_internal_notes(raw_text: str) -> ParsedNotes | None:
+    """Parse a JSON text block emitted by the agent into a ParsedNotes.
 
     Returns ``None`` on parse failure (should not occur under constrained
     decoding except for the refusal / truncation edge cases). Does not raise.
@@ -139,13 +135,13 @@ def parse_output_block(raw_text: str) -> ParsedBlock | None:
         logger.warning("Parsed agent output is not a dict: %r", type(data).__name__)
         return None
     thought = str(data.get("thought") or "")
-    outputs_raw = data.get("outputs")
-    outputs: list[dict[str, Any]] = []
-    if isinstance(outputs_raw, list):
-        for entry in outputs_raw:
-            if isinstance(entry, dict):
-                outputs.append(entry)
-    return ParsedBlock(thought=thought, outputs=outputs, raw=raw_text)
+    obs_raw = data.get("observations")
+    observations: list[str] = []
+    if isinstance(obs_raw, list):
+        for entry in obs_raw:
+            if isinstance(entry, str) and entry.strip():
+                observations.append(entry)
+    return ParsedNotes(thought=thought, observations=observations, raw=raw_text)
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +159,11 @@ async def dispatch_outputs(
 ) -> None:
     """Dispatch each output entry to its appropriate channel.
 
+    Called by the ``message`` tool (one entry per call) and by
+    trigger-fired turns (potentially multiple entries in a batch).
+
     Args:
-        outputs: List of ``{to, channel, content}`` dicts from the agent.
+        outputs: List of ``{to, channel, content}`` dicts.
         conversation_id: For audit logging.
         channel_context: The conversation's source channel — currently only
             used in log messages for provenance.

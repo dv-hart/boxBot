@@ -48,43 +48,56 @@ contributors can add them without touching core code.
 
 ### 3. Tools, SDK, and Skills
 
-Three layers, each with a different loading strategy and context cost:
+Three layers, each with a different loading strategy and context cost.
+The big shift (2026-04): most capability lives in the `bb` Python
+package (sandbox SDK), reached through `execute_script`. Only genuinely
+hot-path or security-sensitive operations remain as standalone tools.
 
-**Tools** (`src/boxbot/tools/`) — 9 always-loaded capabilities for
-real-time, conversational operations:
-- `execute_script` — run Python in the sandbox (gateway to the SDK)
-- `speak` — say something through the speaker (real-time TTS)
-- `switch_display` — change what's on the 7" screen (with optional
-  display-specific `args`)
-- `send_message` — WhatsApp to a whitelisted user
-- `identify_person` — query who is present or recently seen
-- `manage_tasks` — manage triggers (wake conditions) and to-do list
-- `search_memory` — search, summarize, or retrieve stored memories
-- `search_photos` — search and retrieve photos from the photo library
-- `web_search` — search the web or fetch a URL, filtered by the small
-  model (content firewall against prompt injection)
+**Tools** (`src/boxbot/tools/`) — 7 always-loaded tools:
+- `execute_script` — primary gateway: run Python in the sandbox with
+  the `bb` package (photos, camera, workspace, display, memory, tasks,
+  skill, secrets, packages, calendar). Composes many ops per turn.
+- `switch_display` — change what's on the 7" screen (hot-path singleton)
+- `identify_person` — register / correct a speaker's identity; returns
+  a cropped still of the speaker on new-person outcomes so the agent
+  can note appearance into memory
+- `manage_tasks` — triggers + to-dos (hot-path, every-turn)
+- `search_memory` — memory lookup (hot-path, every-turn)
+- `web_search` — web fetch + small-model content firewall
+- `load_skill` — progressive-disclosure entry point (loads a skill's
+  SKILL.md and optional sub-files into context on demand)
 
-**SDK** (`src/boxbot/sdk/`) — a constrained, immutable Python API
-pre-installed in the sandbox venv. Agent scripts import it to perform
-complex or infrequent operations without dedicated tools:
-- `boxbot_sdk.display` — create displays via declarative builder (the
-  agent describes **what** to show using building blocks, never writes
-  raw render code; the main process generates validated display classes)
-- `boxbot_sdk.skill` — create skills via builder
-- `boxbot_sdk.packages` — request package installation (user approval)
-- `boxbot_sdk.memory` — save/search/invalidate memories (shares backend
-  with `search_memory` tool)
-- `boxbot_sdk.secrets` — store and use credentials (write-only, agent
-  cannot view stored secrets after storage)
-- `boxbot_sdk.photos` — manage photo library (tagging, slideshow
-  curation, tag library, soft delete/restore; search shares backend
-  with `search_photos` tool)
-- `boxbot_sdk.tasks` — manage triggers (wake conditions) and to-do
-  items within scripts (shares backend with `manage_tasks` tool)
+Speech and WhatsApp replies flow through the structured output
+(`response_text` / `outputs` array) rather than tools — see
+`output_dispatcher` and the `tools/registry.py` module docstring.
+
+**SDK** (`src/boxbot/sdk/`, importable as `boxbot_sdk` or just `bb`
+inside `execute_script`) — the constrained, immutable Python API:
+- `bb.workspace` — filesystem-backed notebook (notes, CSVs, saved
+  images). Path-safe, quota-capped, grep-searchable. The "now look it
+  up" counterpart to memory's "rings a bell."
+- `bb.camera` — `capture` / `capture_cropped` stills; images attach
+  straight to the tool result so the agent sees pixels
+- `bb.photos` — search, get, view (attaches pixels), show_on_screen
+- `bb.display` — declarative block-based display builder + preview
+- `bb.memory` — save/search/invalidate (shares backend with tool)
+- `bb.tasks` — triggers + to-dos (shares backend with tool)
+- `bb.skill` — create new skills at runtime
+- `bb.secrets` — write-only credential storage
+- `bb.packages` — request package install (human approval required)
+- `bb.calendar` — Google Calendar read/write
 
 The SDK communicates with the main process through structured JSON on
-stdout — the `execute_script` tool parses these actions and applies them
-safely. The agent never directly writes code that runs in the main process.
+stdout + stdin (streaming, bidirectional). `execute_script` reads
+action lines line-by-line, dispatches to per-module handlers, writes
+JSON replies back to the sandbox, and collects image attachments into
+a multimodal tool result. The agent never writes code that runs in the
+main process.
+
+**Self-documentation:** the `skills/bb/` skill is the agent's map to
+the `bb` package. Its `SKILL.md` is injected into the system prompt at
+Level 1 (metadata) and loaded at Level 2 (module index) on demand;
+per-module docs (`skills/bb/modules/*.md`) load at Level 3 as needed.
 
 **Skills** (`src/boxbot/skills/` + `skills/`) — modular capabilities
 loaded per-conversation based on relevance:
@@ -94,9 +107,13 @@ loaded per-conversation based on relevance:
 - Only relevant skills are injected, conserving context
 
 ### 4. Sandbox & Agent Authoring
-The agent operates through a **sandbox** — a separate venv
-(`data/sandbox/venv`) isolated from the main application. Sandbox
-security is enforced at the **OS level** (not Python level):
+The agent operates through a **sandbox** — a separate venv (default
+`/var/lib/boxbot-sandbox/venv`, override via ``sandbox.runtime_dir`` in
+config) isolated from the main application. The sandbox lives outside
+the project tree on purpose: this is open-source, and the
+``boxbot-sandbox`` system user can't traverse a 0700 home directory
+just to reach the venv. Sandbox security is enforced at the **OS
+level** (not Python level):
 - Scripts run as `boxbot-sandbox` user with minimal filesystem permissions
 - **seccomp** blocks `execve`/`fork` — no subprocess spawning of any kind
 - `.env` is mode `0600` owned by `boxbot` — sandbox cannot read secrets
@@ -139,7 +156,19 @@ modes: `lookup` (ranked results), `summary` (synthesized answers), and
 `get` (full record by ID). **Access-based retention** keeps useful memories
 alive and lets unused ones fade.
 
-See [docs/memory.md](docs/memory.md) for the full design.
+Alongside memory there is the **agent workspace** (`data/workspace/`,
+exposed as `bb.workspace`) — a filesystem-backed notebook the agent
+owns. Memory = "rings a bell" (recognize that something is relevant);
+workspace = "now look it up" (read the detail from a file). A 40-item
+Pokémon list lives in `workspace/notes/people/erik/pokemon.md`; memory
+just knows the file exists. This separation keeps memory retrieval
+sharp (no giant records, no tiny records diluting search) and gives
+the agent a real persistent scratch space for notes, CSVs that drive
+displays, drafts, and images it captured or saved.
+
+See [docs/memory.md](docs/memory.md) for the memory design and
+[skills/bb/modules/workspace.md](skills/bb/modules/workspace.md) for
+the workspace API.
 
 The agent should feel like it *knows* you, not like every conversation starts
 from zero.
@@ -216,42 +245,47 @@ processes conversations independent of transport.
 ## Architecture Boundaries
 
 ```
-┌─────────────────────────────────────────────────┐
-│           Claude Agent (large model)             │
-│       conversations · reasoning · authoring      │
-├─────────────────────┬───────────────────────────┤
-│  Tools (9, always)  │  Small model (async)      │
-│  execute_script     │  photo tagging            │
-│  speak              │  intent classification    │
-│  switch_display     │  structured extraction    │
-│  send_message       │  transcript filtering     │
-│  identify_person    │  memory search reranking  │
-│  manage_tasks       │  web search filtering     │
-│  search_memory      │                           │
-│  search_photos      │                           │
-│  web_search         │                           │
-├─────────────────────┴───────────────────────────┤
-│  Sandbox (isolated venv)                         │
-│  ┌─────────────────────────────────────────────┐ │
-│  │ boxbot_sdk (immutable, declarative)         │ │
-│  │ display · skill · packages · memory         │ │
-│  │ secrets · photos · tasks                    │ │
-│  ├─────────────────────────────────────────────┤ │
-│  │ agent scripts · skill scripts · user pkgs   │ │
-│  └─────────────────────────────────────────────┘ │
-├──────────┬──────────┬──────────┬────────────────┤
-│  Skills  │ Displays │  Memory  │   Scheduler    │
-│ (modular)│ (screen) │ (recall) │  (lifecycle)   │
-├──────────┴──────────┴──────────┴────────────────┤
-│              Communication Layer                 │
-│         (Voice I/O · WhatsApp · Buttons)         │
-├─────────────────────────────────────────────────┤
-│              Perception Pipeline                 │
-│    (Person Detection · ReID · Speaker ID · VAD)  │
-├─────────────────────────────────────────────────┤
+┌──────────────────────────────────────────────────┐
+│           Claude Agent (large model)              │
+│      conversations · reasoning · authoring        │
+├──────────────────────┬───────────────────────────┤
+│  Tools (7)           │  Small model (async)      │
+│  execute_script      │  photo tagging            │
+│  switch_display      │  intent classification    │
+│  identify_person     │  structured extraction    │
+│  manage_tasks        │  transcript filtering     │
+│  search_memory       │  memory search reranking  │
+│  web_search          │  web search filtering     │
+│  load_skill          │                           │
+│  (+ structured       │                           │
+│   outputs[voice,     │                           │
+│   text] for speech)  │                           │
+├──────────────────────┴───────────────────────────┤
+│  Sandbox (isolated venv, streaming IO)            │
+│  ┌──────────────────────────────────────────────┐ │
+│  │ boxbot_sdk / bb  (immutable, declarative)    │ │
+│  │ workspace · camera · photos · display        │ │
+│  │ memory · tasks · skill · secrets             │ │
+│  │ packages · calendar                          │ │
+│  ├──────────────────────────────────────────────┤ │
+│  │ agent scripts · skill scripts · user pkgs    │ │
+│  └──────────────────────────────────────────────┘ │
+│  Image attachments from sandbox → multimodal      │
+│  tool result (workspace/photos/crops/tmp only)    │
+├──────────┬──────────┬──────────┬─────────────────┤
+│  Skills  │ Displays │  Memory  │   Scheduler     │
+│ (modular,│ (screen) │ (recall) │  (lifecycle)    │
+│  skills/bb = bb-package reference)                │
+├──────────┴──────────┴──────────┴─────────────────┤
+│              Communication Layer                  │
+│         (Voice I/O · WhatsApp · Buttons)          │
+├──────────────────────────────────────────────────┤
+│              Perception Pipeline                  │
+│    (Person Detection · ReID · Speaker ID · VAD)   │
+├──────────────────────────────────────────────────┤
 │            Hardware Abstraction Layer             │
-│   (Camera · Mic · Speaker · Screen · Hailo NPU)  │
-└─────────────────────────────────────────────────┘
+│   (Camera · Mic · Speaker · Screen · Hailo NPU)   │
+└──────────────────────────────────────────────────┘
 ```
 
 ## Development Guidelines

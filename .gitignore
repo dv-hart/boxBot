@@ -31,14 +31,10 @@ data/memory/
 data/auth/
 data/perception/
 data/models/
-data/sandbox/venv/
-data/sandbox/scripts/*
-!data/sandbox/scripts/.gitkeep
-data/sandbox/output/*
-!data/sandbox/output/.gitkeep
-data/sandbox/tmp/*
-!data/sandbox/tmp/.gitkeep
-data/sandbox/installed.txt
+# Sandbox state lives outside the project tree by default
+# (under /var/lib/boxbot-sandbox/). The patterns below cover legacy
+# in-tree sandbox paths in case anyone bootstraps the older layout.
+data/sandbox/
 
 # Hailo runtime logs
 hailort*.log
@@ -65,9 +61,16 @@ data/scheduler/
 /*.wav
 /tts_samples/
 
-# User-installed plugins (committed examples only)
+# User-installed plugins (committed built-ins only)
 skills/*/
 !skills/example_skill/
+!skills/bb/
+!skills/onboarding/
+!skills/hal-sandbox-ref/
 displays/*/
 !displays/example_display/
 data/credentials/
+
+# Agent workspace — directory committed, runtime contents ignored
+data/workspace/*
+!data/workspace/.gitkeep

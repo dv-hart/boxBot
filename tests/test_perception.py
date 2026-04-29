@@ -103,11 +103,29 @@ class TestPersonDetector:
         assert params.pad_x >= 0
         assert params.pad_y >= 0
 
+    # Layout per the on-device diagnostic dump (yolov5s_personface_h8l):
+    # outputs[<key>] = [batch_dim_len_1[per_class_len_2[ndarray(N,5)]]]
+    # Each row: [y_min, x_min, y_max, x_max, score], normalized [0, 1]
+    # in the model's 640×640 letterboxed input frame.
+
+    @staticmethod
+    def _hailo_outputs(
+        person_rows: list[list[float]] | None = None,
+        face_rows: list[list[float]] | None = None,
+    ) -> dict[str, list]:
+        """Build a Hailo-shaped output dict from per-class detection rows."""
+        person = np.array(
+            person_rows or [], dtype=np.float32
+        ).reshape(-1, 5)
+        face = np.array(
+            face_rows or [], dtype=np.float32
+        ).reshape(-1, 5)
+        return {"yolov5s_personface/yolov5_nms_postprocess": [[person, face]]}
+
     def test_postprocess_empty_output(self):
         det = self._make_detector()
         _, params = det.preprocess(np.zeros((720, 1280, 3), dtype=np.uint8))
-        # All-zero output should produce no detections
-        outputs = {"output": np.zeros((2, 5, 80), dtype=np.float32)}
+        outputs = self._hailo_outputs()  # both classes empty
         detections = det.postprocess(outputs, params, (720, 1280))
         assert detections == []
 
@@ -116,50 +134,40 @@ class TestPersonDetector:
         frame = np.random.randint(0, 255, (720, 1280, 3), dtype=np.uint8)
         _, params = det.preprocess(frame)
 
-        # Simulate NMS output: person class (index 0) with one detection
-        output = np.zeros((2, 5, 80), dtype=np.float32)
-        # Detection 0 in class 0 (person): x1, y1, x2, y2, conf
-        output[0, 0, 0] = 100.0   # x1
-        output[0, 1, 0] = 100.0   # y1
-        output[0, 2, 0] = 300.0   # x2
-        output[0, 3, 0] = 500.0   # y2
-        output[0, 4, 0] = 0.85    # confidence
-
-        detections = det.postprocess(
-            {"output": output}, params, (720, 1280), frame
+        # Person filling left half of frame: y in [0.1, 0.9], x in [0.1, 0.5]
+        outputs = self._hailo_outputs(
+            person_rows=[[0.1, 0.1, 0.9, 0.5, 0.85]],
         )
+
+        detections = det.postprocess(outputs, params, (720, 1280), frame)
         assert len(detections) == 1
         assert detections[0].confidence == pytest.approx(0.85)
         assert detections[0].class_id == 0  # person
+        # Sanity: bbox should be inside the frame
+        x1, y1, x2, y2 = detections[0].bbox
+        assert 0 <= x1 < x2 <= 1280
+        assert 0 <= y1 < y2 <= 720
 
     def test_postprocess_filters_low_confidence(self):
         det = self._make_detector(confidence_threshold=0.5)
         _, params = det.preprocess(np.zeros((720, 1280, 3), dtype=np.uint8))
 
-        output = np.zeros((2, 5, 80), dtype=np.float32)
-        output[0, 0, 0] = 100.0
-        output[0, 1, 0] = 100.0
-        output[0, 2, 0] = 300.0
-        output[0, 3, 0] = 500.0
-        output[0, 4, 0] = 0.3  # below threshold
-
-        detections = det.postprocess({"output": output}, params, (720, 1280))
+        outputs = self._hailo_outputs(
+            person_rows=[[0.1, 0.1, 0.5, 0.4, 0.3]],  # below threshold
+        )
+        detections = det.postprocess(outputs, params, (720, 1280))
         assert len(detections) == 0
 
     def test_postprocess_filters_face_class(self):
         det = self._make_detector(confidence_threshold=0.3)
         _, params = det.preprocess(np.zeros((720, 1280, 3), dtype=np.uint8))
 
-        output = np.zeros((2, 5, 80), dtype=np.float32)
-        # Face detection (class 1) only — should be filtered
-        output[1, 0, 0] = 100.0
-        output[1, 1, 0] = 100.0
-        output[1, 2, 0] = 200.0
-        output[1, 3, 0] = 200.0
-        output[1, 4, 0] = 0.9
-
-        detections = det.postprocess({"output": output}, params, (720, 1280))
-        assert len(detections) == 0  # only person class returned
+        outputs = self._hailo_outputs(
+            face_rows=[[0.1, 0.1, 0.3, 0.3, 0.9]],  # high-confidence face
+        )
+        detections = det.postprocess(outputs, params, (720, 1280))
+        # postprocess returns person-class only
+        assert len(detections) == 0
 
     def test_extract_reid_crops(self):
         from boxbot.perception.person_detector import Detection

@@ -161,9 +161,6 @@ echo ""
 echo "--- Creating data directories ---"
 
 DIRECTORIES=(
-    "$DATA_DIR/sandbox/output"
-    "$DATA_DIR/sandbox/tmp"
-    "$DATA_DIR/sandbox/scripts"
     "$DATA_DIR/scheduler"
     "$DATA_DIR/memory"
     "$DATA_DIR/photos"
@@ -173,12 +170,15 @@ DIRECTORIES=(
     "$PROJECT_DIR/logs"
     "$PROJECT_DIR/models/wake_word"
 )
+# Sandbox directories live outside the project tree (under
+# /var/lib/boxbot-sandbox by default) and are created by
+# setup-sandbox.sh, not here. See that script for the rationale.
 
 DIRS_CREATED=0
 for dir in "${DIRECTORIES[@]}"; do
     if [[ ! -d "$dir" ]]; then
         mkdir -p "$dir"
-        ((DIRS_CREATED++))
+        DIRS_CREATED=$((DIRS_CREATED + 1))
     fi
 done
 

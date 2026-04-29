@@ -25,12 +25,13 @@ from pathlib import Path
 import aiosqlite
 import numpy as np
 
+from boxbot.core.paths import MEMORY_DIR
 from boxbot.memory.embeddings import EMBEDDING_DIM, embed
 
 logger = logging.getLogger(__name__)
 
-# Paths relative to project root
-DB_DIR = Path("data/memory")
+# Anchored to project root via paths module
+DB_DIR = MEMORY_DIR
 DB_PATH = DB_DIR / "memory.db"
 SYSTEM_MEMORY_PATH = DB_DIR / "system.md"
 

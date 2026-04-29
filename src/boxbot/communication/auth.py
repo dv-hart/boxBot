@@ -30,9 +30,11 @@ from pathlib import Path
 
 import aiosqlite
 
+from boxbot.core.paths import AUTH_DIR
+
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path("data/auth/users.db")
+DB_PATH = AUTH_DIR / "users.db"
 
 # Registration defaults (overridden by whatsapp.yaml if loaded)
 DEFAULT_CODE_LENGTH = 6

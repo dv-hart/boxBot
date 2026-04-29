@@ -7,12 +7,14 @@ both the preview renderer and the live pygame renderer.
 Built-in displays:
 - clock: Simple clock with date
 - weather_simple: Current weather with temperature and condition
+- picture: Show a single photo, parameterized by args.image_ids
 """
 
 from boxbot.displays.blocks import (
     CardBlock,
     ClockBlock,
     ColumnBlock,
+    ImageBlock,
     RowBlock,
     TextBlock,
 )
@@ -24,6 +26,7 @@ def get_builtin_specs() -> list[DisplaySpec]:
     return [
         _clock_display(),
         _weather_simple_display(),
+        _picture_display(),
     ]
 
 
@@ -78,6 +81,33 @@ def _weather_simple_display() -> DisplaySpec:
         data_sources=[
             DataSourceSpec(name="weather", source_type="builtin", refresh=3600),
         ],
+        root_block=root,
+        transition="crossfade",
+    )
+
+
+def _picture_display() -> DisplaySpec:
+    """Full-screen photo viewer, parameterized by ``args.image_ids``.
+
+    Called via:
+        mgr.switch("picture", args={"image_ids": ["abc123...", ...]})
+
+    For v1, shows the first id full-screen with "contain" fit. The
+    photo: source is pre-resolved to an absolute file path by the
+    display manager (``_resolve_photo_sources``) before rendering.
+    """
+    root = ColumnBlock(gap=0, align="center", padding=[0, 0, 0, 0])
+    root.children = [
+        ImageBlock(
+            source="photo:{args.image_ids[0]}",
+            fit="contain",
+        ),
+    ]
+
+    return DisplaySpec(
+        name="picture",
+        theme="boxbot",
+        data_sources=[],
         root_block=root,
         transition="crossfade",
     )

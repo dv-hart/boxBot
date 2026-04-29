@@ -25,7 +25,7 @@ from enum import Enum
 
 from boxbot.communication.auth import AuthManager
 from boxbot.communication.whatsapp import WhatsAppClient
-from boxbot.core.events import WhatsAppMessage, get_event_bus
+from boxbot.core.events import UserRegistered, WhatsAppMessage, get_event_bus
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,10 @@ class MessageRouter:
         if message and message.strip():
             code = message.strip()
             if await self._auth.validate_code(code):
+                # Capture inviter before consuming the code (register_user
+                # marks it used). "bootstrap" → first admin; otherwise
+                # the inviting admin's phone for the UserRegistered event.
+                inviter = await self._auth.get_code_creator(code)
                 # Valid code — register with channel name or placeholder
                 name = sender_name or "New User"
                 result = await self._auth.register_user(
@@ -154,7 +158,27 @@ class MessageRouter:
                     code=code,
                 )
                 if result.success and result.user:
-                    # Emit event so agent can welcome the new user
+                    # Two events fire on a successful registration:
+                    # 1) UserRegistered — the structured fact for any
+                    #    consumer (agent welcome flow, audit, etc.).
+                    # 2) A WhatsAppMessage tagged "[REGISTRATION] …" so
+                    #    the agent's existing inbound-message path
+                    #    surfaces this as a user-driven turn it can
+                    #    react to. Both intentionally — older code only
+                    #    reads the WhatsAppMessage, newer flows can
+                    #    subscribe to UserRegistered for cleaner
+                    #    semantics.
+                    invited_by = (
+                        "" if not inviter or inviter == "bootstrap" else inviter
+                    )
+                    await self._event_bus.publish(
+                        UserRegistered(
+                            phone=sender_phone,
+                            name=result.user.name,
+                            role=result.user.role,
+                            invited_by_phone=invited_by,
+                        )
+                    )
                     event = WhatsAppMessage(
                         sender_name=result.user.name,
                         sender_phone=sender_phone,

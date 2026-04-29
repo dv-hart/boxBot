@@ -350,6 +350,22 @@ class AuthManager:
         logger.info("Bootstrap registration code generated")
         return code
 
+    async def get_code_creator(self, code: str) -> str | None:
+        """Return the ``created_by`` of a registration code, or None.
+
+        ``"bootstrap"`` for the first-admin code; an admin's phone for
+        admin-initiated invites. Used by the router to populate the
+        ``invited_by_phone`` field on ``UserRegistered`` events.
+        """
+        async with self._get_db() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT created_by FROM registration_codes WHERE code = ?",
+                (code,),
+            )
+            row = await cursor.fetchone()
+            return row["created_by"] if row else None
+
     async def validate_code(self, code: str) -> bool:
         """Check if a registration code is valid (exists, not expired, not used)."""
         async with self._get_db() as db:

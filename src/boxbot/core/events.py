@@ -139,6 +139,24 @@ class WhatsAppMessage(Event):
 
 
 @dataclass(frozen=True)
+class UserRegistered(Event):
+    """A new user just completed WhatsApp registration.
+
+    Fires on bootstrap (first admin) and on admin-initiated invites.
+    The agent reflects on this to welcome the new user and notify the
+    inviting admin (if any) — see the onboarding skill.
+
+    Source: Communication (router)
+    Consumers: Agent
+    """
+
+    phone: str = ""
+    name: str = ""
+    role: str = "user"            # "admin" or "user"
+    invited_by_phone: str = ""    # empty for bootstrap; admin's phone otherwise
+
+
+@dataclass(frozen=True)
 class TriggerFired(Event):
     """A scheduler trigger's conditions have all been met.
 

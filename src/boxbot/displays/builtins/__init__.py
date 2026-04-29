@@ -8,6 +8,8 @@ Built-in displays:
 - clock: Simple clock with date
 - weather_simple: Current weather with temperature and condition
 - picture: Show a single photo, parameterized by args.image_ids
+- notice: Centered text card; agent's quick "show this short message"
+  channel — used during onboarding to surface a bootstrap code, etc.
 """
 
 from boxbot.displays.blocks import (
@@ -27,6 +29,7 @@ def get_builtin_specs() -> list[DisplaySpec]:
         _clock_display(),
         _weather_simple_display(),
         _picture_display(),
+        _notice_display(),
     ]
 
 
@@ -81,6 +84,50 @@ def _weather_simple_display() -> DisplaySpec:
         data_sources=[
             DataSourceSpec(name="weather", source_type="builtin", refresh=3600),
         ],
+        root_block=root,
+        transition="crossfade",
+    )
+
+
+def _notice_display() -> DisplaySpec:
+    """Short centered text card.
+
+    Called via:
+        mgr.switch("notice", args={
+            "title": "Welcome to boxBot!",
+            "lines": ["Text this code to +1 555 635 8748:",
+                      "Code: 123456",
+                      "Expires in 10 minutes"],
+        })
+
+    Use sparingly — this is the agent's interrupt channel for important
+    short strings (bootstrap codes, setup prompts) where the regular
+    rotating displays would bury the message.
+    """
+    from boxbot.displays.blocks import SpacerBlock
+
+    root = ColumnBlock(gap=0, align="center", padding=[0, 0, 0, 0])
+    card = CardBlock(padding=[40, 56, 40, 56])
+    body = ColumnBlock(gap=20, align="center")
+    body.children = [
+        TextBlock(content="{args.title}", size="xl", weight="bold", align="center"),
+        SpacerBlock(size=8),
+        TextBlock(content="{args.lines[0]}", size="body", align="center"),
+        TextBlock(content="{args.lines[1]}", size="body", align="center"),
+        TextBlock(
+            content="{args.lines[2]}",
+            size="body",
+            color="muted",
+            align="center",
+        ),
+    ]
+    card.children = [body]
+    root.children = [card]
+
+    return DisplaySpec(
+        name="notice",
+        theme="boxbot",
+        data_sources=[],
         root_block=root,
         transition="crossfade",
     )

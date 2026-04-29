@@ -13,6 +13,7 @@ from boxbot.core.events import (
     PersonDetected,
     PersonIdentified,
     TriggerFired,
+    UserRegistered,
     WakeWordHeard,
     WhatsAppMessage,
     get_event_bus,
@@ -38,6 +39,7 @@ __all__ = [
     "PersonDetected",
     "PersonIdentified",
     "TriggerFired",
+    "UserRegistered",
     "WakeWordHeard",
     "WhatsAppMessage",
     # Scheduler

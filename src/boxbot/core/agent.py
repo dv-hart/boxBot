@@ -1109,7 +1109,10 @@ class BoxBotAgent:
                     sections.append(
                         "## Registered users\n"
                         "No users are registered yet. You cannot deliver "
-                        "`channel: \"text\"` outputs until someone registers."
+                        "`channel: \"text\"` outputs until someone registers. "
+                        "If `setup:` todos are present, run them by loading "
+                        "the `onboarding` skill — it covers first-admin "
+                        "bootstrap end-to-end."
                     )
         except Exception:
             logger.debug("Could not list registered users for prompt", exc_info=True)

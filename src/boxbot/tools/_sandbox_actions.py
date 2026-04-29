@@ -569,6 +569,102 @@ async def _handle_calendar_action(
 
 
 # ---------------------------------------------------------------------------
+# Auth action handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_auth_action(
+    action_type: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Auth-state RPC for the agent's onboarding flows.
+
+    Inviting-admin gating for ``generate_registration_code`` is resolved
+    here from the *current conversation* via the tool ContextVar. The
+    sandbox cannot pass an arbitrary ``created_by``, so a compromised
+    script can't mint codes "from" any admin.
+    """
+    from boxbot.communication.auth import get_auth_manager
+    from boxbot.communication.whatsapp import get_whatsapp_client
+    from boxbot.tools._tool_context import get_current_conversation
+
+    auth = get_auth_manager()
+    if auth is None:
+        return {"status": "error", "error": "auth manager not initialised"}
+
+    try:
+        if action_type == "auth.list_users":
+            users = await auth.list_users()
+            return {
+                "status": "ok",
+                "users": [
+                    {
+                        "id": u.id,
+                        "name": u.name,
+                        "phone": u.phone,
+                        "role": u.role,
+                        "created_at": u.created_at,
+                        "last_seen": u.last_seen,
+                    }
+                    for u in users
+                ],
+            }
+
+        if action_type == "auth.generate_bootstrap_code":
+            code = await auth.generate_bootstrap_code()
+            return {"status": "ok", "code": code}
+
+        if action_type == "auth.generate_registration_code":
+            conv = get_current_conversation()
+            if conv is None or conv.channel != "whatsapp":
+                return {
+                    "status": "error",
+                    "error": (
+                        "generate_registration_code requires a WhatsApp "
+                        "conversation context (the inviting admin's reply)"
+                    ),
+                }
+            # channel_key is "whatsapp:+15551234567"
+            sender_phone = conv.channel_key.split(":", 1)[1] if ":" in conv.channel_key else ""
+            if not sender_phone:
+                return {
+                    "status": "error",
+                    "error": "could not resolve sender phone from conversation",
+                }
+            user = await auth.get_user(sender_phone)
+            if user is None or user.role != "admin":
+                return {
+                    "status": "error",
+                    "error": "only admins can generate registration codes",
+                }
+            code = await auth.generate_registration_code(created_by=sender_phone)
+            return {"status": "ok", "code": code}
+
+        if action_type == "auth.notify_admins":
+            text = str(payload.get("text") or "")
+            if not text.strip():
+                return {"status": "error", "error": "text is required"}
+            wa = get_whatsapp_client()
+            if wa is None:
+                return {"status": "error", "error": "WhatsApp client not configured"}
+            admins = [u for u in await auth.list_users() if u.role == "admin"]
+            sent = 0
+            for admin in admins:
+                if await wa.send_text(admin.phone, text):
+                    sent += 1
+            return {"status": "ok", "delivered": sent, "admins": len(admins)}
+
+        return {"status": "error", "error": f"unknown auth action: {action_type}"}
+
+    except RuntimeError as e:
+        # Bootstrap-disabled, rate-limit, or admin-not-found from AuthManager
+        return {"status": "error", "error": str(e)}
+    except Exception as e:  # noqa: BLE001
+        logger.exception("%s failed", action_type)
+        return {"status": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatcher
 # ---------------------------------------------------------------------------
 
@@ -595,6 +691,8 @@ async def process_action(
         result = await _handle_photos_action(action_type, action, ctx)
     elif action_type.startswith("calendar."):
         result = await _handle_calendar_action(action_type, action)
+    elif action_type.startswith("auth."):
+        result = await _handle_auth_action(action_type, action)
     else:
         # Legacy / unimplemented actions: acknowledge so the sandbox
         # doesn't block forever if it called request() instead of

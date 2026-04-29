@@ -115,6 +115,8 @@ def _overlay_env(data: dict[str, Any]) -> None:
         "AWS_ACCESS_KEY_ID": "aws_access_key_id",
         "AWS_SECRET_ACCESS_KEY": "aws_secret_access_key",
         "AWS_S3_BUCKET": "aws_s3_bucket",
+        "AWS_REGION": "aws_region",
+        "BOXBOT_SQS_QUEUE_URL": "whatsapp_sqs_queue_url",
     }
     for env_var, key_name in env_key_map.items():
         if val := os.environ.get(env_var):
@@ -508,9 +510,12 @@ class ApiKeysConfig(BaseModel):
     whatsapp_access_token: str | None = None
     whatsapp_phone_number_id: str | None = None
     whatsapp_verify_token: str | None = None
+    whatsapp_app_secret: str | None = None
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     aws_s3_bucket: str | None = None
+    aws_region: str = "us-west-2"
+    whatsapp_sqs_queue_url: str | None = None
 
     def __repr__(self) -> str:
         """Redact secrets in repr output."""

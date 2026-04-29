@@ -460,6 +460,37 @@ async def _init_communication() -> Any | None:
     return router
 
 
+async def _init_whatsapp_inbound(router: Any) -> Any | None:
+    """Start the SQS-backed WhatsApp webhook poller, if configured.
+
+    Returns the poller if started, otherwise None. Required env:
+    BOXBOT_SQS_QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+    """
+    from boxbot.communication.whatsapp_inbound import WhatsAppInboundPoller
+    from boxbot.core.config import get_config
+
+    config = get_config()
+    queue_url = config.api_keys.whatsapp_sqs_queue_url
+    key = config.api_keys.aws_access_key_id
+    secret = config.api_keys.aws_secret_access_key
+    if not (queue_url and key and secret):
+        logger.info(
+            "WhatsApp SQS poller not configured "
+            "(set BOXBOT_SQS_QUEUE_URL + AWS credentials to enable)"
+        )
+        return None
+
+    poller = WhatsAppInboundPoller(
+        router=router,
+        queue_url=queue_url,
+        region=config.api_keys.aws_region,
+        access_key_id=key,
+        secret_access_key=secret,
+    )
+    await poller.start()
+    return poller
+
+
 async def _init_agent(memory_store: Any) -> Any:
     """Initialise and start the BoxBotAgent."""
     from boxbot.core.agent import BoxBotAgent
@@ -496,6 +527,7 @@ async def _shutdown(
     shutdown_order = [
         "agent",
         "voice",
+        "whatsapp_inbound",
         "communication",
         "photo_intake",
         "perception",
@@ -517,6 +549,8 @@ async def _shutdown(
                 await get_agent_state_tracker().stop()
                 await instance.stop()
             elif name == "voice":
+                await instance.stop()
+            elif name == "whatsapp_inbound":
                 await instance.stop()
             elif name == "communication":
                 # MessageRouter does not have a stop method currently
@@ -664,6 +698,9 @@ async def _async_main() -> None:
         comm_router = await _init_communication()
         if comm_router is not None:
             subsystems["communication"] = comm_router
+            inbound = await _init_whatsapp_inbound(comm_router)
+            if inbound is not None:
+                subsystems["whatsapp_inbound"] = inbound
 
         # Agent — the brain, subscribes to events from all other subsystems
         agent = await _init_agent(memory_store)

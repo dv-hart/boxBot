@@ -89,7 +89,7 @@ from boxbot.core.output_dispatcher import (
     parse_internal_notes,
 )
 from boxbot.core.scheduler import get_status_line
-from boxbot.memory.extraction import extract_memories, process_extraction_result
+from boxbot.memory.batch_poller import BatchPoller
 from boxbot.memory.retrieval import inject_memories
 from boxbot.memory.store import MemoryStore
 # Imported lazily inside _dispatch_tools / _process_tool_calls to avoid a
@@ -455,6 +455,9 @@ class BoxBotAgent:
         """
         self._memory_store = memory_store
         self._client: anthropic.AsyncAnthropic | None = None
+        # Background poller for in-flight extraction batches. Started
+        # alongside the agent and runs for the agent's lifetime.
+        self._batch_poller: BatchPoller | None = None
 
         # People currently detected by the perception pipeline.
         # Updated via PersonIdentified event subscription.
@@ -520,6 +523,13 @@ class BoxBotAgent:
             api_key=config.api_keys.anthropic,
         )
 
+        # Start the extraction batch poller. It will resume any
+        # queued/submitted rows from the previous boot before returning.
+        self._batch_poller = BatchPoller(
+            self._memory_store, self._client,
+        )
+        await self._batch_poller.start()
+
         # Subscribe to events that initiate or inform conversations.
         # Note: WakeWordHeard is intentionally NOT handled here. The
         # voice pipeline activates the mic on wake word; the agent only
@@ -570,6 +580,10 @@ class BoxBotAgent:
                 )
         self._conversations.clear()
         self._conversation_by_key.clear()
+
+        if self._batch_poller is not None:
+            await self._batch_poller.stop()
+            self._batch_poller = None
 
         self._client = None
         logger.info("BoxBotAgent stopped")
@@ -917,6 +931,8 @@ class BoxBotAgent:
                     channel=event.channel,
                     person_name=event.person_name,
                     messages=list(conv.thread),
+                    accessed_memory_ids=list(conv.accessed_memory_ids),
+                    started_at=conv.started_at_iso(),
                 ),
                 name=f"extraction-{conv_id}",
             )
@@ -956,6 +972,7 @@ class BoxBotAgent:
             channel=conv.channel,
             context=context,
             initial_message=initial_message,
+            conv=conv,
         )
 
         # The agent loop returns the full message history — from
@@ -992,6 +1009,7 @@ class BoxBotAgent:
         channel: str,
         context: dict[str, Any] | None,
         initial_message: str,
+        conv: Conversation | None = None,
     ) -> list[dict[str, Any]]:
         """Build the two-block system prompt for ``messages.create``.
 
@@ -1018,6 +1036,7 @@ class BoxBotAgent:
             channel=channel,
             context=context,
             initial_message=initial_message,
+            conv=conv,
         )
 
         blocks: list[dict[str, Any]] = [
@@ -1040,6 +1059,7 @@ class BoxBotAgent:
         channel: str,
         context: dict[str, Any] | None,
         initial_message: str,
+        conv: Conversation | None = None,
     ) -> str:
         """Build the dynamic (non-cached) portion of the system prompt.
 
@@ -1145,12 +1165,21 @@ class BoxBotAgent:
                 )
 
         # Injected memories
-        memory_block = await self._inject_memories(
+        memory_block, surfaced_ids = await self._inject_memories(
             person_name=person_name,
             initial_message=initial_message,
         )
         if memory_block and memory_block.strip():
             sections.append(memory_block.strip())
+        # Record surfaced memory IDs on the conversation so post-
+        # conversation extraction knows which memories the model saw.
+        # Dedupe across turns — the same memory can be re-surfaced.
+        if conv is not None and surfaced_ids:
+            seen = set(conv.accessed_memory_ids)
+            for mid in surfaced_ids:
+                if mid not in seen:
+                    conv.accessed_memory_ids.append(mid)
+                    seen.add(mid)
 
         return "\n\n".join(sections)
 
@@ -1173,20 +1202,18 @@ class BoxBotAgent:
         self,
         person_name: str | None,
         initial_message: str,
-    ) -> str:
+    ) -> tuple[str, list[str]]:
         """Search for relevant memories and format them for prompt injection.
 
         Uses the shared search backend to find fact memories and recent
         conversations relevant to the current speaker and their first
         utterance.
 
-        Args:
-            person_name: The identified speaker, if known.
-            initial_message: The first message text, used as search context.
-
         Returns:
-            Formatted memory injection block, or empty string if no
-            relevant memories found.
+            ``(block, memory_ids)``. The block is the formatted text
+            for the system prompt; memory_ids identifies which records
+            the model could see, so post-conversation extraction can
+            consider them for invalidation.
         """
         try:
             return await inject_memories(
@@ -1196,7 +1223,7 @@ class BoxBotAgent:
             )
         except Exception:
             logger.exception("Memory injection failed")
-            return ""
+            return "", []
 
     # ------------------------------------------------------------------
     # Agent loop (Anthropic SDK)
@@ -1535,57 +1562,53 @@ class BoxBotAgent:
         channel: str,
         person_name: str | None,
         messages: list[dict[str, Any]],
+        accessed_memory_ids: list[str],
+        started_at: str,
     ) -> None:
-        """Post-conversation cleanup: extract memories and log conversation.
+        """Persist transcript + queue extraction batch for this conversation.
 
-        Runs asynchronously after the conversation ends. Builds a
-        transcript from the message history and passes it to the
-        extraction pipeline, which produces:
-        - A conversation summary (for the conversation log)
-        - Extracted fact memories
-        - Contradiction invalidations
-        - System memory update proposals
+        Runs after the conversation ends. The transcript is recorded in
+        ``pending_extractions`` (durable queue, retained 14 days) and a
+        1-request batch is submitted to Anthropic. The BatchPoller picks
+        up the result when it lands (typically <30 min) and applies the
+        memories.
 
-        Args:
-            conversation_id: The conversation's unique ID.
-            channel: The conversation channel.
-            person_name: The primary speaker name.
-            messages: The full message history from the agent loop.
+        On any failure, the row is left in queued status with no batch
+        id, and the next boot's poller resume will retry submission.
         """
         try:
-            # Build a transcript from the message history
             transcript = self._build_transcript(messages, person_name)
-
-            # Collect IDs of memories that were injected into this conversation
-            # (referenced in the system prompt injection block).
-            # For now, pass an empty list — full tracking requires parsing
-            # the injection block for memory IDs.
-            accessed_memory_ids: list[str] = []
 
             participants = [get_config().agent.name]
             if person_name:
                 participants.append(person_name)
 
-            # Run extraction
-            result = await extract_memories(
+            # Persist first (durability), then submit. If submit fails,
+            # the row stays in queued status for the next retry.
+            await self._memory_store.create_pending_extraction(
+                conversation_id=conversation_id,
                 transcript=transcript,
                 accessed_memory_ids=accessed_memory_ids,
-                conversation_id=conversation_id,
                 channel=channel,
                 participants=participants,
+                started_at=started_at,
             )
 
-            # Apply extraction results to the memory store
-            conv_id = await process_extraction_result(
-                self._memory_store,
-                result,
-                conversation_id,
-            )
-
+            poller = self._batch_poller
+            if poller is None:
+                # Agent stopped between conversation end and post-
+                # processing. Row stays queued; next boot resumes.
+                logger.warning(
+                    "Batch poller unavailable; conversation %s queued for retry",
+                    conversation_id,
+                )
+                return
+            row = await self._memory_store.get_pending_extraction(conversation_id)
+            if row is not None:
+                await poller.submit(row)
             logger.info(
-                "Post-conversation extraction complete for %s (logged as %s)",
+                "Conversation %s persisted and extraction batch queued",
                 conversation_id,
-                conv_id,
             )
         except Exception:
             logger.exception(

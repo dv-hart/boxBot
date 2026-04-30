@@ -21,33 +21,46 @@ class SearchMemoryTool(Tool):
 
     name = "search_memory"
     description = (
-        "Search, summarize, or retrieve stored memories. Three modes: "
+        "Search, summarize, or retrieve stored memories. Modes: "
         "'lookup' returns ranked fact memories and conversation matches, "
         "'summary' synthesizes an answer from relevant memories, "
-        "'get' retrieves a full memory record by ID. Use this when you "
-        "need to recall something not in your injected context."
+        "'get' retrieves a full memory record by ID, "
+        "'transcript' recovers raw conversation text — pass conversation_id "
+        "for a single conversation, or query to substring-search recent "
+        "transcripts (last 14 days). Use 'transcript' when memory is "
+        "thin and you need to reconstruct what was actually said."
     )
     parameters = {
         "type": "object",
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["lookup", "summary", "get"],
+                "enum": ["lookup", "summary", "get", "transcript"],
                 "description": (
                     "Search mode: 'lookup' for ranked results, "
                     "'summary' for a synthesized answer, "
-                    "'get' for full record by ID."
+                    "'get' for full record by memory ID, "
+                    "'transcript' for raw conversation text."
                 ),
             },
             "query": {
                 "type": "string",
                 "description": (
-                    "Search query text. Required for 'lookup' and 'summary' modes."
+                    "Search query text. Required for 'lookup' and 'summary' "
+                    "modes; in 'transcript' mode used to substring-search "
+                    "recent transcripts when conversation_id is not given."
                 ),
             },
             "memory_id": {
                 "type": "string",
                 "description": "Memory ID. Required for 'get' mode.",
+            },
+            "conversation_id": {
+                "type": "string",
+                "description": (
+                    "Conversation ID for 'transcript' mode. If provided, "
+                    "returns the full transcript for that conversation."
+                ),
             },
             "types": {
                 "type": "array",
@@ -82,16 +95,18 @@ class SearchMemoryTool(Tool):
         mode: str = kwargs["mode"]
         query: str | None = kwargs.get("query")
         memory_id: str | None = kwargs.get("memory_id")
+        conversation_id: str | None = kwargs.get("conversation_id")
         types: list[str] | None = kwargs.get("types")
         person: str | None = kwargs.get("person")
         include_conversations: bool = kwargs.get("include_conversations", True)
         include_archived: bool = kwargs.get("include_archived", False)
 
         logger.info(
-            "search_memory: mode=%s, query=%s, memory_id=%s",
+            "search_memory: mode=%s, query=%s, memory_id=%s, conv_id=%s",
             mode,
             query[:50] if query else None,
             memory_id,
+            conversation_id,
         )
 
         try:
@@ -106,6 +121,7 @@ class SearchMemoryTool(Tool):
                 mode=mode,
                 query=query,
                 memory_id=memory_id,
+                conversation_id=conversation_id,
                 types=types,
                 person=person,
                 include_conversations=include_conversations,

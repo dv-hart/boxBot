@@ -37,12 +37,15 @@ async def inject_memories(
     utterance: str | None = None,
     max_facts: int = 15,
     max_conversations: int = MAX_CONVERSATIONS,
-) -> str:
+) -> tuple[str, list[str]]:
     """Build the memory injection block for conversation start.
 
     Searches for relevant memories based on who is speaking and what
-    they said. Returns a formatted text block to inject into the
-    agent's system prompt.
+    they said. Returns a formatted text block (for system-prompt
+    injection) AND the list of memory IDs that were surfaced — the
+    caller stores those on the Conversation so post-conversation
+    extraction knows which memories the model could see, and therefore
+    which ones it's qualified to invalidate.
 
     Args:
         store: The MemoryStore instance.
@@ -52,10 +55,12 @@ async def inject_memories(
         max_conversations: Maximum conversation summaries to inject.
 
     Returns:
-        Formatted injection block string. Empty string if no results.
+        ``(block, memory_ids)``. ``block`` is the formatted injection
+        string (empty if no results). ``memory_ids`` is the list of
+        IDs (memories + conversations) actually surfaced.
     """
     if not person and not utterance:
-        return ""
+        return "", []
 
     # Build the search query from available context
     query_parts = []
@@ -76,7 +81,7 @@ async def inject_memories(
     )
 
     if not candidates:
-        return ""
+        return "", []
 
     # Split into facts and conversations
     fact_candidates = [c for c in candidates if c.source == "memory"]
@@ -89,12 +94,14 @@ async def inject_memories(
 
     # Format injection block
     lines: list[str] = []
+    surfaced_ids: list[str] = []
 
     if fact_candidates:
         lines.append("[Active Memories]")
         for c in fact_candidates[:max_facts]:
             person_label = f"/{c.person}" if c.person else ""
             lines.append(f"#{c.id[:8]} ({c.type}{person_label}): {c.summary}")
+            surfaced_ids.append(c.id)
         lines.append("")
 
     if conv_candidates:
@@ -108,6 +115,7 @@ async def inject_memories(
             lines.append(
                 f"#{c.id[:8]} ({started}, {parts_str}, {channel}): {c.summary}"
             )
+            surfaced_ids.append(c.id)
         lines.append("")
 
     result = "\n".join(lines)
@@ -117,4 +125,4 @@ async def inject_memories(
         min(len(conv_candidates), max_conversations),
         person,
     )
-    return result
+    return result, surfaced_ids

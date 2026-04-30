@@ -14,19 +14,22 @@ all share the same search backend (search.py).
 from boxbot.memory.embeddings import cosine_similarity, embed, embed_batch
 from boxbot.memory.extraction import (
     ExtractionResult,
-    extract_memories,
+    parse_extraction_result,
     process_extraction_result,
+    record_extraction_cost,
+    submit_extraction_batch,
 )
 from boxbot.memory.maintenance import run_maintenance
 from boxbot.memory.retrieval import inject_memories
 from boxbot.memory.search import search_memories
-from boxbot.memory.store import Conversation, Memory, MemoryStore
+from boxbot.memory.store import Conversation, Memory, MemoryStore, PendingExtraction
 
 __all__ = [
     # Store
     "MemoryStore",
     "Memory",
     "Conversation",
+    "PendingExtraction",
     # Embeddings
     "embed",
     "embed_batch",
@@ -36,8 +39,10 @@ __all__ = [
     # Injection
     "inject_memories",
     # Extraction
-    "extract_memories",
+    "submit_extraction_batch",
+    "parse_extraction_result",
     "process_extraction_result",
+    "record_extraction_cost",
     "ExtractionResult",
     # Maintenance
     "run_maintenance",

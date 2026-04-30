@@ -19,7 +19,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -39,9 +39,17 @@ SYSTEM_MEMORY_PATH = DB_DIR / "system.md"
 SYSTEM_MEMORY_MAX_BYTES = 4096
 SYSTEM_MEMORY_MAX_VERSIONS = 20
 
+# Pending-extraction transcript retention. After this many days the
+# transcript column is nulled out (the row stays as provenance for the
+# memories produced from it). Configurable via the memory config; this
+# is the default applied when stamping ``transcript_purge_at`` at
+# insert time.
+TRANSCRIPT_RETENTION_DAYS = 14
+
 # Valid values
 MEMORY_TYPES = {"person", "household", "methodology", "operational"}
 MEMORY_STATUSES = {"active", "archived", "invalidated"}
+PENDING_STATUSES = {"queued", "submitted", "applied", "failed"}
 
 # Default system memory template
 DEFAULT_SYSTEM_MEMORY = """## Household
@@ -118,6 +126,25 @@ class SystemMemoryVersion:
     change_summary: str
 
 
+@dataclass
+class PendingExtraction:
+    """A queued or in-flight post-conversation extraction job."""
+
+    conversation_id: str
+    transcript: str | None  # nulled after transcript_purge_at
+    accessed_memory_ids: list[str]
+    channel: str
+    participants: list[str]
+    started_at: str
+    status: str
+    batch_id: str | None
+    submitted_at: str | None
+    completed_at: str | None
+    error: str | None
+    attempts: int
+    transcript_purge_at: str
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -162,11 +189,57 @@ CREATE TABLE IF NOT EXISTS system_memory_versions (
     change_summary    TEXT NOT NULL
 );
 
+-- Durable queue for post-conversation extraction. One row per
+-- conversation; survives boxbot restarts so the batch poller can
+-- resume polling Anthropic's batch API after a crash.
+--
+-- The transcript is retained for ``TRANSCRIPT_RETENTION_DAYS`` (14 by
+-- default) past creation so the agent can recover full conversation
+-- text via search_memory(mode="transcript"). After that, the row is
+-- kept (provenance for the memories produced) but the transcript
+-- column is nulled out by maintenance.
+CREATE TABLE IF NOT EXISTS pending_extractions (
+    conversation_id     TEXT PRIMARY KEY,
+    transcript          TEXT,                  -- nulled after transcript_purge_at
+    accessed_memory_ids TEXT NOT NULL,         -- JSON list
+    channel             TEXT NOT NULL,
+    participants        TEXT NOT NULL,         -- JSON list
+    started_at          TEXT NOT NULL,
+    status              TEXT NOT NULL,         -- queued|submitted|applied|failed
+    batch_id            TEXT,
+    submitted_at        TEXT,
+    completed_at        TEXT,
+    error               TEXT,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    transcript_purge_at TEXT NOT NULL
+);
+
+-- Append-only log of every paid Anthropic API call. Used for cost
+-- attribution and analysis. Pricing is captured at call time so
+-- historical totals don't drift if rates change.
+CREATE TABLE IF NOT EXISTS cost_log (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp          TEXT NOT NULL,
+    purpose            TEXT NOT NULL,         -- extraction|rerank|summary|dream|reflection|...
+    model              TEXT NOT NULL,
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    is_batch           INTEGER NOT NULL DEFAULT 0,
+    cost_usd           REAL NOT NULL,
+    metadata           TEXT                    -- JSON: conversation_id, batch_id, etc.
+);
+
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 CREATE INDEX IF NOT EXISTS idx_memories_person ON memories(person);
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_memories_last_relevant ON memories(last_relevant_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_started ON conversations(started_at);
+CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_extractions(status);
+CREATE INDEX IF NOT EXISTS idx_pending_purge ON pending_extractions(transcript_purge_at);
+CREATE INDEX IF NOT EXISTS idx_cost_log_timestamp ON cost_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_cost_log_purpose ON cost_log(purpose);
 """
 
 FTS_SCHEMA_SQL = """
@@ -778,6 +851,240 @@ class MemoryStore:
         await self.db.commit()
 
     # -------------------------------------------------------------------
+    # Pending extractions (durable batch queue)
+    # -------------------------------------------------------------------
+
+    async def create_pending_extraction(
+        self,
+        *,
+        conversation_id: str,
+        transcript: str,
+        accessed_memory_ids: list[str],
+        channel: str,
+        participants: list[str],
+        started_at: str,
+        retention_days: int = TRANSCRIPT_RETENTION_DAYS,
+    ) -> None:
+        """Insert a new pending-extraction row in queued status."""
+        purge_at = (
+            datetime.utcnow() + timedelta(days=retention_days)
+        ).isoformat()
+        await self.db.execute(
+            """INSERT OR REPLACE INTO pending_extractions (
+                   conversation_id, transcript, accessed_memory_ids,
+                   channel, participants, started_at, status,
+                   transcript_purge_at, attempts
+               ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 0)""",
+            (
+                conversation_id,
+                transcript,
+                json.dumps(accessed_memory_ids),
+                channel,
+                json.dumps(participants),
+                started_at,
+                purge_at,
+            ),
+        )
+        await self.db.commit()
+
+    async def mark_pending_submitted(
+        self,
+        conversation_id: str,
+        batch_id: str,
+    ) -> None:
+        """Move a pending row from queued/failed to submitted."""
+        await self.db.execute(
+            """UPDATE pending_extractions
+               SET status = 'submitted',
+                   batch_id = ?,
+                   submitted_at = ?,
+                   error = NULL,
+                   attempts = attempts + 1
+               WHERE conversation_id = ?""",
+            (batch_id, _now_iso(), conversation_id),
+        )
+        await self.db.commit()
+
+    async def mark_pending_applied(self, conversation_id: str) -> None:
+        await self.db.execute(
+            """UPDATE pending_extractions
+               SET status = 'applied', completed_at = ?, error = NULL
+               WHERE conversation_id = ?""",
+            (_now_iso(), conversation_id),
+        )
+        await self.db.commit()
+
+    async def mark_pending_failed(
+        self,
+        conversation_id: str,
+        error: str,
+    ) -> None:
+        await self.db.execute(
+            """UPDATE pending_extractions
+               SET status = 'failed', completed_at = ?, error = ?
+               WHERE conversation_id = ?""",
+            (_now_iso(), error, conversation_id),
+        )
+        await self.db.commit()
+
+    async def get_pending_extraction(
+        self,
+        conversation_id: str,
+    ) -> PendingExtraction | None:
+        cursor = await self.db.execute(
+            "SELECT * FROM pending_extractions WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        row = await cursor.fetchone()
+        return _row_to_pending(row) if row else None
+
+    async def list_pending_extractions(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[PendingExtraction]:
+        if status:
+            cursor = await self.db.execute(
+                """SELECT * FROM pending_extractions
+                   WHERE status = ?
+                   ORDER BY started_at ASC LIMIT ?""",
+                (status, limit),
+            )
+        else:
+            cursor = await self.db.execute(
+                """SELECT * FROM pending_extractions
+                   ORDER BY started_at DESC LIMIT ?""",
+                (limit,),
+            )
+        rows = await cursor.fetchall()
+        return [_row_to_pending(r) for r in rows]
+
+    async def purge_expired_transcripts(self) -> int:
+        """Null out transcript text for rows past their retention window.
+
+        Rows themselves are preserved as provenance — only the raw
+        transcript column is cleared. Returns the number of rows affected.
+        """
+        cursor = await self.db.execute(
+            """UPDATE pending_extractions
+               SET transcript = NULL
+               WHERE transcript IS NOT NULL
+                 AND transcript_purge_at < ?""",
+            (_now_iso(),),
+        )
+        await self.db.commit()
+        return cursor.rowcount
+
+    async def get_transcript(self, conversation_id: str) -> str | None:
+        """Return the raw transcript for a conversation, or None if
+        already purged or never recorded."""
+        cursor = await self.db.execute(
+            "SELECT transcript FROM pending_extractions WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return row["transcript"]
+
+    async def search_transcripts(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        within_days: int = TRANSCRIPT_RETENTION_DAYS,
+    ) -> list[tuple[str, str, str]]:
+        """Substring search across recent retained transcripts.
+
+        Cheap LIKE-based scan; the volume is bounded by the retention
+        window (default 14 days × ~30 conversations/day worst case).
+        Returns list of (conversation_id, started_at, snippet) where
+        snippet is ~300 chars of context around the first match.
+        """
+        cutoff = (
+            datetime.utcnow() - timedelta(days=within_days)
+        ).isoformat()
+        cursor = await self.db.execute(
+            """SELECT conversation_id, started_at, transcript
+               FROM pending_extractions
+               WHERE transcript IS NOT NULL
+                 AND started_at >= ?
+                 AND transcript LIKE ?
+               ORDER BY started_at DESC
+               LIMIT ?""",
+            (cutoff, f"%{query}%", limit),
+        )
+        rows = await cursor.fetchall()
+        results: list[tuple[str, str, str]] = []
+        for r in rows:
+            transcript = r["transcript"] or ""
+            idx = transcript.lower().find(query.lower())
+            if idx < 0:
+                snippet = transcript[:300]
+            else:
+                start = max(0, idx - 120)
+                end = min(len(transcript), idx + 180)
+                snippet = ("..." if start > 0 else "") + transcript[start:end] + (
+                    "..." if end < len(transcript) else ""
+                )
+            results.append((r["conversation_id"], r["started_at"], snippet))
+        return results
+
+    # -------------------------------------------------------------------
+    # Cost log
+    # -------------------------------------------------------------------
+
+    async def record_cost(
+        self,
+        *,
+        purpose: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        is_batch: bool = False,
+        cost_usd: float,
+        metadata: dict | None = None,
+    ) -> None:
+        """Append a row to the cost log. Pricing computed at call time."""
+        await self.db.execute(
+            """INSERT INTO cost_log (
+                   timestamp, purpose, model,
+                   input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens,
+                   is_batch, cost_usd, metadata
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                _now_iso(),
+                purpose,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                1 if is_batch else 0,
+                cost_usd,
+                json.dumps(metadata) if metadata else None,
+            ),
+        )
+        await self.db.commit()
+
+    async def cost_summary(self, *, days: int = 7) -> dict[str, float]:
+        """Return total cost (USD) per purpose over the last N days."""
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cursor = await self.db.execute(
+            """SELECT purpose, SUM(cost_usd) AS total
+               FROM cost_log
+               WHERE timestamp >= ?
+               GROUP BY purpose""",
+            (cutoff,),
+        )
+        rows = await cursor.fetchall()
+        return {r["purpose"]: float(r["total"] or 0.0) for r in rows}
+
+    # -------------------------------------------------------------------
     # Database size
     # -------------------------------------------------------------------
 
@@ -810,6 +1117,25 @@ def _row_to_memory(row: aiosqlite.Row) -> Memory:
         invalidated_by=row["invalidated_by"],
         superseded_by=row["superseded_by"],
         embedding=_blob_to_embedding(row["embedding"]),
+    )
+
+
+def _row_to_pending(row: aiosqlite.Row) -> PendingExtraction:
+    """Convert a database row to a PendingExtraction dataclass."""
+    return PendingExtraction(
+        conversation_id=row["conversation_id"],
+        transcript=row["transcript"],
+        accessed_memory_ids=json.loads(row["accessed_memory_ids"]),
+        channel=row["channel"],
+        participants=json.loads(row["participants"]),
+        started_at=row["started_at"],
+        status=row["status"],
+        batch_id=row["batch_id"],
+        submitted_at=row["submitted_at"],
+        completed_at=row["completed_at"],
+        error=row["error"],
+        attempts=row["attempts"],
+        transcript_purge_at=row["transcript_purge_at"],
     )
 
 

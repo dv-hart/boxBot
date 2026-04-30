@@ -51,6 +51,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
 from boxbot.core.events import (
+    AgentTurnEnded,
     ConversationEnded,
     ConversationStarted,
     get_event_bus,
@@ -210,6 +211,22 @@ class Conversation:
         # ContextVar to route its scripts through. Stays alive across
         # turns so Python state (last_image, parsed CSVs) persists.
         self.sandbox_runner: "SandboxRunner | None" = None
+
+        # Memory IDs that were injected into the system prompt during
+        # any turn of this conversation. Populated by the agent's
+        # injection step and consumed by post-conversation extraction
+        # so the model knows which memories to consider for invalidation.
+        self.accessed_memory_ids: list[str] = []
+
+        # Wall-clock start of the conversation (UTC ISO 8601). Recorded
+        # at construction so post-conversation extraction has a stable
+        # ``started_at`` independent of how long the conversation ran.
+        from datetime import datetime as _dt
+        self._started_at_iso: str = _dt.utcnow().isoformat()
+
+    def started_at_iso(self) -> str:
+        """Return the conversation's wall-clock start as an ISO 8601 string."""
+        return self._started_at_iso
 
     # ------------------------------------------------------------------
     # Properties
@@ -530,6 +547,22 @@ class Conversation:
                         time.monotonic() - self._current_turn_started,
                         self._state.value,
                     )
+                    # Signals "turn done, BB is idle" — covers turns where
+                    # BB chose not to speak (no AgentSpeakingDone fires).
+                    # Voice adapter listens to arm the post-response
+                    # mic-idle timer.
+                    try:
+                        await get_event_bus().publish(
+                            AgentTurnEnded(
+                                conversation_id=self.conversation_id,
+                                channel=self.channel,
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to publish AgentTurnEnded for %s",
+                            self.conversation_id,
+                        )
                     return result
 
                 # Drain queued utterances and run another turn so the

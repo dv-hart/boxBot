@@ -272,6 +272,25 @@ class AgentSpeakingDone(Event):
 
 
 @dataclass(frozen=True)
+class AgentTurnEnded(Event):
+    """Conversation turn settled in LISTENING — agent is done with this turn.
+
+    Fires once per turn when ``Conversation`` finishes generation and has
+    no queued inputs to drain. Distinct from ``AgentSpeakingDone``: that
+    one fires per ``speak()`` call, this one fires per turn — including
+    turns where BB chose to stay silent and never spoke at all. The voice
+    adapter uses this as the "BB is done" signal that arms the
+    post-response mic-idle timer.
+
+    Source: Conversation
+    Consumers: Communication (VoiceSession)
+    """
+
+    conversation_id: str = ""
+    channel: str = ""
+
+
+@dataclass(frozen=True)
 class DisplaySwitch(Event):
     """Request to switch the active display.
 

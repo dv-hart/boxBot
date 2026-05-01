@@ -232,7 +232,10 @@ class TestSearchMemoryTool:
         assert tool.name == "search_memory"
         props = tool.parameters["properties"]
         assert "mode" in props
-        assert set(props["mode"]["enum"]) == {"lookup", "summary", "get"}
+        assert set(props["mode"]["enum"]) == {
+            "lookup", "summary", "get", "transcript",
+        }
+        assert "conversation_id" in props
 
 
 # ---------------------------------------------------------------------------

@@ -1755,6 +1755,128 @@ class TestVoiceSession:
         assert grace.cancelled() or grace.done()
         assert session._active_timeout_task is None
 
+    @pytest.mark.asyncio
+    async def test_post_response_idle_enters_dormant(self):
+        """When the post-response idle window expires, the adapter goes
+        DORMANT — capture stops but conv_id is retained so the next wake
+        word continues the same conversation."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        session._conversation_id = "voice_t"
+        session._audio_capture = MagicMock()
+        session._audio_capture.stop = AsyncMock()
+        session._audio_capture.reset = MagicMock()
+        session._vad = MagicMock()
+
+        session._POST_RESPONSE_IDLE_SECONDS = 0.05
+        await session._post_response_idle_loop()
+
+        assert session.state == VoiceSessionState.DORMANT
+        assert session._conversation_id == "voice_t"
+        session._audio_capture.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_wake_word_resumes_dormant_with_same_conv_id(self):
+        """A wake word from DORMANT must preserve the voice session id
+        so the agent treats the next transcript as a continuation of the
+        existing room conversation."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.DORMANT
+        session._conversation_id = "voice_keep_me"
+        session._vad = MagicMock()
+        session._audio_capture = MagicMock()
+        session._audio_capture.start = AsyncMock()
+
+        await session._activate_session()
+
+        assert session.state == VoiceSessionState.ACTIVE
+        assert session._conversation_id == "voice_keep_me"
+        assert session._activation_was_resume is True
+
+    @pytest.mark.asyncio
+    async def test_grace_from_resumed_session_falls_back_to_dormant(self):
+        """If a wake word activates a DORMANT session and no utterance
+        follows within the grace window, the adapter must fall back to
+        DORMANT (not IDLE) so the still-alive room conversation isn't
+        thrown away by an accidental wake word."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        session._activation_was_resume = True
+        session._conversation_id = "voice_keep"
+        session._audio_capture = MagicMock()
+        session._audio_capture.stop = AsyncMock()
+        session._audio_capture.reset = MagicMock()
+        session._vad = MagicMock()
+
+        session._WAKE_WORD_GRACE_SECONDS = 0.05
+        await session._wake_word_grace_loop()
+
+        assert session.state == VoiceSessionState.DORMANT
+        assert session._conversation_id == "voice_keep"
+
+    @pytest.mark.asyncio
+    async def test_conversation_ended_from_dormant_goes_idle(self):
+        """ConversationEnded clears the session id from DORMANT just as
+        it does from ACTIVE — capture is already off, so this is purely
+        a cleanup pass."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.DORMANT
+        session._conversation_id = "voice_t"
+        session._audio_capture = MagicMock()
+        session._audio_capture.stop = AsyncMock()
+        session._audio_capture.reset = MagicMock()
+        session._vad = MagicMock()
+
+        await session._deactivate_session(reason="conversation_ended")
+
+        assert session.state == VoiceSessionState.IDLE
+        assert session._conversation_id == ""
+        # Capture stop should not be called from DORMANT — already stopped.
+        session._audio_capture.stop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_agent_turn_ended_arms_post_response_timer(self):
+        """AgentTurnEnded for the matching session arms the post-response
+        idle timer so a silent turn doesn't leave the mic hot."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+        from boxbot.core.events import AgentTurnEnded
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        session._conversation_id = "voice_t"
+
+        await session._on_agent_turn_ended(
+            AgentTurnEnded(conversation_id="voice_t", channel="voice")
+        )
+
+        assert session._active_timeout_task is not None
+        # Cancel so the test doesn't leak a pending sleep.
+        session._active_timeout_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_agent_turn_ended_ignored_for_other_channel(self):
+        """A WhatsApp turn ending must not arm the voice mic-idle timer."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+        from boxbot.core.events import AgentTurnEnded
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        session._conversation_id = "voice_t"
+
+        await session._on_agent_turn_ended(
+            AgentTurnEnded(conversation_id="wa_xyz", channel="whatsapp")
+        )
+
+        assert session._active_timeout_task is None
+
     def test_build_attributed_transcript_no_diarization(self):
         from boxbot.communication.stt import STTResult
         from boxbot.communication.voice import VoiceSession

@@ -4,6 +4,8 @@ This SDK is the ONLY interface sandbox scripts have to boxBot internals.
 It communicates with the main process through structured JSON on stdout.
 
 Modules:
+    auth      — User/admin state and registration code minting (no
+                raw secrets — RPC façade onto AuthManager)
     camera    — Capture stills from the Pi camera; images attach to
                 the tool result so the agent sees pixels directly
     display   — Declarative block-based display builder
@@ -20,6 +22,7 @@ Modules:
 """
 
 from . import (
+    auth,
     calendar,
     camera,
     display,
@@ -33,6 +36,7 @@ from . import (
 )
 
 __all__ = [
+    "auth",
     "calendar",
     "camera",
     "display",

@@ -479,6 +479,7 @@ async def search_memories(
     mode: str,
     query: str | None = None,
     memory_id: str | None = None,
+    conversation_id: str | None = None,
     types: list[str] | None = None,
     person: str | None = None,
     include_conversations: bool = True,
@@ -488,9 +489,12 @@ async def search_memories(
 
     Args:
         store: The MemoryStore instance.
-        mode: One of "lookup", "summary", "get".
-        query: Required for lookup and summary modes.
+        mode: One of "lookup", "summary", "get", "transcript".
+        query: Required for lookup, summary, and transcript-search modes.
         memory_id: Required for get mode.
+        conversation_id: Optional for transcript mode (returns full
+            transcript by id; otherwise the query is used to substring-
+            search across all retained transcripts).
         types: Optional memory type filter.
         person: Optional person name filter.
         include_conversations: Include conversation log in results.
@@ -501,11 +505,18 @@ async def search_memories(
         - lookup: {"facts": [...], "conversations": [...]}
         - summary: {"answer": str, "sources": [...]}
         - get: full memory record dict
+        - transcript: {"conversation_id", "started_at", "transcript"} OR
+                      {"matches": [{"conversation_id", "started_at", "snippet"}]}
     """
     if mode == "get":
         if not memory_id:
             raise ValueError("memory_id is required for get mode")
         return await _search_get(store, memory_id)
+
+    if mode == "transcript":
+        return await _search_transcript(
+            store, query=query, conversation_id=conversation_id,
+        )
 
     if not query:
         raise ValueError("query is required for lookup and summary modes")
@@ -527,7 +538,61 @@ async def search_memories(
             include_archived=include_archived,
         )
     else:
-        raise ValueError(f"Invalid mode: {mode}. Must be lookup, summary, or get.")
+        raise ValueError(
+            f"Invalid mode: {mode}. Must be lookup, summary, get, or transcript."
+        )
+
+
+async def _search_transcript(
+    store: MemoryStore,
+    *,
+    query: str | None,
+    conversation_id: str | None,
+) -> dict:
+    """Transcript mode: retrieve raw conversation text within retention.
+
+    Two sub-modes:
+    - If ``conversation_id`` is given, return the full transcript for
+      that conversation (or an error if purged / not found).
+    - Otherwise, ``query`` is required and we substring-search all
+      retained transcripts (default 14 days), returning up to 5 hits
+      with ~300-char snippets around the first match.
+    """
+    if conversation_id:
+        text = await store.get_transcript(conversation_id)
+        if text is None:
+            return {
+                "error": (
+                    f"Transcript for {conversation_id} not available "
+                    f"(either never recorded or purged after retention window)"
+                ),
+            }
+        # Pull metadata for context.
+        row = await store.get_pending_extraction(conversation_id)
+        return {
+            "conversation_id": conversation_id,
+            "started_at": row.started_at if row else None,
+            "channel": row.channel if row else None,
+            "participants": row.participants if row else [],
+            "transcript": text,
+        }
+
+    if not query:
+        raise ValueError(
+            "transcript mode needs either conversation_id or query"
+        )
+
+    matches = await store.search_transcripts(query, limit=5)
+    return {
+        "matches": [
+            {
+                "conversation_id": cid,
+                "started_at": started_at,
+                "snippet": snippet,
+            }
+            for (cid, started_at, snippet) in matches
+        ],
+    }
 
 
 async def _search_get(store: MemoryStore, memory_id: str) -> dict:

@@ -139,6 +139,24 @@ class WhatsAppMessage(Event):
 
 
 @dataclass(frozen=True)
+class UserRegistered(Event):
+    """A new user just completed WhatsApp registration.
+
+    Fires on bootstrap (first admin) and on admin-initiated invites.
+    The agent reflects on this to welcome the new user and notify the
+    inviting admin (if any) — see the onboarding skill.
+
+    Source: Communication (router)
+    Consumers: Agent
+    """
+
+    phone: str = ""
+    name: str = ""
+    role: str = "user"            # "admin" or "user"
+    invited_by_phone: str = ""    # empty for bootstrap; admin's phone otherwise
+
+
+@dataclass(frozen=True)
 class TriggerFired(Event):
     """A scheduler trigger's conditions have all been met.
 
@@ -251,6 +269,25 @@ class AgentSpeakingDone(Event):
 
     conversation_id: str = ""
     interrupted: bool = False
+
+
+@dataclass(frozen=True)
+class AgentTurnEnded(Event):
+    """Conversation turn settled in LISTENING — agent is done with this turn.
+
+    Fires once per turn when ``Conversation`` finishes generation and has
+    no queued inputs to drain. Distinct from ``AgentSpeakingDone``: that
+    one fires per ``speak()`` call, this one fires per turn — including
+    turns where BB chose to stay silent and never spoke at all. The voice
+    adapter uses this as the "BB is done" signal that arms the
+    post-response mic-idle timer.
+
+    Source: Conversation
+    Consumers: Communication (VoiceSession)
+    """
+
+    conversation_id: str = ""
+    channel: str = ""
 
 
 @dataclass(frozen=True)

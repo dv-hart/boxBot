@@ -457,7 +457,92 @@ async def _init_communication() -> Any | None:
 
     router = MessageRouter(auth=auth, whatsapp=whatsapp)
     logger.info("Communication layer initialised (WhatsApp + router)")
+
+    # First-run setup: if no admins are registered yet AND we haven't
+    # already seeded setup todos, drop a small ordered backlog. The
+    # agent picks these up on its next wake cycle and runs the
+    # onboarding skill against them. Idempotent: re-runs see the
+    # `setup:bootstrap` todo and bail.
+    await _maybe_seed_setup_todos(auth)
+
     return router
+
+
+async def _maybe_seed_setup_todos(auth: Any) -> None:
+    """Seed first-run setup todos if no admin exists and none were seeded.
+
+    The skill is the *how*; these todos are the *what*. Each is a
+    discrete, observable, recoverable unit of work. If any todo
+    tagged ``setup:`` already exists, this is a no-op even if the
+    admin record was somehow deleted later — we don't want to re-seed
+    a partially completed run.
+    """
+    from boxbot.core import scheduler
+
+    if any(u.role == "admin" for u in await auth.list_users()):
+        return
+
+    existing = await scheduler.list_todos()
+    if any(
+        (t.get("description") or "").startswith("setup:") for t in existing
+    ):
+        return
+
+    seeds = [
+        (
+            "setup:bootstrap — register the first admin",
+            (
+                "Mint a single-use bootstrap code with "
+                "bb.auth.generate_bootstrap_code(), then surface it on "
+                "the HDMI screen with switch_display(\"notice\", "
+                "args={\"title\": \"Welcome to boxBot!\", \"lines\": ["
+                "\"Text this code to BB's WhatsApp number:\", "
+                "\"Code: <CODE>\", \"Expires in 10 minutes\"]}). "
+                "Wait for the UserRegistered event (role=admin). Mark "
+                "this todo complete after registration succeeds."
+            ),
+        ),
+        (
+            "setup:greet_admin — welcome the new admin and learn their name",
+            (
+                "On UserRegistered (role=admin), reply via WhatsApp "
+                "with a warm welcome and ask what they'd like you to "
+                "call them. When they answer, save their preferred "
+                "name to system memory."
+            ),
+        ),
+        (
+            "setup:voice_fingerprint — link the admin to a voice profile",
+            (
+                "Send a WhatsApp message inviting the admin to come "
+                "say hi at the box. When they next address you in a "
+                "voice conversation, run the voice-onboarding "
+                "procedure (identify_person) so you recognize their "
+                "voice on future visits. Mark complete on a successful "
+                "create/confirm outcome."
+            ),
+        ),
+        (
+            "setup:household — note household basics",
+            (
+                "Ask the admin (via WhatsApp or voice — whichever they "
+                "prefer) about other household members worth knowing, "
+                "the city to use for weather, and any house "
+                "preferences. Save anything durable to system memory. "
+                "This todo is optional — mark complete or cancel based "
+                "on what they share."
+            ),
+        ),
+    ]
+
+    for description, notes in seeds:
+        await scheduler.create_todo(
+            description=description,
+            notes=notes,
+            source="setup",
+        )
+
+    logger.info("Seeded %d first-run setup todos", len(seeds))
 
 
 async def _init_whatsapp_inbound(router: Any) -> Any | None:

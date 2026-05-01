@@ -1,0 +1,37 @@
+# boxBot web search tool configuration
+#
+# Controls the small-model agent that acts as the content firewall in
+# front of all web content reaching the primary agent. See
+# src/boxbot/tools/builtins/web_search.py for the security model and
+# src/boxbot/tools/README.md for tool-level documentation.
+#
+# All keys are optional; defaults match this file.
+
+# Which search provider the small agent uses.
+#   "anthropic" — Anthropic server-side web_search tool (default).
+#                 No additional API key needed; piggy-backs on the
+#                 same ANTHROPIC_API_KEY used by the rest of boxBot.
+#   "brave"     — (not yet implemented) Brave Search API.
+#   "serper"    — (not yet implemented) Serper.
+#   "searxng"   — (not yet implemented) self-hosted SearXNG instance.
+search_backend: "anthropic"
+
+# Wall-clock timeout for the entire small-agent invocation (seconds).
+# If exceeded, the tool returns a structured timeout response and the
+# large model is told the search was incomplete. The spec calls out
+# 30s as the target ceiling for conversational responsiveness.
+timeout: 30
+
+# Maximum number of pages the small agent may fetch in one invocation.
+# Applies to both Anthropic server-side web_search uses and client-side
+# fetch_url calls. Caps token and bandwidth cost per query.
+max_pages: 5
+
+# Maximum number of small-model turns in the agent loop. Each iteration
+# is one Anthropic API call; bumps in here translate directly to cost.
+# 6 is generous — most queries terminate in 2-3.
+max_iterations: 6
+
+# HTTP User-Agent header used by client-side fetch_url. Override if a
+# specific target site requires a particular UA.
+user_agent: "boxBot/1.0 (+https://github.com/boxbot)"

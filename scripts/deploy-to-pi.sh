@@ -1,5 +1,21 @@
 #!/usr/bin/env bash
-# Deploy the working tree to the Pi safely.
+# FAST-ITERATION DEPLOY (rsync, no commit, no restart).
+#
+# This is NOT the canonical deploy path — see ``scripts/deploy.sh`` and
+# the "Deploying to the Pi" section of CLAUDE.md for the SOP. Use that
+# for any deploy you want to be auditable.
+#
+# Use THIS script when:
+#   - Iterating on a tight loop and don't want to commit each change.
+#   - Testing a quick fix you may not keep.
+#
+# Trade-offs:
+#   - No git audit trail. The Pi's tracked files diverge from its
+#     committed state (uncommitted local modifications).
+#   - Does NOT restart boxbot — must run scripts/restart-boxbot.sh on
+#     the Pi yourself if needed.
+#   - Skips the pre-flight checks in scripts/deploy.sh (clean tree, on
+#     main, push to origin).
 #
 # Usage: scripts/deploy-to-pi.sh [user@host]
 #

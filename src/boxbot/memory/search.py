@@ -6,19 +6,35 @@ Provides hybrid vector + BM25 retrieval used by:
 - SDK boxbot_sdk.memory.search() (via execute_script)
 
 Scoring: 0.6 * vector_cosine + 0.4 * BM25_normalized (configurable).
+
+## Anthropic client threading
+
+Lookup-mode reranking and summary-mode synthesis call Haiku 4.5. The
+search backend doesn't own a client — the agent does. Callers pass the
+client explicitly via the ``client`` keyword argument (option (a) in
+the roadmap). When ``client`` is ``None`` we lazily build one from
+``config.api_keys.anthropic`` (option (c) fallback). If neither is
+available, the backend falls back to ``rerank_stub`` for reranking and
+a degenerate concat for summary mode — this keeps unit tests + offline
+boots functional without forcing every search caller to thread the
+client through.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from boxbot.memory.embeddings import EMBEDDING_DIM, cosine_similarity, embed
 from boxbot.memory.store import MemoryStore
+
+if TYPE_CHECKING:
+    import anthropic
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +47,13 @@ DEFAULT_MEMORY_CANDIDATES = 30
 DEFAULT_CONVERSATION_CANDIDATES = 10
 DEFAULT_MEMORY_RESULTS = 10
 DEFAULT_CONVERSATION_RESULTS = 3
+
+# Reranking / summary tuning. These are deliberately conservative —
+# Haiku is fast but it's still a per-call cost on the hot path.
+RERANK_BATCH_SIZE = 6
+RERANK_MAX_PARALLEL = 6
+RERANK_MODEL = "claude-haiku-4-5-20251001"
+RERANK_MAX_TOKENS = 2048
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +455,576 @@ def _escape_fts_query(query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reranking stub
+# Haiku-backed reranking + summary filtering
+# ---------------------------------------------------------------------------
+
+
+# Tool schema for reranking. Forces the model to emit one
+# ``rerank_candidates`` call with a per-candidate judgment array. The
+# schema is verbatim from docs/plans/memory-roadmap-post-phase-a.md §1.
+RERANK_TOOL: dict[str, Any] = {
+    "name": "rerank_candidates",
+    "description": (
+        "Emit relevance judgments for a batch of memory candidates. "
+        "Call this exactly once with one judgment per input candidate."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["judgments"],
+        "properties": {
+            "judgments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "candidate_id", "relevant", "title",
+                        "summary", "relevance_reason",
+                    ],
+                    "properties": {
+                        "candidate_id": {"type": "string"},
+                        "relevant": {"type": "boolean"},
+                        "title": {
+                            "type": "string",
+                            "description": (
+                                "Contextual one-line title <= 80 chars."
+                            ),
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "One-sentence summary.",
+                        },
+                        "relevance_reason": {
+                            "type": "string",
+                            "description": (
+                                "One sentence explaining why this "
+                                "candidate is or isn't relevant."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
+
+
+# Filter-mode tool. Used by summary mode to identify the candidates that
+# materially contribute to answering a question and to extract the key
+# snippet from each. Shares 90% of its prompt with reranking; only the
+# per-item output fields differ.
+FILTER_TOOL: dict[str, Any] = {
+    "name": "filter_candidates",
+    "description": (
+        "Emit per-candidate relevance + the key snippet that would help "
+        "answer the question. Call exactly once."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["judgments"],
+        "properties": {
+            "judgments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["candidate_id", "relevant", "snippet"],
+                    "properties": {
+                        "candidate_id": {"type": "string"},
+                        "relevant": {"type": "boolean"},
+                        "snippet": {
+                            "type": "string",
+                            "description": (
+                                "Short verbatim-or-paraphrased snippet "
+                                "from the candidate that bears on the "
+                                "question. Empty string if not relevant."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
+
+
+# Synthesis tool for summary mode. One final Haiku call after filtering
+# returns a natural-language answer with citations.
+SYNTHESIZE_TOOL: dict[str, Any] = {
+    "name": "synthesize_answer",
+    "description": (
+        "Emit a natural-language answer to the user's question grounded "
+        "in the supplied snippets, plus the source IDs that materially "
+        "contributed."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["answer", "source_ids"],
+        "properties": {
+            "answer": {
+                "type": "string",
+                "description": (
+                    "Natural-language answer. Cite specifics from the "
+                    "snippets. If the snippets don't actually answer "
+                    "the question, say so plainly."
+                ),
+            },
+            "source_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Memory or conversation IDs whose snippets directly "
+                    "supported the answer. Order doesn't matter. May be "
+                    "empty if no snippets were useful."
+                ),
+            },
+        },
+    },
+}
+
+
+# System prompt shared by reranking and summary-filtering. Stable across
+# calls so the prefix can be cached. The intent ("rank" vs "summarize")
+# is communicated in the user message; the model knows which tool to
+# call because we set ``tool_choice`` to that specific tool name.
+FILTER_SYSTEM_PROMPT = """\
+You are the relevance judge for boxBot's memory search.
+
+You receive:
+- A user query (or question).
+- A small batch of candidate memories / conversation summaries, each \
+with an id, type, optional person, summary, and content excerpt.
+
+For each candidate, decide whether it is RELEVANT to the query:
+- Relevant: the candidate's content directly bears on the query and \
+would help answer it or surface useful related context.
+- Not relevant: the candidate is off-topic, only superficially \
+mentions a query keyword, or is too generic to add anything.
+
+Be strict. It's better to drop a borderline candidate than to keep \
+noise. The agent will see the kept results in a system prompt block, \
+so quality matters more than recall.
+
+When the per-call instruction is "rank":
+- For relevant candidates: produce a contextual `title` (<=80 chars), \
+a one-sentence `summary`, and a one-sentence `relevance_reason`.
+- For irrelevant candidates: still emit the entry, set `relevant: \
+false`, and you may keep the title/summary/reason short (they will \
+be dropped).
+
+When the per-call instruction is "summarize":
+- For relevant candidates: extract the key `snippet` (verbatim or \
+tightly paraphrased) that would help answer the question.
+- For irrelevant candidates: set `relevant: false` and `snippet: ""`.
+
+Always emit one judgment per input candidate, in the same order, with \
+the matching `candidate_id`. Always call the requested tool exactly \
+once. Never respond with prose.
+"""
+
+
+SYNTHESIZE_SYSTEM_PROMPT = """\
+You are the answer synthesizer for boxBot's memory search.
+
+You receive a question and a list of relevant snippets, each with an \
+id. Compose a concise natural-language answer grounded ONLY in the \
+snippets. Cite the snippet ids that materially contributed via the \
+`source_ids` field.
+
+Rules:
+- Do NOT invent facts. If the snippets don't answer the question, say \
+that plainly and return an empty `source_ids`.
+- Prefer specifics from the snippets over generalities.
+- 1-3 sentences typical. Don't pad.
+- Always call the `synthesize_answer` tool exactly once.
+"""
+
+
+def _format_candidate_for_prompt(c: SearchCandidate) -> str:
+    """Render a candidate as a short block for the user prompt.
+
+    Truncates content aggressively — the model only needs enough
+    signal to judge relevance, not the full memory.
+    """
+    person_label = f" person={c.person}" if c.person else ""
+    body = c.content or c.summary or ""
+    if len(body) > 600:
+        body = body[:600] + "..."
+    return (
+        f"[id={c.id}] type={c.type}{person_label}\n"
+        f"summary: {c.summary}\n"
+        f"content: {body}"
+    )
+
+
+def _build_filter_user_message(
+    query: str,
+    batch: list[SearchCandidate],
+    intent: str,
+) -> str:
+    """Build the per-batch user message for filter / rerank calls."""
+    instruction = (
+        "rank" if intent == "rank" else "summarize"
+    )
+    parts = [
+        f"Per-call instruction: {instruction}",
+        f"Query: {query}",
+        "",
+        f"Candidates ({len(batch)}):",
+    ]
+    for c in batch:
+        parts.append("---")
+        parts.append(_format_candidate_for_prompt(c))
+    return "\n".join(parts)
+
+
+def _maybe_get_anthropic_client(
+    client: "anthropic.AsyncAnthropic | None",
+) -> "anthropic.AsyncAnthropic | None":
+    """Return the supplied client, or lazily build one from config.
+
+    Falls back to ``None`` if no API key is configured. Callers must
+    handle the ``None`` case (typically by using the stub path).
+    """
+    if client is not None:
+        return client
+    try:
+        import anthropic
+
+        from boxbot.core.config import get_config
+
+        cfg = get_config()
+        api_key = cfg.api_keys.anthropic
+        if not api_key:
+            return None
+        return anthropic.AsyncAnthropic(api_key=api_key)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("Could not lazily build Anthropic client: %s", e)
+        return None
+
+
+def _extract_tool_use(message: Any, tool_name: str) -> dict | None:
+    """Pull the tool_use block named ``tool_name`` from a message."""
+    content = getattr(message, "content", None) or []
+    for block in content:
+        block_type = getattr(block, "type", None) or (
+            block.get("type") if isinstance(block, dict) else None
+        )
+        if block_type != "tool_use":
+            continue
+        block_name = getattr(block, "name", None) or (
+            block.get("name") if isinstance(block, dict) else None
+        )
+        if block_name == tool_name:
+            payload = getattr(block, "input", None)
+            if payload is None and isinstance(block, dict):
+                payload = block.get("input")
+            if isinstance(payload, dict):
+                return payload
+    return None
+
+
+async def _record_haiku_cost(
+    store: MemoryStore | None,
+    *,
+    purpose: str,
+    usage: Any,
+    metadata: dict | None = None,
+) -> None:
+    """Compute USD cost from a Haiku call's usage and append cost_log."""
+    if store is None or usage is None:
+        return
+    # Lazy import avoids circular load (extraction.py imports search-adjacent stuff).
+    from boxbot.memory.extraction import compute_cost
+
+    in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+    out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+    cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    cache_write = int(
+        getattr(usage, "cache_creation_input_tokens", 0) or 0
+    )
+    cost = compute_cost(
+        RERANK_MODEL,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        cache_read_tokens=cache_read,
+        cache_write_tokens_1h=cache_write,
+        is_batch=False,
+    )
+    try:
+        await store.record_cost(
+            purpose=purpose,
+            model=RERANK_MODEL,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+            is_batch=False,
+            cost_usd=cost,
+            metadata=metadata,
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Failed to record %s cost: %s", purpose, e)
+
+
+def _chunk(lst: list, n: int) -> list[list]:
+    return [lst[i:i + n] for i in range(0, len(lst), n)]
+
+
+async def filter_candidates(
+    client: "anthropic.AsyncAnthropic",
+    candidates: list[SearchCandidate],
+    query: str,
+    *,
+    intent: str,
+    store: MemoryStore | None = None,
+    cost_purpose: str = "rerank",
+) -> list[dict]:
+    """Run parallel Haiku calls to judge candidate relevance.
+
+    Shared helper used by both reranking (``intent="rank"``) and summary
+    mode (``intent="summarize"``). The 90% shared prompt + tool schemas
+    differ only in the per-candidate output fields.
+
+    Returns a flat list of judgment dicts. Each dict carries (at
+    minimum) ``candidate_id`` and ``relevant``. Rank judgments add
+    ``title`` / ``summary`` / ``relevance_reason``; summarize judgments
+    add ``snippet``.
+
+    Cost is recorded against ``cost_purpose`` (one row per parallel
+    call) so the total nightly spend can be attributed correctly.
+    """
+    if not candidates:
+        return []
+
+    if intent not in {"rank", "summarize"}:
+        raise ValueError(f"intent must be rank or summarize, got {intent!r}")
+
+    tool = RERANK_TOOL if intent == "rank" else FILTER_TOOL
+    tool_name = tool["name"]
+
+    batches = _chunk(candidates, RERANK_BATCH_SIZE)
+    # The 5-6 parallel cap is a soft cap — RERANK_BATCH_SIZE * MAX_PARALLEL
+    # = 36 candidates per fan-out, comfortably above hybrid_search's 40.
+    if len(batches) > RERANK_MAX_PARALLEL:
+        # Should be rare. If we ever exceed it, the extras run serially.
+        logger.debug(
+            "Rerank fan-out %d exceeds parallel cap %d; some batches will queue",
+            len(batches), RERANK_MAX_PARALLEL,
+        )
+
+    async def _one_call(batch: list[SearchCandidate]) -> list[dict]:
+        user_msg = _build_filter_user_message(query, batch, intent)
+        try:
+            response = await client.messages.create(
+                model=RERANK_MODEL,
+                max_tokens=RERANK_MAX_TOKENS,
+                system=[
+                    {
+                        "type": "text",
+                        "text": FILTER_SYSTEM_PROMPT,
+                        # 5-min TTL: synchronous hot-path, not batch.
+                        "cache_control": {
+                            "type": "ephemeral", "ttl": "5m",
+                        },
+                    },
+                ],
+                tools=[tool],
+                tool_choice={"type": "tool", "name": tool_name},
+                messages=[{"role": "user", "content": user_msg}],
+            )
+        except Exception as e:
+            logger.warning(
+                "Haiku %s call failed for %d candidates: %s",
+                intent, len(batch), e,
+            )
+            return []
+
+        await _record_haiku_cost(
+            store,
+            purpose=cost_purpose,
+            usage=getattr(response, "usage", None),
+            metadata={"intent": intent, "batch_size": len(batch)},
+        )
+
+        payload = _extract_tool_use(response, tool_name)
+        if not payload:
+            logger.warning(
+                "Haiku %s response missing %s tool_use", intent, tool_name,
+            )
+            return []
+        judgments = payload.get("judgments") or []
+        if not isinstance(judgments, list):
+            return []
+        return judgments
+
+    results = await asyncio.gather(
+        *[_one_call(b) for b in batches],
+        return_exceptions=False,
+    )
+    flat: list[dict] = []
+    for batch_result in results:
+        flat.extend(batch_result)
+    return flat
+
+
+async def rerank_with_haiku(
+    candidates: list[SearchCandidate],
+    query: str,
+    *,
+    client: "anthropic.AsyncAnthropic | None" = None,
+    store: MemoryStore | None = None,
+) -> list[SearchResult]:
+    """Real Haiku-backed reranking. Replaces ``rerank_stub``.
+
+    Pipeline (matches docs/plans/memory-roadmap-post-phase-a.md §1):
+      1. Batch input candidates into groups of RERANK_BATCH_SIZE.
+      2. Fan out parallel Haiku calls. Each returns per-candidate
+         {relevant, title, summary, relevance_reason}.
+      3. Drop candidates with relevant=False.
+      4. Re-sort survivors by their original combined_score.
+      5. Return top DEFAULT_MEMORY_RESULTS facts +
+         DEFAULT_CONVERSATION_RESULTS conversations.
+    """
+    if not candidates:
+        return []
+
+    client = _maybe_get_anthropic_client(client)
+    if client is None:
+        logger.info(
+            "No Anthropic client available; falling back to rerank_stub"
+        )
+        return await rerank_stub(candidates, query)
+
+    judgments = await filter_candidates(
+        client, candidates, query,
+        intent="rank",
+        store=store,
+        cost_purpose="rerank",
+    )
+
+    # If the model utterly failed (no judgments returned), fall back
+    # to the stub so the user still gets *something* back. Logged
+    # above; we don't want the tool call to crash on a transient
+    # API error.
+    if not judgments:
+        logger.warning("Reranking returned no judgments; using stub fallback")
+        return await rerank_stub(candidates, query)
+
+    # Index judgments by candidate id. Drop irrelevant entries.
+    by_id: dict[str, dict] = {}
+    for j in judgments:
+        cid = j.get("candidate_id")
+        if not cid:
+            continue
+        if not j.get("relevant"):
+            continue
+        by_id[cid] = j
+
+    # Build SearchResults from kept candidates, preserving the
+    # original combined_score ordering.
+    survivors = [c for c in candidates if c.id in by_id]
+    survivors.sort(key=lambda c: c.combined_score, reverse=True)
+
+    results: list[SearchResult] = []
+    for c in survivors:
+        j = by_id[c.id]
+        title = (j.get("title") or c.summary or "")[:80]
+        summary = j.get("summary") or c.summary
+        relevance = j.get("relevance_reason") or (
+            f"Matched query (score: {c.combined_score:.2f})"
+        )
+        results.append(SearchResult(
+            id=c.id,
+            source=c.source,
+            type=c.type,
+            person=c.person,
+            title=title,
+            summary=summary,
+            relevance=relevance,
+            metadata=c.metadata,
+        ))
+    return results
+
+
+async def synthesize_answer(
+    client: "anthropic.AsyncAnthropic",
+    question: str,
+    snippets: list[tuple[str, str]],
+    *,
+    store: MemoryStore | None = None,
+) -> dict:
+    """One Haiku call to synthesize a natural-language answer.
+
+    ``snippets`` is a list of ``(id, snippet)`` tuples — the relevant
+    extracted material from filter_candidates. Returns
+    ``{"answer": str, "source_ids": list[str]}``. Cost is recorded
+    against ``"summary"``.
+    """
+    if not snippets:
+        return {
+            "answer": "No relevant memories found.",
+            "source_ids": [],
+        }
+
+    snippet_block = "\n".join(
+        f"[id={sid}] {snippet}" for sid, snippet in snippets if snippet
+    )
+    if not snippet_block.strip():
+        return {
+            "answer": "No relevant memories found.",
+            "source_ids": [],
+        }
+
+    user_msg = (
+        f"Question: {question}\n\nRelevant snippets:\n{snippet_block}\n\n"
+        "Synthesize an answer grounded only in these snippets."
+    )
+
+    try:
+        response = await client.messages.create(
+            model=RERANK_MODEL,
+            max_tokens=RERANK_MAX_TOKENS,
+            system=[
+                {
+                    "type": "text",
+                    "text": SYNTHESIZE_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                },
+            ],
+            tools=[SYNTHESIZE_TOOL],
+            tool_choice={"type": "tool", "name": "synthesize_answer"},
+            messages=[{"role": "user", "content": user_msg}],
+        )
+    except Exception as e:
+        logger.warning("Haiku synthesis call failed: %s", e)
+        return {
+            "answer": "Synthesis failed; falling back to raw snippets.",
+            "source_ids": [sid for sid, _ in snippets],
+        }
+
+    await _record_haiku_cost(
+        store,
+        purpose="summary",
+        usage=getattr(response, "usage", None),
+        metadata={"step": "synthesize"},
+    )
+
+    payload = _extract_tool_use(response, "synthesize_answer")
+    if not payload:
+        logger.warning("Synthesis response missing synthesize_answer block")
+        return {
+            "answer": "Synthesis failed; falling back to raw snippets.",
+            "source_ids": [sid for sid, _ in snippets],
+        }
+
+    answer = payload.get("answer") or ""
+    source_ids = payload.get("source_ids") or []
+    if not isinstance(source_ids, list):
+        source_ids = []
+    return {"answer": answer, "source_ids": source_ids}
+
+
+# ---------------------------------------------------------------------------
+# Reranking stub (legacy fallback)
 # ---------------------------------------------------------------------------
 
 
@@ -440,18 +1032,12 @@ async def rerank_stub(
     candidates: list[SearchCandidate],
     query: str,
 ) -> list[SearchResult]:
-    """Placeholder for small model reranking.
+    """No-op fallback that turns candidates into results unchanged.
 
-    In production, this sends batches of ~6 candidates to the small model
-    (5-6 parallel calls) for relevance scoring, title generation, and
-    summary generation. For now, it converts candidates directly to results.
-
-    Args:
-        candidates: Candidates from hybrid search.
-        query: The original search query.
-
-    Returns:
-        Ranked SearchResult list.
+    Kept as a safety net for offline boots, tests that don't mock the
+    Anthropic client, and transient API failures inside
+    ``rerank_with_haiku``. Production code paths always go through
+    ``rerank_with_haiku`` first.
     """
     results = []
     for c in candidates:
@@ -484,6 +1070,7 @@ async def search_memories(
     person: str | None = None,
     include_conversations: bool = True,
     include_archived: bool = False,
+    client: "anthropic.AsyncAnthropic | None" = None,
 ) -> dict:
     """Main search entry point for the tool, SDK, and injection system.
 
@@ -499,6 +1086,11 @@ async def search_memories(
         person: Optional person name filter.
         include_conversations: Include conversation log in results.
         include_archived: Include archived memories.
+        client: Optional Anthropic client for reranking / summary
+            synthesis. If ``None``, the backend lazily builds one from
+            ``config.api_keys.anthropic``. If neither is available,
+            lookup falls back to ``rerank_stub`` (no model calls) and
+            summary falls back to a concatenated answer.
 
     Returns:
         Dict with mode-specific results:
@@ -528,6 +1120,7 @@ async def search_memories(
             person=person,
             include_conversations=include_conversations,
             include_archived=include_archived,
+            client=client,
         )
     elif mode == "summary":
         return await _search_summary(
@@ -536,6 +1129,7 @@ async def search_memories(
             person=person,
             include_conversations=include_conversations,
             include_archived=include_archived,
+            client=client,
         )
     else:
         raise ValueError(
@@ -624,8 +1218,14 @@ async def _search_lookup(
     person: str | None,
     include_conversations: bool,
     include_archived: bool,
+    client: "anthropic.AsyncAnthropic | None" = None,
 ) -> dict:
-    """Lookup mode: return ranked facts and conversations."""
+    """Lookup mode: return ranked facts and conversations.
+
+    Pipeline: hybrid search → Haiku rerank (5-6 parallel calls) →
+    drop irrelevant → re-sort by combined_score → top-K. Falls back
+    to ``rerank_stub`` if no Anthropic client is available.
+    """
     candidates = await hybrid_search(
         store, query,
         types=types,
@@ -634,8 +1234,9 @@ async def _search_lookup(
         include_archived=include_archived,
     )
 
-    # Rerank (stub for now)
-    results = await rerank_stub(candidates, query)
+    results = await rerank_with_haiku(
+        candidates, query, client=client, store=store,
+    )
 
     # Update relevance timestamps for results that pass the filter
     for r in results:
@@ -683,11 +1284,14 @@ async def _search_summary(
     person: str | None,
     include_conversations: bool,
     include_archived: bool,
+    client: "anthropic.AsyncAnthropic | None" = None,
 ) -> dict:
     """Summary mode: synthesize an answer from relevant memories.
 
-    In production, this runs parallel small model calls for filtering,
-    then a synthesis call. For now, it concatenates relevant summaries.
+    Pipeline: hybrid search → Haiku filter (parallel) → Haiku
+    synthesis (one call) → ``{"answer": str, "sources": [...]}``.
+    Falls back to a concatenated summary string if no client is
+    available.
     """
     candidates = await hybrid_search(
         store, query,
@@ -697,21 +1301,72 @@ async def _search_summary(
         include_archived=include_archived,
     )
 
-    # Update relevance timestamps
-    source_ids = []
-    for c in candidates[:15]:
-        source_ids.append(c.id)
+    if not candidates:
+        return {"answer": "No relevant memories found.", "sources": []}
+
+    client = _maybe_get_anthropic_client(client)
+
+    if client is None:
+        # Offline fallback. Better than crashing the tool call.
+        logger.info("No Anthropic client available; summary fallback path")
+        source_ids: list[str] = []
+        for c in candidates[:15]:
+            source_ids.append(c.id)
+            if c.source == "memory":
+                await store.update_memory_relevance(c.id)
+                if c.metadata.get("status") == "archived":
+                    await store.unarchive_memory(c.id)
+        summaries = [c.summary for c in candidates[:10] if c.summary]
+        answer = " | ".join(summaries) if summaries else "No relevant memories found."
+        return {"answer": answer, "sources": source_ids[:10]}
+
+    # Step 1: parallel filter + snippet extraction.
+    judgments = await filter_candidates(
+        client, candidates, query,
+        intent="summarize",
+        store=store,
+        cost_purpose="summary",
+    )
+
+    relevant_ids = {
+        j["candidate_id"] for j in judgments
+        if j.get("candidate_id") and j.get("relevant")
+    }
+    snippet_by_id = {
+        j["candidate_id"]: (j.get("snippet") or "")
+        for j in judgments
+        if j.get("candidate_id") and j.get("relevant")
+    }
+
+    # Update relevance for the candidates the filter kept.
+    relevant_candidates = [c for c in candidates if c.id in relevant_ids]
+    for c in relevant_candidates:
         if c.source == "memory":
             await store.update_memory_relevance(c.id)
             if c.metadata.get("status") == "archived":
                 await store.unarchive_memory(c.id)
 
-    # Stub synthesis: concatenate top summaries
-    # In production, the small model synthesizes a natural language answer
-    summaries = [c.summary for c in candidates[:10] if c.summary]
-    if summaries:
-        answer = " | ".join(summaries)
-    else:
-        answer = "No relevant memories found."
+    if not relevant_candidates:
+        return {"answer": "No relevant memories found.", "sources": []}
 
-    return {"answer": answer, "sources": source_ids[:10]}
+    # Build (id, snippet) pairs in combined-score order. Cap at the
+    # same 10-source limit the lookup mode uses.
+    ordered = sorted(
+        relevant_candidates,
+        key=lambda c: c.combined_score,
+        reverse=True,
+    )[:10]
+    snippets = [
+        (c.id, snippet_by_id.get(c.id) or c.summary or c.content)
+        for c in ordered
+    ]
+
+    # Step 2: synthesis.
+    synth = await synthesize_answer(
+        client, query, snippets, store=store,
+    )
+
+    return {
+        "answer": synth.get("answer", ""),
+        "sources": synth.get("source_ids", []),
+    }

@@ -99,6 +99,11 @@ class Memory:
     invalidated_by: str | None
     superseded_by: str | None
     embedding: np.ndarray | None
+    # Dream-phase fields (added 2026-04 in PR1). Optional for backwards
+    # compatibility with code that constructs Memory without them.
+    consolidated_by: str | None = None
+    supporting_for: str | None = None
+    dream_created_by: str | None = None
 
 
 @dataclass
@@ -214,6 +219,21 @@ CREATE TABLE IF NOT EXISTS pending_extractions (
     transcript_purge_at TEXT NOT NULL
 );
 
+-- Durable log of dream-phase consolidation cycles. One row per nightly
+-- run. Holds the batch_id (used to undo the cycle) plus a JSON list of
+-- candidate memory IDs and a counts-per-request-type breakdown for
+-- audit/observability. Status mirrors pending_extractions:
+-- submitted -> applied/failed.
+CREATE TABLE IF NOT EXISTS pending_dreams (
+    batch_id        TEXT PRIMARY KEY,
+    submitted_at    TEXT NOT NULL,
+    candidate_ids   TEXT NOT NULL,         -- JSON
+    request_types   TEXT NOT NULL,         -- JSON: {dedup: N, ...}
+    status          TEXT NOT NULL,         -- submitted | applied | failed
+    completed_at    TEXT,
+    summary         TEXT
+);
+
 -- Append-only log of every paid Anthropic API call. Used for cost
 -- attribution and analysis. Pricing is captured at call time so
 -- historical totals don't drift if rates change.
@@ -238,6 +258,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_last_relevant ON memories(last_relevant_
 CREATE INDEX IF NOT EXISTS idx_conversations_started ON conversations(started_at);
 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_extractions(status);
 CREATE INDEX IF NOT EXISTS idx_pending_purge ON pending_extractions(transcript_purge_at);
+CREATE INDEX IF NOT EXISTS idx_pending_dreams_status ON pending_dreams(status);
 CREATE INDEX IF NOT EXISTS idx_cost_log_timestamp ON cost_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_cost_log_purpose ON cost_log(purpose);
 """
@@ -354,6 +375,12 @@ class MemoryStore:
         await self._db.executescript(FTS_TRIGGERS_SQL)
         await self._db.commit()
 
+        # Idempotent column migrations for fields added after the original
+        # schema shipped. Each ALTER is wrapped in try/except so a fresh DB
+        # (where the column already exists) and an upgraded DB (where the
+        # column does not yet exist) both succeed.
+        await self._migrate_columns()
+
         # Ensure system memory file exists
         if not SYSTEM_MEMORY_PATH.exists():
             SYSTEM_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -366,6 +393,30 @@ class MemoryStore:
         if self._db is not None:
             await self._db.close()
             self._db = None
+
+    async def _migrate_columns(self) -> None:
+        """Apply additive ALTER TABLE migrations idempotently.
+
+        SQLite raises ``OperationalError`` if a column already exists; we
+        catch and ignore that case so re-running on a current DB is a
+        no-op while upgraded DBs receive the new columns.
+        """
+        # Each entry: (table, column, type)
+        migrations = [
+            ("memories", "consolidated_by", "TEXT"),
+            ("memories", "supporting_for", "TEXT"),
+            ("memories", "dream_created_by", "TEXT"),
+        ]
+        for table, col, col_type in migrations:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"
+                )
+            except aiosqlite.OperationalError as e:
+                # "duplicate column name" is the expected idempotent case.
+                if "duplicate column name" not in str(e).lower():
+                    raise
+        await self._db.commit()
 
     @property
     def db(self) -> aiosqlite.Connection:
@@ -568,6 +619,103 @@ class MemoryStore:
         await self.db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         await self.db.commit()
 
+    async def set_dream_audit_fields(
+        self,
+        memory_id: str,
+        *,
+        consolidated_by: str | None = None,
+        supporting_for: str | None = None,
+        dream_created_by: str | None = None,
+    ) -> None:
+        """Set one or more dream-phase audit columns on a memory.
+
+        Soft-delete only — never DELETE; never bypass the status field.
+        Pass an explicit None to leave a field untouched (we only update
+        non-None args). Use ``unset_dream_audit_fields`` to clear them.
+        """
+        sets: list[str] = []
+        params: list = []
+        if consolidated_by is not None:
+            sets.append("consolidated_by = ?")
+            params.append(consolidated_by)
+        if supporting_for is not None:
+            sets.append("supporting_for = ?")
+            params.append(supporting_for)
+        if dream_created_by is not None:
+            sets.append("dream_created_by = ?")
+            params.append(dream_created_by)
+        if not sets:
+            return
+        params.append(memory_id)
+        await self.db.execute(
+            f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", params
+        )
+        await self.db.commit()
+
+    async def unset_dream_audit_fields(
+        self,
+        memory_id: str,
+        *,
+        clear_consolidated_by: bool = False,
+        clear_supporting_for: bool = False,
+        clear_dream_created_by: bool = False,
+    ) -> None:
+        """Clear one or more dream-phase audit columns. Used by undo."""
+        sets: list[str] = []
+        if clear_consolidated_by:
+            sets.append("consolidated_by = NULL")
+        if clear_supporting_for:
+            sets.append("supporting_for = NULL")
+        if clear_dream_created_by:
+            sets.append("dream_created_by = NULL")
+        if not sets:
+            return
+        await self.db.execute(
+            f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", (memory_id,)
+        )
+        await self.db.commit()
+
+    async def list_memories_by_dream(
+        self,
+        batch_id: str,
+        *,
+        field: str = "consolidated_by",
+    ) -> list[Memory]:
+        """List memories whose dream audit field matches ``batch_id``.
+
+        Used by the undo script. ``field`` must be one of
+        ``consolidated_by``, ``supporting_for``, ``dream_created_by``.
+        """
+        if field not in {"consolidated_by", "supporting_for", "dream_created_by"}:
+            raise ValueError(f"Invalid dream audit field: {field}")
+        cursor = await self.db.execute(
+            f"SELECT * FROM memories WHERE {field} = ?", (batch_id,)
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_memory(r) for r in rows]
+
+    async def reactivate_invalidated_by_dream(
+        self,
+        batch_id: str,
+    ) -> int:
+        """Restore status='active' for memories invalidated by a dream batch.
+
+        Specifically: memories whose ``consolidated_by = batch_id`` AND
+        whose status is 'invalidated' get their status flipped back to
+        'active', and ``invalidated_by`` / ``superseded_by`` are cleared.
+        Returns count of rows updated.
+        """
+        cursor = await self.db.execute(
+            """UPDATE memories
+               SET status = 'active',
+                   invalidated_by = NULL,
+                   superseded_by = NULL
+               WHERE consolidated_by = ? AND status = 'invalidated'""",
+            (batch_id,),
+        )
+        await self.db.commit()
+        return cursor.rowcount
+
     async def list_memories(
         self,
         *,
@@ -606,6 +754,55 @@ class MemoryStore:
         cursor = await self.db.execute(
             f"SELECT * FROM memories {where} ORDER BY {order_by} LIMIT ?",
             params + [limit],
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_memory(r) for r in rows]
+
+    async def list_memories_created_since(
+        self,
+        iso_timestamp: str,
+        *,
+        status: str | None = "active",
+        limit: int = 1000,
+    ) -> list[Memory]:
+        """Return memories whose created_at >= ``iso_timestamp``.
+
+        Used by the dream phase to gather "today's" candidate memories.
+        Defaults to active memories only, since archived/invalidated
+        records are not consolidation candidates.
+        """
+        conditions = ["created_at >= ?"]
+        params: list = [iso_timestamp]
+        if status is not None:
+            conditions.append("status = ?")
+            params.append(status)
+        where = "WHERE " + " AND ".join(conditions)
+        cursor = await self.db.execute(
+            f"SELECT * FROM memories {where} "
+            f"ORDER BY created_at ASC LIMIT ?",
+            params + [limit],
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_memory(r) for r in rows]
+
+    async def list_memories_relevant_since(
+        self,
+        iso_timestamp: str,
+        *,
+        status: str = "active",
+        limit: int = 1000,
+    ) -> list[Memory]:
+        """Return memories whose last_relevant_at >= ``iso_timestamp``.
+
+        Used by the dream phase for the "used today" pool — any memory
+        that was injected into a conversation today gets its
+        last_relevant_at bumped to the inject time.
+        """
+        cursor = await self.db.execute(
+            "SELECT * FROM memories "
+            "WHERE last_relevant_at >= ? AND status = ? "
+            "ORDER BY last_relevant_at DESC LIMIT ?",
+            (iso_timestamp, status, limit),
         )
         rows = await cursor.fetchall()
         return [_row_to_memory(r) for r in rows]
@@ -1032,6 +1229,109 @@ class MemoryStore:
         return results
 
     # -------------------------------------------------------------------
+    # Pending dreams (durable nightly consolidation queue)
+    # -------------------------------------------------------------------
+
+    async def create_pending_dream(
+        self,
+        *,
+        batch_id: str,
+        candidate_ids: list[str],
+        request_types: dict[str, int],
+        summary: str | None = None,
+    ) -> None:
+        """Insert a new pending-dream row in submitted status.
+
+        Mirrors ``create_pending_extraction``: written as soon as the
+        batch is submitted to Anthropic, so a crash mid-cycle leaves a
+        durable record the DreamPoller can resume from on next boot.
+        """
+        await self.db.execute(
+            """INSERT OR REPLACE INTO pending_dreams (
+                   batch_id, submitted_at, candidate_ids,
+                   request_types, status, summary
+               ) VALUES (?, ?, ?, ?, 'submitted', ?)""",
+            (
+                batch_id,
+                _now_iso(),
+                json.dumps(candidate_ids),
+                json.dumps(request_types),
+                summary,
+            ),
+        )
+        await self.db.commit()
+
+    async def mark_dream_applied(
+        self,
+        batch_id: str,
+        *,
+        summary: str | None = None,
+    ) -> None:
+        """Mark a dream batch as applied; optionally update its summary."""
+        if summary is None:
+            await self.db.execute(
+                """UPDATE pending_dreams
+                   SET status = 'applied', completed_at = ?
+                   WHERE batch_id = ?""",
+                (_now_iso(), batch_id),
+            )
+        else:
+            await self.db.execute(
+                """UPDATE pending_dreams
+                   SET status = 'applied', completed_at = ?, summary = ?
+                   WHERE batch_id = ?""",
+                (_now_iso(), summary, batch_id),
+            )
+        await self.db.commit()
+
+    async def mark_dream_failed(
+        self,
+        batch_id: str,
+        error: str,
+    ) -> None:
+        """Mark a dream batch as failed with an error annotation."""
+        await self.db.execute(
+            """UPDATE pending_dreams
+               SET status = 'failed', completed_at = ?, summary = ?
+               WHERE batch_id = ?""",
+            (_now_iso(), error, batch_id),
+        )
+        await self.db.commit()
+
+    async def get_pending_dream(self, batch_id: str) -> dict | None:
+        """Return one pending-dream row as a dict, or None."""
+        cursor = await self.db.execute(
+            "SELECT * FROM pending_dreams WHERE batch_id = ?", (batch_id,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _row_to_pending_dream(row)
+
+    async def list_pending_dreams(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """List pending-dream rows, newest first."""
+        if status:
+            cursor = await self.db.execute(
+                """SELECT * FROM pending_dreams
+                   WHERE status = ?
+                   ORDER BY submitted_at DESC LIMIT ?""",
+                (status, limit),
+            )
+        else:
+            cursor = await self.db.execute(
+                """SELECT * FROM pending_dreams
+                   ORDER BY submitted_at DESC LIMIT ?""",
+                (limit,),
+            )
+        rows = await cursor.fetchall()
+        return [_row_to_pending_dream(r) for r in rows]
+
+    # -------------------------------------------------------------------
     # Cost log
     # -------------------------------------------------------------------
 
@@ -1102,6 +1402,15 @@ class MemoryStore:
 
 def _row_to_memory(row: aiosqlite.Row) -> Memory:
     """Convert a database row to a Memory dataclass."""
+    # The dream-phase columns are added via _migrate_columns. Reading
+    # them safely covers both fresh and upgraded databases plus any
+    # caller that selects a subset of columns.
+    keys = row.keys() if hasattr(row, "keys") else []
+    consolidated_by = row["consolidated_by"] if "consolidated_by" in keys else None
+    supporting_for = row["supporting_for"] if "supporting_for" in keys else None
+    dream_created_by = (
+        row["dream_created_by"] if "dream_created_by" in keys else None
+    )
     return Memory(
         id=row["id"],
         type=row["type"],
@@ -1117,7 +1426,28 @@ def _row_to_memory(row: aiosqlite.Row) -> Memory:
         invalidated_by=row["invalidated_by"],
         superseded_by=row["superseded_by"],
         embedding=_blob_to_embedding(row["embedding"]),
+        consolidated_by=consolidated_by,
+        supporting_for=supporting_for,
+        dream_created_by=dream_created_by,
     )
+
+
+def _row_to_pending_dream(row: aiosqlite.Row) -> dict:
+    """Convert a pending_dreams database row to a plain dict.
+
+    Returned as a dict (not a dataclass) because the dream phase keeps
+    its own richer in-memory representation; the DB row is just durable
+    state for resume-on-boot and undo.
+    """
+    return {
+        "batch_id": row["batch_id"],
+        "submitted_at": row["submitted_at"],
+        "candidate_ids": json.loads(row["candidate_ids"] or "[]"),
+        "request_types": json.loads(row["request_types"] or "{}"),
+        "status": row["status"],
+        "completed_at": row["completed_at"],
+        "summary": row["summary"],
+    }
 
 
 def _row_to_pending(row: aiosqlite.Row) -> PendingExtraction:

@@ -365,7 +365,7 @@ class TestSeedFromConfig:
     async def test_seeds_three_default_triggers(self, mock_config):
         await seed_from_config(mock_config)
         triggers = await list_triggers()
-        # Default config has 3 wake cycles
+        # Default config has 3 wake cycles + 1 dream-cycle trigger
         assert len(triggers) >= 3
 
     @pytest.mark.asyncio
@@ -373,5 +373,10 @@ class TestSeedFromConfig:
         await create_trigger(description="Pre-existing", instructions="...")
         await seed_from_config(mock_config)
         triggers = await list_triggers()
-        # Should only have the pre-existing trigger, not 3 more
-        assert len(triggers) == 1
+        # Wake-cycle seed is skipped (DB not empty), but the dream-cycle
+        # trigger is still added if missing — so we expect 1 pre-existing
+        # + 1 dream-cycle = 2.
+        assert len(triggers) == 2
+        descriptions = [t["description"] for t in triggers]
+        assert "Pre-existing" in descriptions
+        assert any(d.startswith("[dream-cycle]") for d in descriptions)

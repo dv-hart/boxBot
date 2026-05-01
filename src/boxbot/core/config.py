@@ -399,6 +399,20 @@ class MemoryConfig(BaseModel):
     decay_rate: float = 0.98
     archive_threshold: float = 0.1
 
+    # Dream phase (PR1: deterministic clustering + dedup batch).
+    # Default ON for the audit-only soft-launch — dream cycles run,
+    # candidates and decisions are logged, but NO mutations are applied
+    # to the memory store. Flip to ``False`` after a soft-launch period
+    # to let the dream phase actually consolidate memories.
+    dream_audit_only: bool = True
+    # Cron expression for the nightly dream cycle. Defaults to 3 AM
+    # every day (server-local interpretation of CronExpr — UTC by
+    # default unless the host is on a different TZ).
+    dream_cron: str = "0 3 * * *"
+    # Hard ceiling on dedup pairs sent to the model in a single cycle.
+    # Above this, lowest-confidence pairs are dropped before submission.
+    dream_max_dedup_pairs: int = 30
+
 
 class SlideshowConfig(BaseModel):
     """Photo slideshow display settings."""

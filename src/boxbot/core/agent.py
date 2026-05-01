@@ -90,6 +90,7 @@ from boxbot.core.output_dispatcher import (
 )
 from boxbot.core.scheduler import get_status_line
 from boxbot.memory.batch_poller import BatchPoller
+from boxbot.memory.dream_poller import DreamPoller
 from boxbot.memory.retrieval import inject_memories
 from boxbot.memory.store import MemoryStore
 # Imported lazily inside _dispatch_tools / _process_tool_calls to avoid a
@@ -458,6 +459,11 @@ class BoxBotAgent:
         # Background poller for in-flight extraction batches. Started
         # alongside the agent and runs for the agent's lifetime.
         self._batch_poller: BatchPoller | None = None
+        # Background poller for in-flight dream-phase batches (PR1:
+        # nightly dedup consolidation; runs in audit-only mode by
+        # default — flip ``memory.dream_audit_only=False`` in config to
+        # enable real merges).
+        self._dream_poller: DreamPoller | None = None
 
         # People currently detected by the perception pipeline.
         # Updated via PersonIdentified event subscription.
@@ -530,6 +536,17 @@ class BoxBotAgent:
         )
         await self._batch_poller.start()
 
+        # Start the dream-phase poller. Audit-only by default; flip
+        # ``memory.dream_audit_only=False`` in config to enable real
+        # consolidation. Resumes any in-flight dream batches from the
+        # previous boot.
+        self._dream_poller = DreamPoller(
+            self._memory_store,
+            self._client,
+            audit_only=config.memory.dream_audit_only,
+        )
+        await self._dream_poller.start()
+
         # Subscribe to events that initiate or inform conversations.
         # Note: WakeWordHeard is intentionally NOT handled here. The
         # voice pipeline activates the mic on wake word; the agent only
@@ -585,6 +602,10 @@ class BoxBotAgent:
             await self._batch_poller.stop()
             self._batch_poller = None
 
+        if self._dream_poller is not None:
+            await self._dream_poller.stop()
+            self._dream_poller = None
+
         self._client = None
         logger.info("BoxBotAgent stopped")
 
@@ -638,11 +659,27 @@ class BoxBotAgent:
         )
 
     async def _on_trigger_fired(self, event: TriggerFired) -> None:
-        """Create a one-shot conversation from a scheduler trigger."""
+        """Create a one-shot conversation from a scheduler trigger.
+
+        Special-cased: dream-cycle triggers (description marked with
+        ``[dream-cycle]``) run the nightly memory consolidation directly
+        in the agent process rather than spawning a conversation. The
+        dream phase is housekeeping; it has no user to talk to.
+        """
         logger.info(
             "Trigger fired: %s (%s)",
             event.trigger_id, event.description,
         )
+
+        # Dream-cycle triggers are intercepted here. We use the
+        # description prefix as the marker (rather than adding a
+        # ``source="dream-cycle"`` column) so the trigger schema stays
+        # untouched. Config-seeded dream triggers always use this
+        # exact prefix.
+        if event.description.startswith("[dream-cycle]"):
+            await self._run_dream_cycle_for_trigger(event)
+            return
+
         initial_msg = (
             f"[Trigger fired: {event.description}]\n"
             f"Instructions: {event.instructions}"
@@ -673,6 +710,42 @@ class BoxBotAgent:
                 "todo_id": event.todo_id,
             },
         )
+
+    async def _run_dream_cycle_for_trigger(self, event: TriggerFired) -> None:
+        """Execute the nightly dream-phase consolidation directly.
+
+        Called from :meth:`_on_trigger_fired` when a dream-cycle
+        trigger fires. Audit-only by default (config flag
+        ``memory.dream_audit_only``). Result is written to
+        ``data/workspace/notes/system/dream-log/<YYYY-MM-DD>.md``; the
+        DreamPoller picks up the batch result later and applies any
+        decisions.
+        """
+        from boxbot.core.config import get_config
+        from boxbot.memory.dream import run_dream_cycle
+
+        if self._client is None:
+            logger.warning(
+                "Dream cycle trigger fired but Anthropic client is not "
+                "available; skipping cycle"
+            )
+            return
+        config = get_config()
+        try:
+            summary = await run_dream_cycle(
+                self._memory_store,
+                self._client,
+                audit_only=config.memory.dream_audit_only,
+                max_dedup_pairs=config.memory.dream_max_dedup_pairs,
+            )
+            logger.info(
+                "Dream cycle complete: %s candidates, %s pairs, batch=%s",
+                summary.get("candidate_count"),
+                summary.get("near_dup_pairs"),
+                summary.get("batch_id"),
+            )
+        except Exception:
+            logger.exception("Dream cycle failed")
 
     async def _on_person_identified(self, event: PersonIdentified) -> None:
         """Update the set of currently-present people."""

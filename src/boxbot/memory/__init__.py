@@ -11,6 +11,15 @@ The search_memory tool, boxbot_sdk.memory.search(), and injection system
 all share the same search backend (search.py).
 """
 
+from boxbot.memory.dream import (
+    DreamApplyResult,
+    apply_dream_result,
+    cluster_candidates,
+    find_near_duplicates,
+    gather_candidates,
+    run_dream_cycle,
+    submit_dream_batch,
+)
 from boxbot.memory.embeddings import cosine_similarity, embed, embed_batch
 from boxbot.memory.extraction import (
     ExtractionResult,
@@ -46,4 +55,12 @@ __all__ = [
     "ExtractionResult",
     # Maintenance
     "run_maintenance",
+    # Dream phase
+    "run_dream_cycle",
+    "gather_candidates",
+    "cluster_candidates",
+    "find_near_duplicates",
+    "submit_dream_batch",
+    "apply_dream_result",
+    "DreamApplyResult",
 ]

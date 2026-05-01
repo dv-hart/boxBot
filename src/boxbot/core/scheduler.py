@@ -608,34 +608,65 @@ async def get_status_line() -> str:
 
 
 async def seed_from_config(config: BoxBotConfig) -> None:
-    """Seed wake-cycle triggers from config on first boot.
+    """Seed wake-cycle and dream-cycle triggers from config on first boot.
 
-    Only seeds if the triggers table is empty (no pre-existing data).
-    After seeding, the runtime DB is authoritative.
+    Wake-cycle triggers are only seeded if the triggers table is empty.
+    The dream-cycle trigger is seeded if no row currently has a
+    description starting with ``[dream-cycle]`` — this lets us add the
+    dream trigger to a pre-existing DB without re-seeding the wake
+    cycle. After seeding, the runtime DB is authoritative.
     """
     db = await _get_db()
     try:
         cursor = await db.execute("SELECT COUNT(*) FROM triggers")
-        count = (await cursor.fetchone())[0]
-        if count > 0:
-            logger.info(
-                "Triggers table has %d rows, skipping config seed", count
-            )
-            return
+        total_count = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM triggers WHERE description LIKE ?",
+            ("[dream-cycle]%",),
+        )
+        dream_count = (await cursor.fetchone())[0]
     finally:
         await db.close()
 
-    for entry in config.schedule.wake_cycle:
+    # Seed wake-cycle entries only on a truly empty DB so users can
+    # delete entries at runtime without them coming back.
+    if total_count == 0:
+        for entry in config.schedule.wake_cycle:
+            await create_trigger(
+                description=entry.description,
+                instructions=entry.instructions,
+                cron=entry.cron,
+                source="config",
+            )
+        logger.info(
+            "Seeded %d wake-cycle triggers from config",
+            len(config.schedule.wake_cycle),
+        )
+    else:
+        logger.info(
+            "Triggers table has %d rows, skipping wake-cycle seed",
+            total_count,
+        )
+
+    # Seed the dream-cycle trigger separately so existing DBs gain it
+    # without losing user-modified wake triggers.
+    if dream_count == 0:
         await create_trigger(
-            description=entry.description,
-            instructions=entry.instructions,
-            cron=entry.cron,
+            description="[dream-cycle] Nightly memory consolidation",
+            instructions=(
+                "Internal: run boxbot.memory.dream.run_dream_cycle. "
+                "Audit-only by default; flip "
+                "memory.dream_audit_only=False in config to enable real "
+                "consolidation. Triggered by the agent directly — does "
+                "not spawn a conversation."
+            ),
+            cron=config.memory.dream_cron,
             source="config",
         )
-    logger.info(
-        "Seeded %d wake-cycle triggers from config",
-        len(config.schedule.wake_cycle),
-    )
+        logger.info(
+            "Seeded dream-cycle trigger (cron=%s)",
+            config.memory.dream_cron,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -313,27 +313,36 @@ processes conversations independent of transport.
 
 ## Deploying to the Pi
 
-There is **one canonical deploy path**. Follow it unless you have a
-specific reason to use the fast-iter alternative.
-
-### Canonical: `scripts/deploy.sh`
+There is **one deploy path**: `scripts/deploy.sh`. No alternatives, no
+escape hatches. The Pi mirrors `origin/main` exactly — `git rev-parse
+HEAD` on the Pi always answers "what is running here."
 
 ```bash
 # From the dev machine, after committing your work:
-./scripts/deploy.sh                     # default target pi@boxbot.local
-./scripts/deploy.sh other@host          # override target
+./scripts/deploy.sh                     # uses $BOXBOT_DEPLOY_TARGET
+./scripts/deploy.sh user@host           # explicit override
 ```
+
+Set the target once in your shell init (`~/.bashrc`, `~/.zshrc`, or a
+gitignored `.envrc`):
+
+```bash
+export BOXBOT_DEPLOY_TARGET=user@host
+```
+
+The fallback when neither the arg nor the env var is set is
+`pi@boxbot.local` (mDNS — works on most LANs running Avahi/Bonjour).
+If your Pi checkout lives somewhere other than `software/boxBot`,
+override with `BOXBOT_PI_PROJECT_DIR`.
 
 What it does, in order:
 
 1. **Pre-flight**: refuses to deploy unless the working tree is clean,
-   you're on `main`, and `main` isn't behind `origin/main`. These
-   checks exist because everything that runs on the Pi should be
-   reproducible from a git SHA.
+   you're on `main`, and `main` isn't behind `origin/main`. Everything
+   that runs on the Pi must be reproducible from a git SHA.
 2. **`git push origin main`** — no-op if already pushed.
 3. **SSH to Pi → `git fetch && git pull --ff-only origin main`** —
-   refuses non-fast-forward merges, so the Pi can never silently
-   diverge.
+   fast-forward only. The Pi can never silently diverge.
 4. **Warns** if `scripts/setup-sandbox.sh` changed in this deploy. The
    operator runs `sudo bash scripts/setup-sandbox.sh` manually after
    the deploy because it needs sudo and may want attention.
@@ -346,9 +355,15 @@ If any step fails, the script exits non-zero and the Pi is left in a
 recoverable state (last good commit + still-running old boxbot until
 restart actually fires).
 
+### What if I want to test something before committing?
+
+Don't deploy it. Test in dev, or commit to a throwaway branch and
+deploy that branch to a non-prod target. The Pi is the live device —
+it should never run uncommitted code.
+
 ### Pi-only state that is never deployed
 
-The deploy script never touches these — they live only on the Pi:
+The deploy never touches these — they live only on the Pi:
 
 - `.env` (API keys, secrets) — gitignored, mode 0600.
 - `config/config.yaml`, `config/whatsapp.yaml` — gitignored runtime
@@ -358,27 +373,13 @@ The deploy script never touches these — they live only on the Pi:
   DB, credentials. All Pi-local.
 - `logs/**` — runtime logs.
 
-### Fast-iter alternative: `scripts/deploy-to-pi.sh`
+### One-time Pi reconcile (only if needed)
 
-Pure rsync of the working tree. **Does not commit, does not push, does
-not restart boxbot.** Use only when iterating tight on a change you
-may not keep. Acknowledges the audit-trail bypass.
-
-```bash
-./scripts/deploy-to-pi.sh
-ssh pi@boxbot.local 'cd software/boxBot && bash scripts/restart-boxbot.sh'
-```
-
-After the iteration is done, **always** finish with the canonical path
-(commit + `scripts/deploy.sh`) so the Pi's git state matches reality.
-
-### One-time Pi reconcile
-
-If the Pi's local git is behind what's actually deployed (e.g. after a
-period of fast-iter rsync deploys), reconcile once:
+If the Pi's local git ever ends up out of sync with `origin/main` (e.g.
+historical rsync deploys before this SOP), reconcile once:
 
 ```bash
-ssh pi@boxbot.local 'cd software/boxBot && git fetch origin && git reset --hard origin/main'
+ssh "$BOXBOT_DEPLOY_TARGET" 'cd software/boxBot && git fetch origin && git reset --hard origin/main'
 ```
 
 Safe because `data/`, `.env`, `logs/`, `config/config.yaml` are all

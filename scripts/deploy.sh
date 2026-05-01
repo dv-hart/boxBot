@@ -6,7 +6,17 @@
 #
 # Usage: scripts/deploy.sh [user@host]
 #
-# Default target: pi@boxbot.local
+# Target resolution order:
+#   1. ``user@host`` argument, if given.
+#   2. ``BOXBOT_DEPLOY_TARGET`` environment variable.
+#   3. Fallback ``pi@boxbot.local`` (mDNS — works out of the box on
+#      most LANs running Avahi/Bonjour).
+#
+# Set ``BOXBOT_DEPLOY_TARGET=user@host`` in your shell init or a
+# gitignored ``.envrc`` so you don't have to type it every deploy.
+# The project directory on the Pi is ``software/boxBot`` by default;
+# override with ``BOXBOT_PI_PROJECT_DIR`` if you keep the checkout
+# elsewhere.
 #
 # Pre-flight checks (refuses to proceed if any fail):
 #   - Working tree clean (no uncommitted changes)
@@ -21,14 +31,14 @@
 #   4. Run ``scripts/restart-boxbot.sh`` on the Pi.
 #   5. Show the last 25 startup log lines.
 #
-# To bypass git (rsync the working tree, no commit, no service touch),
-# use scripts/deploy-to-pi.sh instead. That mode is for fast iteration
-# but skips the audit trail; use sparingly.
+# There is no rsync escape hatch. The Pi only ever runs committed
+# code. To test uncommitted changes, do it in dev or push to a
+# throwaway branch.
 
 set -euo pipefail
 
-TARGET="${1:-pi@boxbot.local}"
-PI_PROJECT_DIR="software/boxBot"
+TARGET="${1:-${BOXBOT_DEPLOY_TARGET:-pi@boxbot.local}}"
+PI_PROJECT_DIR="${BOXBOT_PI_PROJECT_DIR:-software/boxBot}"
 
 cd "$(dirname "$0")/.."
 
@@ -50,8 +60,8 @@ if ! git diff-index --quiet HEAD --; then
     echo "Error: working tree has uncommitted changes" >&2
     git status --short >&2
     echo "" >&2
-    echo "Commit or stash before deploying. To deploy WIP without" >&2
-    echo "committing, use scripts/deploy-to-pi.sh (rsync, no audit trail)." >&2
+    echo "Commit or stash before deploying. The Pi runs only" >&2
+    echo "committed code — there is no WIP escape hatch." >&2
     exit 1
 fi
 echo "  working tree clean ✓"

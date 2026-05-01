@@ -183,6 +183,15 @@ Python execution. The bootstrap:
    themselves blocked.
 4. Hands off to the user script via `runpy.run_path`.
 
+`setup-sandbox.sh` copies the bootstrap from the project tree to
+`<runtime_dir>/sandbox_bootstrap.py` and chmods it `750
+<operator>:boxbot`. The per-call `execute_script` path execs that copy,
+not the in-tree one — the sandbox user typically can't traverse the
+operator's home directory (often 0700) to reach the project tree. Re-run
+`setup-sandbox.sh` whenever the bootstrap changes; the in-tree copy is
+the fallback that's only used in tests/dev where the runtime dir
+doesn't exist.
+
 For the long-lived per-conversation runner, the same logic is inlined
 at the top of the server script (`src/boxbot/tools/_sandbox_server.py`,
 prepended at host side by `sandbox_runner.py`) — it can't import the

@@ -144,6 +144,17 @@ else
     echo "Sandbox venv already exists at $SANDBOX_VENV"
 fi
 
+# Copy the bootstrap into the sandbox runtime dir so the sandbox user
+# can reach it without traversing the operator's home directory (which
+# is typically 0700). The runner uses ``python -c <inline>`` and
+# bypasses this, but the per-call ``execute_script`` path needs the
+# bootstrap on disk somewhere boxbot-sandbox can read.
+cp "$SCRIPT_DIR/sandbox_bootstrap.py" "$SANDBOX_DIR/sandbox_bootstrap.py"
+sudo chown "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/sandbox_bootstrap.py"
+sudo chmod 750 "$SANDBOX_DIR/sandbox_bootstrap.py"
+echo "Copied sandbox_bootstrap.py to $SANDBOX_DIR/"
+CHANGES+=("Copied sandbox_bootstrap.py to $SANDBOX_DIR/")
+
 "$SANDBOX_VENV/bin/pip" install --upgrade pip --quiet
 
 # -------------------------------------------------------------------

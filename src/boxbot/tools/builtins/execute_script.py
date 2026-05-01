@@ -48,11 +48,15 @@ logger = logging.getLogger(__name__)
 
 SDK_ACTION_MARKER = "__BOXBOT_SDK_ACTION__:"
 
-# Path to the sandbox bootstrap (resolves seccomp filter + runs user
-# script). Anchored to the project root so the path resolves no matter
-# the cwd. The script is intentionally self-contained — no boxbot
-# imports — because the sandbox venv only ships boxbot_sdk.
-SANDBOX_BOOTSTRAP_PATH = (
+# In-tree copy of the sandbox bootstrap (resolves seccomp filter + runs
+# user script). The script is intentionally self-contained — no boxbot
+# imports — because the sandbox venv only ships boxbot_sdk. At runtime
+# we prefer the copy that ``setup-sandbox.sh`` placed under
+# ``runtime_dir`` because the sandbox user can't traverse the operator's
+# home directory (typically 0700) to reach the project tree. The
+# in-tree path is the fallback for tests/dev where the runtime dir
+# doesn't exist.
+_PROJECT_BOOTSTRAP_PATH = (
     Path(__file__).resolve().parents[3] / "scripts" / "sandbox_bootstrap.py"
 )
 
@@ -61,6 +65,22 @@ SANDBOX_BOOTSTRAP_PATH = (
 # the sandbox under ``/var/lib/boxbot-sandbox`` (default) or anywhere
 # else without touching code.
 _FALLBACK_RUNTIME_DIR = Path("/var/lib/boxbot-sandbox")
+
+
+def _resolve_bootstrap_path(runtime_dir: Path | None) -> Path:
+    """Return the bootstrap path the sandbox subprocess should exec.
+
+    Prefer ``<runtime_dir>/sandbox_bootstrap.py`` (placed there by
+    ``setup-sandbox.sh``) so the sandbox user doesn't need read access
+    to the project tree. Fall back to the in-tree copy if it isn't
+    present yet — useful for tests and for the first run after pulling
+    a change before ``setup-sandbox.sh`` has been re-run.
+    """
+    if runtime_dir is not None:
+        candidate = runtime_dir / "sandbox_bootstrap.py"
+        if candidate.exists():
+            return candidate
+    return _PROJECT_BOOTSTRAP_PATH
 
 
 class ExecuteScriptTool(Tool):
@@ -133,17 +153,21 @@ class ExecuteScriptTool(Tool):
 
         try:
             config = get_config()
+            runtime_dir = Path(config.sandbox.runtime_dir)
             venv_python = Path(config.sandbox.venv_path) / "bin" / "python3"
             timeout = config.sandbox.timeout
             sandbox_user = config.sandbox.user
             scripts_dir = Path(config.sandbox.scripts_dir)
             output_dir = Path(config.sandbox.output_dir)
         except RuntimeError:
+            runtime_dir = _FALLBACK_RUNTIME_DIR
             venv_python = _FALLBACK_RUNTIME_DIR / "venv" / "bin" / "python3"
             timeout = 30
             sandbox_user = "boxbot-sandbox"
             scripts_dir = _FALLBACK_RUNTIME_DIR / "scripts"
             output_dir = _FALLBACK_RUNTIME_DIR / "output"
+
+        bootstrap_path = _resolve_bootstrap_path(runtime_dir)
 
         # Best-effort dir create. Real runs go to /var/lib/boxbot-sandbox/
         # which the setup script chowns to boxbot-sandbox; if we're
@@ -189,7 +213,7 @@ class ExecuteScriptTool(Tool):
                 # to opt them in explicitly.
                 "--preserve-env=BOXBOT_SECCOMP_MODE,BOXBOT_SECCOMP_DISABLE",
                 "-u", sandbox_user,
-                "--", str(venv_python), str(SANDBOX_BOOTSTRAP_PATH),
+                "--", str(venv_python), str(bootstrap_path),
                 str(script_path),
             ]
         else:
@@ -199,7 +223,7 @@ class ExecuteScriptTool(Tool):
                     "— script runs as current user"
                 )
             cmd = [
-                str(venv_python), str(SANDBOX_BOOTSTRAP_PATH), str(script_path),
+                str(venv_python), str(bootstrap_path), str(script_path),
             ]
 
         try:

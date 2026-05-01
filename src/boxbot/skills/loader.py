@@ -214,7 +214,8 @@ load_skill tool. Read the full body only when the task calls for it.
 
 _INDEX_FOOTER = """
 To read a full skill, call load_skill(name="<skill-name>").
-To read a sub-file of a skill, call load_skill(name="<skill-name>", subpath="examples/<file>.py").
+Some skills link to sub-files in their body. Only pass `subpath=` after the
+base body tells you that sub-file exists — do not guess sub-file names.
 """
 
 
@@ -238,9 +239,16 @@ def get_skill_index(root: Path | None = None) -> str:
     for meta in skills:
         # Prefer when_to_use; fall back to description.
         blurb = meta.when_to_use or meta.description or "(no description)"
-        # Collapse embedded newlines so each skill is one list item.
-        blurb = " ".join(blurb.split())
-        lines.append(f"- {meta.name}: {blurb}")
+        # Normalise whitespace within each line but preserve line structure —
+        # bullet lists in when_to_use are how the agent scans match conditions.
+        blurb_lines = [" ".join(line.split()) for line in blurb.splitlines()]
+        blurb_lines = [bl for bl in blurb_lines if bl]
+        if len(blurb_lines) <= 1:
+            lines.append(f"- {meta.name}: {blurb_lines[0] if blurb_lines else ''}")
+        else:
+            lines.append(f"- {meta.name}:")
+            for bl in blurb_lines:
+                lines.append(f"    {bl}")
     lines.append(_INDEX_FOOTER.rstrip("\n"))
     return "\n".join(lines) + "\n"
 

@@ -10,7 +10,11 @@
 
 set -euo pipefail
 
-PI_HOST="${PI_HOST:-pi@boxbot.local}"
+# Target resolution mirrors scripts/deploy.sh:
+#   PI_HOST → BOXBOT_DEPLOY_TARGET → mDNS fallback.
+# Set BOXBOT_DEPLOY_TARGET=user@host once in your shell init and both
+# scripts pick it up. PI_HOST stays supported for backwards compat.
+PI_HOST="${PI_HOST:-${BOXBOT_DEPLOY_TARGET:-pi@boxbot.local}}"
 TARGET=""
 THEME=""
 LIVE_ARG=""

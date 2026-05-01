@@ -39,6 +39,7 @@ from boxbot.communication.wake_word import WakeWordDetector
 from boxbot.core.events import (
     AgentSpeaking,
     AgentSpeakingDone,
+    AgentTurnEnded,
     TranscriptReady,
     VoiceSessionEnded,
     WakeWordHeard,
@@ -79,10 +80,17 @@ def set_voice_session(session: VoiceSession | None) -> None:
 class VoiceSessionState(Enum):
     """Voice adapter hardware-capture state.
 
-    Post-refactor the voice layer is a thin adapter — the IDLE/ACTIVE
-    pair here describes whether the mic is actively producing
-    utterances. Conversation-level state (listening/thinking/speaking)
-    lives on the ``Conversation`` object, not here.
+    Post-refactor the voice layer is a thin adapter — these states
+    describe whether the mic is actively producing utterances.
+    Conversation-level state (listening/thinking/speaking) lives on the
+    ``Conversation`` object, not here.
+
+    DORMANT means "mic off, but the agent's room conversation is still
+    alive" — entered after the post-response idle window expires. The
+    next wake word transitions DORMANT → ACTIVE while preserving the
+    voice session id so the agent treats the new transcript as a
+    continuation of the same conversation. ConversationEnded
+    transitions DORMANT → IDLE for full cleanup.
 
     ENDED and SUSPENDED are retained as aliases for IDLE so older call
     sites don't crash during migration; M6 removes them.
@@ -90,6 +98,7 @@ class VoiceSessionState(Enum):
 
     IDLE = "idle"
     ACTIVE = "active"
+    DORMANT = "dormant"
     SUSPENDED = "idle"   # deprecated alias
     ENDED = "idle"       # deprecated alias
 
@@ -139,6 +148,13 @@ class VoiceSession:
         # TTS playback. ``speak()``'s finally block checks this so it
         # does not double-publish AgentSpeakingDone.
         self._tts_interrupted: bool = False
+
+        # Set when _activate_session resumed a DORMANT session (i.e.
+        # the room conversation on the agent side is still alive). If
+        # the post-wake-word grace expires before an utterance arrives,
+        # we fall back to DORMANT instead of IDLE so the conversation
+        # thread isn't thrown away by an accidental wake word.
+        self._activation_was_resume: bool = False
 
         # Speaker identity mapping (SPEAKER_XX → person name or display label)
         # Populated from voice ReID matches (high-confidence) + agent
@@ -251,6 +267,12 @@ class VoiceSession:
         # the voice conversation ends (silence timeout, explicit end,
         # agent stop), we deactivate mic capture and LEDs.
         bus.subscribe(ConversationEnded, self._on_conversation_ended)
+        # Post-response mic-idle window: AgentTurnEnded fires when a
+        # turn settles in LISTENING (whether or not BB spoke). We arm a
+        # short timer; if no further utterance arrives we go DORMANT so
+        # ambient chatter doesn't keep the mic hot indefinitely.
+        bus.subscribe(AgentTurnEnded, self._on_agent_turn_ended)
+        bus.subscribe(AgentSpeaking, self._on_agent_speaking)
 
         self._state = VoiceSessionState.IDLE
         set_voice_session(self)
@@ -279,6 +301,8 @@ class VoiceSession:
         from boxbot.core.events import ConversationEnded, PersonDetected
         bus.unsubscribe(PersonDetected, self._on_person_detected)
         bus.unsubscribe(ConversationEnded, self._on_conversation_ended)
+        bus.unsubscribe(AgentTurnEnded, self._on_agent_turn_ended)
+        bus.unsubscribe(AgentSpeaking, self._on_agent_speaking)
 
         # Stop components
         if self._wake_word:
@@ -307,6 +331,13 @@ class VoiceSession:
     # from draining batteries with a hot mic indefinitely.
     _WAKE_WORD_GRACE_SECONDS = 12.0
 
+    # Post-response mic-idle window: after BB's turn ends (whether or
+    # not it spoke) the mic stays hot for this long. Past that we go
+    # DORMANT so ambient chatter doesn't keep round-tripping transcripts
+    # to the agent ("not addressed to me, say nothing" forever). The
+    # conversation thread persists; the next wake word continues it.
+    _POST_RESPONSE_IDLE_SECONDS = 15.0
+
     async def _activate_session(
         self, event: WakeWordHeard | None = None
     ) -> None:
@@ -317,16 +348,30 @@ class VoiceSession:
         way to re-enable STT after BB finishes (or is interrupted in
         the middle of) a reply; audio_capture is detached during speech
         so re-attachment must happen on every wake event.
+
+        From DORMANT the existing voice session id is preserved so the
+        agent routes the next transcript into the same room
+        conversation — wake word resumes, it does not restart.
         """
         self._last_speech_time = time.monotonic()
-        was_active = self._state is VoiceSessionState.ACTIVE
+        prev_state = self._state
 
-        if not was_active:
+        if prev_state is VoiceSessionState.IDLE:
             self._state = VoiceSessionState.ACTIVE
             self._conversation_id = f"voice_{uuid.uuid4().hex[:12]}"
+            self._activation_was_resume = False
             logger.info(
                 "Voice adapter activated (session=%s)", self._conversation_id,
             )
+        elif prev_state is VoiceSessionState.DORMANT:
+            self._state = VoiceSessionState.ACTIVE
+            self._activation_was_resume = True
+            logger.info(
+                "Voice adapter re-engaged DORMANT → ACTIVE "
+                "(session=%s)", self._conversation_id,
+            )
+        # else: already ACTIVE — idempotent path (refresh grace timer
+        # and re-attach capture below).
 
         # Always (re-)attach the STT/diarization consumer. ``start`` is
         # idempotent: a no-op if the consumer handle is already live.
@@ -334,8 +379,8 @@ class VoiceSession:
             await self._audio_capture.start(self._microphone)
 
         # Post-wake-word grace — if a TranscriptReady publishes, the
-        # grace is cancelled and the Conversation's silence_timeout
-        # takes over lifecycle.
+        # grace is cancelled and AgentTurnEnded later takes over the
+        # post-response idle window.
         self._reset_wake_word_grace_timer()
 
         # Set LED pattern.
@@ -355,18 +400,93 @@ class VoiceSession:
         )
 
     async def _wake_word_grace_loop(self) -> None:
-        """Deactivate if no utterance arrives within the grace window."""
+        """Deactivate if no utterance arrives within the grace window.
+
+        Cold wake (no prior session): fall through to IDLE — there's no
+        conversation to preserve. Resume from DORMANT: fall back to
+        DORMANT so an accidental wake word doesn't throw away the
+        still-alive room conversation.
+        """
         try:
             await asyncio.sleep(self._WAKE_WORD_GRACE_SECONDS)
         except asyncio.CancelledError:
             return
-        if self._state is VoiceSessionState.ACTIVE:
+        if self._state is not VoiceSessionState.ACTIVE:
+            return
+        if self._activation_was_resume:
+            logger.info(
+                "Voice adapter: no utterance within %.0fs grace — "
+                "returning to DORMANT (session=%s preserved)",
+                self._WAKE_WORD_GRACE_SECONDS, self._conversation_id,
+            )
+            await self._enter_dormant()
+        else:
             logger.info(
                 "Voice adapter: no utterance within %.0fs grace — "
                 "deactivating",
                 self._WAKE_WORD_GRACE_SECONDS,
             )
             await self._deactivate_session(reason="grace_timeout")
+
+    def _arm_post_response_idle_timer(self) -> None:
+        """Arm (or reset) the post-response mic-idle timer.
+
+        Replaces any active timer (e.g. wake-word grace) — once a turn
+        has ended, the post-response window is the only thing that
+        should be ticking.
+        """
+        if self._active_timeout_task is not None:
+            self._active_timeout_task.cancel()
+        self._active_timeout_task = asyncio.create_task(
+            self._post_response_idle_loop(),
+            name=f"voice-idle-{self._conversation_id}",
+        )
+
+    async def _post_response_idle_loop(self) -> None:
+        """Go DORMANT if no follow-up utterance arrives within the window."""
+        try:
+            await asyncio.sleep(self._POST_RESPONSE_IDLE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if self._state is VoiceSessionState.ACTIVE:
+            logger.info(
+                "Voice adapter: %.0fs post-response idle — going DORMANT "
+                "(mic off, session=%s retained)",
+                self._POST_RESPONSE_IDLE_SECONDS,
+                self._conversation_id,
+            )
+            await self._enter_dormant()
+
+    async def _enter_dormant(self) -> None:
+        """ACTIVE → DORMANT: stop capture, retain conv_id, LED off.
+
+        The conversation thread on the agent side keeps living (its own
+        silence_timeout decides when to actually end it). A wake word
+        from DORMANT re-engages the same session id so transcripts flow
+        into the existing room conversation; ConversationEnded from
+        DORMANT triggers a normal IDLE cleanup via _deactivate_session.
+        No VoiceSessionEnded is published here — the session id is
+        still alive.
+        """
+        if self._state is not VoiceSessionState.ACTIVE:
+            return
+
+        self._state = VoiceSessionState.DORMANT
+
+        if self._audio_capture:
+            await self._audio_capture.stop()
+            self._audio_capture.reset()
+
+        if self._vad:
+            self._vad.reset()
+
+        self._cancel_timers()
+
+        if self._microphone:
+            try:
+                await self._microphone.set_led_pattern("off")
+            except Exception:
+                pass
 
     async def _deactivate_session(self, *, reason: str = "external") -> None:
         """Turn off audio capture, publish VoiceSessionEnded.
@@ -375,26 +495,35 @@ class VoiceSession:
         - A ConversationEnded(channel="voice") arrives (the agent's
           room conversation has terminated — silence, explicit end, etc.)
         - The post-wake-word grace window expires with no speech.
+
+        Runs from both ACTIVE and DORMANT. From DORMANT capture is
+        already stopped; this just clears the session id and publishes
+        VoiceSessionEnded so perception runs its end-of-session
+        enrollment flush.
         """
-        if self._state is not VoiceSessionState.ACTIVE:
+        if self._state not in (
+            VoiceSessionState.ACTIVE, VoiceSessionState.DORMANT,
+        ):
             return
 
+        was_active = self._state is VoiceSessionState.ACTIVE
         self._state = VoiceSessionState.IDLE
         ending_session_id = self._conversation_id
         self._conversation_id = ""
 
         logger.info(
-            "Voice adapter deactivated (session=%s, reason=%s)",
+            "Voice adapter deactivated (session=%s, reason=%s, was=%s)",
             ending_session_id, reason,
+            "active" if was_active else "dormant",
         )
 
-        # Stop audio capture. The handle-based consumer API (S1) makes
-        # this reliable; no bound-method identity risk.
-        if self._audio_capture:
+        # From DORMANT capture is already stopped; only call stop again
+        # if we were actually still capturing.
+        if was_active and self._audio_capture:
             await self._audio_capture.stop()
             self._audio_capture.reset()
 
-        if self._vad:
+        if was_active and self._vad:
             self._vad.reset()
 
         self._cancel_timers()
@@ -472,18 +601,51 @@ class VoiceSession:
         """React to ConversationEnded — deactivate capture for voice.
 
         Only voice-channel conversation ends deactivate capture; whatsapp
-        and trigger conversations don't touch the mic.
+        and trigger conversations don't touch the mic. Runs from ACTIVE
+        or DORMANT — _deactivate_session handles both.
         """
         if getattr(event, "channel", "") == "voice":
             await self._deactivate_session(reason="conversation_ended")
+
+    async def _on_agent_turn_ended(self, event: AgentTurnEnded) -> None:
+        """Arm the post-response mic-idle timer.
+
+        Fires once per turn when the room conversation settles in
+        LISTENING. Includes turns where BB chose silence — that's the
+        whole point: previously a silent turn left the mic hot for
+        180s, so ambient chatter would round-trip through the model
+        again and again. Now the timer arms regardless.
+        """
+        if event.channel != "voice":
+            return
+        if event.conversation_id != self._conversation_id:
+            return
+        if self._state is not VoiceSessionState.ACTIVE:
+            return
+        self._arm_post_response_idle_timer()
+
+    async def _on_agent_speaking(self, event: AgentSpeaking) -> None:
+        """Cancel the post-response idle timer — BB is speaking.
+
+        Defensive: while BB speaks, audio_capture is detached anyway,
+        but a stray timer firing mid-TTS would race with speak()'s
+        re-attachment. Easier to just cancel here.
+        """
+        if event.conversation_id != self._conversation_id:
+            return
+        if self._active_timeout_task is not None:
+            self._active_timeout_task.cancel()
+            self._active_timeout_task = None
 
     async def _on_utterance(self, utterance: Utterance) -> None:
         """Process a finalized utterance: run STT + diarization, publish transcript."""
         if self._state is not VoiceSessionState.ACTIVE:
             return
 
-        # An utterance arrived — cancel the post-wake-word grace since
-        # the Conversation's silence_timeout will now drive lifecycle.
+        # An utterance arrived — cancel any pending mic-idle timer
+        # (wake-word grace before the first turn, post-response idle
+        # after). AgentTurnEnded re-arms the post-response timer when
+        # the agent is done.
         if self._active_timeout_task is not None:
             self._active_timeout_task.cancel()
             self._active_timeout_task = None
@@ -617,8 +779,9 @@ class VoiceSession:
 
         On natural completion, STT is re-attached so the user can
         continue the conversation without saying the wake word again.
-        Anything captured between TTS end and the conversation's
-        silence timeout is treated as a continuation of the same turn.
+        The post-response idle timer (armed by AgentTurnEnded) gives
+        the user ~15s to follow up; past that the adapter goes DORMANT
+        and a wake word is required to resume.
 
         Args:
             text: The text to speak.

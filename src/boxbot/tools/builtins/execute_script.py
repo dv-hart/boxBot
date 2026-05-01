@@ -48,6 +48,14 @@ logger = logging.getLogger(__name__)
 
 SDK_ACTION_MARKER = "__BOXBOT_SDK_ACTION__:"
 
+# Path to the sandbox bootstrap (resolves seccomp filter + runs user
+# script). Anchored to the project root so the path resolves no matter
+# the cwd. The script is intentionally self-contained — no boxbot
+# imports — because the sandbox venv only ships boxbot_sdk.
+SANDBOX_BOOTSTRAP_PATH = (
+    Path(__file__).resolve().parents[3] / "scripts" / "sandbox_bootstrap.py"
+)
+
 # Fallback paths used only when the config can't be loaded (e.g. tests).
 # Real runs read the paths from ``cfg.sandbox`` so a deployment can put
 # the sandbox under ``/var/lib/boxbot-sandbox`` (default) or anywhere
@@ -161,11 +169,28 @@ class ExecuteScriptTool(Tool):
         # Force unbuffered stdout so we can stream action lines in real time.
         env["PYTHONUNBUFFERED"] = "1"
 
+        # Seccomp mode is read by sandbox_bootstrap.py at the start of
+        # every sandboxed run. Honours the kill-switch env var so an
+        # operator can bypass the filter without redeploying code.
+        try:
+            seccomp_mode = config.sandbox.seccomp_mode
+        except RuntimeError:
+            seccomp_mode = "disabled"
+        env["BOXBOT_SECCOMP_MODE"] = seccomp_mode
+        if os.environ.get("BOXBOT_SECCOMP_DISABLE") == "1":
+            env["BOXBOT_SECCOMP_DISABLE"] = "1"
+
         enforce_sandbox = os.environ.get("BOXBOT_SANDBOX_ENFORCE", "1") != "0"
         if enforce_sandbox and sandbox_user:
             cmd = [
-                "sudo", "-n", "-u", sandbox_user,
-                "--", str(venv_python), str(script_path),
+                "sudo", "-n",
+                # Forward the seccomp env vars across the sudo boundary
+                # — sudo strips the environment by default, so we have
+                # to opt them in explicitly.
+                "--preserve-env=BOXBOT_SECCOMP_MODE,BOXBOT_SECCOMP_DISABLE",
+                "-u", sandbox_user,
+                "--", str(venv_python), str(SANDBOX_BOOTSTRAP_PATH),
+                str(script_path),
             ]
         else:
             if sandbox_user:
@@ -173,7 +198,9 @@ class ExecuteScriptTool(Tool):
                     "Sandbox enforcement disabled (BOXBOT_SANDBOX_ENFORCE=0) "
                     "— script runs as current user"
                 )
-            cmd = [str(venv_python), str(script_path)]
+            cmd = [
+                str(venv_python), str(SANDBOX_BOOTSTRAP_PATH), str(script_path),
+            ]
 
         try:
             proc = await asyncio.create_subprocess_exec(

@@ -478,6 +478,28 @@ class SandboxConfig(BaseModel):
     install_approval_channels: list[str] = Field(
         default_factory=lambda: ["display", "whatsapp"]
     )
+    # Seccomp filter mode. Three values:
+    #   "disabled" — no syscall filter (current behaviour)
+    #   "log"      — install filter, kernel logs forbidden syscalls but
+    #                does NOT kill the process. Use as a soak period to
+    #                verify the rule set against real workloads.
+    #   "enforce"  — install filter; first forbidden syscall kills the
+    #                process with SIGSYS.
+    # Default is "log" so deployments that have python3-seccomp
+    # installed start gathering audit data immediately. The bootstrap
+    # gracefully degrades to no-filter if the library isn't present.
+    # The kill-switch ``BOXBOT_SECCOMP_DISABLE=1`` env var bypasses
+    # this entirely — for emergencies when the filter breaks something.
+    seccomp_mode: str = "log"
+
+    @model_validator(mode="after")
+    def validate_seccomp_mode(self) -> SandboxConfig:
+        if self.seccomp_mode not in {"disabled", "log", "enforce"}:
+            raise ValueError(
+                f"seccomp_mode must be one of disabled/log/enforce, "
+                f"got {self.seccomp_mode!r}"
+            )
+        return self
 
     @property
     def venv_path(self) -> str:

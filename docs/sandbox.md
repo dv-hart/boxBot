@@ -153,18 +153,78 @@ boxbot-sandbox (sandbox script user):
 
 #### No Subprocess Spawning: seccomp
 
-Sandbox scripts are launched with a **seccomp filter** that blocks the
-`execve`, `execveat`, `fork`, `vfork`, and `clone` (with CLONE_THREAD
-only allowed) syscalls. This means:
+Sandbox scripts are launched with a **seccomp filter** that blocks
+syscalls outside the sandbox's needs. Currently blocked:
 
-- `subprocess.run()` → blocked at kernel level
-- `os.system()` → blocked
-- `os.exec*()` → blocked
-- `ctypes` calling `execve` → blocked
-- Any attempt to spawn a child process → blocked
+- `execve`, `execveat` — exec family. Blocks `subprocess.run`, `os.system`,
+  `os.exec*`, `ctypes` calling exec, every spawn path.
+- `fork`, `vfork` — process duplication.
+- `clone` without `CLONE_THREAD` — full process clone (Python threading
+  uses CLONE_THREAD and is allowed).
+- `ptrace` — debugger attach.
+- `kexec_load`, `init_module`, `delete_module`, `create_module`,
+  `finit_module` — kernel manipulation.
+- `mount`, `umount2`, `pivot_root`, `chroot` — filesystem namespace games.
+- `swapon`, `swapoff`, `reboot`, `perf_event_open`, `bpf` — system controls.
 
 The only process that runs is the Python interpreter itself, which was
 spawned by the main process before seccomp was applied.
+
+##### How it's wired
+
+`scripts/sandbox_bootstrap.py` is the entry point of every sandboxed
+Python execution. The bootstrap:
+
+1. Reads `BOXBOT_SECCOMP_MODE` from env (`disabled` | `log` | `enforce`).
+2. Imports the libseccomp Python binding (`seccomp` from
+   `python3-seccomp`, with PyPI `pyseccomp` as fallback).
+3. Installs the BPF filter on its own process. The filter is inherited
+   by child processes — there are none, since `clone`/`fork`/`exec` are
+   themselves blocked.
+4. Hands off to the user script via `runpy.run_path`.
+
+For the long-lived per-conversation runner, the same logic is inlined
+at the top of the server script (`src/boxbot/tools/_sandbox_server.py`,
+prepended at host side by `sandbox_runner.py`) — it can't import the
+bootstrap module because the sandbox user may not have read access to
+the project tree.
+
+##### Modes
+
+- `disabled` — no filter applied. Currently the on-disk default for
+  `SandboxConfig.seccomp_mode` until the operator confirms enforcement.
+- `log` — filter installed with `SCMP_ACT_LOG`. The kernel logs every
+  forbidden syscall to the audit log / dmesg, but does **not** kill the
+  process. This is the soak mode: run real workloads for days, scrape
+  the kernel log, see which (if any) unexpected syscalls show up.
+- `enforce` — filter installed with `SCMP_ACT_KILL_PROCESS`. The first
+  forbidden syscall kills the process with SIGSYS. Production setting.
+
+##### Recommended rollout
+
+1. Run `setup-sandbox.sh` (installs `python3-seccomp` via apt).
+2. Set `memory.sandbox.seccomp_mode: log` in `config/config.yaml` (the
+   shipped default), restart boxBot.
+3. Use BB normally for several days. Skills, voice, WhatsApp work
+   exactly as before — `log` mode never blocks.
+4. Inspect the audit log for SECCOMP entries:
+
+       sudo journalctl -k -g 'seccomp\|SCMP' --since '2 days ago'
+       # or, if auditd is running:
+       sudo ausearch -m SECCOMP -i
+
+   Each entry shows the syscall name and process. Anything unexpected
+   in the list = a real workload needs that syscall, and it should
+   either be added to the allow set or the script changed.
+5. When the log goes quiet (only the deliberate blocks remain), flip
+   `seccomp_mode: enforce` and restart.
+
+##### Kill switch
+
+If `enforce` mode breaks something unexpectedly, set
+`BOXBOT_SECCOMP_DISABLE=1` in the environment and restart boxBot. The
+bootstrap honours it before applying any filter, regardless of config.
+No code change needed; recovery is just an env var.
 
 #### Filesystem Permissions
 

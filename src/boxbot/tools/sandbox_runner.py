@@ -63,6 +63,75 @@ try:
 except OSError:  # pragma: no cover — only hit if the package is broken
     _SERVER_CODE = ""
 
+
+# Seccomp prologue — prepended to ``_SERVER_CODE`` so the persistent
+# sandbox subprocess installs the syscall filter at startup, BEFORE the
+# stdin loop begins handling user scripts. Mirrors the body of
+# ``scripts/sandbox_bootstrap.py``; the duplication is deliberate
+# because the sandbox subprocess receives this code via ``python -c``
+# and cannot import the standalone bootstrap module from the project
+# tree (the sandbox user may lack read perms there). When the syscall
+# allowlist changes, update both this string and the bootstrap script.
+_SECCOMP_PROLOGUE = '''
+import os as _bb_os, sys as _bb_sys
+_bb_blocked = (
+    "execve", "execveat", "fork", "vfork", "ptrace",
+    "kexec_load", "kexec_file_load",
+    "init_module", "finit_module", "delete_module", "create_module",
+    "swapon", "swapoff",
+    "mount", "umount2", "pivot_root", "chroot",
+    "reboot", "perf_event_open", "bpf",
+)
+def _bb_apply_seccomp():
+    if _bb_os.environ.get("BOXBOT_SECCOMP_DISABLE") == "1":
+        _bb_sys.stderr.write("[sandbox-server] BOXBOT_SECCOMP_DISABLE=1 — no filter\\n")
+        return
+    mode = _bb_os.environ.get("BOXBOT_SECCOMP_MODE", "disabled").lower()
+    if mode == "disabled":
+        return
+    if mode not in ("log", "enforce"):
+        _bb_sys.stderr.write(f"[sandbox-server] unknown BOXBOT_SECCOMP_MODE={mode!r}, no filter\\n")
+        return
+    try:
+        import seccomp
+    except ImportError:
+        try:
+            import pyseccomp as seccomp
+        except ImportError as e:
+            _bb_sys.stderr.write(f"[sandbox-server] no seccomp binding ({e}); no filter\\n")
+            if mode == "enforce":
+                _bb_sys.exit(70)
+            return
+    if mode == "log":
+        action = seccomp.LOG
+    else:
+        action = getattr(seccomp, "KILL_PROCESS", None) or seccomp.KILL
+    f = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
+    added = 0
+    for name in _bb_blocked:
+        try:
+            f.add_rule(action, name)
+            added += 1
+        except Exception:
+            pass
+    try:
+        f.add_rule(action, "clone", seccomp.Arg(0, seccomp.MASKED_EQ, 0x10000, 0))
+        added += 1
+    except Exception:
+        pass
+    f.load()
+    _bb_sys.stderr.write(f"[sandbox-server] seccomp installed: mode={mode}, rules={added}\\n")
+_bb_apply_seccomp()
+del _bb_apply_seccomp, _bb_blocked, _bb_os, _bb_sys
+'''
+
+
+def _server_code_with_seccomp() -> str:
+    """Compose the server source with the seccomp prologue prepended."""
+    if not _SERVER_CODE:
+        return ""
+    return _SECCOMP_PROLOGUE + _SERVER_CODE
+
 _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
     "PYTHONPATH", "VIRTUAL_ENV", "PYTHONDONTWRITEBYTECODE",
@@ -136,8 +205,12 @@ class SandboxRunner:
             # user doesn't need read access to the project source tree.
             if self._enforce_sandbox and self._sandbox_user:
                 cmd: list[str] = [
-                    "sudo", "-n", "-u", self._sandbox_user,
-                    "--", str(self._venv_python), "-c", _SERVER_CODE,
+                    "sudo", "-n",
+                    # sudo strips env by default; opt the seccomp
+                    # control vars in so the prologue can read them.
+                    "--preserve-env=BOXBOT_SECCOMP_MODE,BOXBOT_SECCOMP_DISABLE",
+                    "-u", self._sandbox_user,
+                    "--", str(self._venv_python), "-c", _server_code_with_seccomp(),
                 ]
             else:
                 if self._sandbox_user:
@@ -145,12 +218,23 @@ class SandboxRunner:
                         "Sandbox enforcement disabled "
                         "(BOXBOT_SANDBOX_ENFORCE=0) — runner uses current user"
                     )
-                cmd = [str(self._venv_python), "-c", _SERVER_CODE]
+                cmd = [str(self._venv_python), "-c", _server_code_with_seccomp()]
 
             env = {
                 k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS
             }
             env["PYTHONUNBUFFERED"] = "1"
+            # Pass seccomp mode through to the runner so the inline
+            # prologue can install the filter at startup. Read fresh
+            # from config each spawn so a runtime config edit + runner
+            # restart picks up the new mode.
+            try:
+                from boxbot.core.config import get_config
+                env["BOXBOT_SECCOMP_MODE"] = get_config().sandbox.seccomp_mode
+            except Exception:
+                env["BOXBOT_SECCOMP_MODE"] = "disabled"
+            if os.environ.get("BOXBOT_SECCOMP_DISABLE") == "1":
+                env["BOXBOT_SECCOMP_DISABLE"] = "1"
 
             try:
                 self._proc = await asyncio.create_subprocess_exec(

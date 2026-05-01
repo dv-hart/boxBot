@@ -182,6 +182,38 @@ fi
 echo "Installed boxbot_sdk into sandbox venv."
 CHANGES+=("Installed sandbox packages + boxbot_sdk")
 
+# Install the libseccomp Python binding system-wide so the sandbox
+# bootstrap (scripts/sandbox_bootstrap.py) can apply the syscall filter
+# at startup. ``python3-seccomp`` provides the ``import seccomp`` API.
+# We install it via apt because libseccomp is a C library — pip
+# installs would compile from source and pull build deps.
+#
+# If apt is unavailable (non-Debian) the operator can ``pip install
+# pyseccomp`` into the sandbox venv as a fallback; the bootstrap tries
+# both module names.
+if command -v apt-get >/dev/null 2>&1; then
+    if ! dpkg -s python3-seccomp >/dev/null 2>&1; then
+        echo "--- Installing python3-seccomp ---"
+        apt-get install -y python3-seccomp >/dev/null
+        CHANGES+=("Installed python3-seccomp (libseccomp Python binding)")
+    fi
+    # Also expose the apt-installed binding to the sandbox venv. The
+    # venv was created with ``--system-site-packages`` (see step 3) so
+    # this should already be visible; we just verify.
+    if ! sudo -u "$SANDBOX_USER" "$SANDBOX_VENV/bin/python3" \
+           -c "import seccomp" >/dev/null 2>&1; then
+        echo "  Note: seccomp module not visible to sandbox venv —"
+        echo "  the venv was probably created without --system-site-packages."
+        echo "  Falling back to pyseccomp via pip (PyPI binding)."
+        "$SANDBOX_VENV/bin/pip" install pyseccomp --quiet
+        CHANGES+=("Installed pyseccomp into sandbox venv (fallback)")
+    fi
+else
+    echo "  apt-get not found — installing pyseccomp via pip"
+    "$SANDBOX_VENV/bin/pip" install pyseccomp --quiet
+    CHANGES+=("Installed pyseccomp into sandbox venv (no apt available)")
+fi
+
 # -------------------------------------------------------------------
 # 5. Pre-compile bytecode
 # -------------------------------------------------------------------

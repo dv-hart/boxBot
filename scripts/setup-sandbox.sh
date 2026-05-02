@@ -188,7 +188,13 @@ if [[ ! -f "$SDK_DIR/pyproject.toml" ]]; then
     exit 1
 fi
 
-"$SANDBOX_VENV/bin/pip" install "$SDK_DIR" --quiet
+# --force-reinstall: pip otherwise treats boxbot-sdk==0.1.0 as already
+# satisfied and skips the build, so source edits never reach the venv
+# unless the version is bumped. We don't bump the version every commit,
+# so force a rebuild on every setup-sandbox run instead.
+# --no-deps: the SDK has no runtime deps; this skips re-resolving the
+# already-installed third-party packages above.
+"$SANDBOX_VENV/bin/pip" install --force-reinstall --no-deps "$SDK_DIR" --quiet
 
 echo "Installed boxbot_sdk into sandbox venv."
 CHANGES+=("Installed sandbox packages + boxbot_sdk")

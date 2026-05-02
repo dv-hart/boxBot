@@ -19,6 +19,7 @@ packages = ["boxbot_sdk"]
 "__init__.py" = "boxbot_sdk/__init__.py"
 "_transport.py" = "boxbot_sdk/_transport.py"
 "_validators.py" = "boxbot_sdk/_validators.py"
+"auth.py" = "boxbot_sdk/auth.py"
 "calendar.py" = "boxbot_sdk/calendar.py"
 "camera.py" = "boxbot_sdk/camera.py"
 "display.py" = "boxbot_sdk/display.py"

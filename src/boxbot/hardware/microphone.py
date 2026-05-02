@@ -187,13 +187,17 @@ class Microphone(HardwareModule):
         # the exception, subsequent failures at DEBUG to avoid log spam
         # when the udev rule is missing or the device is unplugged.
         self._usb_write_failure_count: int = 0
-        # Liveness: the audio-thread callback updates this each chunk;
-        # the watchdog task compares against wall time and restarts the
-        # stream if callbacks stop firing. Prevents the silent-death
-        # failure mode where sounddevice stalls and nothing notices.
+        # Liveness: the audio-thread callback updates this each chunk.
+        # The watchdog compares against wall time, and on a stall it
+        # closes the stream and polls for the ReSpeaker to re-enumerate
+        # before opening a new stream. Prevents two failure modes:
+        # silent-death (sounddevice stalls with no exception) and
+        # PortAudio C-level abort (opening a stream while the ALSA
+        # card is mid-flicker — see docs/issues/2026-05-01-microphone-
+        # watchdog-crash.md).
         self._last_chunk_monotonic: float = 0.0
         self._watchdog_task: asyncio.Task[None] | None = None
-        self._stream_restart_count: int = 0
+        self._stream_recovery_count: int = 0
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -273,13 +277,7 @@ class Microphone(HardwareModule):
         self._close_stream()
 
         # Release USB
-        if self._usb_device is not None:
-            try:
-                usb.util.dispose_resources(self._usb_device)
-            except Exception:
-                logger.exception("Error releasing USB device")
-            finally:
-                self._usb_device = None
+        self._dispose_usb()
 
         self._started = False
         self._loop = None
@@ -314,63 +312,137 @@ class Microphone(HardwareModule):
             finally:
                 self._stream = None
 
+    def _dispose_usb(self) -> None:
+        """Drop the cached ReSpeaker USB handle.
+
+        The pyusb device handle is bound to the kernel device that was
+        present at _init_usb() time. After a USB hot-plug, the old
+        handle references a dead device — releasing it lets the next
+        _init_usb() acquire a fresh one.
+        """
+        if self._usb_device is None:
+            return
+        if not _HAS_PYUSB:
+            self._usb_device = None
+            return
+        try:
+            usb.util.dispose_resources(self._usb_device)
+        except Exception:
+            logger.debug("Error releasing USB device", exc_info=True)
+        finally:
+            self._usb_device = None
+
+    def _refresh_portaudio(self) -> None:
+        """Force PortAudio to drop its cached ALSA device list.
+
+        sounddevice loads the ALSA card list once at import time. After
+        a USB hot-plug, sd.query_devices() keeps returning the stale
+        list (sometimes with a now-invalid card index) until PortAudio
+        is re-initialized. The private _terminate/_initialize pair is
+        the standard idiom for this; we guard against missing attrs
+        in case future sounddevice versions rename them.
+        """
+        if not _HAS_SOUNDDEVICE:
+            return
+        terminate = getattr(sd, "_terminate", None)
+        initialize = getattr(sd, "_initialize", None)
+        if terminate is None or initialize is None:
+            return
+        try:
+            terminate()
+            initialize()
+        except Exception:
+            logger.debug("PortAudio re-init raised", exc_info=True)
+
     async def _watchdog_loop(self) -> None:
-        """Monitor the audio stream and restart it if callbacks stall.
+        """Monitor the audio stream and recover after a USB disconnect.
 
         sounddevice has no built-in recovery: if the underlying ALSA/USB
         stream wedges (hub disconnect, driver glitch), the callback
-        simply stops firing and no exception surfaces. This watchdog
-        compares wall time against the last observed chunk timestamp
-        and forces a reopen if chunks haven't arrived for a while.
+        simply stops firing and no exception surfaces. The recovery
+        path has two phases:
+
+        1. Stall detected — close the broken stream, drop the stale
+           USB handle, transition to "waiting for device" mode. We do
+           NOT immediately reopen: the ReSpeaker's ALSA card may still
+           be mid-flicker, and calling sd.InputStream against a half-
+           present card has triggered a C-level assertion in PortAudio
+           that aborts the whole process.
+        2. Waiting — each tick, force PortAudio to re-enumerate and
+           look up the ReSpeaker by name. Only when it shows up cleanly
+           do we re-init USB (LEDs/DOA) and open a new stream.
         """
         # Stall threshold is generous (5s >> any legitimate gap at 64ms
         # cadence) so we don't fight against brief scheduler hiccups.
         stall_seconds = 5.0
         poll_interval = 2.0
+        waiting_for_device = False
         try:
             while self._started:
                 await asyncio.sleep(poll_interval)
                 if not self._started:
                     return
-                elapsed = time.monotonic() - self._last_chunk_monotonic
-                if elapsed < stall_seconds:
-                    continue
 
-                self._stream_restart_count += 1
-                logger.error(
-                    "Audio stream appears stalled (%.1fs since last "
-                    "chunk). Restarting stream (restart #%d).",
-                    elapsed, self._stream_restart_count,
-                )
-                try:
-                    await self._emit_health(
-                        HealthStatus.DEGRADED,
-                        f"audio stream stalled for {elapsed:.1f}s",
-                    )
-                except Exception:
-                    pass
+                if not waiting_for_device:
+                    elapsed = time.monotonic() - self._last_chunk_monotonic
+                    if elapsed < stall_seconds:
+                        continue
 
-                # Reopen the stream. Do it on the event loop thread —
-                # sounddevice close/open are blocking but fast (<100ms);
-                # running them inline is simpler than juggling an
-                # executor + re-registration.
-                self._close_stream()
-                try:
-                    self._open_stream()
-                    self._last_chunk_monotonic = time.monotonic()
-                    logger.info(
-                        "Audio stream reopened after stall (restart #%d)",
-                        self._stream_restart_count,
+                    logger.error(
+                        "Audio stream stalled (%.1fs since last chunk). "
+                        "Closing stream and waiting for ReSpeaker to "
+                        "re-enumerate.",
+                        elapsed,
                     )
                     try:
-                        await self._emit_health(HealthStatus.OK)
+                        await self._emit_health(
+                            HealthStatus.DEGRADED,
+                            f"audio stream stalled for {elapsed:.1f}s",
+                        )
                     except Exception:
                         pass
-                except Exception:
-                    logger.exception(
-                        "Failed to reopen audio stream after stall; "
-                        "will retry on next watchdog tick",
+                    self._close_stream()
+                    self._dispose_usb()
+                    waiting_for_device = True
+                    continue
+
+                # Polling phase. Force PortAudio to drop its cached
+                # ALSA enumeration so query_devices() reflects the
+                # current device list, then look up the ReSpeaker by
+                # name (the ALSA card index can change across hot-plug).
+                self._refresh_portaudio()
+                new_index = self._find_device_index()
+                if new_index is None:
+                    logger.debug(
+                        "ReSpeaker still absent; will keep polling.",
                     )
+                    continue
+
+                self._device_index = new_index
+                self._init_usb()
+                try:
+                    self._open_stream()
+                except Exception:
+                    logger.warning(
+                        "ReSpeaker re-enumerated at index %d but stream "
+                        "open failed; will keep polling.",
+                        new_index, exc_info=True,
+                    )
+                    self._close_stream()
+                    continue
+
+                self._last_chunk_monotonic = time.monotonic()
+                self._stream_recovery_count += 1
+                waiting_for_device = False
+                logger.info(
+                    "Audio stream recovered after USB transient "
+                    "(recovery #%d, device index %d).",
+                    self._stream_recovery_count, new_index,
+                )
+                try:
+                    await self._emit_health(HealthStatus.OK)
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             return
 

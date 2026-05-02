@@ -274,16 +274,27 @@ class TestMicrophone:
         cb2.assert_awaited_once_with(chunk)
 
     @pytest.mark.asyncio
-    async def test_watchdog_loop_detects_stall_and_reopens(self):
-        """Regression: sounddevice can silently stall with no exception;
-        the watchdog must detect the stall and force a reopen."""
+    async def test_watchdog_waits_for_device_then_recovers(self):
+        """Regression: a transient ReSpeaker USB drop must not crash
+        the process. The watchdog should close the stalled stream,
+        poll until the device re-enumerates, and only then reopen.
+        Calling sd.InputStream while the ALSA card is half-present
+        has triggered a PortAudio C-level abort (see
+        docs/issues/2026-05-01-microphone-watchdog-crash.md)."""
         import boxbot.hardware.microphone as mic_mod
+
+        # query_devices is called by _find_device_index() each polling
+        # tick. Simulate the device disappearing for two ticks, then
+        # reappearing on the third.
+        device_listings = [
+            [],  # tick 1: gone
+            [],  # tick 2: still gone
+            [{"name": "TestRespeaker Array", "max_input_channels": 6}],
+        ]
 
         with patch.object(mic_mod, "sd") as mock_sd, \
                 patch.object(mic_mod, "_HAS_SOUNDDEVICE", True):
-            mock_sd.query_devices.return_value = [
-                {"name": "TestRespeaker Array", "max_input_channels": 6}
-            ]
+            mock_sd.query_devices.side_effect = device_listings
             streams = []
             def _make_stream(*a, **k):
                 s = MagicMock()
@@ -293,35 +304,42 @@ class TestMicrophone:
 
             mic = self._make_mic()
             # Simulate a started state without spinning up the real
-            # watchdog — we drive one iteration of the loop by hand.
+            # watchdog — we drive iterations of the loop by hand.
             mic._loop = asyncio.get_event_loop()
             mic._device_index = 0
             mic._started = True
-            mic._open_stream()
-            # Force staleness.
+            mic._open_stream()  # builds streams[0]
+            # Force staleness so the first watchdog tick detects a stall.
             mic._last_chunk_monotonic = time.monotonic() - 60.0
 
-            # Shorten poll interval by patching asyncio.sleep.
+            # Shorten poll interval by patching asyncio.sleep. The
+            # watchdog must do: 1 tick to detect+close, 2 ticks waiting
+            # for the device, 1 tick to reopen → 4 sleeps before we
+            # tell it to exit.
             sleeps = []
             orig_sleep = asyncio.sleep
 
             async def _fast_sleep(seconds):
                 sleeps.append(seconds)
-                if len(sleeps) > 1:
-                    # After the watchdog has gone once through the
-                    # stall-handling path, stop the loop.
+                if len(sleeps) >= 5:
                     mic._started = False
                 await orig_sleep(0)
 
             with patch.object(mic_mod.asyncio, "sleep", _fast_sleep):
                 await mic._watchdog_loop()
 
-            # Original + restart: at least two InputStreams were built.
-            assert mock_sd.InputStream.call_count >= 2
+            # Initial open + recovery open = exactly 2 InputStreams.
+            # If the watchdog tried to open while the device was gone
+            # we'd see 3 or more here.
+            assert mock_sd.InputStream.call_count == 2
             streams[0].stop.assert_called()
             streams[0].close.assert_called()
             streams[-1].start.assert_called()
-            assert mic._stream_restart_count >= 1
+            assert mic._stream_recovery_count == 1
+            # PortAudio re-enumeration should have been forced at least
+            # once during the polling phase.
+            assert mock_sd._terminate.called
+            assert mock_sd._initialize.called
 
     @pytest.mark.asyncio
     async def test_set_led_pattern_changes_current_pattern(self):

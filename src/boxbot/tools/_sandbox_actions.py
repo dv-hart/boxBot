@@ -28,10 +28,12 @@ Security:
 from __future__ import annotations
 
 import base64
+import inspect
 import io
 import logging
 import mimetypes
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -87,6 +89,30 @@ class ActionContext:
     # Every action processed, mirrored into the final tool result so the
     # agent can observe side effects (e.g. "photos.set_tags: ok").
     action_log: list[dict[str, Any]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Handler registry — handlers self-register via @action_handler(prefix). The
+# dispatcher routes by the ``<prefix>.<verb>`` convention used in action
+# names (e.g. ``workspace.write``, ``skill.save``). All handlers share the
+# signature ``(action_type, payload, ctx) -> dict | Awaitable[dict]``;
+# handlers that don't need ``ctx`` accept and ignore it.
+# ---------------------------------------------------------------------------
+
+Handler = Callable[[str, dict[str, Any], "ActionContext"], "dict[str, Any] | Awaitable[dict[str, Any]]"]
+_HANDLERS: dict[str, Handler] = {}
+
+
+def action_handler(prefix: str) -> Callable[[Handler], Handler]:
+    """Register a handler for action types of the form ``<prefix>.<verb>``."""
+
+    def decorator(fn: Handler) -> Handler:
+        if prefix in _HANDLERS:
+            raise RuntimeError(f"duplicate handler registered for prefix '{prefix}'")
+        _HANDLERS[prefix] = fn
+        return fn
+
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +177,7 @@ def build_image_block(abs_path: Path) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+@action_handler("workspace")
 def _handle_workspace_action(
     action_type: str,
     payload: dict[str, Any],
@@ -255,6 +282,7 @@ def _handle_workspace_action(
 # ---------------------------------------------------------------------------
 
 
+@action_handler("photos")
 async def _handle_photos_action(
     action_type: str,
     payload: dict[str, Any],
@@ -424,6 +452,7 @@ async def _grab_frame(full_res: bool):
     return frame, False
 
 
+@action_handler("camera")
 async def _handle_camera_action(
     action_type: str,
     payload: dict[str, Any],
@@ -504,9 +533,11 @@ async def _handle_camera_action(
 # ---------------------------------------------------------------------------
 
 
+@action_handler("calendar")
 async def _handle_calendar_action(
     action_type: str,
     payload: dict[str, Any],
+    ctx: ActionContext,  # unused; kept for uniform handler signature
 ) -> dict[str, Any]:
     from boxbot.integrations import google_calendar as gc
 
@@ -573,9 +604,11 @@ async def _handle_calendar_action(
 # ---------------------------------------------------------------------------
 
 
+@action_handler("auth")
 async def _handle_auth_action(
     action_type: str,
     payload: dict[str, Any],
+    ctx: ActionContext,  # unused; kept for uniform handler signature
 ) -> dict[str, Any]:
     """Auth-state RPC for the agent's onboarding flows.
 
@@ -665,6 +698,483 @@ async def _handle_auth_action(
 
 
 # ---------------------------------------------------------------------------
+# Display action handler
+# ---------------------------------------------------------------------------
+
+
+# Field schemas for built-in data sources. Lets the agent discover what
+# bindings a source exposes without reading source code.
+_BUILTIN_SOURCE_SCHEMAS: dict[str, dict[str, Any]] = {
+    "weather": {
+        "fields": {
+            "temp": "string — current temperature, e.g. '72'",
+            "condition": "string — human label, e.g. 'Partly Cloudy'",
+            "icon": "string — Lucide icon name, e.g. 'cloud-sun'",
+            "humidity": "string — percent, e.g. '65'",
+            "wind": "string — wind speed, e.g. '12 mph'",
+            "forecast": (
+                "array of {day, icon, high, low} — next ~5 days. "
+                "Bind individual days as {weather.forecast[0].high}."
+            ),
+        },
+    },
+    "calendar": {
+        "fields": {
+            "events": (
+                "array of {time, title, duration, location} — upcoming "
+                "events. Bind as {calendar.events[0].title}."
+            ),
+            "count": "int — total events fetched",
+        },
+    },
+    "tasks": {
+        "fields": {
+            "items": (
+                "array of {id, description, due_date, for_person, "
+                "status} — open to-dos. Use a 'repeat' block with "
+                "source='{tasks.items}' and bind {.description}."
+            ),
+            "count": "int — total open to-dos",
+        },
+    },
+    "people": {
+        "fields": {
+            "present": (
+                "array of {name, since} — people currently detected. "
+                "Bind as {people.present[0].name}."
+            ),
+            "count": "int — number of people present",
+        },
+    },
+    "agent_status": {
+        "fields": {
+            "state": "string — sleeping | listening | thinking | speaking",
+            "last_active": "string — humanised timestamp",
+            "next_wake": "string — when the next scheduled wake fires",
+        },
+    },
+    "clock": {
+        "fields": {
+            "hour": "int (0-23)",
+            "minute": "int (0-59)",
+            "second": "int (0-59)",
+            "display": "string — formatted time, e.g. '7:42'",
+            "date": "string — long date, e.g. 'May 1, 2026'",
+            "day_of_week": "string — e.g. 'Friday'",
+        },
+    },
+}
+
+
+@action_handler("skill")
+def _handle_skill_action(
+    action_type: str,
+    payload: dict[str, Any],
+    ctx: ActionContext,  # unused; kept for uniform handler signature
+) -> dict[str, Any]:
+    """Dispatch skill.* actions. Currently only ``skill.save``.
+
+    The writer lives in :mod:`boxbot.skills.persist` so the file-layout
+    contract is reusable from elsewhere (tests, future ``skill.update``).
+    """
+    if action_type != "skill.save":
+        return {
+            "status": "error",
+            "message": f"unknown skill action '{action_type}'",
+        }
+
+    from boxbot.skills.persist import write_skill
+
+    try:
+        return write_skill(payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("skill.save failed")
+        return {"status": "error", "message": str(exc)}
+
+
+def _previews_dir() -> Path:
+    from boxbot.core.paths import PREVIEWS_DIR
+
+    PREVIEWS_DIR.mkdir(parents=True, exist_ok=True)
+    return PREVIEWS_DIR
+
+
+def _agent_displays_dir() -> Path:
+    from boxbot.core.paths import DISPLAYS_DIR
+
+    DISPLAYS_DIR.mkdir(parents=True, exist_ok=True)
+    return DISPLAYS_DIR
+
+
+def _classify_display_source(name: str, agent_dir: Path) -> str:
+    """Return 'agent' if saved through the SDK, else 'builtin' / 'user'."""
+    if (agent_dir / f"{name}.json").exists():
+        return "agent"
+    # Best-effort: anything in the project's displays/ tree is 'user',
+    # everything else (programmatic builtins, builtins/) is 'builtin'.
+    from boxbot.core.paths import PROJECT_ROOT
+
+    user_root = PROJECT_ROOT / "displays"
+    if (user_root / name / "display.json").exists():
+        return "user"
+    if (user_root / f"{name}.json").exists():
+        return "user"
+    return "builtin"
+
+
+def _collect_unresolved_bindings(
+    spec_dict: dict[str, Any],
+    render_data: dict[str, Any] | None = None,
+) -> list[str]:
+    """Walk the layout looking for bindings that don't resolve.
+
+    Returns a list of human-readable warnings — typos, missing fields,
+    sources that aren't declared.
+
+    ``render_data`` is the dict the renderer actually used, assembled
+    by :meth:`DisplayManager.build_preview_data`. Passing it eliminates
+    false positives on bindings to live-fetched data and to ``static``
+    sources whose declared ``value=`` populated the renderer's view but
+    not any standalone placeholder pass.
+    """
+    from boxbot.displays.data_sources import get_placeholder_data
+    from boxbot.displays.spec import _BINDING_PATTERN, _lookup_binding
+
+    declared: set[str] = {"args", "current"}
+    for src in spec_dict.get("data_sources", []) or []:
+        if isinstance(src, dict) and src.get("name"):
+            declared.add(src["name"])
+
+    if render_data is not None:
+        sample = dict(render_data)
+        sample.setdefault("args", {})
+    else:
+        # Standalone fallback for callers without a manager (e.g. ad-hoc
+        # spec linting). Builtins get plausible placeholders; everything
+        # else stays empty and will warn.
+        sample = {}
+        for name in declared:
+            if name in ("args", "current"):
+                continue
+            sample[name] = get_placeholder_data(name) or {}
+        sample["args"] = {}
+
+    warnings: list[str] = []
+    seen: set[str] = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+        elif isinstance(node, str):
+            for match in _BINDING_PATTERN.finditer(node):
+                path = match.group(1)
+                if path in seen:
+                    continue
+                seen.add(path)
+                # Skip repeat-template / rotate-current paths — they're
+                # only valid inside their parent block. Those resolve
+                # at render time per-item, not at the top level.
+                if path.startswith(".") or path.startswith("current."):
+                    continue
+                source = path.split(".", 1)[0]
+                if source not in declared:
+                    warnings.append(
+                        f"binding '{{{path}}}' references undeclared source "
+                        f"'{source}' — call d.data('{source}') or check the "
+                        f"source name."
+                    )
+                    continue
+                value = _lookup_binding(path, sample, None, None)
+                if value is None:
+                    warnings.append(
+                        f"binding '{{{path}}}' did not resolve at render "
+                        f"time. Check the field name on '{source}'."
+                    )
+
+    _walk(spec_dict.get("layout"))
+    return warnings
+
+
+@action_handler("display")
+async def _handle_display_action(
+    action_type: str,
+    payload: dict[str, Any],
+    ctx: ActionContext,
+) -> dict[str, Any]:
+    """Dispatch display.* actions: preview, save, list, load, delete,
+    describe_source, update_data.
+
+    All actions are synchronous — the SDK uses :func:`request` so the
+    agent sees results in the same script run. Validation errors are
+    returned in the response payload, not raised, so the agent can read
+    them and fix the spec.
+    """
+    import json
+
+    from boxbot.displays.manager import get_display_manager
+    from boxbot.displays.spec import parse_spec, validate_spec
+
+    sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+
+    try:
+        if sub == "preview":
+            spec_dict = payload.get("spec") or {}
+            try:
+                parsed = parse_spec(spec_dict)
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "errors": [f"could not parse spec: {e}"],
+                }
+            errors = validate_spec(parsed)
+            if errors:
+                return {"status": "error", "errors": errors}
+
+            mgr = get_display_manager()
+            if mgr is None:
+                return {
+                    "status": "error",
+                    "errors": ["display manager not running"],
+                }
+
+            # Register the spec temporarily so render_preview can find
+            # it by name. If a spec by this name was already registered,
+            # restore it after rendering so we don't clobber a saved
+            # display when the agent is iterating.
+            existing = mgr.get_spec(parsed.name)
+            mgr.register_spec(parsed)
+            try:
+                # Compute warnings against the same data the renderer
+                # uses, so static-source values and live-fetched data
+                # don't get falsely flagged.
+                render_data = mgr.build_preview_data(parsed)
+                image = mgr.render_preview(parsed.name, data=render_data)
+            finally:
+                if existing is not None:
+                    mgr.register_spec(existing)
+                else:
+                    mgr.unregister_spec(parsed.name)
+
+            if image is None:
+                return {
+                    "status": "error",
+                    "errors": ["render_preview returned no image"],
+                }
+
+            previews = _previews_dir()
+            out_path = previews / f"{parsed.name}-{uuid.uuid4().hex[:8]}.png"
+            try:
+                image.save(out_path, format="PNG")
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "errors": [f"could not write preview PNG: {e}"],
+                }
+
+            attached = False
+            if len(ctx.image_attachments) < MAX_IMAGES_PER_CALL:
+                ctx.image_attachments.append(out_path)
+                attached = True
+            else:
+                logger.warning(
+                    "display.preview not attached (exceeded %d/call)",
+                    MAX_IMAGES_PER_CALL,
+                )
+
+            return {
+                "status": "ok",
+                "path": str(out_path),
+                "attached": attached,
+                "warnings": _collect_unresolved_bindings(
+                    spec_dict, render_data=render_data,
+                ),
+            }
+
+        if sub == "save":
+            spec_dict = payload.get("spec") or {}
+            name = payload.get("name") or spec_dict.get("name")
+            if not name:
+                return {"status": "error", "errors": ["display name required"]}
+            try:
+                parsed = parse_spec(spec_dict)
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "errors": [f"could not parse spec: {e}"],
+                }
+            errors = validate_spec(parsed)
+            if errors:
+                return {"status": "error", "errors": errors}
+
+            agent_dir = _agent_displays_dir()
+            out_path = agent_dir / f"{parsed.name}.json"
+            try:
+                out_path.write_text(json.dumps(spec_dict, indent=2))
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "errors": [f"could not write spec: {e}"],
+                }
+
+            mgr = get_display_manager()
+            registered = False
+            render_data: dict[str, Any] | None = None
+            if mgr is not None:
+                # Hot-reload: register on the live manager so
+                # switch_display(name) works in this same conversation,
+                # no restart needed.
+                mgr.register_spec(parsed)
+                registered = True
+                render_data = mgr.build_preview_data(parsed)
+
+            return {
+                "status": "ok",
+                "path": str(out_path),
+                "registered": registered,
+                "warnings": _collect_unresolved_bindings(
+                    spec_dict, render_data=render_data,
+                ),
+            }
+
+        if sub == "list":
+            mgr = get_display_manager()
+            if mgr is None:
+                return {"status": "error", "error": "display manager not running"}
+            agent_dir = _agent_displays_dir()
+            displays = [
+                {"name": n, "source": _classify_display_source(n, agent_dir)}
+                for n in mgr.list_available()
+            ]
+            return {"status": "ok", "displays": displays}
+
+        if sub == "load":
+            name = payload.get("name")
+            if not name:
+                return {"status": "error", "error": "display name required"}
+            mgr = get_display_manager()
+            if mgr is None:
+                return {"status": "error", "error": "display manager not running"}
+            spec = mgr.get_spec(name)
+            if spec is None:
+                return {"status": "error", "error": f"display '{name}' not found"}
+            spec_dict = _spec_to_dict(spec)
+            return {"status": "ok", "spec": spec_dict}
+
+        if sub == "delete":
+            name = payload.get("name")
+            if not name:
+                return {"status": "error", "error": "display name required"}
+            agent_dir = _agent_displays_dir()
+            spec_path = agent_dir / f"{name}.json"
+            if not spec_path.exists():
+                return {
+                    "status": "error",
+                    "error": (
+                        f"display '{name}' is not agent-saved; only "
+                        "displays created via the SDK can be deleted."
+                    ),
+                }
+            try:
+                spec_path.unlink()
+            except Exception as e:
+                return {"status": "error", "error": f"could not delete: {e}"}
+            mgr = get_display_manager()
+            if mgr is not None:
+                mgr.unregister_spec(name)
+            return {"status": "ok"}
+
+        if sub == "describe_source":
+            name = payload.get("name", "")
+            if not name:
+                return {"status": "error", "error": "name required"}
+            from boxbot.displays.data_sources import get_placeholder_data
+
+            schema = _BUILTIN_SOURCE_SCHEMAS.get(name)
+            if schema is None:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"no schema for source '{name}'. Built-in "
+                        f"sources: {sorted(_BUILTIN_SOURCE_SCHEMAS)}"
+                    ),
+                }
+            return {
+                "status": "ok",
+                "fields": schema["fields"],
+                "example": get_placeholder_data(name),
+            }
+
+        if sub == "update_data":
+            mgr = get_display_manager()
+            if mgr is None:
+                return {"status": "error", "error": "display manager not running"}
+            ok = mgr.update_static_data(
+                payload.get("display", ""),
+                payload.get("source", ""),
+                payload.get("value"),
+            )
+            if not ok:
+                return {
+                    "status": "error",
+                    "error": (
+                        "update_data failed — display must be active and "
+                        "source must be of type 'static'."
+                    ),
+                }
+            return {"status": "ok"}
+
+        return {"status": "error", "error": f"unknown display action: {action_type}"}
+
+    except Exception as e:  # noqa: BLE001
+        logger.exception("%s failed", action_type)
+        return {"status": "error", "error": str(e)}
+
+
+def _spec_to_dict(spec: Any) -> dict[str, Any]:
+    """Serialize a DisplaySpec back to the on-disk JSON shape.
+
+    Inverse of :func:`boxbot.displays.spec.parse_spec`. Used by
+    ``display.load`` so the agent can edit existing specs.
+    """
+    out: dict[str, Any] = {
+        "name": spec.name,
+        "theme": spec.theme,
+        "transition": spec.transition,
+    }
+    sources: list[dict[str, Any]] = []
+    for src in spec.data_sources:
+        d: dict[str, Any] = {"name": src.name}
+        if src.source_type and src.source_type != "builtin":
+            d["type"] = src.source_type
+        if src.url:
+            d["url"] = src.url
+        if src.params:
+            d["params"] = dict(src.params)
+        if src.secret:
+            d["secret"] = src.secret
+        if src.refresh is not None:
+            d["refresh"] = src.refresh
+        if src.fields:
+            d["fields"] = dict(src.fields)
+        if src.value is not None:
+            d["value"] = src.value
+        if src.query:
+            d["query"] = src.query
+        sources.append(d)
+    if sources:
+        out["data_sources"] = sources
+    if spec.root_block is not None:
+        # Block.to_dict() already produces the JSON-compatible shape
+        # (type + params + recursively-serialized children).
+        out["layout"] = spec.root_block.to_dict()
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatcher
 # ---------------------------------------------------------------------------
 
@@ -678,29 +1188,28 @@ async def process_action(
     The response is written back to the sandbox iff the action was tagged
     ``_expects_response: true``. It is also appended to ``ctx.action_log``
     so the tool result reflects every side effect.
+
+    Handlers register themselves via :func:`action_handler` and are
+    looked up by the prefix before the first ``.`` in ``action_type``.
+    Unknown prefixes return ``status: error`` so the sandbox sees the
+    failure rather than a silent acknowledgement.
     """
     action_type = action.get("_sdk") or action.get("action") or "unknown"
 
     logger.info("sandbox action: %s", action_type)
 
-    if action_type.startswith("workspace."):
-        result = _handle_workspace_action(action_type, action, ctx)
-    elif action_type.startswith("camera."):
-        result = await _handle_camera_action(action_type, action, ctx)
-    elif action_type.startswith("photos."):
-        result = await _handle_photos_action(action_type, action, ctx)
-    elif action_type.startswith("calendar."):
-        result = await _handle_calendar_action(action_type, action)
-    elif action_type.startswith("auth."):
-        result = await _handle_auth_action(action_type, action)
-    else:
-        # Legacy / unimplemented actions: acknowledge so the sandbox
-        # doesn't block forever if it called request() instead of
-        # emit_action().
-        result = {
-            "status": "stub",
-            "message": f"action '{action_type}' acknowledged but not yet handled.",
+    prefix = action_type.split(".", 1)[0]
+    handler = _HANDLERS.get(prefix)
+    if handler is None:
+        result: dict[str, Any] = {
+            "status": "error",
+            "message": f"unknown action '{action_type}' (no handler registered for prefix '{prefix}')",
         }
+    else:
+        outcome = handler(action_type, action, ctx)
+        if inspect.isawaitable(outcome):
+            outcome = await outcome
+        result = outcome
 
     ctx.action_log.append({"action": action_type, **result})
     return result

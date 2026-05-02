@@ -230,9 +230,9 @@ class TestDisplayBuilder:
         d = create("text_test")
         d.text("Hello World", size="title", color="accent")
         spec = d._build_spec()
-        assert len(spec["layout"]) == 1
-        assert spec["layout"][0]["type"] == "text"
-        assert spec["layout"][0]["content"] == "Hello World"
+        # Single child unwraps — layout IS the text block.
+        assert spec["layout"]["type"] == "text"
+        assert spec["layout"]["content"] == "Hello World"
 
     def test_nested_row_with_children(self):
         from boxbot.sdk.display import create
@@ -241,8 +241,9 @@ class TestDisplayBuilder:
         row.text("Left")
         row.text("Right")
         spec = d._build_spec()
-        assert spec["layout"][0]["type"] == "row"
-        assert len(spec["layout"][0]["children"]) == 2
+        # Single top-level row → layout unwraps to the row itself.
+        assert spec["layout"]["type"] == "row"
+        assert len(spec["layout"]["children"]) == 2
 
     def test_columns_builder(self):
         from boxbot.sdk.display import create
@@ -252,7 +253,7 @@ class TestDisplayBuilder:
         cols[0].text("Wide column")
         cols[1].text("Narrow column")
         spec = d._build_spec()
-        columns_block = spec["layout"][0]
+        columns_block = spec["layout"]
         assert columns_block["type"] == "columns"
         assert columns_block["ratios"] == [2, 1]
 
@@ -261,9 +262,19 @@ class TestDisplayBuilder:
         d = create("metric_test")
         d.metric("{weather.temp}", label="Temperature", icon="thermometer")
         spec = d._build_spec()
-        block = spec["layout"][0]
+        block = spec["layout"]
         assert block["type"] == "metric"
         assert block["value"] == "{weather.temp}"
+
+    def test_multiple_top_level_blocks_wrap_in_column(self):
+        from boxbot.sdk.display import create
+        d = create("multi_test")
+        d.text("first")
+        d.text("second")
+        spec = d._build_spec()
+        # Two siblings → wrapped in implicit column.
+        assert spec["layout"]["type"] == "column"
+        assert len(spec["layout"]["children"]) == 2
 
     def test_chart_requires_data_or_series(self):
         from boxbot.sdk.display import create
@@ -271,15 +282,21 @@ class TestDisplayBuilder:
         with pytest.raises(ValueError, match="requires either"):
             d.chart()
 
-    def test_save_emits_transport_action(self):
+    def test_save_round_trips_through_load(self):
+        from boxbot.sdk import display as display_mod
         from boxbot.sdk.display import create
-        d = create("save_test")
-        d.text("Content")
-        fake_stdout = io.StringIO()
-        with patch("sys.stdout", fake_stdout):
-            d.save()
-        output = fake_stdout.getvalue()
-        assert "display.save" in output
+
+        d = create("rt_test")
+        d.set_theme("midnight")
+        d.data("weather")
+        d.text("{weather.temp}", size="title")
+        spec = d._build_spec()
+
+        # Load uses the same layout shape that save would produce.
+        rebuilt = display_mod.DisplayBuilder._from_spec(spec)
+        rebuilt_spec = rebuilt._build_spec()
+        assert rebuilt_spec["theme"] == "midnight"
+        assert rebuilt_spec["layout"] == spec["layout"]
 
     def test_set_transition(self):
         from boxbot.sdk.display import create
@@ -303,33 +320,66 @@ class TestDisplayBuilder:
 
 
 class TestSkillBuilder:
-    """Test the declarative skill builder API."""
+    """Test the declarative skill builder API.
+
+    Skills are structured prompt data: a SKILL.md (frontmatter + body)
+    plus optional bundled scripts and Level 3 sub-docs. Parameters,
+    env vars, and scheduling belong to integrations, not skills.
+    """
 
     def test_create_returns_skill_builder(self):
         from boxbot.sdk.skill import create
-        s = create("test_skill")
-        assert s.name == "test_skill"
+        s = create("test-skill")
+        assert s.name == "test-skill"
+
+    def test_create_rejects_uppercase(self):
+        from boxbot.sdk.skill import create
+        with pytest.raises(ValueError, match="lowercase"):
+            create("TestSkill")
+
+    def test_create_rejects_reserved_names(self):
+        from boxbot.sdk.skill import create
+        with pytest.raises(ValueError, match="reserved"):
+            create("anthropic")
+        with pytest.raises(ValueError, match="reserved"):
+            create("claude")
+
+    def test_create_rejects_overlong_name(self):
+        from boxbot.sdk.skill import create
+        with pytest.raises(ValueError, match="≤64"):
+            create("a" * 65)
 
     def test_save_without_description_raises(self):
         from boxbot.sdk.skill import create
         s = create("incomplete")
-        s.set_script("print('hi')")
+        s.body = "# Hi"
         with pytest.raises(ValueError, match="description is required"):
             s.save()
 
-    def test_save_without_script_raises(self):
+    def test_save_without_body_raises(self):
         from boxbot.sdk.skill import create
-        s = create("no_script")
-        s.description = "A skill without a script"
-        with pytest.raises(ValueError, match="script is required"):
+        s = create("no-body")
+        s.description = "A skill without a body"
+        with pytest.raises(ValueError, match="body is required"):
             s.save()
 
-    def test_add_parameter(self):
+    def test_description_rejects_overlong(self):
         from boxbot.sdk.skill import create
-        s = create("param_skill")
-        s.description = "Skill with params"
-        s.add_parameter("count", type="integer", default=10, description="Max items")
-        s.set_script("print('run')")
+        s = create("longdesc")
+        with pytest.raises(ValueError, match="≤1024"):
+            s.description = "x" * 1025
+
+    def test_description_rejects_xml(self):
+        from boxbot.sdk.skill import create
+        s = create("xmldesc")
+        with pytest.raises(ValueError, match="XML"):
+            s.description = "Use this <evil>tag</evil>"
+
+    def test_save_emits_minimal_payload(self):
+        from boxbot.sdk.skill import create
+        s = create("weather")
+        s.description = "Get weather forecasts. Use when asked about weather."
+        s.body = "# Weather\n\nUse bb.weather.forecast()."
 
         fake_stdout = io.StringIO()
         with patch("sys.stdout", fake_stdout):
@@ -337,24 +387,63 @@ class TestSkillBuilder:
         output = fake_stdout.getvalue()
         data = json.loads(output.split(_MARKER, 1)[1].strip())
         assert data["_sdk"] == "skill.save"
-        assert len(data["parameters"]) == 1
-        assert data["parameters"][0]["name"] == "count"
-        assert data["parameters"][0]["type"] == "integer"
+        assert data["name"] == "weather"
+        assert data["description"].startswith("Get weather")
+        assert data["body"].startswith("# Weather")
+        assert "scripts" not in data
+        assert "resources" not in data
 
-    def test_add_env_var(self):
+    def test_add_script_emits_in_payload(self):
         from boxbot.sdk.skill import create
-        s = create("env_skill")
-        s.description = "Uses secrets"
-        s.add_env_var("GMAIL_USER", secret=True)
-        s.set_script("import os")
+        s = create("with-script")
+        s.description = "Skill bundling a helper script."
+        s.body = "# With script\n\nSee scripts/helper.py."
+        s.add_script("helper.py", "def go():\n    return 42\n")
 
         fake_stdout = io.StringIO()
         with patch("sys.stdout", fake_stdout):
             s.save()
-        output = fake_stdout.getvalue()
-        data = json.loads(output.split(_MARKER, 1)[1].strip())
-        assert data["env_vars"][0]["name"] == "GMAIL_USER"
-        assert data["env_vars"][0]["secret"] is True
+        data = json.loads(fake_stdout.getvalue().split(_MARKER, 1)[1].strip())
+        assert len(data["scripts"]) == 1
+        assert data["scripts"][0]["filename"] == "helper.py"
+        assert "def go" in data["scripts"][0]["content"]
+
+    def test_add_script_rejects_path_traversal(self):
+        from boxbot.sdk.skill import create
+        s = create("badpath")
+        s.description = "x" * 30
+        s.body = "# x"
+        with pytest.raises(ValueError, match="bare basename"):
+            s.add_script("../escape.py", "x")
+
+    def test_add_script_requires_py_extension(self):
+        from boxbot.sdk.skill import create
+        s = create("ext")
+        s.description = "x" * 30
+        s.body = "# x"
+        with pytest.raises(ValueError, match=r"\.py"):
+            s.add_script("helper.txt", "x")
+
+    def test_add_resource_emits_in_payload(self):
+        from boxbot.sdk.skill import create
+        s = create("with-ref")
+        s.description = "Skill with a Level 3 sub-doc."
+        s.body = "# Skill\n\nSee REFERENCE.md."
+        s.add_resource("REFERENCE.md", "# Reference\n\n…")
+
+        fake_stdout = io.StringIO()
+        with patch("sys.stdout", fake_stdout):
+            s.save()
+        data = json.loads(fake_stdout.getvalue().split(_MARKER, 1)[1].strip())
+        assert data["resources"][0]["filename"] == "REFERENCE.md"
+
+    def test_add_resource_rejects_skill_md(self):
+        from boxbot.sdk.skill import create
+        s = create("res-skill-md")
+        s.description = "x" * 30
+        s.body = "# x"
+        with pytest.raises(ValueError, match="reserved"):
+            s.add_resource("SKILL.md", "x")
 
 
 # ---------------------------------------------------------------------------

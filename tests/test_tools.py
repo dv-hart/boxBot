@@ -154,14 +154,16 @@ class TestExecuteScriptTool:
         assert schema["parameters"]["required"] == ["script", "description"]
 
     @pytest.mark.asyncio
-    async def test_process_action_unknown_returns_stub(self):
+    async def test_process_action_unknown_returns_error(self):
         ctx = ActionContext()
         result = await process_action(
             {"_sdk": "memory.save", "content": "test"}, ctx
         )
-        # memory.* not yet wired to a real handler, so the dispatcher
-        # acknowledges without failing — keeps the sandbox un-blocked.
-        assert result["status"] == "stub"
+        # memory.* has no registered handler — the dispatcher returns an
+        # error so the sandbox sees the failure rather than a silent
+        # acknowledgement that masks unimplemented features.
+        assert result["status"] == "error"
+        assert "memory" in result["message"]
         assert ctx.action_log[-1]["action"] == "memory.save"
 
     @pytest.mark.asyncio

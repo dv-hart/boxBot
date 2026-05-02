@@ -39,6 +39,7 @@ This file is a map. For each module, there is a deeper doc under
 `modules/`:
 
 - `modules/workspace.md` — full API and patterns for the notebook
+- `modules/skill.md` — `bb.skill` API for creating new skills at runtime
 - (further modules land here as they become stable; check `ls modules/`)
 
 Load a module doc only when you need it. The sandbox path to do so:

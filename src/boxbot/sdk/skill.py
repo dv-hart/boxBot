@@ -1,20 +1,42 @@
 """Skill builder — create new agent skills declaratively.
 
-Skills are modular capabilities the agent can invoke. The skill's execution
-logic is a Python script that runs in the sandbox.
+A skill is **structured prompt data**: a SKILL.md file (YAML frontmatter
++ markdown body) you, the agent, will read on demand later, optionally
+bundled with helper scripts under ``scripts/`` and Level 3 sub-docs.
 
-Usage:
-    from boxbot_sdk import skill
+Skills are not callable functions. They have no parameters, no env
+vars, and no schedule. If your use case needs any of those — credential
+storage, scheduled fetches, multi-consumer data — you want an
+**integration** (``src/boxbot/integrations/``), not a skill. See
+``skills/skill_authoring/SKILL.md`` for the full authoring guide.
 
-    s = skill.create("check_gmail")
-    s.description = "Check for unread emails and return summaries"
-    s.add_parameter("max_results", type="integer", default=10)
-    s.set_script('''
-    import imaplib
-    # ...
-    ''')
-    s.add_env_var("GMAIL_USER", secret=True)
+Usage::
+
+    import boxbot_sdk as bb
+
+    s = bb.skill.create("weather")
+    s.description = (
+        "Get NOAA weather forecasts for the configured location. "
+        "Use when the user asks about weather, temperature, or conditions."
+    )
+    s.body = '''
+    # Weather
+
+    Use ``bb.weather.forecast(days=N)`` for an N-day forecast.
+    For hourly precipitation, see HOURLY.md.
+    '''
+    s.add_resource("HOURLY.md", "# Hourly forecast\\n…")
+    s.add_script("nws_raw.py", "import requests\\n…")
     s.save()
+
+The main process writes ``skills/<name>/SKILL.md``, optional resources
+at the skill root, and bundled scripts under ``scripts/`` (with an
+auto-generated ``__init__.py`` so ``from skills.<name>.scripts import
+<file>`` resolves inside ``execute_script``). Files are owned
+``boxbot:boxbot`` mode 0644 — the sandbox can read but not modify them
+after save.
+
+The loader picks the new skill up on the next discovery scan.
 """
 
 from __future__ import annotations
@@ -28,24 +50,30 @@ def create(name: str) -> SkillBuilder:
     """Create a new skill builder.
 
     Args:
-        name: Unique skill name (alphanumeric, underscores, hyphens).
+        name: Skill name. ≤64 chars, lowercase, ``[a-z0-9_-]+``,
+            not ``anthropic`` or ``claude``.
 
     Returns:
         A new SkillBuilder instance.
     """
-    v.validate_name(name, "skill name")
+    v.validate_skill_name(name)
     return SkillBuilder(name)
 
 
 class SkillBuilder:
-    """Builder for defining skills declaratively."""
+    """Builder for defining skills declaratively.
+
+    Skills are documentation, not callable functions. Set ``description``
+    (frontmatter) and ``body`` (markdown), optionally bundle scripts and
+    Level 3 sub-docs, then call ``save()``.
+    """
 
     def __init__(self, name: str) -> None:
         self._name = name
         self._description: str | None = None
-        self._parameters: list[dict[str, Any]] = []
-        self._script: str | None = None
-        self._env_vars: list[dict[str, Any]] = []
+        self._body: str | None = None
+        self._scripts: list[dict[str, str]] = []
+        self._resources: list[dict[str, str]] = []
 
     @property
     def name(self) -> str:
@@ -54,79 +82,87 @@ class SkillBuilder:
 
     @property
     def description(self) -> str | None:
-        """Skill description."""
+        """Skill description (frontmatter)."""
         return self._description
 
     @description.setter
     def description(self, value: str) -> None:
-        v.require_str(value, "description")
+        v.validate_skill_description(value)
         self._description = value
 
-    def add_parameter(self, name: str, *, type: str = "string",
-                      default: Any = None,
-                      required: bool = False,
-                      description: str | None = None) -> None:
-        """Add a parameter to the skill.
+    @property
+    def body(self) -> str | None:
+        """SKILL.md body (markdown)."""
+        return self._body
+
+    @body.setter
+    def body(self, value: str) -> None:
+        v.require_str(value, "body")
+        self._body = value
+
+    def add_script(self, filename: str, content: str) -> None:
+        """Bundle a Python helper script under ``scripts/<filename>``.
+
+        Bundled scripts are importable from ``execute_script`` via
+        ``from skills.<name>.scripts import <module>``. The writer also
+        stamps a ``scripts/__init__.py`` so the import resolves; you do
+        not need to add it yourself.
+
+        Subprocess execution is not available (seccomp blocks
+        ``execve``/``fork``); always import.
 
         Args:
-            name: Parameter name.
-            type: Parameter type — string, integer, float, boolean.
-            default: Default value.
-            required: Whether the parameter is required.
-            description: Parameter description.
+            filename: Script filename, must end in ``.py`` and be a
+                bare basename (no slashes, no traversal).
+            content: Python source code.
         """
-        v.require_str(name, "parameter name")
-        v.validate_one_of(type, "type", v.VALID_SKILL_PARAM_TYPES)
+        v.require_str(filename, "filename")
+        v.require_str(content, "content")
+        if not filename.endswith(".py"):
+            raise ValueError(f"script filename must end in '.py', got '{filename}'")
+        if "/" in filename or "\\" in filename or filename.startswith("."):
+            raise ValueError(f"script filename must be a bare basename, got '{filename}'")
+        self._scripts.append({"filename": filename, "content": content})
 
-        param: dict[str, Any] = {"name": name, "type": type}
-        if default is not None:
-            param["default"] = default
-        if required:
-            param["required"] = True
-        if description is not None:
-            param["description"] = v.require_str(description, "description")
-        self._parameters.append(param)
+    def add_resource(self, filename: str, content: str) -> None:
+        """Bundle a Level 3 sub-doc at the skill root (e.g. ``REFERENCE.md``).
 
-    def set_script(self, script: str) -> None:
-        """Set the Python script that runs when the skill is invoked.
-
-        The script runs in the sandbox with access to the SDK and any
-        declared environment variables.
+        Use for guidance that's too long for the main SKILL.md body.
+        Reference it from the body by filename so future-you knows it
+        exists without paying for it upfront.
 
         Args:
-            script: Python source code.
+            filename: Filename, bare basename, conventionally ``.md``.
+            content: File content.
         """
-        v.require_str(script, "script")
-        self._script = script
-
-    def add_env_var(self, name: str, *, secret: bool = False) -> None:
-        """Declare an environment variable the skill needs at runtime.
-
-        Args:
-            name: Environment variable name.
-            secret: If True, the value is stored in boxbot_sdk.secrets.
-        """
-        v.require_str(name, "env var name")
-        env_var: dict[str, Any] = {"name": name}
-        if secret:
-            env_var["secret"] = True
-        self._env_vars.append(env_var)
+        v.require_str(filename, "filename")
+        v.require_str(content, "content")
+        if "/" in filename or "\\" in filename or filename.startswith("."):
+            raise ValueError(f"resource filename must be a bare basename, got '{filename}'")
+        if filename == "SKILL.md":
+            raise ValueError("'SKILL.md' is reserved — set s.body instead")
+        self._resources.append({"filename": filename, "content": content})
 
     def save(self) -> None:
-        """Save the skill. Auto-activates since skill logic is sandboxed."""
+        """Save the skill. The loader picks it up on next discovery scan.
+
+        Refuses if a skill with the same name already exists — call
+        ``skill.delete`` first (when implemented), or pick a different
+        name. Never silently overwrites a community skill.
+        """
         if self._description is None:
             raise ValueError("Skill description is required — set s.description")
-        if self._script is None:
-            raise ValueError("Skill script is required — call s.set_script()")
+        if self._body is None:
+            raise ValueError("Skill body is required — set s.body")
 
         payload: dict[str, Any] = {
             "name": self._name,
             "description": self._description,
-            "script": self._script,
+            "body": self._body,
         }
-        if self._parameters:
-            payload["parameters"] = self._parameters
-        if self._env_vars:
-            payload["env_vars"] = self._env_vars
+        if self._scripts:
+            payload["scripts"] = self._scripts
+        if self._resources:
+            payload["resources"] = self._resources
 
         _transport.emit_action("skill.save", payload)

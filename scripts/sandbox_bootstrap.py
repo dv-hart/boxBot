@@ -211,6 +211,26 @@ def _maybe_apply_filter() -> None:
             sys.exit(70)
 
 
+def _add_skills_to_path() -> None:
+    """Prepend the project ``skills/`` dir to ``sys.path`` if pointed to.
+
+    Lets bundled skill scripts be imported as ``skills.<name>.scripts.<module>``
+    from inside ``execute_script``. ``BOXBOT_SKILLS_ROOT`` is an absolute
+    path set by ``execute_script`` before spawning the sandbox; if the
+    env var is missing or the path doesn't exist we just skip — bundled
+    imports will then fail with a regular ``ImportError`` rather than
+    silently resolving to something unexpected.
+    """
+    skills_root = os.environ.get("BOXBOT_SKILLS_ROOT")
+    if not skills_root:
+        return
+    parent = os.path.dirname(skills_root.rstrip("/"))
+    if not parent or not os.path.isdir(skills_root):
+        return
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         sys.stderr.write(
@@ -219,6 +239,7 @@ def main(argv: list[str]) -> int:
         return 2
 
     _maybe_apply_filter()
+    _add_skills_to_path()
 
     script_path = argv[1]
     # Hand off to the user script. runpy.run_path mimics ``python script.py``:

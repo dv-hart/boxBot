@@ -63,10 +63,10 @@ data/scheduler/
 
 # User-installed plugins (committed built-ins only)
 skills/*/
-!skills/example_skill/
 !skills/bb/
 !skills/onboarding/
 !skills/hal-sandbox-ref/
+!skills/skill_authoring/
 displays/*/
 !displays/example_display/
 data/credentials/

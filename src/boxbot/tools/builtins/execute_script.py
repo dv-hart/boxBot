@@ -204,6 +204,12 @@ class ExecuteScriptTool(Tool):
         if os.environ.get("BOXBOT_SECCOMP_DISABLE") == "1":
             env["BOXBOT_SECCOMP_DISABLE"] = "1"
 
+        # Project skills/ on the sandbox sys.path so bundled skill scripts
+        # can be imported as ``skills.<name>.scripts.<module>``. The
+        # bootstrap reads this env var and prepends the parent dir.
+        from boxbot.skills.loader import _DEFAULT_SKILLS_ROOT
+        env["BOXBOT_SKILLS_ROOT"] = str(_DEFAULT_SKILLS_ROOT)
+
         enforce_sandbox = os.environ.get("BOXBOT_SANDBOX_ENFORCE", "1") != "0"
         if enforce_sandbox and sandbox_user:
             cmd = [
@@ -211,7 +217,7 @@ class ExecuteScriptTool(Tool):
                 # Forward the seccomp env vars across the sudo boundary
                 # — sudo strips the environment by default, so we have
                 # to opt them in explicitly.
-                "--preserve-env=BOXBOT_SECCOMP_MODE,BOXBOT_SECCOMP_DISABLE",
+                "--preserve-env=BOXBOT_SECCOMP_MODE,BOXBOT_SECCOMP_DISABLE,BOXBOT_SKILLS_ROOT",
                 "-u", sandbox_user,
                 "--", str(venv_python), str(bootstrap_path),
                 str(script_path),

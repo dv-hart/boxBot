@@ -64,9 +64,9 @@ SDK emits structured JSON to stdout:
 execute_script tool (main process) applies:
 ┌──────────────────────────────────────────┐
 │  Validates spec against block schemas    │
-│  Writes to displays/weather_board/       │
-│  Queues user approval for activation     │
-│  Returns confirmation to agent           │
+│  Writes data/displays/weather_board.json │
+│  Registers with the display manager      │
+│  Returns confirmation to the agent       │
 └──────────────────────────────────────────┘
 ```
 
@@ -106,8 +106,8 @@ day_col.text("{.day}", size="caption", color="muted")
 day_col.icon("{.icon}", size="sm")
 day_col.text("{.high}°/{.low}°", size="small")
 
-d.preview()    # render to PNG, agent views the image
-d.save()       # emit spec, main process queues for user approval
+d.preview()    # render to PNG; the image attaches to the tool result
+d.save()       # write spec + register with display manager (live)
 ```
 
 **Layout containers (7):** `row`, `column`/`stack`, `columns` (with
@@ -141,37 +141,48 @@ validated block implementations.
 
 ### `skill` — Skill Builder
 
-Create new skills. The skill's execution logic is a Python script that
-runs in the sandbox.
+Create new skills. A skill is **structured prompt data** — a SKILL.md
+(YAML frontmatter + markdown body) the agent reads on demand later,
+optionally bundled with helper scripts under `scripts/` and Level 3
+sub-docs at the skill root.
+
+Skills are not callable functions — there are no parameters, env vars,
+or scheduling. If you need any of those, what you actually want is an
+**integration** (`src/boxbot/integrations/`), not a skill. See
+`skills/skill_authoring/SKILL.md` for the full authoring guide.
 
 ```python
-from boxbot_sdk import skill
+import boxbot_sdk as bb
 
-s = skill.create("check_gmail")
-s.description = "Check for unread emails and return summaries"
-s.add_parameter("max_results", type="integer", default=10)
-s.add_parameter("label", type="string", default="INBOX")
+s = bb.skill.create("weather")
+s.description = (
+    "Get NOAA weather forecasts for the configured location. "
+    "Use when the user asks about weather, temperature, or conditions."
+)
+s.body = """
+# Weather
 
-# The script that runs when the skill is invoked
-s.set_script('''
-import imaplib
-import email
-import json
-import os
+Use `bb.weather.forecast(days=N)` to get an N-day forecast.
+For hourly precipitation detail, see HOURLY.md.
+"""
 
-mail = imaplib.IMAP4_SSL("imap.gmail.com")
-mail.login(os.environ["GMAIL_USER"], os.environ["GMAIL_APP_PASSWORD"])
-mail.select(params.get("label", "INBOX"))
-_, data = mail.search(None, "UNSEEN")
-# ... process and print results ...
-''')
+# Optional Level 3 sub-doc — referenced from the body, loaded on demand
+s.add_resource("HOURLY.md", "# Hourly forecast\n\n…")
 
-# Environment variables this skill needs at runtime
-s.add_env_var("GMAIL_USER", secret=True)
-s.add_env_var("GMAIL_APP_PASSWORD", secret=True)
+# Optional bundled helper script — importable as
+# `from skills.weather.scripts import nws_raw` inside execute_script.
+# The writer auto-stamps a sibling __init__.py so the import resolves.
+s.add_script("nws_raw.py", "import requests\n…")
 
-s.save()  # auto-activates (skill logic is sandboxed)
+s.save()  # loader picks it up on next discovery scan
 ```
+
+**Validation** (per Anthropic's Agent Skills spec):
+- `name`: ≤64 chars, lowercase, `[a-z0-9_-]+`, not `anthropic`/`claude`
+- `description`: ≤1024 chars, non-empty, no XML brackets
+
+**Conflict policy:** if `skills/<name>/` already exists, save fails
+with `status: "exists"`. Skills are never silently overwritten.
 
 ### `packages` — Package Manager
 
@@ -348,8 +359,10 @@ tasks.cancel("trigger_xyz789")
    Invalid specs are rejected with clear error messages
 3. **Declarative displays** — the agent describes what to show using
    building blocks, never writes raw render code that runs in main process
-4. **Approval gates** — `display.save()` queues for user approval,
-   `packages.request()` blocks for user approval
+4. **Approval gates** — `packages.request()` blocks for out-of-band
+   human approval (screen tap or admin WhatsApp YES). Display saves do
+   *not* gate: the render spec is declarative, so there is no executable
+   code path to police
 5. **No core access** — the SDK cannot import from `boxbot.*` (different
    venv). It communicates only through structured JSON actions
 6. **Auditable** — every SDK action is logged with timestamp and context

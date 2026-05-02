@@ -394,43 +394,61 @@ inputs and generate correct output.
 
 ### Creating Skills (Lower Risk)
 
+Skills are structured prompt data — markdown instructions BB reads on
+demand, optionally bundled with helper scripts. They are *not* callable
+functions with parameters. Data pipelines, scheduled fetchers, and
+service connectors belong in **integrations** instead (see
+`src/boxbot/integrations/`); a skill points at the relevant integration
+when one exists.
+
 The agent writes a script that uses `boxbot_sdk.skill`:
 
 ```python
 from boxbot_sdk import skill
 
-s = skill.create("check_gmail")
-s.description = "Check for unread emails and return summaries"
-s.add_parameter("max_results", type="integer", default=10)
-s.set_script('''
-import imaplib, email, json, os
-mail = imaplib.IMAP4_SSL("imap.gmail.com")
-mail.login(os.environ["GMAIL_USER"], os.environ["GMAIL_APP_PASSWORD"])
-# ... fetch and format unread emails ...
-''')
-s.add_env_var("GMAIL_USER", secret=True)
-s.add_env_var("GMAIL_APP_PASSWORD", secret=True)
+s = skill.create("weather")
+s.description = (
+    "Get NOAA weather forecasts for the configured location. "
+    "Use when the user asks about weather, temperature, rain, or conditions."
+)
+s.body = """
+# Weather
+
+Use `bb.weather.forecast(days=N)` to get an N-day forecast. For hourly
+detail, see HOURLY.md. For raw NWS request structure, see scripts/nws_raw.py.
+"""
+s.add_resource("HOURLY.md", "# Hourly forecast\n...")  # Level 3 sub-doc
+s.add_script("nws_raw.py", "import requests\n...")     # bundled helper
 s.save()
 ```
 
-The SDK emits a structured action. The `execute_script` tool (main
-process) generates the skill directory:
+The SDK emits a structured `skill.save` action. The main-process handler
+generates the skill directory:
 
 ```
 skills/
-  check_gmail/
-    __init__.py        # Generated thin wrapper — delegates to run_script()
-    skill.yaml         # Generated metadata
+  weather/
+    SKILL.md          # frontmatter (name, description) + body markdown
+    HOURLY.md         # optional Level 3 sub-doc
     scripts/
-      check_gmail.py   # The script the agent provided
+      __init__.py     # auto-written so `from skills.weather.scripts import nws_raw` works
+      nws_raw.py      # the helper the agent provided
 ```
 
-The generated `__init__.py` is always the same template — a Skill
-subclass that delegates execution to the sandbox. The agent never writes
-this file directly.
+`SKILL.md` is the canonical descriptor — frontmatter plus body, matching
+Anthropic's Agent Skills format. `discover_skills()` scans for it on
+startup. There is no `skill.yaml` and no generated `__init__.py` at the
+skill root; skills are read by BB as documentation, not imported as
+Python modules.
 
 **Policy:** `auto_activate_skills: true` — agent-created skills activate
-immediately because their logic is sandboxed.
+immediately because their logic is sandboxed and the loader picks them
+up on the next discovery scan.
+
+**Permissions:** `skills/` files are written by the main process owned
+`boxbot:boxbot` mode `0644`. The sandbox can read but not modify them
+after save, so a later sandbox script cannot tamper with what an
+earlier one wrote.
 
 ### Creating Displays (Declarative Block System)
 
@@ -466,8 +484,8 @@ header.metric(value="${current.price}", change="{current.change_pct}%",
 
 d.chart(data="{current.history}", type="area", color="accent", height=300)
 
-d.preview()    # render to PNG, agent views it before saving
-d.save()       # emit spec, queue for user approval
+d.preview()    # render to PNG, attached to the tool result
+d.save()       # write spec + register live with the display manager
 ```
 
 The SDK emits a display **spec** (JSON). The rendering engine draws it
@@ -490,15 +508,11 @@ value → icon/color mapping without conditional logic.
 
 See [display-system.md](display-system.md) for the complete design.
 
-**Policy:** `auto_activate_displays: false` — agent-created displays are
-saved but **inactive** until the user confirms.
-
-```
-Agent: "I've created a stock tracker display. It will show your
-       portfolio with live prices. Want me to activate it?"
-User:  "Yeah, turn it on."
-Agent: activates display, adds to rotation
-```
+**Policy:** displays auto-activate. The render spec is purely
+declarative (a tree of validated blocks bound to data sources) — no
+executable code reaches the main process, so there is nothing to gate.
+``save()`` writes the spec and registers it live; the agent can call
+``switch_display(name)`` immediately.
 
 ### Why This Is Safer Than Raw Code
 

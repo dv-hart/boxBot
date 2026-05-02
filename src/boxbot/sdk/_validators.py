@@ -50,6 +50,14 @@ VALID_TODO_STATUSES = {"pending", "completed", "cancelled"}
 
 VALID_SKILL_PARAM_TYPES = {"string", "integer", "float", "boolean"}
 
+# Reserved skill names per Anthropic's Agent Skills spec — must not be used.
+RESERVED_SKILL_NAMES = {"anthropic", "claude"}
+
+# Hard caps from Anthropic's Agent Skills spec.
+SKILL_NAME_MAX_LEN = 64
+SKILL_DESCRIPTION_MAX_LEN = 1024
+SKILL_BODY_SOFT_MAX = 5 * 1024  # body should be ≤5KB; longer split to Level 3 sub-docs
+
 
 # --- Validation helpers ---
 
@@ -170,6 +178,50 @@ def validate_name(value: str, kind: str = "name") -> str:
             f"'{kind}' must contain only alphanumeric characters, "
             f"underscores, and hyphens, got '{value}'"
         )
+    return value
+
+
+def validate_skill_name(value: str) -> str:
+    """Validate a skill name per Anthropic's Agent Skills spec.
+
+    Stricter than ``validate_name``: enforces lowercase, ≤64-char cap,
+    and rejects the reserved words ``anthropic`` / ``claude``.
+    Underscores are kept (project convention; existing skills use them).
+    """
+    require_str(value, "skill name")
+    if value != value.lower():
+        raise ValueError(f"skill name must be lowercase, got '{value}'")
+    if len(value) > SKILL_NAME_MAX_LEN:
+        raise ValueError(
+            f"skill name must be ≤{SKILL_NAME_MAX_LEN} chars, got {len(value)}"
+        )
+    if value.lower() in RESERVED_SKILL_NAMES:
+        raise ValueError(
+            f"'{value}' is a reserved skill name and cannot be used"
+        )
+    if "<" in value or ">" in value:
+        raise ValueError(f"skill name must not contain XML brackets, got '{value}'")
+    if not value.replace("_", "").replace("-", "").isalnum():
+        raise ValueError(
+            f"skill name must contain only lowercase letters, digits, "
+            f"underscores, and hyphens, got '{value}'"
+        )
+    return value
+
+
+def validate_skill_description(value: str) -> str:
+    """Validate a skill description per Anthropic's Agent Skills spec.
+
+    ≤1024 chars, non-empty, no XML brackets.
+    """
+    require_str(value, "description")
+    if len(value) > SKILL_DESCRIPTION_MAX_LEN:
+        raise ValueError(
+            f"description must be ≤{SKILL_DESCRIPTION_MAX_LEN} chars, "
+            f"got {len(value)}"
+        )
+    if "<" in value or ">" in value:
+        raise ValueError("description must not contain XML brackets")
     return value
 
 

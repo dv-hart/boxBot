@@ -118,11 +118,11 @@ class TestAuthActions:
     @pytest.mark.asyncio
     async def test_list_users_empty(self, auth_manager: AuthManager):
         from boxbot.communication import auth as auth_module
-        from boxbot.tools._sandbox_actions import _handle_auth_action
+        from boxbot.tools._sandbox_actions import ActionContext, _handle_auth_action
 
         auth_module.set_auth_manager(auth_manager)
         try:
-            r = await _handle_auth_action("auth.list_users", {})
+            r = await _handle_auth_action("auth.list_users", {}, ActionContext())
             assert r["status"] == "ok"
             assert r["users"] == []
         finally:
@@ -133,11 +133,11 @@ class TestAuthActions:
         self, auth_manager: AuthManager
     ):
         from boxbot.communication import auth as auth_module
-        from boxbot.tools._sandbox_actions import _handle_auth_action
+        from boxbot.tools._sandbox_actions import ActionContext, _handle_auth_action
 
         auth_module.set_auth_manager(auth_manager)
         try:
-            r = await _handle_auth_action("auth.generate_bootstrap_code", {})
+            r = await _handle_auth_action("auth.generate_bootstrap_code", {}, ActionContext())
             assert r["status"] == "ok"
             assert r["code"].isdigit()
             assert len(r["code"]) == 6
@@ -149,13 +149,13 @@ class TestAuthActions:
         self, auth_manager: AuthManager
     ):
         from boxbot.communication import auth as auth_module
-        from boxbot.tools._sandbox_actions import _handle_auth_action
+        from boxbot.tools._sandbox_actions import ActionContext, _handle_auth_action
 
         boot = await auth_manager.generate_bootstrap_code()
         await auth_manager.register_user("+15550000001", "Admin", boot)
         auth_module.set_auth_manager(auth_manager)
         try:
-            r = await _handle_auth_action("auth.generate_bootstrap_code", {})
+            r = await _handle_auth_action("auth.generate_bootstrap_code", {}, ActionContext())
             assert r["status"] == "error"
             assert "admin" in r["error"].lower()
         finally:
@@ -167,7 +167,7 @@ class TestAuthActions:
     ):
         """The sandbox cannot mint codes — only admins in a WhatsApp turn can."""
         from boxbot.communication import auth as auth_module
-        from boxbot.tools._sandbox_actions import _handle_auth_action
+        from boxbot.tools._sandbox_actions import ActionContext, _handle_auth_action
 
         boot = await auth_manager.generate_bootstrap_code()
         await auth_manager.register_user("+15550000001", "Admin", boot)
@@ -175,7 +175,7 @@ class TestAuthActions:
         try:
             # No conversation context → refuse
             r = await _handle_auth_action(
-                "auth.generate_registration_code", {}
+                "auth.generate_registration_code", {}, ActionContext()
             )
             assert r["status"] == "error"
             assert "whatsapp" in r["error"].lower()
@@ -187,7 +187,7 @@ class TestAuthActions:
         self, auth_manager: AuthManager
     ):
         from boxbot.communication import auth as auth_module
-        from boxbot.tools._sandbox_actions import _handle_auth_action
+        from boxbot.tools._sandbox_actions import ActionContext, _handle_auth_action
         from boxbot.tools._tool_context import current_conversation
 
         boot = await auth_manager.generate_bootstrap_code()
@@ -202,7 +202,7 @@ class TestAuthActions:
         token = current_conversation.set(fake_conv)
         try:
             r = await _handle_auth_action(
-                "auth.generate_registration_code", {}
+                "auth.generate_registration_code", {}, ActionContext()
             )
             assert r["status"] == "ok"
             assert r["code"].isdigit()
@@ -215,7 +215,7 @@ class TestAuthActions:
         self, auth_manager: AuthManager
     ):
         from boxbot.communication import auth as auth_module
-        from boxbot.tools._sandbox_actions import _handle_auth_action
+        from boxbot.tools._sandbox_actions import ActionContext, _handle_auth_action
         from boxbot.tools._tool_context import current_conversation
 
         boot = await auth_manager.generate_bootstrap_code()
@@ -233,7 +233,7 @@ class TestAuthActions:
         token = current_conversation.set(fake_conv)
         try:
             r = await _handle_auth_action(
-                "auth.generate_registration_code", {}
+                "auth.generate_registration_code", {}, ActionContext()
             )
             assert r["status"] == "error"
             assert "admin" in r["error"].lower()
@@ -247,7 +247,7 @@ class TestAuthActions:
     ):
         from boxbot.communication import auth as auth_module
         from boxbot.communication import whatsapp as wa_module
-        from boxbot.tools._sandbox_actions import _handle_auth_action
+        from boxbot.tools._sandbox_actions import ActionContext, _handle_auth_action
 
         boot = await auth_manager.generate_bootstrap_code()
         await auth_manager.register_user("+15550000001", "Admin", boot)
@@ -258,7 +258,7 @@ class TestAuthActions:
         auth_module.set_auth_manager(auth_manager)
         try:
             r = await _handle_auth_action(
-                "auth.notify_admins", {"text": "hello admins"}
+                "auth.notify_admins", {"text": "hello admins"}, ActionContext()
             )
             assert r["status"] == "ok"
             assert r["delivered"] == 1

@@ -226,11 +226,23 @@ async def _init_hal(config: Any) -> dict[str, Any]:
     try:
         from boxbot.hardware.camera import Camera, set_camera
 
+        cam_cfg = config.hardware.camera
         camera = Camera(
-            rotation=config.hardware.camera.rotation,
+            rotation=cam_cfg.rotation,
             main_resolution=tuple(config.camera.resolution),
-            lores_resolution=tuple(config.hardware.camera.lores_resolution),
+            lores_resolution=tuple(cam_cfg.lores_resolution),
             scan_fps=config.camera.scan_fps,
+            colour_gains=(
+                tuple(cam_cfg.colour_gains)  # type: ignore[arg-type]
+                if cam_cfg.colour_gains is not None
+                else None
+            ),
+            colour_correction_matrix=(
+                tuple(cam_cfg.colour_correction_matrix)
+                if cam_cfg.colour_correction_matrix is not None
+                else None
+            ),
+            saturation=cam_cfg.saturation,
         )
         await camera.start()
         system.register_module(camera)

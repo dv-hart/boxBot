@@ -218,11 +218,24 @@ class CameraConfig(BaseModel):
 
 
 class HardwareCameraConfig(BaseModel):
-    """Camera hardware-level settings (rotation, stream resolutions)."""
+    """Camera hardware-level settings (rotation, stream resolutions, colour)."""
 
     rotation: int = 180
     lores_resolution: list[int] = Field(default_factory=lambda: [320, 240])
     photo_resolution: list[int] = Field(default_factory=lambda: [4608, 2592])
+
+    # Colour correction. The IMX708 NoIR has no IR-cut filter, so daylight
+    # captures pick up an IR cast. When both fields are set, AWB is disabled
+    # and these fixed values are applied via picamera2 set_controls.
+    # Calibrate per install — see scripts/calibrate_colour.py.
+    colour_gains: list[float] | None = None  # [red_gain, blue_gain]
+    colour_correction_matrix: list[float] | None = None  # 9 values, row-major 3x3
+
+    # Saturation multiplier. 1.0 = normal colour, 0.0 = monochrome. Useful
+    # stopgap on NoIR sensors with severe IR cast — produces honest greyscale
+    # rather than colour-shifted nonsense. Restore to 1.0 once an IR-cut
+    # filter is installed.
+    saturation: float = 1.0
 
 
 class HardwareHailoConfig(BaseModel):

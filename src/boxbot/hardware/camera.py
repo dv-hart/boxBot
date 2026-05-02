@@ -59,12 +59,18 @@ class Camera(HardwareModule):
         main_resolution: tuple[int, int] = (1280, 720),
         lores_resolution: tuple[int, int] = (320, 240),
         scan_fps: int = 5,
+        colour_gains: tuple[float, float] | None = None,
+        colour_correction_matrix: tuple[float, ...] | None = None,
+        saturation: float = 1.0,
     ) -> None:
         super().__init__()
         self._rotation = rotation
         self._main_resolution = main_resolution
         self._lores_resolution = lores_resolution
         self._scan_fps = scan_fps
+        self._colour_gains = colour_gains
+        self._colour_correction_matrix = colour_correction_matrix
+        self._saturation = saturation
 
         # Set by start(), typed as Any to avoid import at module level
         self._picam2: Any = None
@@ -123,6 +129,19 @@ class Camera(HardwareModule):
         )
 
         self._picam2.start()
+
+        # Colour correction (NoIR sensor — see HardwareCameraConfig docstring).
+        # Both gains and CCM must be set together; otherwise AWB stays on.
+        controls: dict[str, Any] = {}
+        if self._colour_gains is not None and self._colour_correction_matrix is not None:
+            controls["AwbEnable"] = False
+            controls["ColourGains"] = tuple(self._colour_gains)
+            controls["ColourCorrectionMatrix"] = tuple(self._colour_correction_matrix)
+        if self._saturation != 1.0:
+            controls["Saturation"] = float(self._saturation)
+        if controls:
+            self._picam2.set_controls(controls)
+            logger.info("Camera controls applied: %s", controls)
 
     async def stop(self) -> None:
         """Stop camera and release resources."""

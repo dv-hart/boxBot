@@ -64,12 +64,25 @@ display:
 # ── Hardware ──────────────────────────────────────────────────────────
 hardware:
   camera:
-    # Sensor rotation (degrees, applied by picamera2)
-    rotation: 180
+    # Sensor rotation (degrees, applied by picamera2). 0 if mounted
+    # right-side-up; 180 if upside-down; 90/270 if rotated sideways.
+    rotation: 0
     # Low-res stream for CPU motion detection [width, height]
     lores_resolution: [320, 240]
     # Full-res photo capture resolution [width, height]
     photo_resolution: [4608, 2592]
+    # Colour correction for the NoIR sensor (no IR-cut filter, daylight
+    # captures pick up an IR cast). Both must be set together; otherwise
+    # AWB-auto is left on. Calibrate against a known-colour reference —
+    # see scripts/calibrate_colour.py.
+    # colour_gains: [red_gain, blue_gain]
+    # colour_correction_matrix: 9 floats, row-major 3x3
+    colour_gains: null
+    colour_correction_matrix: null
+    # Saturation. 1.0 = normal, 0.0 = monochrome. Set to 0.0 as a stopgap
+    # on a NoIR sensor with no IR-cut filter — produces honest greyscale
+    # rather than IR-shifted colour. Restore once a filter is installed.
+    saturation: 1.0
   hailo:
     # Model paths for Hailo-8L inference
     models:

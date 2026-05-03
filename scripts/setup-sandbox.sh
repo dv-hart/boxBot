@@ -309,6 +309,13 @@ if [[ -d "$PROJECT_DIR/displays" ]]; then
     find "$PROJECT_DIR/displays" -type f -exec sudo chmod 640 {} +
 fi
 
+# -- Integrations directory: group-readable (runner spawns as sandbox user) --
+if [[ -d "$PROJECT_DIR/integrations" ]]; then
+    sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$PROJECT_DIR/integrations"
+    find "$PROJECT_DIR/integrations" -type d -exec sudo chmod 750 {} +
+    find "$PROJECT_DIR/integrations" -type f -exec sudo chmod 640 {} +
+fi
+
 # -- .env: owner-only (sandbox CANNOT read secrets) --
 if [[ -f "$PROJECT_DIR/.env" ]]; then
     sudo chown "$REAL_USER:$REAL_USER" "$PROJECT_DIR/.env"

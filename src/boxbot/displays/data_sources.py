@@ -138,7 +138,7 @@ class WeatherSource(DataSource):
     async def fetch(self) -> dict[str, Any]:
         import os
 
-        from boxbot.integrations import noaa_weather as wx
+        from boxbot.integrations.runner import IntegrationRunError, run
 
         lat = self.config.get("lat")
         lon = self.config.get("lon")
@@ -154,15 +154,30 @@ class WeatherSource(DataSource):
             return _weather_placeholder()
 
         try:
-            data = await wx.fetch_weather(
-                lat=float(lat),
-                lon=float(lon),
-                forecast_days=int(self.config.get("forecast_days", 5)),
+            result = await run(
+                "weather",
+                {
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "forecast_days": int(self.config.get("forecast_days", 5)),
+                },
             )
-        except Exception as e:
-            logger.warning("Weather fetch failed: %s", e)
+        except IntegrationRunError as e:
+            logger.warning("Weather integration not registered: %s", e)
+            return _weather_placeholder()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Weather integration call failed: %s", e)
             return _weather_placeholder()
 
+        if result.get("status") != "ok":
+            logger.warning(
+                "Weather integration returned %s: %s",
+                result.get("status"),
+                result.get("error", "no error message"),
+            )
+            return _weather_placeholder()
+
+        data = result.get("output") or {}
         if not data:
             return _weather_placeholder()
         return data
@@ -571,36 +586,62 @@ def _apply_field_transforms(data: dict[str, Any],
     """Apply field extraction and mapping transforms to raw data.
 
     The 'fields' config maps output field names to either:
-    - A string: simple field rename (extract from raw data)
-    - A dict with 'from' and 'map': value mapping transform
+    - A string: dotted path into raw data (e.g. "main.temp"). Single
+      keys still work as before; nested API responses no longer require
+      separate post-processing.
+    - A dict with 'from' (dotted path) and 'map' (value→value): value
+      mapping transform.
 
     Args:
         data: Raw fetched data.
         fields: Field extraction/mapping config.
 
     Returns:
-        Transformed data dict.
+        Transformed data dict — original keys plus the extracted ones.
     """
     if not fields:
         return data
 
-    result = dict(data)  # Start with all raw fields
+    result = dict(data) if isinstance(data, dict) else {}
 
     for output_name, spec in fields.items():
         if isinstance(spec, str):
-            # Simple rename: output_name = data[spec]
-            result[output_name] = data.get(spec)
+            result[output_name] = _dotted_get(data, spec)
         elif isinstance(spec, dict):
-            # Map transform
             from_field = spec.get("from", "")
             mapping = spec.get("map", {})
-            raw_value = data.get(from_field)
+            raw_value = _dotted_get(data, from_field)
             if raw_value is not None and mapping:
                 result[output_name] = mapping.get(str(raw_value), raw_value)
             else:
                 result[output_name] = raw_value
 
     return result
+
+
+def _dotted_get(data: Any, path: str) -> Any:
+    """Walk a dotted path into nested dicts/lists.
+
+    Examples: ``"temp"``, ``"main.temp"``, ``"items.0.name"``. Returns
+    ``None`` if any segment is missing — never raises, since fetch-time
+    transforms must not crash a display refresh on malformed payloads.
+    """
+    if not path:
+        return data
+    current: Any = data
+    for segment in path.split("."):
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(segment)
+        elif isinstance(current, list):
+            try:
+                current = current[int(segment)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            current = getattr(current, segment, None)
+    return current
 
 
 # ---------------------------------------------------------------------------

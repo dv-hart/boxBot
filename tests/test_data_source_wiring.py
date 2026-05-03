@@ -205,19 +205,33 @@ class TestAgentStateTracker:
 
 
 class TestWeatherSourceWiring:
-    async def test_returns_data_from_noaa(self):
-        from boxbot.integrations import noaa_weather as wx
+    """WeatherSource now goes through the integration runner.
 
-        async def fake_fetch(*, lat, lon, forecast_days=5):
-            assert lat == 47.6062
-            assert lon == -122.3321
+    The pure-data logic (icon mapping, day/night forecast pairing)
+    moved into ``integrations/weather/script.py``. End-to-end coverage
+    of that logic lives in ``tests/test_integration_runner.py`` once
+    the weather integration is registered against a test root.
+    """
+
+    async def test_returns_data_from_runner(self):
+        from boxbot.integrations import runner as runner_mod
+
+        async def fake_run(name, inputs, *, timeout_override=None):
+            assert name == "weather"
+            assert inputs["lat"] == 47.6062
+            assert inputs["lon"] == -122.3321
             return {
-                "temp": "62", "condition": "Cloudy", "icon": "cloud",
-                "humidity": "85", "wind": "10 mph SW",
-                "forecast": [{"day": "Mon", "icon": "sun", "high": "68", "low": "52"}],
+                "status": "ok",
+                "output": {
+                    "temp": "62", "condition": "Cloudy", "icon": "cloud",
+                    "humidity": "85", "wind": "10 mph SW",
+                    "forecast": [
+                        {"day": "Mon", "icon": "sun", "high": "68", "low": "52"}
+                    ],
+                },
             }
 
-        with patch.object(wx, "fetch_weather", new=fake_fetch):
+        with patch.object(runner_mod, "run", new=fake_run):
             data = await WeatherSource(
                 {"lat": 47.6062, "lon": -122.3321}
             ).fetch()
@@ -235,69 +249,29 @@ class TestWeatherSourceWiring:
             data = await WeatherSource().fetch()
         assert "icon" in data  # placeholder has icon
 
-    async def test_falls_back_to_placeholder_on_fetch_failure(self):
-        from boxbot.integrations import noaa_weather as wx
+    async def test_falls_back_to_placeholder_on_runner_error(self):
+        from boxbot.integrations import runner as runner_mod
 
-        async def boom(**kwargs):
-            raise RuntimeError("API down")
+        async def boom(name, inputs, *, timeout_override=None):
+            return {"status": "error", "error": "API down"}
 
-        with patch.object(wx, "fetch_weather", new=boom):
+        with patch.object(runner_mod, "run", new=boom):
             data = await WeatherSource(
                 {"lat": 47.6062, "lon": -122.3321}
             ).fetch()
         assert "icon" in data  # placeholder fallback
 
+    async def test_falls_back_to_placeholder_on_unregistered_integration(self):
+        from boxbot.integrations import runner as runner_mod
 
-class TestNOAAIconMapping:
-    def test_maps_common_conditions(self):
-        from boxbot.integrations.noaa_weather import _map_icon
+        async def absent(name, inputs, *, timeout_override=None):
+            raise runner_mod.IntegrationRunError(f"unknown integration '{name}'")
 
-        assert _map_icon("Sunny", {"isDaytime": True}) == "sun"
-        assert _map_icon("Clear", {"isDaytime": False}) == "moon"
-        assert _map_icon("Partly Cloudy", {"isDaytime": True}) == "cloud-sun"
-        assert _map_icon("Partly Cloudy", {"isDaytime": False}) == "cloud-moon"
-        assert _map_icon("Cloudy", {"isDaytime": True}) == "cloud"
-        assert _map_icon("Light Rain", {"isDaytime": True}) == "cloud-drizzle"
-        assert _map_icon("Heavy Rain", {"isDaytime": True}) == "cloud-rain"
-        assert _map_icon("Snow Showers", {"isDaytime": True}) == "cloud-snow"
-        assert _map_icon("Thunderstorms", {"isDaytime": True}) == "cloud-lightning"
-        assert _map_icon("Foggy", {"isDaytime": True}) == "cloud-fog"
-
-    def test_falls_back_for_unknown(self):
-        from boxbot.integrations.noaa_weather import _map_icon
-
-        # Unknown condition with "cloud" word
-        assert _map_icon("Unknown cloud thing", {"isDaytime": True}) == "cloud"
-        # Pure unknown
-        assert _map_icon("Bizarre weather", {"isDaytime": True}) == "sun"
-
-
-class TestNOAAForecastBuilding:
-    def test_pairs_day_and_night(self):
-        from boxbot.integrations.noaa_weather import _build_forecast
-
-        periods = [
-            {"name": "Friday", "isDaytime": True, "temperature": 75,
-             "shortForecast": "Sunny",
-             "startTime": "2026-04-24T06:00:00-07:00"},
-            {"name": "Friday Night", "isDaytime": False, "temperature": 55,
-             "shortForecast": "Clear",
-             "startTime": "2026-04-24T18:00:00-07:00"},
-            {"name": "Saturday", "isDaytime": True, "temperature": 78,
-             "shortForecast": "Mostly Sunny",
-             "startTime": "2026-04-25T06:00:00-07:00"},
-            {"name": "Saturday Night", "isDaytime": False, "temperature": 58,
-             "shortForecast": "Partly Cloudy",
-             "startTime": "2026-04-25T18:00:00-07:00"},
-        ]
-
-        result = _build_forecast(periods, days=5)
-        assert len(result) == 2
-        assert result[0]["day"] == "Fri"
-        assert result[0]["high"] == "75"
-        assert result[0]["low"] == "55"
-        assert result[1]["high"] == "78"
-        assert result[1]["low"] == "58"
+        with patch.object(runner_mod, "run", new=absent):
+            data = await WeatherSource(
+                {"lat": 47.6062, "lon": -122.3321}
+            ).fetch()
+        assert "icon" in data
 
 
 class TestCalendarIntegrationNormalization:

@@ -13,8 +13,9 @@ when to use them, gotchas, examples. Optional bundled scripts under
 
 Skills are not callable functions. They have no parameters, no env vars,
 no schedule. If you need any of those, what you actually want is an
-**integration** (`src/boxbot/integrations/`), not a skill — see
-[Skill vs. integration](#skill-vs-integration) below.
+**integration** (a manifest+script bundle under `integrations/<name>/` —
+see `bb.integrations` and [Skill vs. integration](#skill-vs-integration)
+below), not a skill.
 
 ## When to write a skill
 
@@ -141,7 +142,7 @@ already exists, save fails with `status: "exists"` — delete it first
 
 | | Skill | Integration |
 |---|---|---|
-| Form | SKILL.md + optional bundled scripts | Python module under `src/boxbot/integrations/` |
+| Form | SKILL.md + optional bundled scripts | `integrations/<name>/{manifest.yaml, script.py}` (sandbox-runnable bundle) |
 | Stateful? | No | Yes (creds, cached values, refresh tokens) |
 | Runs on its own? | No, inert until triggered | Yes, on a schedule or events |
 | Consumers | The agent, in one conversation | Many: displays, scheduler, agent SDK, briefings |

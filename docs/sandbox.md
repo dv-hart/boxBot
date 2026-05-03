@@ -398,8 +398,9 @@ Skills are structured prompt data — markdown instructions BB reads on
 demand, optionally bundled with helper scripts. They are *not* callable
 functions with parameters. Data pipelines, scheduled fetchers, and
 service connectors belong in **integrations** instead (see
-`src/boxbot/integrations/`); a skill points at the relevant integration
-when one exists.
+[docs/integrations.md](integrations.md) for the paradigm and
+`integrations/` at the repo root for the bundles); a skill points
+at the relevant integration when one exists.
 
 The agent writes a script that uses `boxbot_sdk.skill`:
 
@@ -450,46 +451,54 @@ up on the next discovery scan.
 after save, so a later sandbox script cannot tamper with what an
 earlier one wrote.
 
-### Creating Displays (Declarative Block System)
+### Creating Displays (JSON Specs)
 
 Displays run in the main process, so the agent **cannot write arbitrary
-display code**. Instead, it uses `boxbot_sdk.display` to compose displays
-from a block library — layout containers handle positioning, content
-blocks handle rendering, and themes handle styling:
+display code**. The display SDK exposes a tiny CRUD interface over JSON
+spec dicts — the agent reads, edits, and writes the dict like any other
+data file. Layout containers handle positioning, content blocks handle
+rendering, themes handle styling.
 
 ```python
 from boxbot_sdk import display
 
-d = display.create("stock_tracker")
-d.set_theme("boxbot")
+spec = {
+    "name": "stock_tracker",
+    "theme": "boxbot",
+    "data_sources": [{
+        "name": "stocks", "type": "http_json",
+        "url": "https://api.example.com/quotes",
+        "secret": "stock_api_key",
+        "refresh": 60,
+        "fields": {
+            "symbol": "ticker",
+            "price": "lastPrice",
+            "trend_icon": {"from": "direction",
+                           "map": {"up": "trending-up",
+                                   "down": "trending-down"}},
+        },
+    }],
+    "rotate": {"source": "stocks", "key": "quotes", "interval": 20},
+    "layout": {"type": "column", "padding": [16, 24], "children": [
+        {"type": "row", "align": "center", "children": [
+            {"type": "text", "content": "{current.symbol}",
+             "size": "title", "weight": "bold"},
+            {"type": "spacer"},
+            {"type": "metric", "value": "${current.price}",
+             "change": "{current.change_pct}%", "animation": "count_up"},
+        ]},
+        {"type": "chart", "data": "{current.history}",
+         "type": "area", "color": "accent", "height": 300},
+    ]},
+}
 
-d.data("stocks", type="http_json",
-       url="https://api.example.com/quotes",
-       secret="stock_api_key",
-       refresh=60,
-       fields={
-           "symbol": "ticker",
-           "price": "lastPrice",
-           "trend_icon": {"from": "direction",
-                          "map": {"up": "trending-up", "down": "trending-down"}}
-       })
-
-d.rotate(source="stocks", key="quotes", interval=20)
-
-header = d.row(padding=[16, 24], align="center")
-header.text("{current.symbol}", size="title", weight="bold")
-header.spacer()
-header.metric(value="${current.price}", change="{current.change_pct}%",
-              animation="count_up")
-
-d.chart(data="{current.history}", type="area", color="accent", height=300)
-
-d.preview()    # render to PNG, attached to the tool result
-d.save()       # write spec + register live with the display manager
+display.preview(spec)    # render to PNG, attached to the tool result
+display.save(spec)       # validate, write, register live
 ```
 
-The SDK emits a display **spec** (JSON). The rendering engine draws it
-using validated block implementations. The agent describes **what** to
+The agent never produces render code — the spec is purely declarative.
+The dispatcher validates against the block schema; the rendering engine
+draws each block from a fixed registry. The agent describes **what** to
 show; the system decides **how** to render it.
 
 The block library includes 7 layout containers (`row`, `column`,

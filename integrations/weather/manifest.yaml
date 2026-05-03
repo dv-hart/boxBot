@@ -1,0 +1,36 @@
+name: weather
+description: Get NOAA weather forecasts (api.weather.gov) for a US lat/lon. Returns current conditions and a multi-day outlook with display-ready Lucide icon names.
+inputs:
+  lat:
+    type: float
+    required: true
+    description: Latitude in decimal degrees.
+  lon:
+    type: float
+    required: true
+    description: Longitude in decimal degrees (negative for west).
+  forecast_days:
+    type: int
+    default: 5
+    description: Number of forecast entries to return (max 7).
+outputs:
+  temp:
+    type: string
+    description: Current temperature, degrees Fahrenheit.
+  condition:
+    type: string
+    description: Short forecast text (e.g. "Partly Sunny").
+  icon:
+    type: string
+    description: Lucide icon name mapped from condition.
+  humidity:
+    type: string
+  wind:
+    type: string
+  forecast:
+    type: array
+    description: Per-day entries with day, icon, high, low, condition.
+  updated_at:
+    type: string
+secrets: []
+timeout: 20

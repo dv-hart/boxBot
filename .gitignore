@@ -67,6 +67,8 @@ skills/*/
 !skills/onboarding/
 !skills/hal-sandbox-ref/
 !skills/skill_authoring/
+integrations/*/
+!integrations/weather/
 displays/*/
 !displays/example_display/
 data/credentials/

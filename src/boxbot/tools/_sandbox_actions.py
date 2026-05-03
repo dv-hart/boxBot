@@ -792,6 +792,90 @@ def _handle_skill_action(
         return {"status": "error", "message": str(exc)}
 
 
+@action_handler("integrations")
+async def _handle_integrations_action(
+    action_type: str,
+    payload: dict[str, Any],
+    ctx: ActionContext,  # unused; kept for uniform handler signature
+) -> dict[str, Any]:
+    """Dispatch ``integrations.*`` — list, get, create, update, delete, logs.
+
+    Read paths (``list``, ``get``, ``logs``) defer to the runner and
+    log store. Write paths (``create``, ``update``, ``delete``) defer
+    to the persist module. All persist operations re-validate the
+    payload main-side; the SDK validators are convenience.
+    """
+    sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+
+    try:
+        if sub == "list":
+            from boxbot.integrations.loader import discover_integrations
+
+            metas = discover_integrations()
+            return {
+                "status": "ok",
+                "integrations": [
+                    {
+                        "name": m.name,
+                        "description": m.description,
+                        "inputs": m.inputs,
+                        "outputs": m.outputs,
+                        "secrets": list(m.secrets),
+                        "timeout": m.timeout,
+                    }
+                    for m in metas
+                ],
+            }
+
+        if sub == "get":
+            from boxbot.integrations.runner import IntegrationRunError, run
+
+            name = payload.get("name")
+            if not isinstance(name, str) or not name:
+                return {"status": "error", "message": "'name' is required"}
+            inputs = payload.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                return {"status": "error", "message": "'inputs' must be a dict"}
+            try:
+                return await run(name, inputs)
+            except IntegrationRunError as exc:
+                return {"status": "error", "message": str(exc)}
+
+        if sub == "logs":
+            from boxbot.integrations.logs import list_runs
+
+            name = payload.get("name")
+            if not isinstance(name, str) or not name:
+                return {"status": "error", "message": "'name' is required"}
+            limit = payload.get("limit", 20)
+            if not isinstance(limit, int) or limit < 1:
+                return {"status": "error", "message": "'limit' must be a positive integer"}
+            return {"status": "ok", "runs": list_runs(name, limit=limit)}
+
+        if sub == "create":
+            from boxbot.integrations.persist import create_integration
+
+            return create_integration(payload)
+
+        if sub == "update":
+            from boxbot.integrations.persist import update_integration
+
+            return update_integration(payload)
+
+        if sub == "delete":
+            from boxbot.integrations.persist import delete_integration
+
+            return delete_integration(payload.get("name"))
+
+        return {
+            "status": "error",
+            "message": f"unknown integrations action '{action_type}'",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("%s failed", action_type)
+        return {"status": "error", "message": str(exc)}
+
+
 def _previews_dir() -> Path:
     from boxbot.core.paths import PREVIEWS_DIR
 
@@ -950,8 +1034,14 @@ async def _handle_display_action(
             try:
                 # Compute warnings against the same data the renderer
                 # uses, so static-source values and live-fetched data
-                # don't get falsely flagged.
+                # don't get falsely flagged. ``data`` from the payload
+                # is an agent-supplied override (useful for testing
+                # http_json fields/maps without a real fetch); it
+                # layers on top of live + static + placeholder data.
+                override = payload.get("data") or {}
                 render_data = mgr.build_preview_data(parsed)
+                if isinstance(override, dict):
+                    render_data.update(override)
                 image = mgr.render_preview(parsed.name, data=render_data)
             finally:
                 if existing is not None:
@@ -1108,6 +1198,9 @@ async def _handle_display_action(
                 "example": get_placeholder_data(name),
             }
 
+        if sub == "schema":
+            return _build_display_schema()
+
         if sub == "update_data":
             mgr = get_display_manager()
             if mgr is None:
@@ -1132,6 +1225,127 @@ async def _handle_display_action(
     except Exception as e:  # noqa: BLE001
         logger.exception("%s failed", action_type)
         return {"status": "error", "error": str(e)}
+
+
+def _build_display_schema() -> dict[str, Any]:
+    """Return the full block + spec reference as a dict.
+
+    Introspection target for ``bb.display.schema()``. Each block entry
+    lists its fields with type/default/valid-values pulled directly
+    from the dataclass + the SDK validators, so the doc and the
+    runtime can never drift.
+    """
+    import dataclasses
+
+    from boxbot.displays.blocks import BLOCK_REGISTRY
+    from boxbot.sdk import _validators as v
+
+    # Validator-set names → human-readable bullets the agent can match
+    # against the field's annotated type.
+    enum_sets: dict[str, list[str]] = {
+        "VALID_TEXT_SIZES": sorted(v.VALID_TEXT_SIZES),
+        "VALID_TEXT_COLORS": sorted(v.VALID_TEXT_COLORS),
+        "VALID_TEXT_WEIGHTS": sorted(v.VALID_TEXT_WEIGHTS),
+        "VALID_TEXT_ALIGNS": sorted(v.VALID_TEXT_ALIGNS),
+        "VALID_TEXT_ANIMATIONS": sorted(v.VALID_TEXT_ANIMATIONS),
+        "VALID_CONTAINER_ALIGNS": sorted(v.VALID_CONTAINER_ALIGNS),
+        "VALID_ICON_SIZES": sorted(v.VALID_ICON_SIZES),
+        "VALID_EMOJI_SIZES": sorted(v.VALID_EMOJI_SIZES),
+        "VALID_CLOCK_FORMATS": sorted(v.VALID_CLOCK_FORMATS),
+        "VALID_CLOCK_SIZES": sorted(v.VALID_CLOCK_SIZES),
+        "VALID_CHART_TYPES": sorted(v.VALID_CHART_TYPES),
+        "VALID_LIST_STYLES": sorted(v.VALID_LIST_STYLES),
+        "VALID_IMAGE_FITS": sorted(v.VALID_IMAGE_FITS),
+        "VALID_METRIC_ANIMATIONS": sorted(v.VALID_METRIC_ANIMATIONS),
+        "VALID_DIVIDER_ORIENTATIONS": sorted(v.VALID_DIVIDER_ORIENTATIONS),
+    }
+
+    # block-name → field-name → which enum set governs it. Drives the
+    # "valid values" column without us hand-listing every block.
+    field_enums: dict[str, dict[str, str]] = {
+        "row":      {"align": "VALID_CONTAINER_ALIGNS"},
+        "column":   {"align": "VALID_CONTAINER_ALIGNS"},
+        "stack":    {"align": "VALID_CONTAINER_ALIGNS"},
+        "columns":  {},
+        "card":     {},
+        "spacer":   {},
+        "divider":  {"orientation": "VALID_DIVIDER_ORIENTATIONS"},
+        "repeat":   {},
+        "text":     {"size": "VALID_TEXT_SIZES",
+                     "color": "VALID_TEXT_COLORS",
+                     "weight": "VALID_TEXT_WEIGHTS",
+                     "align": "VALID_TEXT_ALIGNS",
+                     "animation": "VALID_TEXT_ANIMATIONS"},
+        "metric":   {"animation": "VALID_METRIC_ANIMATIONS"},
+        "badge":    {},
+        "list":     {"style": "VALID_LIST_STYLES"},
+        "table":    {},
+        "key_value": {},
+        "icon":     {"size": "VALID_ICON_SIZES"},
+        "emoji":    {"size": "VALID_EMOJI_SIZES"},
+        "image":    {"fit": "VALID_IMAGE_FITS"},
+        "chart":    {"type": "VALID_CHART_TYPES"},
+        "progress": {},
+        "clock":    {"format": "VALID_CLOCK_FORMATS",
+                     "size": "VALID_CLOCK_SIZES"},
+        "countdown": {},
+        "weather_widget": {},
+        "calendar_widget": {},
+        "rotate":   {},
+        "page_dots": {},
+    }
+
+    container_types = {"row", "column", "stack", "columns", "card",
+                       "spacer", "divider", "repeat"}
+
+    blocks: dict[str, dict[str, Any]] = {}
+    for block_type, cls in BLOCK_REGISTRY.items():
+        fields: dict[str, dict[str, Any]] = {}
+        enums = field_enums.get(block_type, {})
+        for f in dataclasses.fields(cls):
+            if f.name in ("block_type", "children", "params"):
+                continue
+            field_info: dict[str, Any] = {
+                "type": _annotation_to_str(f.type),
+            }
+            if f.default is not dataclasses.MISSING:
+                field_info["default"] = f.default
+            elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+                field_info["default_factory"] = (
+                    f.default_factory.__name__
+                    if hasattr(f.default_factory, "__name__")
+                    else str(f.default_factory)
+                )
+            if f.name in enums:
+                field_info["valid_values"] = enum_sets[enums[f.name]]
+            fields[f.name] = field_info
+        blocks[block_type] = {
+            "kind": "container" if block_type in container_types else "content",
+            "fields": fields,
+            "accepts_children": block_type in container_types,
+        }
+
+    return {
+        "status": "ok",
+        "blocks": blocks,
+        "themes": sorted(v.VALID_THEMES),
+        "data_source_types": ["builtin", *sorted(v.VALID_DATA_SOURCE_TYPES)],
+        "transitions": sorted(v.VALID_TRANSITIONS),
+        "binding_syntax": {
+            "source_field": "{source.field}",
+            "array_index": "{source.field[0].sub}",
+            "repeat_item": "{.field}  (inside a repeat block)",
+            "rotate_item": "{current.field}  (inside a rotate block)",
+            "args": "{args.field}  (passed to switch_display)",
+        },
+    }
+
+
+def _annotation_to_str(annotation: Any) -> str:
+    """Render a dataclass field annotation as a short human string."""
+    if isinstance(annotation, str):
+        return annotation
+    return getattr(annotation, "__name__", str(annotation))
 
 
 def _spec_to_dict(spec: Any) -> dict[str, Any]:

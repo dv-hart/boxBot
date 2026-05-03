@@ -29,9 +29,10 @@ calls.
 | `bb.tasks` | Manage triggers (wake conditions) and to-do items. | Setting a reminder, scheduling a check-in, marking something done. The `manage_tasks` tool is fine for most edits. |
 | `bb.auth` | Mint registration codes for new users, list registered users, message every admin. | Admin asks to add a new user (`generate_registration_code`), first-boot bootstrap (`generate_bootstrap_code`), or you need to know who's registered. See the `onboarding` skill for the full flow. |
 | `bb.skill` | Create new skills at runtime. | You want to teach yourself a new recurring workflow. |
+| `bb.integrations` | List, call, create, update, delete data-pipe integrations. Read execution logs. | You need fresh data from an external service (weather, stocks, …) or you want to register a new such pipe. Also where you reach the calendar — see below. |
 | `bb.packages` | Request package installation. | A script needs a new PyPI dependency. Requires human approval. |
 | `bb.secrets` | Store and use credentials (write-only after store). | Before calling a third-party API on behalf of the user. |
-| `bb.calendar` | Read and write Google Calendar. | Any calendar operation. |
+| `bb.calendar` | Read and write Google Calendar. | Any calendar operation. **Note:** scheduled to migrate into `bb.integrations.get("calendar", action="…")`; for now keep using `bb.calendar` directly. |
 
 ## Progressive disclosure
 
@@ -40,6 +41,7 @@ This file is a map. For each module, there is a deeper doc under
 
 - `modules/workspace.md` — full API and patterns for the notebook
 - `modules/skill.md` — `bb.skill` API for creating new skills at runtime
+- `modules/integrations.md` — `bb.integrations` API for calling and authoring data-pipe integrations
 - (further modules land here as they become stable; check `ls modules/`)
 
 Load a module doc only when you need it. The sandbox path to do so:

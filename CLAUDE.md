@@ -83,9 +83,13 @@ inside `execute_script`) — the constrained, immutable Python API:
 - `bb.memory` — save/search/invalidate (shares backend with tool)
 - `bb.tasks` — triggers + to-dos (shares backend with tool)
 - `bb.skill` — create new skills at runtime
+- `bb.integrations` — list / call / create / update / delete data-pipe
+  integrations (sandbox-runnable manifest+script bundles); read
+  execution logs for self-debugging
 - `bb.secrets` — write-only credential storage
 - `bb.packages` — request package install (human approval required)
-- `bb.calendar` — Google Calendar read/write
+- `bb.calendar` — Google Calendar read/write (scheduled to fold into
+  `bb.integrations.get("calendar", ...)`; keep using `bb.calendar` for now)
 
 The SDK communicates with the main process through structured JSON on
 stdout + stdin (streaming, bidirectional). `execute_script` reads
@@ -122,7 +126,10 @@ level** (not Python level):
 - The SDK is **declarative for displays**: building blocks only, no raw
   render code. Main process generates validated display classes
 - Agent-created **skills auto-activate** (their logic runs sandboxed)
-- Agent-created **displays require user confirmation** (runs in main process)
+- Agent-created **displays auto-activate** — saved spec is registered
+  with the live display manager and immediately switchable. The render
+  spec is declarative (block tree only, no executable code), so there
+  is no privileged code path to gate
 - **Package installation requires out-of-band human approval** — physical
   screen tap or WhatsApp reply from admin. The sandbox can only emit
   requests; there is no way to spoof approval

@@ -66,6 +66,7 @@ from typing import Any
 import anthropic
 
 from boxbot.core.config import get_config
+from boxbot.cost import from_anthropic_usage, record as record_cost
 from boxbot.core.conversation import (
     Conversation,
     ConversationState,
@@ -1406,6 +1407,27 @@ class BoxBotAgent:
                 "role": "assistant",
                 "content": assistant_content,
             })
+
+            # Cost tracking: one row per Claude turn (raw Anthropic API).
+            # This is the single hook for conversation spend — keep it here
+            # so retries / refusals / max_tokens all bill correctly.
+            try:
+                event = from_anthropic_usage(
+                    purpose="conversation",
+                    model=getattr(response, "model", model) or model,
+                    usage=getattr(response, "usage", None),
+                    correlation_id=conversation_id,
+                    metadata={
+                        "channel": channel,
+                        "turn": turn_count,
+                    },
+                )
+                await record_cost(self._memory_store, event)
+            except Exception:
+                logger.exception(
+                    "Failed to record conversation cost (conv=%s turn=%d)",
+                    conversation_id, turn_count,
+                )
 
             stop_reason = getattr(response, "stop_reason", None)
 

@@ -1,0 +1,59 @@
+# API pricing — single source of truth for cost calculations.
+#
+# Used by ``src/boxbot/cost/``. Where the SDK returns a dollar cost
+# directly (e.g. claude_agent_sdk ResultMessage.total_cost_usd), that
+# value is preferred over recomputing here. This file is the fallback
+# for raw API surfaces that only return units (tokens, characters,
+# audio seconds).
+#
+# When prices change: bump ``verified_on`` for the affected provider
+# block and update the relevant entry. Historical cost_log rows
+# captured the price at write time, so they don't need to change.
+
+anthropic:
+  source_url: https://platform.claude.com/docs/en/about-claude/pricing
+  verified_on: 2026-05-02
+  # Cache and batch multipliers are constant across models per Anthropic
+  # docs and are applied in code, not configured here:
+  #   cache_read       = 0.10 × input
+  #   cache_write_5m   = 1.25 × input
+  #   cache_write_1h   = 2.00 × input
+  #   batch discount   = 50% off all line items
+  models:
+    claude-opus-4-7:
+      input_per_mtok: 15.00
+      output_per_mtok: 75.00
+    claude-sonnet-4-6:
+      input_per_mtok: 3.00
+      output_per_mtok: 15.00
+    claude-sonnet-4-20250514:
+      input_per_mtok: 3.00
+      output_per_mtok: 15.00
+    claude-haiku-4-5:
+      input_per_mtok: 1.00
+      output_per_mtok: 5.00
+    claude-haiku-4-5-20251001:
+      input_per_mtok: 1.00
+      output_per_mtok: 5.00
+
+elevenlabs:
+  source_url: https://elevenlabs.io/pricing/api
+  verified_on: 2026-05-02
+  # TTS billed per input character. Turbo / Flash families = 0.5 cr/char,
+  # multilingual / v3 = 1 cr/char. 1 credit = $0.00005.
+  tts:
+    eleven_turbo_v2_5:
+      dollars_per_char: 0.0000250
+    eleven_flash_v2_5:
+      dollars_per_char: 0.0000250
+    eleven_multilingual_v2:
+      dollars_per_char: 0.0000500
+    eleven_v3:
+      dollars_per_char: 0.0000500
+  # STT (Scribe) billed per minute of input audio. Standard ≈ $0.22/hr,
+  # realtime ≈ $0.39/hr.
+  stt:
+    scribe_v2:
+      dollars_per_minute: 0.003667
+    scribe_v2_realtime:
+      dollars_per_minute: 0.006500

@@ -234,21 +234,35 @@ CREATE TABLE IF NOT EXISTS pending_dreams (
     summary         TEXT
 );
 
--- Append-only log of every paid Anthropic API call. Used for cost
--- attribution and analysis. Pricing is captured at call time so
--- historical totals don't drift if rates change.
+-- Append-only log of every paid external API call. Used for cost
+-- attribution and analysis. cost_usd is captured at write time so
+-- historical totals don't drift if rates change. Provider-neutral:
+-- Anthropic-shaped fields (tokens, is_batch) and ElevenLabs-shaped
+-- fields (character_count, audio_seconds) coexist; unused columns
+-- default to 0.
+--
+-- ``cache_write_tokens`` is the legacy column from the original
+-- schema; new writes dual-populate it (= 5m + 1h) so older queries
+-- keep working. New code should read the split columns instead.
 CREATE TABLE IF NOT EXISTS cost_log (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp          TEXT NOT NULL,
-    purpose            TEXT NOT NULL,         -- extraction|rerank|summary|dream|reflection|...
-    model              TEXT NOT NULL,
-    input_tokens       INTEGER NOT NULL DEFAULT 0,
-    output_tokens      INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
-    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-    is_batch           INTEGER NOT NULL DEFAULT 0,
-    cost_usd           REAL NOT NULL,
-    metadata           TEXT                    -- JSON: conversation_id, batch_id, etc.
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp                TEXT NOT NULL,
+    purpose                  TEXT NOT NULL,         -- conversation|extraction|rerank|summary|dream|web_search|tts|stt|...
+    provider                 TEXT NOT NULL DEFAULT 'anthropic',
+    model                    TEXT NOT NULL,
+    input_tokens             INTEGER NOT NULL DEFAULT 0,
+    output_tokens            INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens        INTEGER NOT NULL DEFAULT 0,
+    cache_write_5m_tokens    INTEGER NOT NULL DEFAULT 0,
+    cache_write_1h_tokens    INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens       INTEGER NOT NULL DEFAULT 0,    -- legacy mirror of 5m+1h
+    is_batch                 INTEGER NOT NULL DEFAULT 0,
+    character_count          INTEGER NOT NULL DEFAULT 0,    -- elevenlabs TTS billed chars
+    audio_seconds            REAL    NOT NULL DEFAULT 0,    -- elevenlabs STT measured input
+    iterations               INTEGER NOT NULL DEFAULT 0,    -- agentic-loop turn count
+    correlation_id           TEXT,                          -- groups rows belonging to one user turn
+    cost_usd                 REAL NOT NULL,
+    metadata                 TEXT                           -- JSON: conversation_id, batch_id, etc.
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
@@ -406,6 +420,15 @@ class MemoryStore:
             ("memories", "consolidated_by", "TEXT"),
             ("memories", "supporting_for", "TEXT"),
             ("memories", "dream_created_by", "TEXT"),
+            # cost_log columns added with the unified cost-tracker rollout.
+            # Existing rows backfill cleanly with the column defaults.
+            ("cost_log", "provider", "TEXT NOT NULL DEFAULT 'anthropic'"),
+            ("cost_log", "cache_write_5m_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("cost_log", "cache_write_1h_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("cost_log", "character_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("cost_log", "audio_seconds", "REAL NOT NULL DEFAULT 0"),
+            ("cost_log", "iterations", "INTEGER NOT NULL DEFAULT 0"),
+            ("cost_log", "correlation_id", "TEXT"),
         ]
         for table, col, col_type in migrations:
             try:
@@ -1348,28 +1371,34 @@ class MemoryStore:
         cost_usd: float,
         metadata: dict | None = None,
     ) -> None:
-        """Append a row to the cost log. Pricing computed at call time."""
-        await self.db.execute(
-            """INSERT INTO cost_log (
-                   timestamp, purpose, model,
-                   input_tokens, output_tokens,
-                   cache_read_tokens, cache_write_tokens,
-                   is_batch, cost_usd, metadata
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                _now_iso(),
-                purpose,
-                model,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-                1 if is_batch else 0,
-                cost_usd,
-                json.dumps(metadata) if metadata else None,
-            ),
+        """Append a row to the cost log.
+
+        Legacy entry point. New code should build a
+        :class:`boxbot.cost.CostEvent` and call
+        :func:`boxbot.cost.record` directly. This shim builds an
+        Anthropic-shaped event from the keyword arguments and treats
+        ``cache_write_tokens`` as 1h-TTL (matching the historical
+        assumption baked into the prior ``compute_cost`` helper) so
+        existing callers continue to record correct numbers without
+        change.
+        """
+        # Local import to avoid a circular load at module import time
+        # (cost.record reaches back into anything importing the store).
+        from boxbot.cost import CostEvent, record
+
+        event = CostEvent(
+            purpose=purpose,
+            provider="anthropic",
+            model=model,
+            cost_usd=cost_usd,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_1h_tokens=cache_write_tokens,
+            is_batch=is_batch,
+            metadata=metadata,
         )
-        await self.db.commit()
+        await record(self, event)
 
     async def cost_summary(self, *, days: int = 7) -> dict[str, float]:
         """Return total cost (USD) per purpose over the last N days."""

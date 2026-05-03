@@ -104,13 +104,24 @@ class FakeAnthropicClient:
         batch_id: str,
         entries: list[tuple[str, dict]],
     ):
-        """entries: list of (custom_id, dedup_decision_payload)."""
+        """entries: list of (custom_id, dedup_decision_payload).
+
+        Each stub message carries a small usage block so that
+        DreamPoller's per-message cost recording (which reads real
+        ``usage`` from each succeeded message) writes a non-zero row.
+        """
         out: list[_StubResultEntry] = []
         for custom_id, payload in entries:
             msg = _StubMessage(
                 content=[_StubBlock(
                     type="tool_use", name="dedup_decision", input=payload,
-                )]
+                )],
+                usage={
+                    "input_tokens": 2000,
+                    "output_tokens": 200,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
             )
             out.append(_StubResultEntry(custom_id, _StubResult("succeeded", message=msg)))
         self._results[batch_id] = out

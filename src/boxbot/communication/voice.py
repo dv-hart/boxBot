@@ -673,6 +673,7 @@ class VoiceSession:
                     utterance.audio,
                     utterance.sample_rate,
                     self._config.stt.language,
+                    conversation_id=self._conversation_id or None,
                 )
             )
 
@@ -821,7 +822,9 @@ class VoiceSession:
             await self._audio_capture.stop()
 
         try:
-            await self._tts_stream.speak(text)
+            await self._tts_stream.speak(
+                text, conversation_id=self._conversation_id or None
+            )
         except Exception:
             logger.exception("TTS playback failed")
         finally:

@@ -57,6 +57,7 @@ from typing import Any
 import httpx
 import yaml
 
+from boxbot.cost import from_anthropic_usage, record as record_cost
 from boxbot.core.config import get_config
 from boxbot.tools.base import Tool
 
@@ -1014,6 +1015,87 @@ def _parse_small_agent_response(raw_text: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Cost recording — one row per outer web_search call, not per inner turn.
+# ---------------------------------------------------------------------------
+
+# Memory store singleton for the cost writer. We follow the same pattern
+# used by search_memory: lazy initialise on first call, reuse for the
+# lifetime of the process. The store is shared with the rest of boxBot;
+# this is simply a stable reference for tools that don't get one
+# threaded through their constructor.
+_cost_store: Any = None
+
+
+async def _get_cost_store() -> Any:
+    """Get or create a MemoryStore singleton for cost writes."""
+    global _cost_store
+    if _cost_store is None:
+        from boxbot.memory.store import MemoryStore
+
+        _cost_store = MemoryStore()
+        await _cost_store.initialize()
+    return _cost_store
+
+
+async def _record_web_search_cost(
+    *,
+    usage: dict[str, int],
+    iterations: int,
+    model: str,
+    query: str | None,
+    url: str | None,
+) -> None:
+    """Record one cost_log row for a completed web_search invocation.
+
+    Sums of ``usage`` come from every Haiku turn the sub-agent ran;
+    ``iterations`` is how many turns that was. Cost is computed once
+    from the totals, so the row reads as a single billed unit.
+
+    Failures here must not affect the tool's return value — cost is
+    observability, the search result is what the user asked for.
+    """
+    if not usage:
+        return
+
+    # Correlation id — the conversation that triggered this search, if
+    # any. Tool calls outside a conversation (tests, ad-hoc) leave it
+    # unset and the row simply records a NULL correlation_id.
+    correlation_id: str | None = None
+    try:
+        from boxbot.tools._tool_context import get_current_conversation
+
+        conv = get_current_conversation()
+        if conv is not None:
+            correlation_id = conv.conversation_id
+    except Exception:  # pragma: no cover - defensive
+        correlation_id = None
+
+    metadata: dict[str, Any] = {}
+    if query:
+        metadata["query"] = query[:200]
+    if url:
+        metadata["url"] = url[:500]
+
+    try:
+        event = from_anthropic_usage(
+            purpose="web_search",
+            model=model,
+            usage=usage,
+            iterations=iterations,
+            correlation_id=correlation_id,
+            metadata=metadata or None,
+        )
+        store = await _get_cost_store()
+        await record_cost(store, event)
+    except Exception:
+        logger.exception(
+            "Failed to record web_search cost (iter=%d model=%s)",
+            iterations,
+            model,
+        )
+
+
+# ---------------------------------------------------------------------------
 # The tool class itself
 # ---------------------------------------------------------------------------
 
@@ -1148,15 +1230,21 @@ class WebSearchTool(Tool):
         usage = result.get("usage", {}) or {}
         iterations = result.get("iterations", 0)
         logger.info(
-            "web_search done elapsed=%.2fs iter=%s sources=%d "
-            "tokens_in=%d tokens_out=%d cache_read=%d cache_write=%d",
+            "web_search done elapsed=%.2fs iter=%s sources=%d",
             elapsed,
             iterations,
             len(result.get("sources", [])),
-            usage.get("input_tokens", 0),
-            usage.get("output_tokens", 0),
-            usage.get("cache_read_input_tokens", 0),
-            usage.get("cache_creation_input_tokens", 0),
+        )
+
+        # Persist one cost row per outer call. Sub-agent ran 1-N Haiku
+        # turns; we collapse them into a single cost_log entry so the
+        # whole web_search invocation reads as one billed unit.
+        await _record_web_search_cost(
+            usage=usage,
+            iterations=iterations,
+            model=small_model,
+            query=query,
+            url=url,
         )
 
         # Public return shape: only summary + sources (+ error markers).

@@ -30,19 +30,18 @@ from typing import TYPE_CHECKING, Any
 
 import anthropic
 
+from boxbot.cost import from_anthropic_usage, record
 from boxbot.memory.dream import (
     DEDUP_CONFIDENCE_THRESHOLD,
     DedupDecision,
     NearDupPair,
+    _collect_entries,
     _decision_from_payload,
     _dream_log_path,
     _parse_dedup_message,
     apply_dream_result,
 )
-from boxbot.memory.extraction import (
-    DEFAULT_EXTRACTION_MODEL,
-    compute_cost,
-)
+from boxbot.memory.extraction import DEFAULT_EXTRACTION_MODEL
 
 if TYPE_CHECKING:
     from boxbot.memory.store import MemoryStore
@@ -209,10 +208,24 @@ class DreamPoller:
             self._reschedule(batch_id)
             return
 
+        # Materialise the results once: ``apply_dream_result`` needs
+        # them to drive merges, and we need them to record real
+        # per-message usage for cost_log. The async iterator can only
+        # be drained once.
+        try:
+            entries = await _collect_entries(results_iter)
+        except Exception:
+            logger.exception(
+                "Failed to materialise results for dream batch %s",
+                batch_id,
+            )
+            self._reschedule(batch_id)
+            return
+
         try:
             apply_result = await apply_dream_result(
                 self._store,
-                results_iter,
+                entries,
                 batch_id=batch_id,
                 pairs_by_custom_id={},  # not retained across boots
                 audit_only=self._audit_only,
@@ -236,11 +249,12 @@ class DreamPoller:
         await self._store.mark_dream_applied(batch_id, summary=summary)
         logger.info(summary)
 
-        # Best-effort cost recording. The Anthropic batch results API
-        # does not expose per-message usage in the same place — we fall
-        # back to a fixed rough estimate using the configured model.
+        # Per-message cost recording (mirrors record_extraction_cost in
+        # the non-dream batch poller). One row per successful batch
+        # message, using the real Anthropic ``usage`` returned by that
+        # message — never a synthetic estimate.
         try:
-            await self._record_cycle_cost(batch_id, apply_result.decisions)
+            await self._record_per_message_costs(batch_id, entries)
         except Exception:
             logger.exception(
                 "Cost recording failed for dream batch %s (apply OK)",
@@ -262,38 +276,51 @@ class DreamPoller:
     # Cost + log helpers
     # -------------------------------------------------------------------
 
-    async def _record_cycle_cost(
+    async def _record_per_message_costs(
         self,
         batch_id: str,
-        decisions: list[DedupDecision],
+        entries: list[Any],
     ) -> None:
-        """Record an estimated cost for this dream cycle.
+        """Record one ``cost_log`` row per successful batch message.
 
-        We don't have per-message token counts here without re-fetching
-        each result's usage block. This is a coarse estimate based on
-        the number of decisions returned (each one costs roughly the
-        same): ~2K input + 200 output tokens per pair, batch discount.
+        Reads the real ``usage`` block from each succeeded message and
+        delegates pricing to :func:`from_anthropic_usage`. Failed or
+        errored messages are skipped (no synthetic fallback). Mirrors
+        the per-message shape used by ``record_extraction_cost`` in
+        the non-dream batch poller.
         """
-        n = len(decisions)
-        if n == 0:
-            return
-        in_tok = 2000 * n
-        out_tok = 200 * n
-        cost = compute_cost(
-            self._model,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            is_batch=True,
-        )
-        await self._store.record_cost(
-            purpose="dream",
-            model=self._model,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            is_batch=True,
-            cost_usd=cost,
-            metadata={"batch_id": batch_id, "decisions": n},
-        )
+        for entry in entries:
+            result_obj = (
+                getattr(entry, "result", None)
+                or (entry.get("result") if isinstance(entry, dict) else None)
+            )
+            result_type = (
+                getattr(result_obj, "type", None)
+                or (result_obj.get("type") if isinstance(result_obj, dict) else None)
+            )
+            if result_type != "succeeded":
+                continue
+            message = (
+                getattr(result_obj, "message", None)
+                or (result_obj.get("message") if isinstance(result_obj, dict) else None)
+            )
+            if message is None:
+                continue
+            usage = getattr(message, "usage", None)
+            if usage is None and isinstance(message, dict):
+                usage = message.get("usage")
+            if usage is None:
+                continue
+            decisions = 1 if _parse_dedup_message(message) is not None else 0
+            event = from_anthropic_usage(
+                purpose="dream",
+                model=self._model,
+                usage=usage,
+                is_batch=True,
+                correlation_id=batch_id,
+                metadata={"decisions": decisions},
+            )
+            await record(self._store, event)
 
     def _append_decisions_to_log(
         self,

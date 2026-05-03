@@ -92,18 +92,28 @@ class ExtractionResult:
 # ``boxbot.core.config.models.large`` in YAML.
 DEFAULT_EXTRACTION_MODEL = "claude-sonnet-4-6"
 
-# Per-MTok prices in USD. Batch prices are exactly 50% of standard per
-# Anthropic's docs. Cache-read is 10% of input. Cache-write (1h) is 2x
-# input. We tag the system prompt with a 1h cache TTL because batches
-# can sit for 30+ minutes which exceeds the 5-minute default.
-STANDARD_PRICING: dict[str, tuple[float, float]] = {
-    # model: (input_per_mtok, output_per_mtok)
-    "claude-sonnet-4-6": (3.00, 15.00),
-    "claude-sonnet-4-20250514": (3.00, 15.00),
-    "claude-haiku-4-5": (1.00, 5.00),
-    "claude-haiku-4-5-20251001": (1.00, 5.00),
-    "claude-opus-4-7": (15.00, 75.00),
-}
+# Pricing lives in ``config/pricing.yaml`` and is read through
+# :mod:`boxbot.cost.pricing`. The two symbols below are kept for
+# backward compatibility with existing imports; values are sourced from
+# the YAML at access time so there is no hardcoded duplicate.
+
+
+def __getattr__(name: str):  # pragma: no cover - thin re-export
+    """Lazily expose STANDARD_PRICING from the YAML config.
+
+    Module-level ``__getattr__`` (PEP 562) lets ``from
+    boxbot.memory.extraction import STANDARD_PRICING`` continue to
+    work without baking prices into source.
+    """
+    if name == "STANDARD_PRICING":
+        from boxbot.cost.pricing import get_pricing
+
+        pricing = get_pricing()
+        return {
+            model: (entry["input_per_mtok"], entry["output_per_mtok"])
+            for model, entry in pricing.anthropic_models.items()
+        }
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def compute_cost(
@@ -115,27 +125,29 @@ def compute_cost(
     cache_write_tokens_1h: int = 0,
     is_batch: bool = False,
 ) -> float:
-    """Compute USD cost for a single API call.
+    """Compute USD cost for a single Anthropic call.
 
-    Cache-write at 1h TTL costs 2x input. Cache-read costs 10% of input.
-    Batch applies a flat 50% discount to all line items.
+    Thin shim over :func:`boxbot.cost.from_anthropic_usage` — kept for
+    callers in the memory subsystem that still pass keyword arguments.
+    Cache-write at 1h TTL is 2x input, cache-read is 10% of input,
+    batch applies a flat 50% discount; multipliers live in the cost
+    module, prices in ``config/pricing.yaml``.
     """
-    if model not in STANDARD_PRICING:
-        # Fall back to sonnet pricing; better to over-estimate than zero.
-        in_per, out_per = STANDARD_PRICING["claude-sonnet-4-6"]
-        logger.warning("No pricing for %s, using sonnet fallback", model)
-    else:
-        in_per, out_per = STANDARD_PRICING[model]
+    from boxbot.cost import from_anthropic_usage
 
-    cost = (
-        (input_tokens / 1_000_000.0) * in_per
-        + (output_tokens / 1_000_000.0) * out_per
-        + (cache_read_tokens / 1_000_000.0) * (in_per * 0.1)
-        + (cache_write_tokens_1h / 1_000_000.0) * (in_per * 2.0)
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read_tokens,
+        "cache_creation_input_tokens": cache_write_tokens_1h,
+    }
+    event = from_anthropic_usage(
+        purpose="_legacy_compute_cost",
+        model=model,
+        usage=usage,
+        is_batch=is_batch,
     )
-    if is_batch:
-        cost *= 0.5
-    return cost
+    return event.cost_usd
 
 
 # ---------------------------------------------------------------------------

@@ -96,6 +96,25 @@ _ASSETS_DIR = __import__("pathlib").Path(__file__).parent / "assets"
 _FONTS_DIR = _ASSETS_DIR / "fonts"
 _LUCIDE_DIR = _ASSETS_DIR / "lucide"
 
+
+def available_lucide_icons() -> list[str]:
+    """Return every bundled Lucide icon name (sans the .svg suffix).
+
+    Surfaces what's actually available — the bundled subset is much
+    smaller than the full Lucide catalog. Used by ``display.schema``
+    so the agent can introspect which icon names will resolve.
+    """
+    if not _LUCIDE_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in _LUCIDE_DIR.glob("*.svg"))
+
+
+def lucide_icon_exists(name: str) -> bool:
+    """Whether ``name`` corresponds to a bundled Lucide SVG."""
+    if not name:
+        return False
+    return (_LUCIDE_DIR / f"{name}.svg").exists()
+
 # Named weight → numeric weight for when a TextBlock specifies weight by name.
 _WEIGHT_NAMES: dict[str, int] = {
     "thin": 100, "extralight": 200, "light": 300,
@@ -1432,10 +1451,20 @@ def _render_progress(ctx: RenderContext, block: Block, rect: Rect) -> None:
     label = block.params.get("label")
     color_token = block.params.get("color", "auto")
 
-    if isinstance(value, str):
+    # Coerce to float, treating None / missing / unparseable as 0. A
+    # progress bar bound to a data source that hasn't loaded yet (or
+    # to a typo'd field) used to crash the whole render here.
+    if value is None:
+        value = 0.0
+    elif isinstance(value, str):
         try:
             value = float(value)
         except ValueError:
+            value = 0.0
+    else:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
             value = 0.0
 
     value = max(0.0, min(1.0, value))

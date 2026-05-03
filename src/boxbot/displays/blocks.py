@@ -582,7 +582,22 @@ def parse_block(data: dict[str, Any]) -> Block:
 
 
 def _construct_block(cls: type[Block], params: dict[str, Any]) -> Block:
-    """Construct a Block subclass from a params dict."""
+    """Construct a Block subclass from a params dict.
+
+    Each subclass's ``__post_init__`` rebuilds ``self.params`` from
+    typed fields and (historically) drops any value that matches the
+    dataclass default. That kept generated JSON tidy but silently lost
+    agent-provided values on save → load round trips: a caller who
+    explicitly passed ``show_seconds=False`` on a ``ClockBlock`` could
+    not tell, after a reload, whether they had set it or not — and a
+    later default change would silently rewrite the rendered display.
+
+    Preserve caller intent by re-populating ``block.params`` with the
+    JSON-provided keys verbatim after ``__post_init__`` runs. Fields
+    constructed in code (built-in display specs) still get the trimmed
+    defaults; only blocks coming through ``parse_block`` carry the
+    full set.
+    """
     import dataclasses
 
     field_names = {f.name for f in dataclasses.fields(cls)}
@@ -592,4 +607,10 @@ def _construct_block(cls: type[Block], params: dict[str, Any]) -> Block:
         if k in field_names and k not in ("block_type", "children", "params"):
             kwargs[k] = v
 
-    return cls(**kwargs)
+    block = cls(**kwargs)
+
+    for k, v in params.items():
+        if k in ("type", "block_type", "children", "params"):
+            continue
+        block.params[k] = v
+    return block

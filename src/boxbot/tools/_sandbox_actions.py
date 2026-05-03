@@ -943,10 +943,33 @@ def _collect_unresolved_bindings(
             sample[name] = get_placeholder_data(name) or {}
         sample["args"] = {}
 
+    from boxbot.displays.renderer import lucide_icon_exists
+
     warnings: list[str] = []
     seen: set[str] = set()
+    seen_icons: set[str] = set()
 
     def _walk(node: Any) -> None:
+        # Icon-name validation: when an icon block specifies a literal
+        # name (no binding), confirm the SVG is bundled. Without this,
+        # an unknown icon falls back to a circled-letter placeholder
+        # silently and the agent has no way to notice.
+        if (isinstance(node, dict)
+                and node.get("type") == "icon"):
+            raw_name = node.get("name", "")
+            if isinstance(raw_name, str) and raw_name and raw_name not in seen_icons:
+                seen_icons.add(raw_name)
+                # Skip pure-binding names — they resolve at render time.
+                if not (raw_name.startswith("{") and raw_name.endswith("}")):
+                    if not lucide_icon_exists(raw_name):
+                        warnings.append(
+                            f"icon name '{raw_name}' is not in the bundled "
+                            "Lucide set — render will fall back to a "
+                            "circled-letter placeholder. Use "
+                            "bb.display.schema()['icons'] to see what's "
+                            "available."
+                        )
+
         if isinstance(node, dict):
             for value in node.values():
                 _walk(value)
@@ -1038,10 +1061,21 @@ async def _handle_display_action(
                 # is an agent-supplied override (useful for testing
                 # http_json fields/maps without a real fetch); it
                 # layers on top of live + static + placeholder data.
+                #
+                # For each declared source the override touches, run
+                # the source's ``fields`` config over the fixture
+                # before handing it to the renderer. That's what the
+                # author actually wants: validate "given an API
+                # response shaped like this, do my fields+map produce
+                # the right binding values?" Without this, the
+                # override would have to be in post-fields shape,
+                # defeating the purpose.
                 override = payload.get("data") or {}
                 render_data = mgr.build_preview_data(parsed)
                 if isinstance(override, dict):
-                    render_data.update(override)
+                    render_data.update(_apply_fields_to_override(
+                        override, parsed,
+                    ))
                 image = mgr.render_preview(parsed.name, data=render_data)
             finally:
                 if existing is not None:
@@ -1227,6 +1261,39 @@ async def _handle_display_action(
         return {"status": "error", "error": str(e)}
 
 
+def _apply_fields_to_override(
+    override: dict[str, Any],
+    parsed_spec: Any,
+) -> dict[str, Any]:
+    """Run each source's ``fields`` transform over the matching override.
+
+    The agent passes ``data=`` to ``preview()`` to validate an
+    ``http_json`` source's ``fields`` mapping before the source is
+    live. Without this hook, the override would have to already be in
+    post-fields shape — the override would dodge the very transform
+    the agent is trying to verify. We mirror what
+    :class:`HttpJsonSource.do_fetch` does: the override entry is
+    treated as the raw fetch response, ``_apply_field_transforms``
+    layers the named fields on top.
+
+    Sources without a ``fields`` config or sources that aren't
+    overridden pass through unchanged.
+    """
+    from boxbot.displays.data_sources import _apply_field_transforms
+
+    out = dict(override)
+    for src_spec in parsed_spec.data_sources:
+        if src_spec.name not in out:
+            continue
+        if not src_spec.fields:
+            continue
+        raw = out[src_spec.name]
+        if not isinstance(raw, dict):
+            continue
+        out[src_spec.name] = _apply_field_transforms(raw, src_spec.fields)
+    return out
+
+
 def _build_display_schema() -> dict[str, Any]:
     """Return the full block + spec reference as a dict.
 
@@ -1325,18 +1392,105 @@ def _build_display_schema() -> dict[str, Any]:
             "accepts_children": block_type in container_types,
         }
 
+    from boxbot.displays.renderer import available_lucide_icons
+
     return {
         "status": "ok",
         "blocks": blocks,
         "themes": sorted(v.VALID_THEMES),
         "data_source_types": ["builtin", *sorted(v.VALID_DATA_SOURCE_TYPES)],
         "transitions": sorted(v.VALID_TRANSITIONS),
+        "data_sources": _data_source_schema(),
+        "icons": available_lucide_icons(),
         "binding_syntax": {
             "source_field": "{source.field}",
             "array_index": "{source.field[0].sub}",
             "repeat_item": "{.field}  (inside a repeat block)",
             "rotate_item": "{current.field}  (inside a rotate block)",
             "args": "{args.field}  (passed to switch_display)",
+        },
+    }
+
+
+def _data_source_schema() -> dict[str, Any]:
+    """Per-source-type field reference, mirroring the per-block one.
+
+    Each entry lists required + optional fields the spec accepts, plus
+    the built-in source names so the agent can introspect what's
+    available without re-reading the doc.
+    """
+    return {
+        "builtin": {
+            "kind": "builtin",
+            "fields": {
+                "name": {"type": "str", "required": True,
+                         "valid_values": sorted(_BUILTIN_SOURCE_SCHEMAS)},
+            },
+            "available_names": sorted(_BUILTIN_SOURCE_SCHEMAS),
+            "describe": (
+                "Use bb.display.describe_source(name) to see fields a "
+                "specific built-in exposes."
+            ),
+        },
+        "http_json": {
+            "kind": "custom",
+            "fields": {
+                "name": {"type": "str", "required": True},
+                "url": {"type": "str", "required": True},
+                "params": {"type": "dict", "required": False,
+                           "describe": "Query string params"},
+                "secret": {"type": "str", "required": False,
+                           "describe": "Secret name resolved at fetch time; "
+                                       "sent as 'Authorization: Bearer <value>'"},
+                "refresh": {"type": "int (seconds)", "required": False,
+                            "default": 60},
+                "fields": {
+                    "type": "dict",
+                    "required": False,
+                    "describe": (
+                        "Field extraction/mapping. Each key is the "
+                        "output binding name; the value is either a "
+                        "dotted-path string ('data.current.price') or "
+                        "{from: <path>, map: {raw: out, ...}} for "
+                        "value mapping."
+                    ),
+                },
+            },
+        },
+        "http_text": {
+            "kind": "custom",
+            "fields": {
+                "name": {"type": "str", "required": True},
+                "url": {"type": "str", "required": True},
+                "refresh": {"type": "int (seconds)", "required": False,
+                            "default": 60},
+            },
+            "describe": "Bind body as {<name>.text}",
+        },
+        "static": {
+            "kind": "custom",
+            "fields": {
+                "name": {"type": "str", "required": True},
+                "value": {
+                    "type": "any (typically dict)",
+                    "required": True,
+                    "describe": (
+                        "Initial value. Update at runtime with "
+                        "bb.display.update_data(...)."
+                    ),
+                },
+            },
+        },
+        "memory_query": {
+            "kind": "custom",
+            "fields": {
+                "name": {"type": "str", "required": True},
+                "query": {"type": "str", "required": True,
+                          "describe": "Memory search query string"},
+                "refresh": {"type": "int (seconds)", "required": False,
+                            "default": 300},
+            },
+            "describe": "Bind results as {<name>.results}",
         },
     }
 

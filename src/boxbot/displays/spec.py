@@ -303,6 +303,39 @@ def _navigate(obj: Any, path: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
+_VALID_THEMES = ("boxbot", "midnight", "daylight", "classic")
+_VALID_TRANSITIONS = ("crossfade", "slide_left", "slide_right", "none")
+
+# Per-block enum constraints — field name → tuple of valid values. Keep
+# in sync with ``_validators.VALID_*`` constants and the schema dump in
+# ``boxbot.tools._sandbox_actions._build_display_schema``. Listed here
+# so save/preview reject invalid values up front instead of letting
+# them silently fall back at render time.
+_BLOCK_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
+    "text": {
+        "size": ("title", "heading", "subtitle", "body", "caption", "small"),
+        "color": ("default", "muted", "dim", "accent", "success", "warning", "error"),
+        "weight": ("normal", "medium", "semibold", "bold"),
+        "align": ("left", "center", "right"),
+        "animation": ("none", "fade", "typewriter", "count_up", "slide_up"),
+    },
+    "row": {"align": ("start", "center", "end", "spread")},
+    "column": {"align": ("start", "center", "end", "spread")},
+    "stack": {"align": ("start", "center", "end", "spread")},
+    "icon": {"size": ("sm", "md", "lg", "xl")},
+    "emoji": {"size": ("md", "lg", "xl")},
+    "clock": {
+        "format": ("12h", "24h"),
+        "size": ("md", "lg", "xl"),
+    },
+    "chart": {"type": ("line", "bar", "area")},
+    "list": {"style": ("bullet", "number", "check", "none")},
+    "image": {"fit": ("cover", "contain", "fill")},
+    "metric": {"animation": ("none", "fade", "count_up")},
+    "divider": {"orientation": ("horizontal", "vertical")},
+}
+
+
 def validate_spec(spec: DisplaySpec) -> list[str]:
     """Validate a display spec and return a list of error messages.
 
@@ -319,10 +352,16 @@ def validate_spec(spec: DisplaySpec) -> list[str]:
     if not spec.name:
         errors.append("Display spec must have a name")
 
-    if spec.transition not in ("crossfade", "slide_left", "slide_right", "none"):
+    if spec.theme not in _VALID_THEMES:
+        errors.append(
+            f"Invalid theme '{spec.theme}'. "
+            f"Must be one of: {', '.join(_VALID_THEMES)}"
+        )
+
+    if spec.transition not in _VALID_TRANSITIONS:
         errors.append(
             f"Invalid transition '{spec.transition}'. "
-            "Must be: crossfade, slide_left, slide_right, none"
+            f"Must be one of: {', '.join(_VALID_TRANSITIONS)}"
         )
 
     # Validate data sources
@@ -355,8 +394,9 @@ def _validate_block(block: Block, errors: list[str],
 
     if block.block_type not in BLOCK_REGISTRY:
         errors.append(f"Unknown block type: '{block.block_type}'")
+        return
 
-    # Validate specific block types
+    # Required-field checks
     if block.block_type == "text" and not block.params.get("content"):
         errors.append("Text block requires 'content'")
 
@@ -366,6 +406,23 @@ def _validate_block(block: Block, errors: list[str],
     if block.block_type == "chart":
         if not block.params.get("data") and not block.params.get("series"):
             errors.append("Chart block requires 'data' or 'series'")
+
+    # Per-block enum-field checks. Skip values that look like data
+    # bindings ("{source.field}") — the renderer resolves those at
+    # render time and we can't validate them statically.
+    enum_constraints = _BLOCK_ENUMS.get(block.block_type)
+    if enum_constraints:
+        for field_name, valid_values in enum_constraints.items():
+            if field_name not in block.params:
+                continue
+            value = block.params[field_name]
+            if isinstance(value, str) and value.startswith("{") and value.endswith("}"):
+                continue
+            if value not in valid_values:
+                errors.append(
+                    f"{block.block_type}.{field_name} value '{value}' "
+                    f"is not one of: {', '.join(valid_values)}"
+                )
 
     # Recurse
     for child in block.children:

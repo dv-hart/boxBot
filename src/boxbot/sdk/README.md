@@ -43,21 +43,21 @@ Agent calls execute_script with:
 ┌──────────────────────────────────────────┐
 │  from boxbot_sdk import display          │
 │                                          │
-│  d = display.create("weather_board")     │
-│  d.set_theme("boxbot")                   │
-│  d.data("weather")                       │
-│  header = d.row(padding=24)              │
-│  header.icon("{weather.icon}", size="xl")│
-│  header.text("{weather.temp}°F")         │
-│  d.save()                                │
+│  spec = {                                │
+│    "name": "weather_board",              │
+│    "theme": "boxbot",                    │
+│    "data_sources": [{"name": "weather"}],│
+│    "layout": { ... block tree ... },     │
+│  }                                       │
+│  display.preview(spec)                   │
+│  display.save(spec)                      │
 └─────────────────┬────────────────────────┘
                   │
                   ▼
 SDK emits structured JSON to stdout:
 ┌──────────────────────────────────────────┐
-│  {"_sdk": "display.save",               │
-│   "name": "weather_board",              │
-│   "spec": { ... block tree + data ... }}│
+│  {"_sdk": "display.save",                │
+│   "spec": { ... full spec dict ... }}    │
 └─────────────────┬────────────────────────┘
                   │
                   ▼
@@ -70,74 +70,89 @@ execute_script tool (main process) applies:
 └──────────────────────────────────────────┘
 ```
 
-The agent never writes raw display Python. It composes from the block
-library through the SDK's builder API. The rendering engine draws the
-spec using validated block implementations.
+The agent doesn't write raw render code — the spec is purely
+declarative. The rendering engine draws each block from a fixed,
+validated registry; the agent describes **what** to show.
 
 ## Modules
 
-### `display` — Display Builder
+### `display` — Display specs as JSON dicts
 
-Create displays through a declarative block system. The agent composes
-layout containers and content blocks into a tree — the rendering engine
-handles all positioning, text wrapping, overflow, and theming. The agent
-describes **what** to show, not **how** to render it.
+The display SDK is a thin pair of CRUD calls over JSON dicts. There
+is no builder, no fluent API, no block classes — the agent reads,
+mutates, and writes the spec dict directly.
 
-For the complete block reference, data binding system, theme schema,
-and use case walkthroughs, see [../../docs/display-system.md](../../docs/display-system.md).
+For the complete block reference and data binding system, see
+[../../skills/bb/modules/display.md](../../skills/bb/modules/display.md).
 
 ```python
 from boxbot_sdk import display
 
-d = display.create("weather_board")
-d.set_theme("boxbot")
-d.data("weather")                     # built-in source, zero config
+# Author from scratch
+spec = {
+    "name": "weather_board",
+    "theme": "boxbot",
+    "data_sources": [{"name": "weather"}],
+    "layout": {
+        "type": "column",
+        "padding": 24,
+        "gap": 16,
+        "children": [
+            {"type": "row", "padding": 24, "align": "center", "children": [
+                {"type": "icon", "name": "{weather.icon}", "size": "xl"},
+                {"type": "metric", "value": "{weather.temp}°F",
+                 "label": "{weather.condition}"},
+            ]},
+            {"type": "row", "gap": 16, "padding": [0, 24], "align": "spread",
+             "children": [
+                {"type": "repeat", "source": "{weather.forecast}", "max": 5,
+                 "children": [{"type": "column", "align": "center", "children": [
+                    {"type": "text", "content": "{.day}", "size": "caption",
+                     "color": "muted"},
+                    {"type": "icon", "name": "{.icon}", "size": "sm"},
+                    {"type": "text", "content": "{.high}°/{.low}°",
+                     "size": "small"},
+                 ]}]},
+            ]},
+        ],
+    },
+}
 
-header = d.row(padding=24, align="center")
-header.icon("{weather.icon}", size="xl")    # icon name from data source
-info = header.column()
-info.text("{weather.temp}°F", size="title", animation="count_up")
-info.text("{weather.condition}", size="body", color="muted")
+display.preview(spec)    # render PNG, attach to the tool result
+display.save(spec)       # validate, write, register live
 
-forecast = d.row(gap=16, padding=[0, 24], align="spread")
-day = forecast.repeat("{weather.forecast}", max=5)
-day_col = day.column(align="center")
-day_col.text("{.day}", size="caption", color="muted")
-day_col.icon("{.icon}", size="sm")
-day_col.text("{.high}°/{.low}°", size="small")
-
-d.preview()    # render to PNG; the image attaches to the tool result
-d.save()       # write spec + register with display manager (live)
+# Edit an existing display
+spec = display.load("weather_board")
+spec["theme"] = "midnight"
+display.save(spec)
 ```
 
-**Layout containers (7):** `row`, `column`/`stack`, `columns` (with
-ratio-based widths like `[2, 1]`), `card`, `spacer`, `divider`, `repeat`
+**SDK calls (8 total):** `list`, `load`, `save`, `preview` (with
+optional ``data=`` override for http_json testing), `delete`,
+`describe_source`, `schema`, `update_data`.
+
+**Layout containers (7):** `row`, `column`/`stack`, `columns`,
+`card`, `spacer`, `divider`, `repeat`.
 
 **Content blocks (13):** `text`, `metric`, `badge`, `list`, `table`,
-`key_value`, `icon`, `emoji`, `image`, `chart` (line/bar/area with
-multi-series), `progress`, `clock` (live), `countdown` (live)
-
-**Composite widgets (2):** `weather_widget`, `calendar_widget`
-
-**Meta blocks (2):** `rotate` (cycle through data items on interval),
-`page_dots`
+`key_value`, `icon`, `emoji`, `image`, `chart`, `progress`, `clock`,
+`countdown`.
 
 **Data sources:** Built-in (`weather`, `calendar`, `tasks`, `people`,
-`agent_status`, `clock`) deliver display-ready data including resolved
-icon names and color tokens. Custom sources (`http_json`, `http_text`,
-`memory_query`, `static`) support `fields` with `map` transforms for
-declarative value mapping — no conditional logic needed.
+`agent_status`, `clock`); custom (`http_json`, `http_text`, `static`,
+`memory_query`).
 
-**Themes:** `boxbot` (default), `midnight`, `daylight`, `classic`.
-Community themes are YAML files in `themes/`.
+**Themes:** `boxbot`, `midnight`, `daylight`, `classic`.
 
-**Preview:** `d.preview()` renders the display to a 1024x600 PNG. The
-agent views the image (multimodal), evaluates the result, and iterates
-before saving.
+**Validation + warnings:** `save` and `preview` validate the spec and
+raise `RuntimeError` listing every problem on a bad input. Successful
+calls return `warnings` — bindings that didn't resolve at render time
+(usually a typo, sometimes a not-yet-fetched http_json source). The
+agent fixes warnings by editing the dict and previewing again.
 
-The agent **cannot** provide arbitrary render code. It composes from
-the block library. The main process renders the spec to pygame using
-validated block implementations.
+**Discovery:** `display.schema()` returns the full block reference as
+a dict — every field, default, and valid-values list. Use it to
+introspect what's available without re-reading the doc.
 
 ### `skill` — Skill Builder
 

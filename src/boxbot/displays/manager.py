@@ -748,23 +748,72 @@ class DisplayManager:
                 "Render failed for display '%s'", self._active_display
             )
 
+    def build_preview_data(
+        self,
+        spec: DisplaySpec,
+        data: dict[str, Any] | None = None,
+        args: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Assemble the data dict the renderer (and warnings checker) sees.
+
+        Resolution order, per source declared on the spec:
+
+        1. ``data`` override, if the caller passed one.
+        2. Live cached data from the running data manager.
+        3. The source's own declared payload — for ``static`` sources,
+           this is the ``value=`` the agent set when authoring. Critical
+           for previewing a fresh spec before save/switch, since static
+           sources are inert until they're registered with a manager.
+        4. Built-in placeholder data (``weather``, ``calendar``, …).
+
+        ``args`` are exposed to bindings as ``{args.<field>}``.
+        """
+        if data:
+            preview_data: dict[str, Any] = dict(data)
+        else:
+            preview_data = dict(self._data_manager.get_all_data())
+
+        for src_spec in spec.data_sources:
+            if (src_spec.name in preview_data
+                    and preview_data[src_spec.name]):
+                continue
+            if src_spec.source_type == "static" and src_spec.value is not None:
+                v = src_spec.value
+                preview_data[src_spec.name] = (
+                    v if isinstance(v, dict) else {"value": v}
+                )
+                continue
+            preview_data[src_spec.name] = get_placeholder_data(src_spec.name)
+
+        if args:
+            preview_data["args"] = dict(args)
+        elif "args" not in preview_data:
+            preview_data["args"] = {}
+
+        return preview_data
+
     def render_preview(
         self,
         name: str | None = None,
         data: dict[str, Any] | None = None,
         width: int | None = None,
         height: int | None = None,
+        args: dict[str, Any] | None = None,
     ) -> Image.Image | None:
         """Render a display to a PIL Image for preview.
 
         Used by the SDK preview workflow. Fills missing data sources
-        with placeholder data so the agent sees a realistic layout.
+        with placeholder data — and, for ``static`` sources, the
+        declared ``value`` — so the agent sees a realistic layout
+        even before the spec has been saved and switched to.
 
         Args:
             name: Display name (defaults to active display).
-            data: Override data dict. If None, uses live data + placeholders.
+            data: Override data dict. If None, uses live data +
+                placeholders + declared static values.
             width: Preview width override.
             height: Preview height override.
+            args: Optional args dict, exposed as ``{args.<field>}``.
 
         Returns:
             A PIL Image of the rendered display, or None if the display
@@ -780,7 +829,6 @@ class DisplayManager:
             logger.warning("Display '%s' not found for preview", display_name)
             return None
 
-        # Create a preview renderer if dimensions differ
         pw = width or self._width
         ph = height or self._height
         if pw != self._width or ph != self._height:
@@ -788,12 +836,7 @@ class DisplayManager:
         else:
             renderer = self._renderer
 
-        # Build data dict: live data + placeholders for missing sources
-        preview_data = dict(data) if data else dict(self._data_manager.get_all_data())
-        for src_spec in spec.data_sources:
-            if src_spec.name not in preview_data or not preview_data[src_spec.name]:
-                preview_data[src_spec.name] = get_placeholder_data(src_spec.name)
-
+        preview_data = self.build_preview_data(spec, data=data, args=args)
         return renderer.render_preview(spec, preview_data)
 
     # ------------------------------------------------------------------

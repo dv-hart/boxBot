@@ -197,121 +197,285 @@ class TestValidators:
 # ---------------------------------------------------------------------------
 
 
-class TestDisplayBuilder:
-    """Test the declarative display builder API."""
+class TestDisplaySDK:
+    """Test the JSON-first display SDK.
 
-    def test_create_returns_display_builder(self):
-        from boxbot.sdk.display import create
-        d = create("test_display")
-        assert d.name == "test_display"
+    The SDK is now a thin wrapper over ``_transport.request``. Each
+    test mocks the transport and verifies the SDK forwards the right
+    action + payload, raises on errors, and unwraps successful
+    responses correctly.
+    """
 
-    def test_create_rejects_invalid_name(self):
-        from boxbot.sdk.display import create
-        with pytest.raises(ValueError):
-            create("bad name!")
+    @pytest.fixture
+    def fake_request(self, monkeypatch):
+        """Replace ``_transport.request`` with a configurable stub.
 
-    def test_set_theme(self):
-        from boxbot.sdk.display import create
-        d = create("themed")
-        d.set_theme("midnight")
-        spec = d._build_spec()
-        assert spec["theme"] == "midnight"
+        Yields a ``recorder`` dict the test can populate with
+        ``{action_type: response_dict}`` to script behavior.
+        """
+        from boxbot.sdk import _transport
 
-    def test_add_data_source(self):
-        from boxbot.sdk.display import create
-        d = create("data_test")
-        d.data("weather")
-        spec = d._build_spec()
-        assert len(spec["data_sources"]) == 1
-        assert spec["data_sources"][0]["name"] == "weather"
+        recorder = {"calls": [], "responses": {}}
 
-    def test_add_text_block(self):
-        from boxbot.sdk.display import create
-        d = create("text_test")
-        d.text("Hello World", size="title", color="accent")
-        spec = d._build_spec()
-        # Single child unwraps — layout IS the text block.
-        assert spec["layout"]["type"] == "text"
-        assert spec["layout"]["content"] == "Hello World"
+        def stub(action_type, payload, *, timeout=30):
+            recorder["calls"].append((action_type, payload))
+            resp = recorder["responses"].get(action_type)
+            if resp is None:
+                return {"status": "ok"}
+            return resp
 
-    def test_nested_row_with_children(self):
-        from boxbot.sdk.display import create
-        d = create("nested_test")
-        row = d.row(gap=16)
-        row.text("Left")
-        row.text("Right")
-        spec = d._build_spec()
-        # Single top-level row → layout unwraps to the row itself.
-        assert spec["layout"]["type"] == "row"
-        assert len(spec["layout"]["children"]) == 2
+        monkeypatch.setattr(_transport, "request", stub)
+        return recorder
 
-    def test_columns_builder(self):
-        from boxbot.sdk.display import create
-        d = create("cols_test")
-        cols = d.columns([2, 1], gap=8)
-        assert len(cols) == 2
-        cols[0].text("Wide column")
-        cols[1].text("Narrow column")
-        spec = d._build_spec()
-        columns_block = spec["layout"]
-        assert columns_block["type"] == "columns"
-        assert columns_block["ratios"] == [2, 1]
+    def test_list_returns_displays(self, fake_request):
+        from boxbot.sdk import display
 
-    def test_metric_block(self):
-        from boxbot.sdk.display import create
-        d = create("metric_test")
-        d.metric("{weather.temp}", label="Temperature", icon="thermometer")
-        spec = d._build_spec()
-        block = spec["layout"]
-        assert block["type"] == "metric"
-        assert block["value"] == "{weather.temp}"
+        fake_request["responses"]["display.list"] = {
+            "status": "ok",
+            "displays": [{"name": "clock", "source": "builtin"}],
+        }
+        result = display.list()
+        assert result == [{"name": "clock", "source": "builtin"}]
 
-    def test_multiple_top_level_blocks_wrap_in_column(self):
-        from boxbot.sdk.display import create
-        d = create("multi_test")
-        d.text("first")
-        d.text("second")
-        spec = d._build_spec()
-        # Two siblings → wrapped in implicit column.
-        assert spec["layout"]["type"] == "column"
-        assert len(spec["layout"]["children"]) == 2
+    def test_load_returns_spec_dict(self, fake_request):
+        from boxbot.sdk import display
 
-    def test_chart_requires_data_or_series(self):
-        from boxbot.sdk.display import create
-        d = create("chart_test")
-        with pytest.raises(ValueError, match="requires either"):
-            d.chart()
+        spec = {"name": "demo", "theme": "boxbot",
+                "layout": {"type": "text", "content": "hi"}}
+        fake_request["responses"]["display.load"] = {
+            "status": "ok", "spec": spec,
+        }
+        result = display.load("demo")
+        assert result == spec
+        action, payload = fake_request["calls"][-1]
+        assert action == "display.load"
+        assert payload == {"name": "demo"}
 
-    def test_save_round_trips_through_load(self):
-        from boxbot.sdk import display as display_mod
-        from boxbot.sdk.display import create
+    def test_save_forwards_spec_and_returns_path(self, fake_request):
+        from boxbot.sdk import display
 
-        d = create("rt_test")
-        d.set_theme("midnight")
-        d.data("weather")
-        d.text("{weather.temp}", size="title")
-        spec = d._build_spec()
+        spec = {"name": "demo", "layout": {"type": "text", "content": "hi"}}
+        fake_request["responses"]["display.save"] = {
+            "status": "ok", "path": "/data/displays/demo.json",
+            "registered": True, "warnings": [],
+        }
+        result = display.save(spec)
+        assert result["path"] == "/data/displays/demo.json"
+        assert result["registered"] is True
+        action, payload = fake_request["calls"][-1]
+        assert action == "display.save"
+        assert payload == {"spec": spec}
 
-        # Load uses the same layout shape that save would produce.
-        rebuilt = display_mod.DisplayBuilder._from_spec(spec)
-        rebuilt_spec = rebuilt._build_spec()
-        assert rebuilt_spec["theme"] == "midnight"
-        assert rebuilt_spec["layout"] == spec["layout"]
+    def test_save_raises_on_validation_error(self, fake_request):
+        from boxbot.sdk import display
 
-    def test_set_transition(self):
-        from boxbot.sdk.display import create
-        d = create("transition_test")
-        d.set_transition("slide_left")
-        spec = d._build_spec()
-        assert spec["transition"] == "slide_left"
+        fake_request["responses"]["display.save"] = {
+            "status": "error",
+            "errors": ["Chart block requires 'data' or 'series'",
+                       "Unknown theme 'pastel'"],
+        }
+        with pytest.raises(RuntimeError) as excinfo:
+            display.save({"name": "broken"})
+        # Both errors land in the message — the agent sees every problem
+        # at once instead of having to fix them serially.
+        assert "Chart block" in str(excinfo.value)
+        assert "Unknown theme" in str(excinfo.value)
 
-    def test_rotate_config(self):
-        from boxbot.sdk.display import create
-        d = create("rotate_test")
-        d.rotate("photos", "items", interval=15)
-        spec = d._build_spec()
-        assert spec["rotate"]["source"] == "photos"
-        assert spec["rotate"]["interval"] == 15
+    def test_preview_returns_path_and_warnings(self, fake_request):
+        from boxbot.sdk import display
+
+        fake_request["responses"]["display.preview"] = {
+            "status": "ok",
+            "path": "/tmp/p.png",
+            "attached": True,
+            "warnings": ["binding '{weather.tempurature}' did not resolve"],
+        }
+        result = display.preview({"name": "demo"})
+        assert result["path"] == "/tmp/p.png"
+        assert result["attached"] is True
+        assert len(result["warnings"]) == 1
+
+    def test_preview_passes_data_override(self, fake_request):
+        from boxbot.sdk import display
+
+        spec = {"name": "demo"}
+        override = {"stocks": {"price": "184.20"}}
+        display.preview(spec, data=override)
+        action, payload = fake_request["calls"][-1]
+        assert action == "display.preview"
+        assert payload == {"spec": spec, "data": override}
+
+    def test_preview_omits_data_when_none(self, fake_request):
+        from boxbot.sdk import display
+
+        display.preview({"name": "demo"})
+        _, payload = fake_request["calls"][-1]
+        # No ``data`` key in payload when caller didn't pass one — the
+        # dispatcher then uses live + static + placeholder data.
+        assert "data" not in payload
+
+    def test_delete(self, fake_request):
+        from boxbot.sdk import display
+
+        display.delete("demo")
+        action, payload = fake_request["calls"][-1]
+        assert action == "display.delete"
+        assert payload == {"name": "demo"}
+
+    def test_delete_raises_on_error(self, fake_request):
+        from boxbot.sdk import display
+
+        fake_request["responses"]["display.delete"] = {
+            "status": "error", "error": "is a built-in",
+        }
+        with pytest.raises(RuntimeError, match="built-in"):
+            display.delete("clock")
+
+    def test_describe_source(self, fake_request):
+        from boxbot.sdk import display
+
+        fake_request["responses"]["display.describe_source"] = {
+            "status": "ok",
+            "fields": {"temp": "string"},
+            "example": {"temp": "72"},
+        }
+        result = display.describe_source("weather")
+        assert result["fields"]["temp"] == "string"
+        assert result["example"]["temp"] == "72"
+
+    def test_schema_returns_block_reference(self, fake_request):
+        from boxbot.sdk import display
+
+        fake_request["responses"]["display.schema"] = {
+            "status": "ok",
+            "blocks": {"text": {"kind": "content", "fields": {}}},
+            "themes": ["boxbot", "midnight"],
+            "data_source_types": ["builtin", "http_json"],
+            "transitions": ["crossfade"],
+        }
+        result = display.schema()
+        assert "text" in result["blocks"]
+        assert "boxbot" in result["themes"]
+
+    def test_update_data(self, fake_request):
+        from boxbot.sdk import display
+
+        display.update_data("focus", "session",
+                            value={"task": "writing", "minutes": 12})
+        action, payload = fake_request["calls"][-1]
+        assert action == "display.update_data"
+        assert payload == {
+            "display": "focus",
+            "source": "session",
+            "value": {"task": "writing", "minutes": 12},
+        }
+
+    def test_update_data_raises_when_inactive(self, fake_request):
+        from boxbot.sdk import display
+
+        fake_request["responses"]["display.update_data"] = {
+            "status": "error",
+            "error": "display must be active",
+        }
+        with pytest.raises(RuntimeError, match="must be active"):
+            display.update_data("focus", "session", value={})
+
+
+class TestDisplaySchemaBuilder:
+    """The dispatcher's _build_display_schema dumps the block registry.
+
+    Drives ``bb.display.schema()``. Lives in
+    ``boxbot.tools._sandbox_actions``; we exercise it directly so the
+    test doesn't need a running DisplayManager or transport.
+    """
+
+    def test_schema_lists_every_block_in_registry(self):
+        from boxbot.displays.blocks import BLOCK_REGISTRY
+        from boxbot.tools._sandbox_actions import _build_display_schema
+
+        schema = _build_display_schema()
+        assert schema["status"] == "ok"
+        # Every block type the parser knows about must show up — if a
+        # new block lands without a schema entry, this catches it.
+        for block_type in BLOCK_REGISTRY:
+            assert block_type in schema["blocks"], (
+                f"{block_type} missing from schema"
+            )
+
+    def test_schema_text_block_has_valid_size_values(self):
+        from boxbot.tools._sandbox_actions import _build_display_schema
+
+        schema = _build_display_schema()
+        text = schema["blocks"]["text"]
+        assert text["kind"] == "content"
+        assert "size" in text["fields"]
+        # Semantic taxonomy — distinct from icon/clock t-shirt sizes.
+        sizes = text["fields"]["size"]["valid_values"]
+        assert "title" in sizes
+        assert "body" in sizes
+        assert "lg" not in sizes  # t-shirt sizes belong to other blocks
+
+    def test_schema_clock_block_uses_t_shirt_sizes(self):
+        from boxbot.tools._sandbox_actions import _build_display_schema
+
+        schema = _build_display_schema()
+        clock = schema["blocks"]["clock"]
+        sizes = clock["fields"]["size"]["valid_values"]
+        assert "lg" in sizes
+        assert "title" not in sizes  # semantic sizes belong to text
+
+    def test_schema_marks_containers(self):
+        from boxbot.tools._sandbox_actions import _build_display_schema
+
+        schema = _build_display_schema()
+        assert schema["blocks"]["row"]["kind"] == "container"
+        assert schema["blocks"]["row"]["accepts_children"] is True
+        assert schema["blocks"]["text"]["kind"] == "content"
+        assert schema["blocks"]["text"]["accepts_children"] is False
+
+    def test_schema_includes_themes_and_transitions(self):
+        from boxbot.tools._sandbox_actions import _build_display_schema
+
+        schema = _build_display_schema()
+        assert "boxbot" in schema["themes"]
+        assert "midnight" in schema["themes"]
+        assert "crossfade" in schema["transitions"]
+        assert "builtin" in schema["data_source_types"]
+        assert "http_json" in schema["data_source_types"]
+
+
+class TestBlockRoundTrip:
+    """Save → load round-trip preserves caller-provided fields.
+
+    Regression test for the bug where ``__post_init__`` stripped values
+    matching the dataclass default. ``_construct_block`` now overlays
+    JSON-provided params verbatim.
+    """
+
+    def test_clock_round_trip_preserves_all_props(self):
+        from boxbot.displays.blocks import parse_block
+
+        original = {
+            "type": "clock",
+            "format": "12h",
+            "show_date": False,
+            "show_seconds": False,
+            "size": "lg",
+        }
+        block = parse_block(original)
+        assert block.to_dict() == original
+
+    @pytest.mark.parametrize("spec", [
+        {"type": "row", "gap": 0, "align": "start", "padding": 0},
+        {"type": "text", "content": "hi", "size": "body", "color": "default"},
+        {"type": "icon", "name": "x", "size": "md"},
+        {"type": "card", "padding": 16, "color": "muted"},
+    ])
+    def test_default_matching_values_survive_round_trip(self, spec):
+        from boxbot.displays.blocks import parse_block
+
+        block = parse_block(spec)
+        assert block.to_dict() == spec
 
 
 # ---------------------------------------------------------------------------

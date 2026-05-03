@@ -7,9 +7,10 @@ secret named ``GOOGLE_CALENDAR_TOKEN_JSON``; the file is renamed to
 ``.migrated`` so a future deploy of this script is a no-op rather than
 silently overwriting an updated secret.
 
-Usage (run on the Pi as the boxbot user, or in dev):
+Usage (run on the Pi or in dev — the project venv is required because
+the import path pulls in boxbot.core which depends on anthropic):
 
-    python3 scripts/migrate_calendar_secret.py
+    .venv/bin/python3 scripts/migrate_calendar_secret.py
 
 Idempotent: if the secret already exists and the file is already
 suffixed ``.migrated``, the script reports the state and exits 0.

@@ -239,27 +239,48 @@ No code change needed; recovery is just an env var.
 
 ```
 READ + EXECUTE (sandbox user can read):
-  data/sandbox/venv/lib/       → installed packages (read-only!)
-  data/sandbox/venv/bin/python3 → the interpreter itself
-  config/                      → configuration (read-only)
+  <runtime_dir>/venv/lib/      → installed packages (read-only!)
+  <runtime_dir>/venv/bin/python3 → the interpreter itself
+  <runtime_dir>/sandbox_bootstrap.py → seccomp + runpy launcher
+  <runtime_dir>/integrations/  → staged manifest+script for each integration
   data/photos/, data/photos/photos.db, data/memory/ → project data (read-only)
   data/scheduler/scheduler.db            → trigger and to-do data (read-only)
   skills/                      → existing skill code
   displays/                    → existing display code
 
 WRITE (sandbox user can write):
-  data/sandbox/output/         → script outputs
-  data/sandbox/tmp/            → working space
+  <runtime_dir>/output/        → script outputs
+  <runtime_dir>/tmp/           → working space (setgid, group=boxbot)
+  <runtime_dir>/scripts/       → per-call execute_script source (setgid)
   skills/                      → new skill directories (group-writable)
 
 NO ACCESS (sandbox user has no permissions):
-  .env                         → secrets (mode 0600, owned by boxbot)
-  src/boxbot/                  → core code (owned by boxbot)
-  data/sandbox/venv/lib/       → site-packages (read-only to sandbox)
-  data/sandbox/venv/bin/pip    → pip binary (not executable by sandbox)
+  .env                         → secrets (mode 0600, owned by main user)
+  config/                      → configuration (home dir 0700 blocks traversal)
+  data/credentials/secrets.json → bb.secrets store (mode 0600, owned by main user)
+  data/credentials/google_client_secrets.json → OAuth client config (mode 0600)
+  src/boxbot/                  → core code (owned by main user)
+  <runtime_dir>/venv/lib/      → site-packages (read-only to sandbox)
+  <runtime_dir>/venv/bin/pip   → pip binary (not executable by sandbox)
   .git/                        → repository internals
   /etc, /usr, ~                → system directories
 ```
+
+`<runtime_dir>` defaults to `/var/lib/boxbot-sandbox/`. The
+project-tree `integrations/` is **staged** here by
+`scripts/setup-sandbox.sh`: the sandbox user can't traverse the
+operator's `0700` home directory to reach the project tree, so
+`manifest.yaml` and `script.py` are rsynced into
+`<runtime_dir>/integrations/<name>/` (mode 0640, group `boxbot`)
+where the sandbox can read them. The runner picks the staged path
+when it exists; the in-tree path is the dev/test fallback.
+
+The `setgid` bit on `tmp/`, `output/`, `scripts/` (mode 2770) is
+load-bearing: without it, files the main process drops there for the
+sandbox to read/write get the main user's primary group (e.g.
+`jhart`), which `boxbot-sandbox` can't access. Setgid forces new
+files to inherit the directory's `boxbot` group, so cross-user file
+handoff works.
 
 #### pip Is Inaccessible from the Sandbox
 
@@ -296,8 +317,14 @@ process's environment is NOT inherited — only these safe variables are
 passed through:
 - `PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`
 - `PYTHONPATH`, `VIRTUAL_ENV`, `PYTHONDONTWRITEBYTECODE`, `PYTHONUNBUFFERED`
-- Specific API keys needed for the current skill (passed explicitly via
-  the tool's `env_vars` parameter, not from .env)
+- `BOXBOT_SECRET_<NAME>` for each secret that:
+  (a) the integration's manifest declares in `secrets:`, OR
+  (b) the agent passed by name in `execute_script`'s `secrets=[…]` argument.
+  The runner / tool resolves names against `bb.secrets` (the file-backed
+  store at `data/credentials/secrets.json`) and adds the resolved values
+  to the launch env, then names them in `sudo --preserve-env=` so they
+  cross the privilege drop. The agent never sees the values; only the
+  spawned subprocess does.
 
 All secrets (`ANTHROPIC_API_KEY`, `WHATSAPP_ACCESS_TOKEN`,
 `ELEVENLABS_API_KEY`, AWS keys, etc.) are excluded by default because

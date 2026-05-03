@@ -230,6 +230,12 @@ tokens.
 }
 ```
 
+The ``secret`` field is the **name** of a secret in the boxBot secret
+store, not the value. The data-source manager looks it up via
+``bb.secrets`` at fetch time and sends it as a Bearer token. Store
+the actual key once with ``bb.secrets.store("STOCKS_API_KEY", "…")``;
+the spec only ever references the name.
+
 Then bind ``{stocks.price}`` and ``{stocks.trend}`` (the latter as an
 icon ``name``).
 

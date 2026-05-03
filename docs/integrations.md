@@ -189,37 +189,99 @@ The display system's `WeatherSource` calls `weather` via the runner;
 
 ## Calendar migration runbook (one-time, per device)
 
-The calendar surface moved out of `src/boxbot/integrations/google_calendar.py`
-(removed) and `bb.calendar` (removed) into `integrations/calendar/`,
-backed by a stored secret. After deploying this change, do **one** of
-the following on the Pi:
+The calendar surface lives in `integrations/calendar/`, backed by an
+OAuth token stored as the secret `GOOGLE_CALENDAR_TOKEN_JSON`. There
+is no `bb.calendar`, no `src/boxbot/integrations/google_calendar.py`,
+no calendar-specific dispatcher path — it's just a regular integration.
 
-**(a) You already had a working `data/credentials/google_calendar_token.json`:**
+Both helper scripts below need the project venv (`anthropic` and
+`google-auth-oauthlib` aren't available to the system Python). Use
+`.venv/bin/python3` everywhere, not bare `python3`.
+
+### Path A — You already have a working `data/credentials/google_calendar_token.json`
 
 ```bash
 ssh "$BOXBOT_DEPLOY_TARGET"
 cd software/boxBot
-python3 scripts/migrate_calendar_secret.py
-# Reads the existing token file and stores it as
-# GOOGLE_CALENDAR_TOKEN_JSON in the secret store, then renames the
-# source file to .migrated. Idempotent — safe to re-run.
+.venv/bin/python3 scripts/migrate_calendar_secret.py
+# Reads the existing token file, stores it as GOOGLE_CALENDAR_TOKEN_JSON,
+# renames the source to .migrated. Idempotent — safe to re-run.
+scripts/restart-boxbot.sh
 ```
 
-**(b) Fresh device or token never minted:**
+If Google then comes back with `invalid_grant` (the migrated refresh
+token expired or was revoked), fall through to Path C.
+
+### Path B — Local desktop with a browser
 
 ```bash
-# Same as before, this still does the InstalledAppFlow on the box.
-# Output goes straight to the secret store now (no JSON file).
-python3 scripts/calendar_auth.py --manual
+.venv/bin/python3 scripts/calendar_auth.py
+# Opens a browser, runs a local server on port 8765, completes the flow.
 ```
 
-After either path, restart boxbot
-(`scripts/restart-boxbot.sh`). The display calendar source and any
-agent-issued calendar calls will work via
-`bb.integrations.get("calendar", action="…")`. The
-`google_client_secrets.json` file stays on disk — only the
-runtime-rotating token moved into the secret store; the static client
-credentials are still needed if you ever re-run `calendar_auth.py`.
+### Path C — Headless device (Pi over SSH, no keyboard/mouse)
+
+Two-phase flow. Phase 1 runs on the device, prints the consent URL,
+saves OAuth state (including the PKCE code verifier) to
+`/tmp/boxbot_oauth_state.json` mode 0600. Phase 2 takes the redirect
+URL and completes the flow — both phases are non-interactive.
+
+```bash
+# Phase 1 — print the auth URL
+ssh "$BOXBOT_DEPLOY_TARGET" \
+  'cd software/boxBot && .venv/bin/python3 scripts/calendar_auth.py --print-url'
+```
+
+Open the printed URL in any browser, sign in, grant calendar access.
+The "App not verified" warning appears for testing-mode OAuth clients
+— click **Advanced → Go to <project> (unsafe)**. After consent the
+browser redirects to a `localhost:8765/?state=…&code=…` URL that
+fails to load — that's expected. Copy the entire redirect URL.
+
+```bash
+# Phase 2 — complete the flow
+ssh "$BOXBOT_DEPLOY_TARGET" \
+  "cd software/boxBot && .venv/bin/python3 scripts/calendar_auth.py \
+   --redirect-url '<paste full URL here>'"
+# → Stored GOOGLE_CALENDAR_TOKEN_JSON in the secret store (replaced).
+# → Calendar integration is ready.
+```
+
+Phase 2 cleans up `/tmp/boxbot_oauth_state.json` on success. Both
+phases must run within the same boot — `/tmp` is wiped on reboot.
+
+### After any path
+
+The `data/credentials/google_client_secrets.json` file stays on disk:
+only the runtime-rotating token moved into the secret store; the
+static client credentials are still needed for any future
+`calendar_auth.py` run.
+
+To verify end-to-end:
+
+```bash
+ssh "$BOXBOT_DEPLOY_TARGET" \
+  'cd software/boxBot && .venv/bin/python3 -c "
+import asyncio
+from boxbot.integrations.runner import run
+print(asyncio.run(run(\"calendar\", {\"action\": \"list_upcoming_events\", \"max_results\": 3})))
+"'
+```
+
+Expected: `{"status": "ok", "output": {"events": [...], "count": N}}`.
+
+### When the refresh token expires
+
+Google revokes refresh tokens for OAuth clients in **testing** status
+after seven days of inactivity (sometimes sooner). If
+`bb.integrations.get("calendar", ...)` starts returning
+`{"output": {"error": "calendar API 400: ... invalid_grant ..."}}`,
+re-run Path C.
+
+The durable fix is to publish the OAuth client (Google Cloud Console
+→ APIs & Services → OAuth consent screen → **Publish app**). For
+personal/internal use this requires no review and changes the refresh
+token lifetime to ~6 months of inactivity.
 
 ## Open follow-ups
 

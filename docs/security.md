@@ -77,9 +77,33 @@ and keeps the authenticated channel clean.
 ## Data Security
 
 ### Secrets Management
-- API keys and tokens stored in `.env` (gitignored)
-- WhatsApp credentials in `config/whatsapp.yaml` (gitignored)
-- No secrets in code or committed config files
+
+Two distinct surfaces, by who needs the value:
+
+**1. Main-process secrets — `.env`**
+- API keys the main process uses directly: `ANTHROPIC_API_KEY`,
+  `WHATSAPP_ACCESS_TOKEN`, `ELEVENLABS_API_KEY`, AWS keys, etc.
+- File mode `0600`, owned by the main-process user
+- WhatsApp credentials also in `config/whatsapp.yaml` (gitignored)
+- The sandbox user has no read access (and home-dir `0700` blocks
+  traversal regardless)
+
+**2. Agent-managed secrets — `bb.secrets` / `data/credentials/secrets.json`**
+- Credentials the agent stores at runtime (third-party API keys,
+  OAuth refresh tokens, e.g. `GOOGLE_CALENDAR_TOKEN_JSON`)
+- File mode `0600`, owned by the main-process user, atomic write,
+  64-secret cap, ≤8 KB per value
+- Sandbox scripts and integrations receive their values **only** as
+  `BOXBOT_SECRET_<NAME>` env vars at launch, scoped to:
+  - The names declared in an integration's manifest `secrets:` list, or
+  - The names the agent passed in `execute_script`'s `secrets=[…]`
+- The agent itself **cannot read values back**. SDK calls return name
+  lists and existence checks; values cross only the runner→subprocess
+  boundary
+- Action log redaction: `secrets.store` records `{name, status}` only;
+  the value is never written to the action log the agent observes
+
+Neither store is committed; both are gitignored.
 
 ### Local Data
 - Person embeddings stored locally in `data/` (gitignored)

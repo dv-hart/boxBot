@@ -211,7 +211,7 @@ CHANGES+=("Installed sandbox packages + boxbot_sdk")
 if command -v apt-get >/dev/null 2>&1; then
     if ! dpkg -s python3-seccomp >/dev/null 2>&1; then
         echo "--- Installing python3-seccomp ---"
-        apt-get install -y python3-seccomp >/dev/null
+        sudo apt-get install -y python3-seccomp >/dev/null
         CHANGES+=("Installed python3-seccomp (libseccomp Python binding)")
     fi
     # Also expose the apt-installed binding to the sandbox venv. The

@@ -104,7 +104,17 @@ def _phase_print_url(secrets_path: Path) -> int:
     auth_url, state = flow.authorization_url(
         access_type="offline", prompt="consent",
     )
-    payload = {"state": state, "redirect_uri": _REDIRECT_URI}
+    # PKCE: from_client_secrets_file defaults autogenerate_code_verifier
+    # to True for installed-app flows in recent google-auth-oauthlib
+    # versions, so the URL carries a code_challenge. Phase 2 must
+    # present the matching code_verifier when exchanging the auth code,
+    # otherwise Google returns invalid_grant. Persist whatever the
+    # library generated.
+    payload = {
+        "state": state,
+        "redirect_uri": _REDIRECT_URI,
+        "code_verifier": getattr(flow, "code_verifier", None),
+    }
     _STATE_PATH.write_text(json.dumps(payload))
     _STATE_PATH.chmod(0o600)
 
@@ -143,6 +153,10 @@ def _phase_redirect_url(secrets_path: Path, redirect_url: str) -> int:
         redirect_uri=payload.get("redirect_uri", _REDIRECT_URI),
         state=payload["state"],
     )
+    # Restore the PKCE code_verifier that phase 1 generated; without
+    # it, Google rejects the auth code exchange.
+    if payload.get("code_verifier"):
+        flow.code_verifier = payload["code_verifier"]
     try:
         flow.fetch_token(authorization_response=redirect_url)
     except Exception as exc:  # noqa: BLE001

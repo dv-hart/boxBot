@@ -291,9 +291,13 @@ done
 sudo chown -R "$SANDBOX_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/output"
 sudo chown -R "$SANDBOX_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/tmp"
 sudo chown -R "$SANDBOX_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/scripts"
-sudo chmod -R 770 "$SANDBOX_DIR/output"
-sudo chmod -R 770 "$SANDBOX_DIR/tmp"
-sudo chmod -R 770 "$SANDBOX_DIR/scripts"
+# 2770 = rwx for owner+group, setgid so new files inherit the boxbot
+# group regardless of which user created them. Without setgid, files
+# the main process (running as $REAL_USER) drops here for the sandbox
+# to read/write end up with the wrong group and hit EACCES.
+sudo chmod -R 2770 "$SANDBOX_DIR/output"
+sudo chmod -R 2770 "$SANDBOX_DIR/tmp"
+sudo chmod -R 2770 "$SANDBOX_DIR/scripts"
 
 # -- Skills directory: group-writable (sandbox can create skills) --
 if [[ -d "$PROJECT_DIR/skills" ]]; then

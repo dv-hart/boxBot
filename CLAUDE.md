@@ -330,15 +330,22 @@ HEAD` on the Pi always answers "what is running here."
 ./scripts/deploy.sh user@host           # explicit override
 ```
 
-Set the target once in your shell init (`~/.bashrc`, `~/.zshrc`, or a
-gitignored `.envrc`):
+Set the target once. Three options, checked in this order by
+`deploy.sh`:
 
-```bash
-export BOXBOT_DEPLOY_TARGET=user@host
-```
+1. **Shell init** (`~/.bashrc`, `~/.zshrc`, or a gitignored `.envrc`):
+   ```bash
+   export BOXBOT_DEPLOY_TARGET=user@host
+   ```
+2. **Project `.env`** (gitignored, mode 0600 — same file as runtime
+   secrets):
+   ```
+   BOXBOT_DEPLOY_TARGET=user@host
+   ```
+3. **Positional arg** (one-off override): `./scripts/deploy.sh user@host`
 
-The fallback when neither the arg nor the env var is set is
-`pi@boxbot.local` (mDNS — works on most LANs running Avahi/Bonjour).
+The fallback when none are set is `pi@boxbot.local` (mDNS — works on
+most LANs running Avahi/Bonjour).
 If your Pi checkout lives somewhere other than `software/boxBot`,
 override with `BOXBOT_PI_PROJECT_DIR`.
 

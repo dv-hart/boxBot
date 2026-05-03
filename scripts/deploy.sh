@@ -9,12 +9,14 @@
 # Target resolution order:
 #   1. ``user@host`` argument, if given.
 #   2. ``BOXBOT_DEPLOY_TARGET`` environment variable.
-#   3. Fallback ``pi@boxbot.local`` (mDNS — works out of the box on
+#   3. ``BOXBOT_DEPLOY_TARGET=...`` in the repo's gitignored ``.env``.
+#   4. Fallback ``pi@boxbot.local`` (mDNS — works out of the box on
 #      most LANs running Avahi/Bonjour).
 #
-# Set ``BOXBOT_DEPLOY_TARGET=user@host`` in your shell init or a
-# gitignored ``.envrc`` so you don't have to type it every deploy.
-# The project directory on the Pi is ``software/boxBot`` by default;
+# Set ``BOXBOT_DEPLOY_TARGET=user@host`` once — either in shell init,
+# in a gitignored ``.envrc``, or as a line in the project's ``.env``
+# file (which is already 0600 and gitignored for secrets). The
+# project directory on the Pi is ``software/boxBot`` by default;
 # override with ``BOXBOT_PI_PROJECT_DIR`` if you keep the checkout
 # elsewhere.
 #
@@ -37,10 +39,31 @@
 
 set -euo pipefail
 
-TARGET="${1:-${BOXBOT_DEPLOY_TARGET:-pi@boxbot.local}}"
-PI_PROJECT_DIR="${BOXBOT_PI_PROJECT_DIR:-software/boxBot}"
-
 cd "$(dirname "$0")/.."
+
+# Target resolution: positional arg → environment → .env → mDNS default.
+# Pure bash so it survives ``set -euo pipefail`` without subshell
+# gymnastics; no shell-expansion of arbitrary .env content (we read
+# only this one variable, with optional surrounding quotes stripped).
+if [[ $# -ge 1 ]]; then
+    TARGET="$1"
+elif [[ -n "${BOXBOT_DEPLOY_TARGET:-}" ]]; then
+    TARGET="$BOXBOT_DEPLOY_TARGET"
+else
+    TARGET=""
+    if [[ -f .env ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^BOXBOT_DEPLOY_TARGET=(.*)$ ]]; then
+                TARGET="${BASH_REMATCH[1]}"
+                TARGET="${TARGET#\"}"; TARGET="${TARGET%\"}"
+                TARGET="${TARGET#\'}"; TARGET="${TARGET%\'}"
+                break
+            fi
+        done < .env
+    fi
+    TARGET="${TARGET:-pi@boxbot.local}"
+fi
+PI_PROJECT_DIR="${BOXBOT_PI_PROJECT_DIR:-software/boxBot}"
 
 # -------------------------------------------------------------------
 # Pre-flight

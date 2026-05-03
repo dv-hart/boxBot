@@ -155,6 +155,27 @@ sudo chmod 750 "$SANDBOX_DIR/sandbox_bootstrap.py"
 echo "Copied sandbox_bootstrap.py to $SANDBOX_DIR/"
 CHANGES+=("Copied sandbox_bootstrap.py to $SANDBOX_DIR/")
 
+# Stage integrations/ into the sandbox runtime dir for the same
+# reason: the runner spawns a subprocess that runs as boxbot-sandbox
+# and needs to runpy the integration's script.py. We rsync rather
+# than chown the project tree because home dir 0700 blocks
+# traversal even with group-readable target files. Only the
+# manifest+script land here; data/credentials/ etc never do.
+if [[ -d "$PROJECT_DIR/integrations" ]]; then
+    sudo mkdir -p "$SANDBOX_DIR/integrations"
+    sudo rsync -a --delete \
+        --include='*/' \
+        --include='manifest.yaml' \
+        --include='script.py' \
+        --exclude='*' \
+        "$PROJECT_DIR/integrations/" "$SANDBOX_DIR/integrations/"
+    sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/integrations"
+    find "$SANDBOX_DIR/integrations" -type d -exec sudo chmod 750 {} +
+    find "$SANDBOX_DIR/integrations" -type f -exec sudo chmod 640 {} +
+    echo "Staged integrations/ to $SANDBOX_DIR/integrations/"
+    CHANGES+=("Staged integrations/ to $SANDBOX_DIR/integrations/")
+fi
+
 "$SANDBOX_VENV/bin/pip" install --upgrade pip --quiet
 
 # -------------------------------------------------------------------

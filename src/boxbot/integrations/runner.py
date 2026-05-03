@@ -89,6 +89,22 @@ def _validate_inputs(meta: IntegrationMeta, supplied: dict[str, Any]) -> dict[st
 # ---------------------------------------------------------------------------
 
 
+def _resolve_script_path(meta: IntegrationMeta, runtime_dir: Path) -> Path:
+    """Return the path the sandbox should ``runpy`` for this integration.
+
+    setup-sandbox.sh stages ``integrations/`` into
+    ``<runtime_dir>/integrations/<name>/script.py`` so the sandbox user
+    (which can't traverse a 0700 home directory to reach the project
+    tree) has a path it actually owns. If the staged copy doesn't
+    exist (dev runs, tests with sandbox enforcement off), fall back to
+    the in-tree path.
+    """
+    staged = runtime_dir / "integrations" / meta.name / "script.py"
+    if staged.exists():
+        return staged
+    return meta.script_path
+
+
 def _build_command(
     meta: IntegrationMeta,
     *,
@@ -97,7 +113,9 @@ def _build_command(
     sandbox_user: str | None,
     enforce_sandbox: bool,
     secret_env_names: list[str] | None = None,
+    script_path: Path | None = None,
 ) -> list[str]:
+    target_script = script_path if script_path is not None else meta.script_path
     if enforce_sandbox and sandbox_user:
         preserve = [
             "BOXBOT_SECCOMP_MODE", "BOXBOT_SECCOMP_DISABLE",
@@ -114,9 +132,9 @@ def _build_command(
             "--preserve-env=" + ",".join(preserve),
             "-u", sandbox_user,
             "--", str(venv_python), str(bootstrap_path),
-            str(meta.script_path),
+            str(target_script),
         ]
-    return [str(venv_python), str(bootstrap_path), str(meta.script_path)]
+    return [str(venv_python), str(bootstrap_path), str(target_script)]
 
 
 def _build_env(
@@ -305,6 +323,7 @@ async def run(
         env, secret_env_names = _build_env(
             inputs_path=inputs_path, output_path=output_path, meta=meta,
         )
+        script_path = _resolve_script_path(meta, runtime_dir)
         cmd = _build_command(
             meta,
             venv_python=venv_python,
@@ -312,6 +331,7 @@ async def run(
             sandbox_user=sandbox_user,
             enforce_sandbox=enforce_sandbox,
             secret_env_names=secret_env_names,
+            script_path=script_path,
         )
 
         try:

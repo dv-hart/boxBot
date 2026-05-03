@@ -285,14 +285,22 @@ async def run(
         enforce_sandbox = os.environ.get("BOXBOT_SANDBOX_ENFORCE", "1") != "0"
 
         # Use temp files so the sandbox can read/write without touching
-        # the project tree. tmp paths are inside `_sandbox_tmp_dir()`
-        # below, which the setup script chowns to the sandbox group.
+        # the project tree. tmp paths are inside `_sandbox_tmp_dir()`,
+        # which the setup script chowns to the sandbox group. We force
+        # mode 0660 after creation so the sandbox user (in the same
+        # group) can overwrite the output file — Python's default
+        # umask gives us 0644 which is read-only for the group.
         tmp_root = _resolve_tmp_dir()
         run_id = uuid4().hex[:12]
         inputs_path = tmp_root / f"integration-{run_id}-in.json"
         output_path = tmp_root / f"integration-{run_id}-out.json"
         inputs_path.write_text(json.dumps(validated_inputs), encoding="utf-8")
         output_path.write_text("", encoding="utf-8")
+        try:
+            os.chmod(inputs_path, 0o660)
+            os.chmod(output_path, 0o660)
+        except OSError as exc:
+            logger.warning("could not chmod integration tmp files: %s", exc)
 
         env, secret_env_names = _build_env(
             inputs_path=inputs_path, output_path=output_path, meta=meta,

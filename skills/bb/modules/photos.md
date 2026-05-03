@@ -64,6 +64,44 @@ the agent sees the image this turn. Returns `{id, filename, kind:
 Use this before responding to "what's in that photo?" or when you need
 the actual content, not just the description.
 
+### View an unsaved file by path
+
+```python
+bb.photos.view_path("/var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg")
+```
+
+Same idea as `view()`, but for image files that aren't in the photo
+library yet. The most common case: an inbound WhatsApp image. The
+user's message will start with `[image attached at <path>]` — pass
+that exact path. The path must live under one of the allowlisted
+roots (sandbox tmp, workspace, photos, perception crops); anything
+else is refused.
+
+### Ingest — save an image into the library
+
+```python
+photo_id = bb.photos.ingest(
+    "/var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg",
+    source="whatsapp",
+    sender="Erik",
+    caption="my new pokémon",
+)
+```
+
+Hands a local image file to the intake pipeline. The pipeline copies
+the bytes into `data/photos/`, runs detection + tagging, and indexes
+for search. The original file is deleted on success.
+
+Use this when an inbound photo is worth keeping — family moments,
+things the user asked you to remember, anything you'd want to surface
+later. Don't ingest memes, throwaway shares, or anything ephemeral.
+View it, respond, and let the inbound janitor reap it (7-day TTL).
+
+`source` is mandatory and goes on the photo for filtering later;
+`sender` and `caption` are optional but help. The caption seeds the
+photo's description so search works even before the small-model
+tagger fills it in.
+
 ### Show on the 7" screen
 
 ```python
@@ -129,6 +167,27 @@ p = bb.photos.get(photo_id)         # metadata
 bb.photos.view(photo_id)            # pixels (attaches to tool result)
 # Now you have the description + can cross-reference visual details.
 ```
+
+### Inbound WhatsApp image — view and decide
+
+```python
+# The user's WhatsApp message arrived as:
+#   "[image attached at /var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg] check this out"
+path = "/var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg"
+
+bb.photos.view_path(path)         # see it this turn
+
+# Decide based on what you see + who sent it + the caption:
+photo_id = bb.photos.ingest(
+    path,
+    source="whatsapp",
+    sender="Erik",
+    caption="check this out",
+)
+```
+
+If you decide *not* to keep it, just don't call `ingest()` — the
+janitor deletes staged inbound files older than 7 days.
 
 ### Curate the idle slideshow
 

@@ -11,7 +11,11 @@ Public API:
     get_photo_detail — full photo record by ID
 """
 
-from boxbot.photos.intake import IntakePipeline
+from boxbot.photos.intake import (
+    IntakePipeline,
+    get_intake_pipeline,
+    set_intake_pipeline,
+)
 from boxbot.photos.search import SearchResult, get_photo_detail, hybrid_search
 from boxbot.photos.store import (
     PhotoRecord,
@@ -27,6 +31,8 @@ __all__ = [
     "SearchResult",
     "StorageInfo",
     "TagRecord",
+    "get_intake_pipeline",
     "get_photo_detail",
     "hybrid_search",
+    "set_intake_pipeline",
 ]

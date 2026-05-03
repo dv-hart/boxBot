@@ -121,6 +121,76 @@ def _generate_conversation_id() -> str:
     return f"conv_{uuid.uuid4().hex[:12]}"
 
 
+# Mime type → file extension for inbound WhatsApp images. Restricted to
+# the formats the multimodal attach pipeline accepts (build_image_block).
+_WHATSAPP_IMAGE_EXTS: dict[str, str] = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
+
+async def _stage_whatsapp_image(media_id: str, message_id: str) -> Path | None:
+    """Download an inbound WhatsApp image to the sandbox tmp dir.
+
+    Lands at ``{sandbox.tmp_dir}/inbound/whatsapp/{message_id}.{ext}``.
+    The directory inherits group ``boxbot`` (setgid on tmp/), so the
+    sandbox user can read the staged file. Bytes are owned by the
+    main-process user.
+
+    Returns the staged path on success, or None if the WhatsApp client
+    is not configured, the download fails, or the mime type isn't
+    supported by the multimodal attach pipeline.
+    """
+    from boxbot.communication.whatsapp import get_whatsapp_client
+
+    client = get_whatsapp_client()
+    if client is None:
+        logger.warning("WhatsApp image %s: client not configured", media_id)
+        return None
+
+    result = await client.download_media(media_id)
+    if result is None:
+        return None
+    data, mime_type = result
+
+    ext = _WHATSAPP_IMAGE_EXTS.get(mime_type.lower())
+    if ext is None:
+        logger.warning(
+            "WhatsApp image %s: unsupported mime %s", media_id, mime_type
+        )
+        return None
+
+    try:
+        from boxbot.core.config import get_config
+
+        tmp_dir = Path(get_config().sandbox.tmp_dir)
+    except Exception:
+        tmp_dir = Path("/var/lib/boxbot-sandbox/tmp")
+
+    inbound_dir = tmp_dir / "inbound" / "whatsapp"
+    try:
+        inbound_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("WhatsApp inbound dir create failed: %s", e)
+        return None
+
+    # message_id is a Meta-issued opaque token (e.g. ``wamid.HBg…``).
+    # Strip path separators defensively before using it as a filename.
+    safe_id = message_id.replace("/", "_").replace("\\", "_") or uuid.uuid4().hex
+    dest = inbound_dir / f"{safe_id}.{ext}"
+    try:
+        dest.write_bytes(data)
+    except OSError as e:
+        logger.warning("WhatsApp image write failed for %s: %s", dest, e)
+        return None
+
+    logger.info("Staged WhatsApp image %s → %s (%d bytes)", media_id, dest, len(data))
+    return dest
+
+
 def _render_identity_section(
     identities: dict[str, dict[str, Any]] | None,
 ) -> str:
@@ -639,7 +709,22 @@ class BoxBotAgent:
             "WhatsApp message from %s", event.sender_name or event.sender_phone,
         )
         text = event.text or ""
-        if event.media_type:
+
+        # For images, download to a sandbox-readable staging path so the
+        # agent can view + ingest via bb.photos. Other media types are
+        # surfaced as a marker only for now.
+        attachment_path: Path | None = None
+        if event.media_type == "image" and event.media_url:
+            attachment_path = await _stage_whatsapp_image(
+                media_id=event.media_url,
+                message_id=event.message_id,
+            )
+
+        if attachment_path is not None:
+            text = f"[image attached at {attachment_path}] {text}".strip()
+        elif event.media_type == "image":
+            text = f"[image attached, download failed] {text}".strip()
+        elif event.media_type:
             text = f"[{event.media_type} attached] {text}".strip()
 
         channel_key = f"whatsapp:{event.sender_phone or 'unknown'}"
@@ -656,6 +741,7 @@ class BoxBotAgent:
                 "sender_phone": event.sender_phone,
                 "media_url": event.media_url,
                 "media_type": event.media_type,
+                "attachment_path": str(attachment_path) if attachment_path else None,
             },
         )
 
@@ -1218,6 +1304,30 @@ class BoxBotAgent:
                 sections.append(status_line.strip())
         except Exception:
             logger.debug("Could not fetch scheduler status line")
+
+        # WhatsApp inbound image hint: when the inbound handler stages a
+        # photo, the user message starts with "[image attached at <path>]".
+        # Tell the agent how to act on it. Only injected when this turn's
+        # context actually carries a staged path so we don't waste prompt
+        # bytes on plain text turns.
+        if (
+            channel == "whatsapp"
+            and context
+            and context.get("attachment_path")
+        ):
+            sections.append(
+                "## Inbound image\n"
+                "The user's message starts with "
+                "`[image attached at <path>]`. To see it, call "
+                "`bb.photos.view_path(path)` from `execute_script` — the "
+                "pixels attach to the tool result. If the photo is worth "
+                "keeping (family moment, something the user asked you to "
+                "remember, anything you'd want to surface later), save it "
+                "with `bb.photos.ingest(path, source=\"whatsapp\", "
+                "sender=<name>, caption=<their text>)`. Do NOT ingest "
+                "memes, throwaway shares, or anything ephemeral — view, "
+                "respond, and let the janitor reap it."
+            )
 
         # Trigger details (trigger-initiated conversations)
         if context and channel == "trigger":

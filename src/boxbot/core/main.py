@@ -392,10 +392,13 @@ async def _init_display_manager() -> Any:
 
 async def _init_photo_intake(photo_store: Any) -> Any:
     """Initialise and start the photo intake pipeline."""
-    from boxbot.photos.intake import IntakePipeline
+    from boxbot.photos.intake import IntakePipeline, set_intake_pipeline
 
     pipeline = IntakePipeline(photo_store)
     await pipeline.start()
+    # Publish so sandbox action handlers (bb.photos.ingest) can reach
+    # the live pipeline without DI plumbing.
+    set_intake_pipeline(pipeline)
     logger.info("Photo intake pipeline started")
     return pipeline
 

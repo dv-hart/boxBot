@@ -414,24 +414,30 @@ class WhatsAppWebhook:
     async def download_media(
         self,
         media_id: str,
-        access_token: str,
-    ) -> bytes | None:
+        access_token: str | None = None,
+    ) -> tuple[bytes, str] | None:
         """Download media content by its WhatsApp media ID.
 
-        Two-step process: first get the media URL, then download the content.
+        Two-step process: fetch the metadata (which carries a short-lived
+        URL plus the mime type), then GET the bytes.
 
         Args:
             media_id: The WhatsApp media ID from the webhook payload.
-            access_token: The Graph API access token.
+            access_token: The Graph API access token. Defaults to the
+                token this client was constructed with.
 
         Returns:
-            The raw media bytes, or None on failure.
+            ``(bytes, mime_type)`` on success, or None on failure. The
+            mime_type comes from Meta's metadata response (e.g.
+            ``"image/jpeg"``) and is what the caller should use when
+            picking a file extension.
         """
-        headers = {"Authorization": f"Bearer {access_token}"}
+        token = access_token or self._access_token
+        headers = {"Authorization": f"Bearer {token}"}
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                # Step 1: Get the media URL
+                # Step 1: Get the media URL + mime type
                 url_response = await client.get(
                     f"{GRAPH_API_BASE}/{media_id}",
                     headers=headers,
@@ -444,7 +450,9 @@ class WhatsAppWebhook:
                     )
                     return None
 
-                media_url = url_response.json().get("url")
+                meta = url_response.json()
+                media_url = meta.get("url")
+                mime_type = meta.get("mime_type", "application/octet-stream")
                 if not media_url:
                     logger.error("No URL in media response for %s", media_id)
                     return None
@@ -459,7 +467,7 @@ class WhatsAppWebhook:
                     )
                     return None
 
-                return media_response.content
+                return media_response.content, mime_type
         except httpx.HTTPError as e:
             logger.error("HTTP error downloading media %s: %s", media_id, e)
             return None

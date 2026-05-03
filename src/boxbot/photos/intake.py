@@ -40,6 +40,31 @@ from boxbot.photos.store import PhotoStore
 logger = logging.getLogger(__name__)
 
 
+# Module-level accessor so sandbox action handlers (bb.photos.ingest)
+# can reach the running pipeline without DI plumbing. Mirrors the
+# display manager / WhatsApp client singleton pattern.
+_intake_pipeline_instance: "IntakePipeline | None" = None
+
+
+def get_intake_pipeline() -> "IntakePipeline | None":
+    """Return the process-wide IntakePipeline instance, or None if unset."""
+    return _intake_pipeline_instance
+
+
+def set_intake_pipeline(pipeline: "IntakePipeline | None") -> None:
+    """Register the process-wide IntakePipeline instance."""
+    global _intake_pipeline_instance
+    _intake_pipeline_instance = pipeline
+
+
+# How long staged inbound files (e.g. tmp/inbound/whatsapp/…) may sit
+# before the janitor reaps them. Files the agent actively ingested are
+# deleted right after the pipeline copies them; this only catches the
+# ones the agent looked at and decided not to keep.
+_INBOUND_TTL_SECONDS = 7 * 24 * 3600
+_INBOUND_SWEEP_INTERVAL = 6 * 3600
+
+
 @dataclass
 class IntakeItem:
     """An item in the intake queue awaiting processing."""
@@ -48,6 +73,8 @@ class IntakeItem:
     source: str  # "whatsapp", "camera", "upload"
     sender: str | None
     future: asyncio.Future[str]
+    caption: str | None = None
+    delete_source: bool = False
 
 
 @dataclass
@@ -76,6 +103,7 @@ class IntakePipeline:
         self._store = store
         self._queue: asyncio.Queue[IntakeItem] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
+        self._janitor_task: asyncio.Task[None] | None = None
         self._running = False
 
     async def start(self) -> None:
@@ -84,11 +112,22 @@ class IntakePipeline:
             return
         self._running = True
         self._task = asyncio.create_task(self._process_loop())
+        self._janitor_task = asyncio.create_task(
+            self._inbound_janitor_loop(),
+            name="photo-intake-janitor",
+        )
         logger.info("Photo intake pipeline started")
 
     async def stop(self) -> None:
         """Stop the background processing loop gracefully."""
         self._running = False
+        if self._janitor_task is not None:
+            self._janitor_task.cancel()
+            try:
+                await self._janitor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._janitor_task = None
         if self._task:
             # Put a sentinel to unblock the queue.get()
             sentinel_future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
@@ -108,12 +147,59 @@ class IntakePipeline:
             self._task = None
         logger.info("Photo intake pipeline stopped")
 
+    async def _inbound_janitor_loop(self) -> None:
+        """Periodically prune stale files under tmp/inbound/.
+
+        Files the agent ingests are deleted by the pipeline as soon as
+        the bytes are copied into the photo store. This loop catches
+        the rest — inbound images the agent looked at and decided not
+        to keep — and prevents the staging dir from growing without
+        bound. Runs every ``_INBOUND_SWEEP_INTERVAL`` seconds.
+        """
+        # First sweep at startup catches anything left over from a
+        # previous run that crashed mid-ingest.
+        while self._running:
+            try:
+                await self._sweep_inbound_dir()
+            except Exception:
+                logger.exception("Inbound janitor sweep failed")
+            try:
+                await asyncio.sleep(_INBOUND_SWEEP_INTERVAL)
+            except asyncio.CancelledError:
+                return
+
+    async def _sweep_inbound_dir(self) -> None:
+        """Delete inbound staging files older than ``_INBOUND_TTL_SECONDS``."""
+        try:
+            tmp_dir = Path(get_config().sandbox.tmp_dir)
+        except Exception:
+            tmp_dir = Path("/var/lib/boxbot-sandbox/tmp")
+        inbound_root = tmp_dir / "inbound"
+        if not inbound_root.exists():
+            return
+
+        cutoff = datetime.now(timezone.utc).timestamp() - _INBOUND_TTL_SECONDS
+        reaped = 0
+        for path in inbound_root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+                    reaped += 1
+            except OSError as e:
+                logger.debug("Janitor skip %s: %s", path, e)
+        if reaped:
+            logger.info("Inbound janitor: reaped %d stale files", reaped)
+
     async def enqueue(
         self,
         file_path: str | Path,
         *,
         source: str = "upload",
         sender: str | None = None,
+        caption: str | None = None,
+        delete_source: bool = False,
     ) -> str:
         """Add a photo to the intake queue for processing.
 
@@ -121,6 +207,13 @@ class IntakePipeline:
             file_path: Path to the image file to process.
             source: Origin — "whatsapp", "camera", or "upload".
             sender: Person name if from messaging.
+            caption: Optional human-supplied description (e.g. WhatsApp
+                caption). Seeds the photo description so search works
+                even before the small-model tagger fills it in.
+            delete_source: If True, delete ``file_path`` after the
+                pipeline has copied the bytes into the photo store. Used
+                for staged inbound files (tmp/inbound/whatsapp/…) so we
+                don't leave duplicates lying around.
 
         Returns:
             The photo ID once processing is complete.
@@ -152,6 +245,8 @@ class IntakePipeline:
             source=source,
             sender=sender,
             future=future,
+            caption=caption,
+            delete_source=delete_source,
         )
         await self._queue.put(item)
         logger.debug("Enqueued photo for intake: %s", file_path)
@@ -164,6 +259,7 @@ class IntakePipeline:
         *,
         source: str = "upload",
         sender: str | None = None,
+        caption: str | None = None,
     ) -> str:
         """Process a photo synchronously (bypasses the queue).
 
@@ -173,6 +269,7 @@ class IntakePipeline:
             file_path: Path to the image file to process.
             source: Origin — "whatsapp", "camera", or "upload".
             sender: Person name if from messaging.
+            caption: Optional human-supplied description.
 
         Returns:
             The photo ID.
@@ -191,7 +288,7 @@ class IntakePipeline:
                 f"Cannot save new photos. Ask the user what to remove."
             )
 
-        result = await self._run_pipeline(file_path, source, sender)
+        result = await self._run_pipeline(file_path, source, sender, caption=caption)
         return result.photo_id
 
     # ------------------------------------------------------------------
@@ -210,10 +307,19 @@ class IntakePipeline:
 
                 try:
                     result = await self._run_pipeline(
-                        item.file_path, item.source, item.sender
+                        item.file_path, item.source, item.sender,
+                        caption=item.caption,
                     )
                     if not item.future.done():
                         item.future.set_result(result.photo_id)
+                    if item.delete_source:
+                        try:
+                            item.file_path.unlink(missing_ok=True)
+                        except OSError as e:
+                            logger.warning(
+                                "Could not delete intake source %s: %s",
+                                item.file_path, e,
+                            )
                 except Exception as e:
                     logger.exception("Intake pipeline failed for %s", item.file_path)
                     if not item.future.done():
@@ -231,6 +337,8 @@ class IntakePipeline:
         file_path: Path,
         source: str,
         sender: str | None,
+        *,
+        caption: str | None = None,
     ) -> IntakeResult:
         """Execute the full intake pipeline on a single photo.
 
@@ -256,6 +364,13 @@ class IntakePipeline:
         description, tags, new_tags = await self._generate_tags(
             resized_image, people
         )
+
+        # Caption fallback: if the small-model tagger gave us nothing
+        # (current behaviour — it's a stub), use the human-supplied
+        # caption so search at least has something to match against.
+        # Once the tagger lands, the caption can be passed in as a hint.
+        if not description and caption:
+            description = caption
 
         # Step 4: Embed the description
         description_embedding: np.ndarray | None = None

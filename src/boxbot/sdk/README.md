@@ -258,6 +258,22 @@ for p in results:
 info = photos.get("photo_123")
 print(info.description, info.tags, info.people, info.file_path)
 
+# View an unsaved file by path (e.g. inbound WhatsApp image staged at
+# tmp/inbound/whatsapp/<wamid>.jpg). Path must be under an allowlisted
+# root: sandbox tmp, workspace, photos, perception crops.
+photos.view_path("/var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg")
+
+# Save a local image into the library — pipeline copies bytes, runs
+# detection + tagging, and deletes the source on success. Use this
+# when an inbound photo is worth keeping; otherwise let the inbound
+# janitor reap it (7-day TTL on tmp/inbound/).
+photo_id = photos.ingest(
+    "/var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg",
+    source="whatsapp",
+    sender="Erik",
+    caption="my new pokémon",
+)
+
 # Update metadata
 photos.update("photo_123",
               description="Updated description of this photo")

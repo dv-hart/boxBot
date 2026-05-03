@@ -344,6 +344,96 @@ async def _handle_photos_action(
                 "attached": attached,
             }
 
+        if action_type == "photos.view_path":
+            raw = payload.get("path")
+            if not raw:
+                return {"status": "error", "error": "path is required"}
+            try:
+                abs_path = Path(raw).resolve()
+            except OSError as e:
+                return {"status": "error", "error": f"bad path: {e}"}
+            if not abs_path.exists() or not abs_path.is_file():
+                return {
+                    "status": "error",
+                    "error": f"file not found: {abs_path}",
+                }
+            if not _is_attach_allowed(abs_path):
+                return {
+                    "status": "error",
+                    "error": (
+                        "path is outside the allowed roots "
+                        "(sandbox tmp, workspace, photos, perception crops)"
+                    ),
+                }
+            if len(ctx.image_attachments) < MAX_IMAGES_PER_CALL:
+                ctx.image_attachments.append(abs_path)
+                attached = True
+            else:
+                attached = False
+                logger.warning(
+                    "photos.view_path not attached (exceeded %d/call)",
+                    MAX_IMAGES_PER_CALL,
+                )
+            return {
+                "status": "ok",
+                "path": str(abs_path),
+                "filename": abs_path.name,
+                "kind": "image",
+                "attached": attached,
+            }
+
+        if action_type == "photos.ingest":
+            raw = payload.get("path")
+            source = payload.get("source")
+            if not raw:
+                return {"status": "error", "error": "path is required"}
+            if not source:
+                return {"status": "error", "error": "source is required"}
+            try:
+                abs_path = Path(raw).resolve()
+            except OSError as e:
+                return {"status": "error", "error": f"bad path: {e}"}
+            if not abs_path.exists() or not abs_path.is_file():
+                return {
+                    "status": "error",
+                    "error": f"file not found: {abs_path}",
+                }
+            if not _is_attach_allowed(abs_path):
+                return {
+                    "status": "error",
+                    "error": (
+                        "path is outside the allowed roots "
+                        "(sandbox tmp, workspace, photos, perception crops)"
+                    ),
+                }
+            from boxbot.photos.intake import get_intake_pipeline
+
+            pipeline = get_intake_pipeline()
+            if pipeline is None:
+                return {
+                    "status": "error",
+                    "error": "photo intake pipeline is not running",
+                }
+            # Staged inbound files live under tmp/inbound/ — the pipeline
+            # owns them after a successful ingest, so it deletes them
+            # once the bytes are copied into the photo store.
+            staged = "inbound" in abs_path.parts
+            try:
+                photo_id = await pipeline.enqueue(
+                    abs_path,
+                    source=str(source),
+                    sender=payload.get("sender"),
+                    caption=payload.get("caption"),
+                    delete_source=staged,
+                )
+            except (FileNotFoundError, ValueError) as e:
+                return {"status": "error", "error": str(e)}
+            return {
+                "status": "ok",
+                "photo_id": photo_id,
+                "source": source,
+            }
+
         if action_type == "photos.show_on_screen":
             ids = payload.get("photo_ids") or []
             if not isinstance(ids, list) or not ids:

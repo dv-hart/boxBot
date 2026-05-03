@@ -154,6 +154,61 @@ def view(photo_id: str) -> dict[str, Any]:
     return _check(_transport.request("photos.view", {"id": photo_id}, timeout=30))
 
 
+def view_path(path: str) -> dict[str, Any]:
+    """Attach a local image file's pixels to the tool result.
+
+    Use this for files that haven't been ingested into the photo
+    library yet — most often an inbound WhatsApp image staged at
+    ``[image attached at <path>]`` in the user's message. Path must
+    live under one of the allowlisted roots (sandbox tmp, workspace,
+    photos, perception crops); anything else is refused.
+
+    Returns ``{path, filename, kind: "image", attached: True}``. The
+    image bytes ride back as an image content block on the tool
+    result, not as a field in this dict.
+    """
+    v.require_str(path, "path")
+    return _check(_transport.request("photos.view_path", {"path": path}, timeout=30))
+
+
+def ingest(
+    path: str,
+    *,
+    source: str,
+    sender: str | None = None,
+    caption: str | None = None,
+) -> str:
+    """Hand a local image file to the photo intake pipeline.
+
+    Use this once you've decided an inbound or scratch image belongs in
+    the photo library. The pipeline copies the bytes into
+    ``data/photos/``, runs detection + tagging, and indexes for search.
+    The original ``path`` is deleted on success (it was only staging).
+
+    Args:
+        path: Local file path (must be under an allowlisted root).
+        source: Where the image came from — ``"whatsapp"``, ``"camera"``,
+            or ``"upload"``. Stored on the photo for filtering later.
+        sender: Person who sent it, if known.
+        caption: Optional human-supplied description; used as the
+            initial photo description until the small-model tagger
+            replaces it.
+
+    Returns the new photo's ID.
+    """
+    v.require_str(path, "path")
+    v.require_str(source, "source")
+    payload: dict[str, Any] = {"path": path, "source": source}
+    if sender is not None:
+        v.require_str(sender, "sender")
+        payload["sender"] = sender
+    if caption is not None:
+        v.require_str(caption, "caption")
+        payload["caption"] = caption
+    resp = _check(_transport.request("photos.ingest", payload, timeout=120))
+    return resp["photo_id"]
+
+
 def show_on_screen(photo_ids: list[str]) -> dict[str, Any]:
     """Display one or more photos on the 7\" screen.
 

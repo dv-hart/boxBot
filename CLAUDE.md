@@ -56,7 +56,7 @@ hot-path or security-sensitive operations remain as standalone tools.
 **Tools** (`src/boxbot/tools/`) — 7 always-loaded tools:
 - `execute_script` — primary gateway: run Python in the sandbox with
   the `bb` package (photos, camera, workspace, display, memory, tasks,
-  skill, secrets, packages, calendar). Composes many ops per turn.
+  skill, secrets, packages, integrations). Composes many ops per turn.
 - `switch_display` — change what's on the 7" screen (hot-path singleton)
 - `identify_person` — register / correct a speaker's identity; returns
   a cropped still of the speaker on new-person outcomes so the agent
@@ -85,11 +85,10 @@ inside `execute_script`) — the constrained, immutable Python API:
 - `bb.skill` — create new skills at runtime
 - `bb.integrations` — list / call / create / update / delete data-pipe
   integrations (sandbox-runnable manifest+script bundles); read
-  execution logs for self-debugging
+  execution logs for self-debugging. **Calendar lives here**:
+  `bb.integrations.get("calendar", action="list_upcoming_events", …)`.
 - `bb.secrets` — write-only credential storage
 - `bb.packages` — request package install (human approval required)
-- `bb.calendar` — Google Calendar read/write (scheduled to fold into
-  `bb.integrations.get("calendar", ...)`; keep using `bb.calendar` for now)
 
 The SDK communicates with the main process through structured JSON on
 stdout + stdin (streaming, bidirectional). `execute_script` reads
@@ -273,7 +272,7 @@ processes conversations independent of transport.
 │  │ boxbot_sdk / bb  (immutable, declarative)    │ │
 │  │ workspace · camera · photos · display        │ │
 │  │ memory · tasks · skill · secrets             │ │
-│  │ packages · calendar                          │ │
+│  │ packages · integrations                      │ │
 │  ├──────────────────────────────────────────────┤ │
 │  │ agent scripts · skill scripts · user pkgs    │ │
 │  └──────────────────────────────────────────────┘ │

@@ -1,0 +1,52 @@
+name: calendar
+description: Read and write Google Calendar via the v3 REST API. Auto-refreshes the OAuth token from the secret store. Use action=list_upcoming_events for reads, create_event/update_event/delete_event for writes.
+inputs:
+  action:
+    type: string
+    required: true
+    description: One of list_upcoming_events, create_event, update_event, delete_event.
+  calendar_id:
+    type: string
+    description: Calendar to read/write (defaults to primary).
+  max_results:
+    type: int
+    default: 5
+    description: For list_upcoming_events — maximum events to return (1-50).
+  event_id:
+    type: string
+    description: For update_event / delete_event — the event ID.
+  summary:
+    type: string
+    description: For create_event / update_event — event title.
+  start:
+    type: string
+    description: For create_event / update_event — ISO datetime, or YYYY-MM-DD when all_day is true.
+  end:
+    type: string
+    description: For create_event / update_event — ISO datetime, or YYYY-MM-DD when all_day is true.
+  description:
+    type: string
+    description: For create_event / update_event — long description.
+  location:
+    type: string
+    description: For create_event / update_event — location string.
+  all_day:
+    type: bool
+    default: false
+    description: For create_event / update_event — treat start/end as YYYY-MM-DD dates.
+outputs:
+  events:
+    type: array
+    description: For list_upcoming_events — display-ready event dicts (id, title, time, start, end, location, duration, all_day, description).
+  count:
+    type: int
+    description: For list_upcoming_events — number of events returned.
+  event_id:
+    type: string
+    description: For create_event — the new event's ID.
+  ok:
+    type: bool
+    description: For update_event / delete_event — success flag.
+secrets:
+  - GOOGLE_CALENDAR_TOKEN_JSON
+timeout: 20

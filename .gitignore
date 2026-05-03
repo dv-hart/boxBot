@@ -56,6 +56,7 @@ Thumbs.db
 
 # Runtime state
 data/scheduler/
+data/integrations/
 
 # Ad-hoc audio artifacts (test output)
 /*.wav
@@ -69,6 +70,7 @@ skills/*/
 !skills/skill_authoring/
 integrations/*/
 !integrations/weather/
+!integrations/calendar/
 displays/*/
 !displays/example_display/
 data/credentials/

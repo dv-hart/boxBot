@@ -111,9 +111,22 @@ class ExecuteScriptTool(Tool):
                 "type": "object",
                 "description": (
                     "Optional environment variables to inject into the script's "
-                    "environment (e.g., API credentials for a specific service)."
+                    "environment. Use this for non-secret values; for stored "
+                    "credentials, prefer the 'secrets' parameter so the value "
+                    "is resolved server-side and never crosses the agent's view."
                 ),
                 "additionalProperties": {"type": "string"},
+            },
+            "secrets": {
+                "type": "array",
+                "description": (
+                    "Names of stored secrets to inject as BOXBOT_SECRET_<NAME> "
+                    "env vars. The tool resolves names against the secret store; "
+                    "the agent never sees values. Names not in the store are "
+                    "silently skipped — the script can detect None and surface "
+                    "a helpful error."
+                ),
+                "items": {"type": "string"},
             },
         },
         "required": ["script", "description"],
@@ -123,7 +136,30 @@ class ExecuteScriptTool(Tool):
     async def execute(self, **kwargs: Any) -> str | list[dict[str, Any]]:
         script: str = kwargs["script"]
         description: str = kwargs["description"]
-        env_vars: dict[str, str] = kwargs.get("env_vars") or {}
+        env_vars: dict[str, str] = dict(kwargs.get("env_vars") or {})
+        secret_names: list[str] = list(kwargs.get("secrets") or [])
+
+        # Resolve named secrets server-side and merge into env_vars. The
+        # agent supplied names only; values come from the SecretStore and
+        # never reach the agent's view. Unknown names are skipped (logged
+        # by load(); the script can detect None and surface its own error).
+        secret_env_keys: list[str] = []
+        if secret_names:
+            from boxbot.secrets import get_secret_store
+
+            store = get_secret_store()
+            for name in secret_names:
+                value = store.load(name)
+                if value is None:
+                    logger.warning(
+                        "execute_script: secret '%s' is not stored — "
+                        "BOXBOT_SECRET_%s will be absent",
+                        name, name,
+                    )
+                    continue
+                key = f"BOXBOT_SECRET_{name}"
+                env_vars[key] = value
+                secret_env_keys.append(key)
 
         logger.info("execute_script: %s", description)
 
@@ -212,12 +248,18 @@ class ExecuteScriptTool(Tool):
 
         enforce_sandbox = os.environ.get("BOXBOT_SANDBOX_ENFORCE", "1") != "0"
         if enforce_sandbox and sandbox_user:
+            preserve = [
+                "BOXBOT_SECCOMP_MODE",
+                "BOXBOT_SECCOMP_DISABLE",
+                "BOXBOT_SKILLS_ROOT",
+            ]
+            # sudo strips env not listed here, so any BOXBOT_SECRET_* we
+            # resolved above must be named explicitly to cross the
+            # privilege drop.
+            preserve.extend(secret_env_keys)
             cmd = [
                 "sudo", "-n",
-                # Forward the seccomp env vars across the sudo boundary
-                # — sudo strips the environment by default, so we have
-                # to opt them in explicitly.
-                "--preserve-env=BOXBOT_SECCOMP_MODE,BOXBOT_SECCOMP_DISABLE,BOXBOT_SKILLS_ROOT",
+                "--preserve-env=" + ",".join(preserve),
                 "-u", sandbox_user,
                 "--", str(venv_python), str(bootstrap_path),
                 str(script_path),

@@ -17,15 +17,16 @@ Modules:
     photos       — Photo library management
     tasks        — Trigger and to-do management
     secrets      — Write-only secret storage
-    calendar     — DEPRECATED: use integrations.get("calendar", ...)
     workspace    — Filesystem-backed notebook (read, write, view, search,
                    CSVs). The counterpart to memory: memory recognizes,
                    workspace holds content.
+
+The calendar surface lives behind the ``calendar`` integration —
+reach it via ``bb.integrations.get("calendar", action="...", ...)``.
 """
 
 from . import (
     auth,
-    calendar,
     camera,
     display,
     integrations,
@@ -40,7 +41,6 @@ from . import (
 
 __all__ = [
     "auth",
-    "calendar",
     "camera",
     "display",
     "integrations",

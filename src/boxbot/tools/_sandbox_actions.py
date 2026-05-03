@@ -533,72 +533,6 @@ async def _handle_camera_action(
 # ---------------------------------------------------------------------------
 
 
-@action_handler("calendar")
-async def _handle_calendar_action(
-    action_type: str,
-    payload: dict[str, Any],
-    ctx: ActionContext,  # unused; kept for uniform handler signature
-) -> dict[str, Any]:
-    from boxbot.integrations import google_calendar as gc
-
-    try:
-        if action_type == "calendar.create_event":
-            event_id = await gc.create_event(
-                summary=payload["summary"],
-                start=payload["start"],
-                end=payload["end"],
-                description=payload.get("description"),
-                location=payload.get("location"),
-                calendar_id=payload.get("calendar_id"),
-                all_day=bool(payload.get("all_day", False)),
-            )
-            return {"status": "ok", "event_id": event_id}
-
-        if action_type == "calendar.update_event":
-            ok = await gc.update_event(
-                payload["event_id"],
-                summary=payload.get("summary"),
-                start=payload.get("start"),
-                end=payload.get("end"),
-                description=payload.get("description"),
-                location=payload.get("location"),
-                calendar_id=payload.get("calendar_id"),
-                all_day=bool(payload.get("all_day", False)),
-            )
-            return {"status": "ok" if ok else "error"}
-
-        if action_type == "calendar.delete_event":
-            ok = await gc.delete_event(
-                payload["event_id"],
-                calendar_id=payload.get("calendar_id"),
-            )
-            return {"status": "ok" if ok else "error"}
-
-        if action_type == "calendar.list_upcoming_events":
-            events = await gc.list_upcoming_events(
-                max_results=int(payload.get("max_results", 5)),
-                calendar_id=payload.get("calendar_id"),
-            )
-            return {"status": "ok", "events": events}
-
-        return {
-            "status": "error",
-            "error": f"unknown calendar action: {action_type}",
-        }
-
-    except gc.CalendarNotAuthenticated as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "remedy": "Run scripts/calendar_auth.py to grant access.",
-        }
-    except KeyError as e:
-        return {"status": "error", "error": f"missing field: {e}"}
-    except Exception as e:  # noqa: BLE001
-        logger.exception("%s failed", action_type)
-        return {"status": "error", "error": str(e)}
-
-
 # ---------------------------------------------------------------------------
 # Auth action handler
 # ---------------------------------------------------------------------------
@@ -870,6 +804,69 @@ async def _handle_integrations_action(
         return {
             "status": "error",
             "message": f"unknown integrations action '{action_type}'",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("%s failed", action_type)
+        return {"status": "error", "message": str(exc)}
+
+
+@action_handler("secrets")
+def _handle_secrets_action(
+    action_type: str,
+    payload: dict[str, Any],
+    ctx: ActionContext,  # unused; kept for uniform handler signature
+) -> dict[str, Any]:
+    """Dispatch ``secrets.*`` — store, delete, list, use.
+
+    The handler never echoes secret values. ``store`` accepts a value
+    and persists it; ``use`` confirms a secret exists and returns the
+    env-var name the runner will set; ``list`` returns names + stored_at
+    only; ``delete`` removes by name.
+
+    Action log redaction: only ``name`` and ``status`` (and the optional
+    ``previous`` / ``env_var`` fields) are returned, so the action log
+    surfaced to the agent never carries the value.
+    """
+    sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+
+    try:
+        from boxbot.secrets import SecretStoreError, get_secret_store
+
+        store = get_secret_store()
+
+        if sub == "store":
+            name = payload.get("name")
+            value = payload.get("value")
+            try:
+                return store.store(name, value)  # type: ignore[arg-type]
+            except SecretStoreError as exc:
+                return {"status": "error", "message": str(exc)}
+
+        if sub == "delete":
+            name = payload.get("name")
+            try:
+                return store.delete(name)  # type: ignore[arg-type]
+            except SecretStoreError as exc:
+                return {"status": "error", "message": str(exc)}
+
+        if sub == "list":
+            return {"status": "ok", "secrets": store.list_names()}
+
+        if sub == "use":
+            name = payload.get("name")
+            if not isinstance(name, str) or not name:
+                return {"status": "error", "message": "'name' is required"}
+            if not store.has(name):
+                return {"status": "missing", "name": name}
+            return {
+                "status": "ok",
+                "name": name,
+                "env_var": f"BOXBOT_SECRET_{name.upper()}",
+            }
+
+        return {
+            "status": "error",
+            "message": f"unknown secrets action '{action_type}'",
         }
     except Exception as exc:  # noqa: BLE001
         logger.exception("%s failed", action_type)

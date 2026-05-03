@@ -96,14 +96,22 @@ def _build_command(
     bootstrap_path: Path,
     sandbox_user: str | None,
     enforce_sandbox: bool,
+    secret_env_names: list[str] | None = None,
 ) -> list[str]:
     if enforce_sandbox and sandbox_user:
+        preserve = [
+            "BOXBOT_SECCOMP_MODE", "BOXBOT_SECCOMP_DISABLE",
+            "BOXBOT_SKILLS_ROOT",
+            "BOXBOT_INTEGRATION_INPUTS_PATH", "BOXBOT_INTEGRATION_OUTPUT_PATH",
+        ]
+        if secret_env_names:
+            # sudo strips env vars not in --preserve-env=, so any
+            # BOXBOT_SECRET_* we set in the env dict has to be named here
+            # too, or it never reaches the script.
+            preserve.extend(secret_env_names)
         return [
             "sudo", "-n",
-            "--preserve-env="
-            "BOXBOT_SECCOMP_MODE,BOXBOT_SECCOMP_DISABLE,"
-            "BOXBOT_SKILLS_ROOT,"
-            "BOXBOT_INTEGRATION_INPUTS_PATH,BOXBOT_INTEGRATION_OUTPUT_PATH",
+            "--preserve-env=" + ",".join(preserve),
             "-u", sandbox_user,
             "--", str(venv_python), str(bootstrap_path),
             str(meta.script_path),
@@ -111,8 +119,22 @@ def _build_command(
     return [str(venv_python), str(bootstrap_path), str(meta.script_path)]
 
 
-def _build_env(*, inputs_path: Path, output_path: Path) -> dict[str, str]:
-    """Subset of os.environ + integration-specific vars."""
+def _build_env(
+    *,
+    inputs_path: Path,
+    output_path: Path,
+    meta: IntegrationMeta | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Subset of os.environ + integration-specific vars + declared secrets.
+
+    Returns ``(env, secret_env_names)``. ``secret_env_names`` is the
+    list of ``BOXBOT_SECRET_*`` keys that were resolved successfully —
+    the caller passes them to :func:`_build_command` so sudo's
+    ``--preserve-env`` lets them through privilege drop. Missing
+    secrets are logged but don't block the run; the script can detect
+    ``os.environ.get(...)`` returning ``None`` and surface a helpful
+    error in its output.
+    """
     SAFE_ENV_KEYS = {
         "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
         "PYTHONPATH", "VIRTUAL_ENV", "PYTHONDONTWRITEBYTECODE",
@@ -122,6 +144,24 @@ def _build_env(*, inputs_path: Path, output_path: Path) -> dict[str, str]:
     env["PYTHONUNBUFFERED"] = "1"
     env["BOXBOT_INTEGRATION_INPUTS_PATH"] = str(inputs_path)
     env["BOXBOT_INTEGRATION_OUTPUT_PATH"] = str(output_path)
+
+    secret_env_names: list[str] = []
+    if meta is not None and meta.secrets:
+        from boxbot.secrets import get_secret_store
+
+        store = get_secret_store()
+        for name in meta.secrets:
+            value = store.load(name)
+            if value is None:
+                logger.warning(
+                    "integration '%s' declared secret '%s' but it is not "
+                    "stored — script will see an empty env var",
+                    meta.name, name,
+                )
+                continue
+            env_key = f"BOXBOT_SECRET_{name}"
+            env[env_key] = value
+            secret_env_names.append(env_key)
 
     # Reuse the same seccomp policy as agent scripts.
     try:
@@ -141,7 +181,7 @@ def _build_env(*, inputs_path: Path, output_path: Path) -> dict[str, str]:
     except Exception:  # noqa: BLE001
         pass
 
-    return env
+    return env, secret_env_names
 
 
 # ---------------------------------------------------------------------------
@@ -254,13 +294,16 @@ async def run(
         inputs_path.write_text(json.dumps(validated_inputs), encoding="utf-8")
         output_path.write_text("", encoding="utf-8")
 
-        env = _build_env(inputs_path=inputs_path, output_path=output_path)
+        env, secret_env_names = _build_env(
+            inputs_path=inputs_path, output_path=output_path, meta=meta,
+        )
         cmd = _build_command(
             meta,
             venv_python=venv_python,
             bootstrap_path=bootstrap_path,
             sandbox_user=sandbox_user,
             enforce_sandbox=enforce_sandbox,
+            secret_env_names=secret_env_names,
         )
 
         try:

@@ -54,7 +54,12 @@ agent's gateway to the SDK and general-purpose computation.
   - `script` (string) — Python source code
   - `description` (string) — what the script does (for logging)
   - `env_vars` (dict, optional) — environment variables to inject
-    (e.g., API credentials for a specific service)
+    (use for non-secret values; for credentials prefer `secrets`)
+  - `secrets` (list[str], optional) — names of stored secrets to inject
+    as `BOXBOT_SECRET_<NAME>` env vars. Resolved server-side via the
+    secret store; the agent never sees values. Names not on file are
+    silently skipped — the script can detect a `None` env and surface
+    a helpful error.
 - **Behavior:** Writes script to `data/sandbox/scripts/{uuid}.py`,
   executes via `data/sandbox/venv/bin/python3`, captures stdout/stderr.
   Parses any `_sdk` actions from stdout and applies them in the main

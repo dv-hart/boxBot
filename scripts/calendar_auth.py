@@ -2,9 +2,10 @@
 """One-time Google Calendar OAuth bootstrap.
 
 Runs the InstalledAppFlow with a local server callback. Saves the
-resulting token to ``data/credentials/google_calendar_token.json`` (or
-the path given by GOOGLE_CALENDAR_TOKEN). The saved token auto-refreshes
-on subsequent use — this script only needs to be run once per device.
+resulting token directly into the boxBot secret store under
+``GOOGLE_CALENDAR_TOKEN_JSON``. The saved token auto-refreshes on
+subsequent use (the calendar integration handles that) — this script
+only needs to be run once per device.
 
 Setup:
     1. In Google Cloud Console, create OAuth 2.0 credentials of type
@@ -16,26 +17,41 @@ Setup:
 
 Usage:
     python3 scripts/calendar_auth.py [--port 8765] [--no-browser]
+                                     [--manual]
 
-After authenticating, both the display calendar source and any
-agent-issued calendar calls will work without further interaction.
+After authenticating, the calendar integration is ready: a fresh
+conversation will see ``Secrets: N stored`` include
+``GOOGLE_CALENDAR_TOKEN_JSON`` (via ``bb.secrets.list()``), and
+``bb.integrations.get("calendar", action="list_upcoming_events")``
+will succeed.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
-# Ensure the repo's src/ is importable when run from the repo root
+
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
-from boxbot.integrations.google_calendar import (  # noqa: E402
-    SCOPES,
-    _client_secrets_path,
-    _token_path,
-)
+from boxbot.core.paths import CREDENTIALS_DIR  # noqa: E402
+from boxbot.secrets import SecretStore  # noqa: E402
+
+
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SECRET_NAME = "GOOGLE_CALENDAR_TOKEN_JSON"
+
+_CLIENT_SECRETS_ENV = "GOOGLE_CALENDAR_CLIENT_SECRETS"
+
+
+def _client_secrets_path() -> Path:
+    return Path(
+        os.environ.get(_CLIENT_SECRETS_ENV)
+        or CREDENTIALS_DIR / "google_client_secrets.json"
+    )
 
 
 def main() -> int:
@@ -56,7 +72,6 @@ def main() -> int:
     args = parser.parse_args()
 
     secrets_path = _client_secrets_path()
-    token_path = _token_path()
 
     if not secrets_path.exists():
         print(f"ERROR: client secrets not found at {secrets_path}")
@@ -65,7 +80,7 @@ def main() -> int:
         print("  1. https://console.cloud.google.com/apis/credentials")
         print("  2. Create OAuth client ID → Desktop app")
         print("  3. Download JSON, save it to the path above")
-        print(f"     (or set GOOGLE_CALENDAR_CLIENT_SECRETS=/your/path)")
+        print(f"     (or set {_CLIENT_SECRETS_ENV}=/your/path)")
         return 1
 
     try:
@@ -75,13 +90,11 @@ def main() -> int:
             "ERROR: google-auth-oauthlib is not installed. "
             "Install it with:"
         )
-        print("  pip install google-auth-oauthlib google-api-python-client")
+        print("  pip install google-auth-oauthlib")
         return 1
 
     if args.manual:
-        # Manual flow: no local server, user pastes redirect URL back.
-        import os as _os
-        _os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
         from google_auth_oauthlib.flow import Flow
 
         flow = Flow.from_client_secrets_file(
@@ -121,9 +134,9 @@ def main() -> int:
         else:
             creds = flow.run_local_server(port=args.port, prompt="consent")
 
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(creds.to_json())
-    print(f"Saved token to {token_path}")
+    token_json = creds.to_json()
+    result = SecretStore().store(SECRET_NAME, token_json)
+    print(f"Stored {SECRET_NAME} in the secret store ({result['previous']}).")
     print("Calendar integration is ready.")
     return 0
 

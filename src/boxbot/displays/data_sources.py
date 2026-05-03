@@ -186,10 +186,11 @@ class WeatherSource(DataSource):
 class CalendarSource(DataSource):
     """Calendar events from Google Calendar.
 
-    Reads the next ``max_results`` upcoming events via the
-    ``boxbot.integrations.google_calendar`` client. Falls back to the
-    placeholder data (with a debug log) when the OAuth token is missing
-    so previews and first-boot displays still render something useful.
+    Reads the next ``max_results`` upcoming events via the ``calendar``
+    integration (sandbox-runnable, OAuth handled by the integration's
+    script). Falls back to placeholder data when the integration
+    returns an error — typically "token not stored" before the
+    operator runs scripts/calendar_auth.py.
     """
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -200,26 +201,42 @@ class CalendarSource(DataSource):
         return self.config.get("refresh", 300)
 
     async def fetch(self) -> dict[str, Any]:
-        from boxbot.integrations import google_calendar as gc
+        from boxbot.integrations.runner import IntegrationRunError, run
 
         max_results = int(self.config.get("max_results", 5))
         calendar_id = self.config.get("calendar_id")
+        inputs: dict[str, Any] = {
+            "action": "list_upcoming_events",
+            "max_results": max_results,
+        }
+        if calendar_id:
+            inputs["calendar_id"] = calendar_id
 
         try:
-            events = await gc.list_upcoming_events(
-                max_results=max_results, calendar_id=calendar_id
-            )
-        except gc.CalendarNotAuthenticated:
-            logger.debug(
-                "Google Calendar not authenticated; using placeholder data. "
-                "Run scripts/calendar_auth.py to connect."
-            )
+            result = await run("calendar", inputs)
+        except IntegrationRunError as e:
+            logger.warning("Calendar integration not registered: %s", e)
             return _calendar_placeholder()
-        except Exception as e:
-            logger.warning("Calendar fetch failed: %s", e)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Calendar integration call failed: %s", e)
             return {"events": []}
 
-        return {"events": events, "count": len(events)}
+        if result.get("status") != "ok":
+            logger.debug(
+                "Calendar integration returned %s: %s",
+                result.get("status"),
+                result.get("error", result.get("output", {}).get("error", "")),
+            )
+            return _calendar_placeholder()
+
+        output = result.get("output") or {}
+        if "error" in output:
+            logger.debug("Calendar integration error: %s", output["error"])
+            return _calendar_placeholder()
+        return {
+            "events": output.get("events", []),
+            "count": output.get("count", 0),
+        }
 
 
 class TasksSource(DataSource):
@@ -330,10 +347,23 @@ class HttpJsonSource(DataSource):
         try:
             import aiohttp
             headers: dict[str, str] = {}
-            secret = self.config.get("secret")
-            if secret:
-                # In production, resolve secret from boxbot_sdk.secrets
-                headers["Authorization"] = f"Bearer {secret}"
+            secret_name = self.config.get("secret")
+            if secret_name:
+                # The spec stores a *name* (e.g. "STOCKS_API_KEY"); the
+                # SecretStore is the only place that resolves it to a
+                # value. Display data sources run in the main process,
+                # so we read directly — no sandbox hop.
+                from boxbot.secrets import get_secret_store
+
+                value = get_secret_store().load(secret_name)
+                if value is None:
+                    logger.warning(
+                        "data source '%s' references secret '%s' but it "
+                        "is not stored — request will go out without auth",
+                        self.name, secret_name,
+                    )
+                else:
+                    headers["Authorization"] = f"Bearer {value}"
 
             params = self.config.get("params", {})
             async with aiohttp.ClientSession() as session:

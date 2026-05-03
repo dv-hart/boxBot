@@ -673,27 +673,86 @@ class TestSDKMemory:
 
 
 class TestSDKSecrets:
-    """Test the SDK secrets module."""
+    """Test the SDK secrets module.
 
-    def test_store_emits_action(self):
-        from boxbot.sdk import secrets
-        fake_stdout = io.StringIO()
-        with patch("sys.stdout", fake_stdout):
-            secrets.store("my_key", "my_value")
-        output = fake_stdout.getvalue()
-        data = json.loads(output.split(_MARKER, 1)[1].strip())
-        assert data["_sdk"] == "secrets.store"
-        assert data["name"] == "my_key"
+    Each call now round-trips through ``_transport.request`` — the SDK
+    is a thin wrapper that forwards the action and unwraps the
+    response. We stub the transport so tests don't need real stdin/stdout.
+    """
 
-    def test_use_returns_env_var_name(self):
-        from boxbot.sdk import secrets
-        result = secrets.use("polygon_api_key")
-        assert result == "BOXBOT_SECRET_POLYGON_API_KEY"
+    @pytest.fixture
+    def fake_request(self, monkeypatch):
+        from boxbot.sdk import _transport
 
-    def test_use_uppercases_name(self):
+        recorder = {"calls": [], "responses": {}}
+
+        def stub(action_type, payload, *, timeout=30):
+            recorder["calls"].append((action_type, payload))
+            return recorder["responses"].get(action_type, {"status": "ok"})
+
+        monkeypatch.setattr(_transport, "request", stub)
+        return recorder
+
+    def test_store_round_trips(self, fake_request):
         from boxbot.sdk import secrets
-        result = secrets.use("my_secret")
-        assert result == "BOXBOT_SECRET_MY_SECRET"
+
+        fake_request["responses"]["secrets.store"] = {
+            "status": "ok", "name": "POLYGON_API_KEY", "previous": "created",
+        }
+        result = secrets.store("POLYGON_API_KEY", "pk_live_abc")
+        assert result["status"] == "ok"
+        assert result["previous"] == "created"
+        assert fake_request["calls"][0] == (
+            "secrets.store",
+            {"name": "POLYGON_API_KEY", "value": "pk_live_abc"},
+        )
+
+    def test_delete_round_trips(self, fake_request):
+        from boxbot.sdk import secrets
+
+        secrets.delete("POLYGON_API_KEY")
+        assert fake_request["calls"][0] == (
+            "secrets.delete", {"name": "POLYGON_API_KEY"}
+        )
+
+    def test_list_returns_names(self, fake_request):
+        from boxbot.sdk import secrets
+
+        fake_request["responses"]["secrets.list"] = {
+            "status": "ok",
+            "secrets": [{"name": "ALPHA", "stored_at": "2026-05-02T00:00:00Z"}],
+        }
+        result = secrets.list()
+        assert result["status"] == "ok"
+        assert result["secrets"][0]["name"] == "ALPHA"
+
+    def test_has_returns_true_when_present(self, fake_request):
+        from boxbot.sdk import secrets
+
+        fake_request["responses"]["secrets.use"] = {
+            "status": "ok", "env_var": "BOXBOT_SECRET_POLYGON_API_KEY",
+        }
+        assert secrets.has("POLYGON_API_KEY") is True
+
+    def test_has_returns_false_when_missing(self, fake_request):
+        from boxbot.sdk import secrets
+
+        fake_request["responses"]["secrets.use"] = {"status": "missing"}
+        assert secrets.has("POLYGON_API_KEY") is False
+
+    def test_use_returns_env_var_iff_present(self, fake_request):
+        from boxbot.sdk import secrets
+
+        fake_request["responses"]["secrets.use"] = {
+            "status": "ok", "env_var": "BOXBOT_SECRET_POLYGON_API_KEY",
+        }
+        assert secrets.use("POLYGON_API_KEY") == "BOXBOT_SECRET_POLYGON_API_KEY"
+
+    def test_use_returns_none_when_missing(self, fake_request):
+        from boxbot.sdk import secrets
+
+        fake_request["responses"]["secrets.use"] = {"status": "missing"}
+        assert secrets.use("POLYGON_API_KEY") is None
 
 
 # ---------------------------------------------------------------------------

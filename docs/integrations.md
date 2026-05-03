@@ -182,23 +182,49 @@ secret needs refreshing.
 | Name | Description |
 |---|---|
 | `weather` | NOAA `api.weather.gov` forecasts for a US lat/lon. No API key required. |
+| `calendar` | Google Calendar v3 — `list_upcoming_events`, `create_event`, `update_event`, `delete_event`. Reads OAuth token from secret `GOOGLE_CALENDAR_TOKEN_JSON`; auto-refreshes and persists the rotated token back. |
 
-The display system's `WeatherSource` calls `weather` via the runner.
+The display system's `WeatherSource` calls `weather` via the runner;
+`CalendarSource` calls `calendar` the same way.
+
+## Calendar migration runbook (one-time, per device)
+
+The calendar surface moved out of `src/boxbot/integrations/google_calendar.py`
+(removed) and `bb.calendar` (removed) into `integrations/calendar/`,
+backed by a stored secret. After deploying this change, do **one** of
+the following on the Pi:
+
+**(a) You already had a working `data/credentials/google_calendar_token.json`:**
+
+```bash
+ssh "$BOXBOT_DEPLOY_TARGET"
+cd software/boxBot
+python3 scripts/migrate_calendar_secret.py
+# Reads the existing token file and stores it as
+# GOOGLE_CALENDAR_TOKEN_JSON in the secret store, then renames the
+# source file to .migrated. Idempotent — safe to re-run.
+```
+
+**(b) Fresh device or token never minted:**
+
+```bash
+# Same as before, this still does the InstalledAppFlow on the box.
+# Output goes straight to the secret store now (no JSON file).
+python3 scripts/calendar_auth.py --manual
+```
+
+After either path, restart boxbot
+(`scripts/restart-boxbot.sh`). The display calendar source and any
+agent-issued calendar calls will work via
+`bb.integrations.get("calendar", action="…")`. The
+`google_client_secrets.json` file stays on disk — only the
+runtime-rotating token moved into the secret store; the static client
+credentials are still needed if you ever re-run `calendar_auth.py`.
 
 ## Open follow-ups
 
 These are explicitly deferred to keep the v1 scope contained:
 
-- **Calendar migration.** The existing `bb.calendar` SDK module and
-  `_handle_calendar_action` dispatcher path remain in place. Migrating
-  Google Calendar to an integration depends on a working `bb.secrets`
-  backend (currently a stub) for OAuth refresh tokens. Tracked
-  alongside the secrets work.
-- **`bb.secrets` backend.** Today the SDK side exists but there's no
-  main-process handler that persists secrets. Until that lands,
-  integrations declaring `secrets` in their manifest can't actually
-  receive their values at runtime. Build before adding more
-  integrations that need credentials.
 - **Output deduplication.** If three consumers call the same
   integration in the same minute, that's three network hits. Acceptable
   today; revisit with a per-call `max_age_seconds` parameter if it

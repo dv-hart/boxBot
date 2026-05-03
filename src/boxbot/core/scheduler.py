@@ -585,7 +585,12 @@ async def cancel_todo(todo_id: str) -> bool:
 async def get_status_line() -> str:
     """Return a compact status line for conversation start injection.
 
-    Format: ``[To-do: N items | Triggers: N active]``
+    Format: ``[To-do: N items | Triggers: N active | Secrets: N stored]``
+
+    The secret count tells a fresh conversation whether credentials
+    are already on file (so the agent doesn't ask the user to provide
+    them again). Names live behind ``bb.secrets.list()`` for the
+    handful of cases where the agent needs to pick from them.
     """
     db = await _get_db()
     try:
@@ -598,10 +603,23 @@ async def get_status_line() -> str:
             "SELECT COUNT(*) FROM triggers WHERE status = 'active'"
         )
         trigger_count = (await cursor.fetchone())[0]
-
-        return f"[To-do: {todo_count} items | Triggers: {trigger_count} active]"
     finally:
         await db.close()
+
+    try:
+        from boxbot.secrets import get_secret_store
+        secret_count = get_secret_store().count()
+    except Exception:  # noqa: BLE001
+        # Surface a count of 0 rather than blowing up the prompt build —
+        # the secrets file may not exist yet, or the dir may be missing
+        # in dev environments.
+        secret_count = 0
+
+    return (
+        f"[To-do: {todo_count} items | "
+        f"Triggers: {trigger_count} active | "
+        f"Secrets: {secret_count} stored]"
+    )
 
 
 # ── Config seeding ────────────────────────────────────────────────────────

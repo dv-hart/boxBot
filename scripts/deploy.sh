@@ -30,8 +30,12 @@
 #   1. ``git push origin main`` (no-op if already pushed).
 #   2. SSH to Pi, ``git pull --ff-only`` (refuses non-fast-forward).
 #   3. Warn if scripts/setup-sandbox.sh changed (operator runs it manually).
-#   4. Run ``scripts/restart-boxbot.sh`` on the Pi.
-#   5. Show the last 25 startup log lines.
+#   4. If src/boxbot/sdk/ changed, ``pip install --force-reinstall``
+#      the SDK into the sandbox venv (needed because the SDK is
+#      installed non-editable; source edits don't otherwise reach the
+#      sandbox).
+#   5. Run ``scripts/restart-boxbot.sh`` on the Pi.
+#   6. Show the last 25 startup log lines.
 #
 # There is no rsync escape hatch. The Pi only ever runs committed
 # code. To test uncommitted changes, do it in dev or push to a
@@ -114,20 +118,32 @@ echo ""
 echo "--- Push ---"
 git push origin main
 
-# Detect if scripts/setup-sandbox.sh changed in commits we're about to
-# deploy (vs. what's currently on the Pi). We'll warn the operator
-# rather than auto-run it, since setup-sandbox.sh requires sudo and
-# may need attention.
+# Detect what changed between the Pi's current HEAD and the deploy
+# target. We use this for two follow-up actions:
+#   - setup-sandbox.sh changes → warn the operator (needs sudo + may
+#     need attention).
+#   - SDK source changes (src/boxbot/sdk/*.py) → auto-refresh the
+#     sandbox venv copy. The SDK is installed non-editable, so source
+#     edits don't reach the sandbox until pip re-installs them.
+#     setup-sandbox.sh handles this via --force-reinstall, but is too
+#     heavy to run every deploy; we do just the SDK install here.
 PI_HEAD="$(ssh "$TARGET" "cd $PI_PROJECT_DIR && git rev-parse HEAD" 2>/dev/null || echo unknown)"
+SETUP_CHANGED=0
+SDK_CHANGED=0
 if [[ "$PI_HEAD" != "unknown" && "$PI_HEAD" != "$LOCAL_HEAD" ]]; then
-    if git diff --name-only "$PI_HEAD" "$LOCAL_HEAD" 2>/dev/null \
-           | grep -q '^scripts/setup-sandbox\.sh$'; then
+    CHANGED_FILES="$(git diff --name-only "$PI_HEAD" "$LOCAL_HEAD" 2>/dev/null || true)"
+    if echo "$CHANGED_FILES" | grep -q '^scripts/setup-sandbox\.sh$'; then
         SETUP_CHANGED=1
-    else
-        SETUP_CHANGED=0
     fi
-else
-    SETUP_CHANGED=0
+    # README.md is doc-only and never affects imports. Everything else
+    # under src/boxbot/sdk/ — .py files AND pyproject.toml (version
+    # bump is the canonical "SDK changed" signal) — triggers a refresh.
+    if echo "$CHANGED_FILES" \
+           | grep -E '^src/boxbot/sdk/' \
+           | grep -vE '/README\.md$' \
+           | grep -q .; then
+        SDK_CHANGED=1
+    fi
 fi
 
 # -------------------------------------------------------------------
@@ -153,6 +169,28 @@ if [[ "$SETUP_CHANGED" -eq 1 ]]; then
     echo "After restart, run on the Pi:"
     echo "    ssh $TARGET 'cd $PI_PROJECT_DIR && sudo bash scripts/setup-sandbox.sh'"
     echo ""
+fi
+
+# Refresh the sandbox SDK if any importable file under src/boxbot/sdk/
+# changed. Same install line setup-sandbox.sh uses, scoped to just the
+# SDK so we don't drag in apt steps or chown rebuilds. The sandbox
+# venv is owned by the deploy user (jhart), so no sudo is required.
+if [[ "$SDK_CHANGED" -eq 1 ]]; then
+    echo ""
+    echo "--- Refresh sandbox SDK ---"
+    ssh "$TARGET" bash <<EOF
+set -euo pipefail
+cd "$PI_PROJECT_DIR"
+SANDBOX_VENV_PIP="/var/lib/boxbot-sandbox/venv/bin/pip"
+if [[ ! -x "\$SANDBOX_VENV_PIP" ]]; then
+    echo "  sandbox venv pip not found at \$SANDBOX_VENV_PIP — skipping"
+    echo "  (run 'sudo bash scripts/setup-sandbox.sh' to create it)"
+    exit 0
+fi
+"\$SANDBOX_VENV_PIP" install --force-reinstall --no-deps --quiet \\
+    src/boxbot/sdk
+echo "  sandbox SDK reinstalled (boxbot_sdk)"
+EOF
 fi
 
 ssh "$TARGET" "cd $PI_PROJECT_DIR && bash scripts/restart-boxbot.sh"

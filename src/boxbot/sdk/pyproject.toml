@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "boxbot-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "boxBot SDK — constrained API for agent sandbox scripts"
 requires-python = ">=3.11"
 # No dependencies beyond stdlib — the SDK runs in an isolated sandbox venv

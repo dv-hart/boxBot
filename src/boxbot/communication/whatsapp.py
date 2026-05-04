@@ -260,6 +260,67 @@ class WhatsAppClient:
             logger.error("Error uploading/sending image to %s: %s", phone, e)
             return False
 
+    async def download_media(
+        self,
+        media_id: str,
+        access_token: str | None = None,
+    ) -> tuple[bytes, str] | None:
+        """Download media content by its WhatsApp media ID.
+
+        Two-step process: fetch the metadata (which carries a short-lived
+        URL plus the mime type), then GET the bytes.
+
+        Args:
+            media_id: The WhatsApp media ID from the webhook payload.
+            access_token: The Graph API access token. Defaults to the
+                token this client was constructed with.
+
+        Returns:
+            ``(bytes, mime_type)`` on success, or None on failure. The
+            mime_type comes from Meta's metadata response (e.g.
+            ``"image/jpeg"``) and is what the caller should use when
+            picking a file extension.
+        """
+        token = access_token or self._access_token
+        headers = {"Authorization": f"Bearer {token}"}
+
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                # Step 1: Get the media URL + mime type
+                url_response = await client.get(
+                    f"{GRAPH_API_BASE}/{media_id}",
+                    headers=headers,
+                )
+                if url_response.status_code != 200:
+                    logger.error(
+                        "Failed to get media URL for %s: %d",
+                        media_id,
+                        url_response.status_code,
+                    )
+                    return None
+
+                meta = url_response.json()
+                media_url = meta.get("url")
+                mime_type = meta.get("mime_type", "application/octet-stream")
+                if not media_url:
+                    logger.error("No URL in media response for %s", media_id)
+                    return None
+
+                # Step 2: Download the media
+                media_response = await client.get(media_url, headers=headers)
+                if media_response.status_code != 200:
+                    logger.error(
+                        "Failed to download media from %s: %d",
+                        media_url,
+                        media_response.status_code,
+                    )
+                    return None
+
+                return media_response.content, mime_type
+        except httpx.HTTPError as e:
+            logger.error("HTTP error downloading media %s: %s", media_id, e)
+            return None
+
 
 class WhatsAppWebhook:
     """Handles incoming WhatsApp webhook verification and message parsing.
@@ -411,63 +472,3 @@ class WhatsAppWebhook:
 
         return messages
 
-    async def download_media(
-        self,
-        media_id: str,
-        access_token: str | None = None,
-    ) -> tuple[bytes, str] | None:
-        """Download media content by its WhatsApp media ID.
-
-        Two-step process: fetch the metadata (which carries a short-lived
-        URL plus the mime type), then GET the bytes.
-
-        Args:
-            media_id: The WhatsApp media ID from the webhook payload.
-            access_token: The Graph API access token. Defaults to the
-                token this client was constructed with.
-
-        Returns:
-            ``(bytes, mime_type)`` on success, or None on failure. The
-            mime_type comes from Meta's metadata response (e.g.
-            ``"image/jpeg"``) and is what the caller should use when
-            picking a file extension.
-        """
-        token = access_token or self._access_token
-        headers = {"Authorization": f"Bearer {token}"}
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                # Step 1: Get the media URL + mime type
-                url_response = await client.get(
-                    f"{GRAPH_API_BASE}/{media_id}",
-                    headers=headers,
-                )
-                if url_response.status_code != 200:
-                    logger.error(
-                        "Failed to get media URL for %s: %d",
-                        media_id,
-                        url_response.status_code,
-                    )
-                    return None
-
-                meta = url_response.json()
-                media_url = meta.get("url")
-                mime_type = meta.get("mime_type", "application/octet-stream")
-                if not media_url:
-                    logger.error("No URL in media response for %s", media_id)
-                    return None
-
-                # Step 2: Download the media
-                media_response = await client.get(media_url, headers=headers)
-                if media_response.status_code != 200:
-                    logger.error(
-                        "Failed to download media from %s: %d",
-                        media_url,
-                        media_response.status_code,
-                    )
-                    return None
-
-                return media_response.content, mime_type
-        except httpx.HTTPError as e:
-            logger.error("HTTP error downloading media %s: %s", media_id, e)
-            return None

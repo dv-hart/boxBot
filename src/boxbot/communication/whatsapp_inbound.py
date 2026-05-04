@@ -120,6 +120,7 @@ class WhatsAppInboundPoller:
             media_url=m.media_url,
             media_type=m.media_type,
             sender_name=m.sender_name or None,
+            message_id=m.message_id,
         )
 
     async def _delete(self, sqs, receipt: str) -> None:

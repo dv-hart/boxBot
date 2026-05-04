@@ -67,6 +67,7 @@ class MessageRouter:
         media_url: str | None = None,
         media_type: str | None = None,
         sender_name: str | None = None,
+        message_id: str = "",
     ) -> bool:
         """Route an incoming message through auth and to the agent.
 
@@ -82,6 +83,9 @@ class MessageRouter:
             media_url: Optional media URL/ID.
             media_type: Optional media type.
             sender_name: Display name from the channel (e.g., WhatsApp profile name).
+            message_id: Channel-issued message id (e.g. ``wamid.*`` for
+                WhatsApp). Propagated onto the event so the agent's
+                inbound staging can name files deterministically.
 
         Returns:
             True if the message was routed to the agent, False if dropped.
@@ -98,6 +102,7 @@ class MessageRouter:
                 media_url=media_url,
                 media_type=media_type,
                 sender_name=sender_name,
+                message_id=message_id,
             )
 
         logger.warning("Unknown channel: %s", channel)
@@ -111,6 +116,7 @@ class MessageRouter:
         media_url: str | None = None,
         media_type: str | None = None,
         sender_name: str | None = None,
+        message_id: str = "",
     ) -> bool:
         """Route a WhatsApp message through auth to the agent.
 
@@ -133,6 +139,7 @@ class MessageRouter:
                 text=message or "",
                 media_url=media_url,
                 media_type=media_type,
+                message_id=message_id,
             )
             await self._event_bus.publish(event)
             logger.info(

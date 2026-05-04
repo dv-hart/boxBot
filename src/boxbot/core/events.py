@@ -136,6 +136,7 @@ class WhatsAppMessage(Event):
     text: str = ""
     media_url: str | None = None
     media_type: str | None = None  # "image", "audio", "document"
+    message_id: str = ""  # Meta-issued wamid.* — used for staged-file naming
 
 
 @dataclass(frozen=True)

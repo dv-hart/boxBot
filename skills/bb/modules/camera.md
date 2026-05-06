@@ -91,9 +91,10 @@ bb.workspace.write(
     "# {name}\n- medium build, dark curly hair, round glasses\n- sounded ~30s\n",
 )
 bb.memory.save(
-    kind="person",
-    subject=name,
     content=f"{name} appearance notes are at notes/people/{name}.md; headshot alongside.",
+    memory_type="person",
+    person=name,
+    summary=f"{name} headshot + notes saved",
 )
 ```
 

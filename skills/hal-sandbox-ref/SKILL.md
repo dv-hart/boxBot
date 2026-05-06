@@ -65,20 +65,23 @@ Displays require **user confirmation** before they go live.
 ```python
 from boxbot_sdk import memory
 
-memory.save(
+mem_id = memory.save(
     content="Jacob is allergic to peanuts",
-    people=["Jacob"],
+    memory_type="person",       # person | household | methodology | operational
+    person="Jacob",
+    summary="Jacob — peanut allergy",
     tags=["health", "allergy"],
-    importance=0.9,
 )
 
 hits = memory.search("allergies", people=["Jacob"])
 for m in hits:
-    print(m.content, m.importance)
+    print(m.content)
 ```
 
-Shares the backend with the `search_memory` tool. Types are inferred from
-tags/people; for typed filters use the tool instead.
+Shares the backend with the `search_memory` tool. `memory_type` defaults
+to `household` if omitted; `summary` is auto-derived from `content` when
+not provided. Writes raise `MemoryError` if the main process rejects the
+call — a successful return means the row is on disk.
 
 ## photos — library + slideshow
 
@@ -117,7 +120,7 @@ items the agent tracks.
 from boxbot_sdk import tasks
 
 # Timer + person (AND): both must fire before the agent wakes
-tasks.create_trigger(
+trigger_id = tasks.create_trigger(
     description="Remind Jacob the Amazon package arrived",
     instructions="Remind Jacob the Amazon package arrived",
     fire_after="30m",
@@ -125,7 +128,7 @@ tasks.create_trigger(
     for_person="Jacob",
 )
 
-tasks.create_todo(
+todo_id = tasks.create_todo(
     description="Return library books",
     notes="Books on kitchen counter. Due Saturday.",
     for_person="Jacob",
@@ -138,7 +141,8 @@ for t in tasks.list_triggers(status="active"):
 
 Trigger kinds: `fire_at` (ISO timestamp), `fire_after` (duration, max 24h),
 `cron` (recurring), `person` (on detection). Combine for compound wake
-conditions.
+conditions. `create_trigger` and `create_todo` return the new id; writes
+raise `RuntimeError` if the main process rejects them.
 
 ## skill — author new skills
 

@@ -5,17 +5,22 @@ is for complex multi-step task management within scripts — batch
 operations, conditional logic, or combining task management with other
 SDK calls.
 
+All write calls (create_*, complete, cancel) wait for the main process
+to acknowledge and raise ``RuntimeError`` if the dispatcher rejects them.
+This is on purpose — silent failures previously let writes look like
+they had succeeded when no handler was wired up.
+
 Usage:
     from boxbot_sdk import tasks
 
-    tasks.create_trigger(
+    trigger_id = tasks.create_trigger(
         description="Dentist reminder for Jacob",
         instructions="Remind Jacob about his dentist appointment",
         fire_at="2026-02-21T15:30:00",
         for_person="Jacob"
     )
 
-    tasks.create_todo(
+    todo_id = tasks.create_todo(
         description="Return library books",
         notes="Due Saturday.",
         for_person="Jacob",
@@ -125,6 +130,15 @@ class TodoRecord:
                 f"status={self.status!r})")
 
 
+def _raise_on_error(response: dict, op: str) -> None:
+    if response.get("status") != "ok":
+        raise RuntimeError(
+            response.get("message")
+            or response.get("error")
+            or f"{op} failed"
+        )
+
+
 # --- Triggers ---
 
 def create_trigger(description: str, instructions: str, *,
@@ -133,8 +147,8 @@ def create_trigger(description: str, instructions: str, *,
                    cron: str | None = None,
                    person: str | None = None,
                    for_person: str | None = None,
-                   todo_id: str | None = None) -> None:
-    """Create a trigger (wake condition).
+                   todo_id: str | None = None) -> str:
+    """Create a trigger (wake condition); return the new trigger's ID.
 
     Triggers use AND logic — all specified conditions must be met.
     At least one condition (fire_at, fire_after, cron, or person) is required.
@@ -148,6 +162,9 @@ def create_trigger(description: str, instructions: str, *,
         person: Person name for presence trigger.
         for_person: Person this trigger is about (for context).
         todo_id: Link to a to-do item.
+
+    Raises:
+        RuntimeError: if the main process rejects the call.
     """
     v.require_str(description, "description")
     v.require_str(instructions, "instructions")
@@ -176,7 +193,9 @@ def create_trigger(description: str, instructions: str, *,
     if todo_id is not None:
         payload["todo_id"] = v.require_str(todo_id, "todo_id")
 
-    _transport.emit_action("tasks.create_trigger", payload)
+    response = _transport.request("tasks.create_trigger", payload, timeout=30)
+    _raise_on_error(response, "tasks.create_trigger")
+    return response.get("id", "")
 
 
 def list_triggers(*, status: str | None = None) -> list[TriggerRecord]:
@@ -194,6 +213,7 @@ def list_triggers(*, status: str | None = None) -> list[TriggerRecord]:
         payload["status"] = status
 
     response = _transport.request("tasks.list_triggers", payload, timeout=30)
+    _raise_on_error(response, "tasks.list_triggers")
     results = response.get("results", [])
     return [TriggerRecord(r) for r in results]
 
@@ -203,14 +223,17 @@ def list_triggers(*, status: str | None = None) -> list[TriggerRecord]:
 def create_todo(description: str, *,
                 notes: str | None = None,
                 for_person: str | None = None,
-                due_date: str | None = None) -> None:
-    """Create a to-do item.
+                due_date: str | None = None) -> str:
+    """Create a to-do item; return the new to-do's ID.
 
     Args:
         description: Short description of the to-do.
         notes: Detailed notes (loaded on demand via get()).
         for_person: Person this to-do is for.
         due_date: Due date string (YYYY-MM-DD).
+
+    Raises:
+        RuntimeError: if the main process rejects the call.
     """
     v.require_str(description, "description")
 
@@ -222,7 +245,9 @@ def create_todo(description: str, *,
     if due_date is not None:
         payload["due_date"] = v.require_str(due_date, "due_date")
 
-    _transport.emit_action("tasks.create_todo", payload)
+    response = _transport.request("tasks.create_todo", payload, timeout=30)
+    _raise_on_error(response, "tasks.create_todo")
+    return response.get("id", "")
 
 
 def list_todos(*, status: str | None = None) -> list[TodoRecord]:
@@ -240,6 +265,7 @@ def list_todos(*, status: str | None = None) -> list[TodoRecord]:
         payload["status"] = status
 
     response = _transport.request("tasks.list_todos", payload, timeout=30)
+    _raise_on_error(response, "tasks.list_todos")
     results = response.get("results", [])
     return [TodoRecord(r) for r in results]
 
@@ -257,6 +283,7 @@ def get(item_id: str) -> TriggerRecord | TodoRecord:
     """
     v.require_str(item_id, "item_id")
     response = _transport.request("tasks.get", {"id": item_id}, timeout=30)
+    _raise_on_error(response, "tasks.get")
     item_type = response.get("item_type", "")
     if item_type == "trigger":
         return TriggerRecord(response)
@@ -268,9 +295,13 @@ def complete(item_id: str) -> None:
 
     Args:
         item_id: To-do item ID.
+
+    Raises:
+        RuntimeError: if the main process rejects the call.
     """
     v.require_str(item_id, "item_id")
-    _transport.emit_action("tasks.complete", {"id": item_id})
+    response = _transport.request("tasks.complete", {"id": item_id}, timeout=30)
+    _raise_on_error(response, "tasks.complete")
 
 
 def cancel(item_id: str) -> None:
@@ -278,6 +309,10 @@ def cancel(item_id: str) -> None:
 
     Args:
         item_id: Item ID (trigger or to-do).
+
+    Raises:
+        RuntimeError: if the main process rejects the call.
     """
     v.require_str(item_id, "item_id")
-    _transport.emit_action("tasks.cancel", {"id": item_id})
+    response = _transport.request("tasks.cancel", {"id": item_id}, timeout=30)
+    _raise_on_error(response, "tasks.cancel")

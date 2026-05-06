@@ -380,3 +380,53 @@ class TestSeedFromConfig:
         descriptions = [t["description"] for t in triggers]
         assert "Pre-existing" in descriptions
         assert any(d.startswith("[dream-cycle]") for d in descriptions)
+
+    @pytest.mark.asyncio
+    async def test_resyncs_dream_cron_when_config_changes(self, mock_config):
+        # First seed with the default config cron.
+        await seed_from_config(mock_config)
+        triggers = await list_triggers()
+        dream = next(
+            t for t in triggers if t["description"].startswith("[dream-cycle]")
+        )
+        original_cron = dream["cron"]
+        original_fire_at = dream["fire_at"]
+
+        # Change config and re-seed; the existing config-sourced row
+        # should be updated, not duplicated.
+        mock_config.memory.dream_cron = "30 11 * * *"
+        await seed_from_config(mock_config)
+
+        triggers = await list_triggers()
+        dream_rows = [
+            t for t in triggers if t["description"].startswith("[dream-cycle]")
+        ]
+        assert len(dream_rows) == 1
+        assert dream_rows[0]["cron"] == "30 11 * * *"
+        assert dream_rows[0]["cron"] != original_cron
+        assert dream_rows[0]["fire_at"] != original_fire_at
+
+    @pytest.mark.asyncio
+    async def test_resync_leaves_user_modified_dream_trigger_alone(
+        self, mock_config,
+    ):
+        # Simulate a user/agent override: same description prefix, but
+        # source != 'config'.
+        await create_trigger(
+            description="[dream-cycle] custom",
+            instructions="user override",
+            cron="0 4 * * *",
+            source="agent",
+        )
+        mock_config.memory.dream_cron = "0 10 * * *"
+        await seed_from_config(mock_config)
+
+        triggers = await list_triggers()
+        dream_rows = [
+            t for t in triggers if t["description"].startswith("[dream-cycle]")
+        ]
+        # The user-owned row stays at 0 4 * * *; nothing else gets seeded
+        # because the dream_count check sees ≥1 [dream-cycle] row.
+        assert len(dream_rows) == 1
+        assert dream_rows[0]["cron"] == "0 4 * * *"
+        assert dream_rows[0]["source"] == "agent"

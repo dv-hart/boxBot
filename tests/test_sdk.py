@@ -618,11 +618,14 @@ class TestSkillBuilder:
 class TestSDKMemory:
     """Test the SDK memory module functions."""
 
-    def test_save_emits_action(self):
+    def test_save_emits_action_and_returns_id(self):
         from boxbot.sdk import memory
         fake_stdout = io.StringIO()
-        with patch("sys.stdout", fake_stdout):
-            memory.save(
+        # save() now uses request() — main process replies with {ok, id}.
+        with patch("sys.stdout", fake_stdout), \
+             patch("boxbot.sdk._transport.collect_response",
+                   return_value={"status": "ok", "id": "mem-001"}):
+            memory_id = memory.save(
                 content="Jacob likes coffee",
                 memory_type="person",
                 people=["Jacob"],
@@ -633,6 +636,18 @@ class TestSDKMemory:
         assert data["_sdk"] == "memory.save"
         assert data["content"] == "Jacob likes coffee"
         assert data["importance"] == 0.8
+        assert data["_expects_response"] is True
+        assert memory_id == "mem-001"
+
+    def test_save_raises_on_dispatcher_error(self):
+        from boxbot.sdk import memory
+        fake_stdout = io.StringIO()
+        with patch("sys.stdout", fake_stdout), \
+             patch("boxbot.sdk._transport.collect_response",
+                   return_value={"status": "error",
+                                 "message": "no handler"}):
+            with pytest.raises(MemoryError, match="no handler"):
+                memory.save(content="x", memory_type="household")
 
     def test_save_validates_memory_type(self):
         from boxbot.sdk import memory
@@ -642,12 +657,15 @@ class TestSDKMemory:
     def test_delete_emits_action(self):
         from boxbot.sdk import memory
         fake_stdout = io.StringIO()
-        with patch("sys.stdout", fake_stdout):
+        with patch("sys.stdout", fake_stdout), \
+             patch("boxbot.sdk._transport.collect_response",
+                   return_value={"status": "ok"}):
             memory.delete("mem-123")
         output = fake_stdout.getvalue()
         data = json.loads(output.split(_MARKER, 1)[1].strip())
         assert data["_sdk"] == "memory.delete"
         assert data["id"] == "mem-123"
+        assert data["_expects_response"] is True
 
     def test_memory_record_properties(self):
         from boxbot.sdk.memory import MemoryRecord

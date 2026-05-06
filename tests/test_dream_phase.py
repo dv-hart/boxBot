@@ -701,6 +701,57 @@ class TestApplyDreamResult:
 
 
 # ---------------------------------------------------------------------------
+# write_dream_log — maintenance section
+# ---------------------------------------------------------------------------
+
+
+class TestWriteDreamLogMaintenance:
+    def test_maintenance_section_renders_stats(self, tmp_path):
+        from boxbot.memory.dream import CandidateSet, write_dream_log
+
+        with patch("boxbot.memory.dream.WORKSPACE_DIR", tmp_path):
+            path = write_dream_log(
+                candidates=CandidateSet(),
+                clusters=[],
+                pairs=[],
+                batch_id=None,
+                request_types={},
+                decisions=None,
+                audit_only=True,
+                maintenance_stats={
+                    "archived_memories": 4,
+                    "archived_conversations": 2,
+                    "evicted_archived": 1,
+                    "evicted_active": 0,
+                    "fts_rebuilt": 1,
+                },
+            )
+        text = path.read_text()
+        assert "## Maintenance" in text
+        assert "archived: 4 memories, 2 conversations" in text
+        assert "evicted: 1 archived, 0 active" in text
+        assert "fts_rebuilt: 1" in text
+
+    def test_maintenance_section_handles_missing_stats(self, tmp_path):
+        from boxbot.memory.dream import CandidateSet, write_dream_log
+
+        with patch("boxbot.memory.dream.WORKSPACE_DIR", tmp_path):
+            path = write_dream_log(
+                candidates=CandidateSet(),
+                clusters=[],
+                pairs=[],
+                batch_id=None,
+                request_types={},
+                decisions=None,
+                audit_only=True,
+                maintenance_stats=None,
+            )
+        text = path.read_text()
+        assert "## Maintenance" in text
+        assert "skipped or failed" in text
+
+
+# ---------------------------------------------------------------------------
 # DreamPoller resume + lifecycle
 # ---------------------------------------------------------------------------
 
@@ -887,6 +938,11 @@ class TestRunDreamCycle:
         text = log_files[0].read_text()
         assert "Dream cycle" in text
         assert "audit-only" in text
+        # Maintenance stats are wired into the audit log.
+        assert "## Maintenance" in text
+        assert "archived:" in text
+        assert "evicted:" in text
+        assert "fts_rebuilt:" in text
 
 
 # ---------------------------------------------------------------------------

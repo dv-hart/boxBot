@@ -141,9 +141,10 @@ bb.workspace.write(
     "- snorlax\n- pikachu\n- eevee\n- gengar\n...",
 )
 bb.memory.save(
-    kind="person",
-    subject="Erik",
     content="Erik keeps a top-15 Pokémon list at notes/people/erik/pokemon.md — read the file for the current lineup.",
+    memory_type="person",
+    person="Erik",
+    summary="Erik's Pokémon list lives at notes/people/erik/pokemon.md",
 )
 ```
 

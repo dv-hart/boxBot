@@ -157,14 +157,14 @@ class TestExecuteScriptTool:
     async def test_process_action_unknown_returns_error(self):
         ctx = ActionContext()
         result = await process_action(
-            {"_sdk": "memory.save", "content": "test"}, ctx
+            {"_sdk": "bogus.verb", "x": 1}, ctx
         )
-        # memory.* has no registered handler — the dispatcher returns an
-        # error so the sandbox sees the failure rather than a silent
-        # acknowledgement that masks unimplemented features.
+        # No handler registered for prefix 'bogus' — the dispatcher
+        # returns an error so the sandbox sees the failure rather than
+        # a silent acknowledgement that masks unimplemented features.
         assert result["status"] == "error"
-        assert "memory" in result["message"]
-        assert ctx.action_log[-1]["action"] == "memory.save"
+        assert "bogus" in result["message"]
+        assert ctx.action_log[-1]["action"] == "bogus.verb"
 
     @pytest.mark.asyncio
     async def test_process_action_workspace_routes_correctly(self, tmp_path, monkeypatch):

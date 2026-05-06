@@ -890,6 +890,7 @@ def write_dream_log(
     decisions: list[DedupDecision] | None,
     audit_only: bool,
     cost_usd: float | None = None,
+    maintenance_stats: dict[str, int] | None = None,
     now: datetime | None = None,
 ) -> Path:
     """Write a per-cycle markdown audit log to the workspace.
@@ -982,6 +983,24 @@ def write_dream_log(
         lines.append(f"- {merges} merges applied")
     lines.append("")
 
+    lines.append("## Maintenance")
+    if maintenance_stats is None:
+        lines.append("- (skipped or failed — see boxbot.log)")
+    else:
+        lines.append(
+            f"- archived: {maintenance_stats.get('archived_memories', 0)} "
+            f"memories, {maintenance_stats.get('archived_conversations', 0)} "
+            f"conversations"
+        )
+        lines.append(
+            f"- evicted: {maintenance_stats.get('evicted_archived', 0)} "
+            f"archived, {maintenance_stats.get('evicted_active', 0)} active"
+        )
+        lines.append(
+            f"- fts_rebuilt: {maintenance_stats.get('fts_rebuilt', 0)}"
+        )
+    lines.append("")
+
     path.write_text("\n".join(lines), encoding="utf-8")
     logger.info("Dream log written to %s", path)
     return path
@@ -1054,6 +1073,7 @@ async def run_dream_cycle(
         request_types=request_types,
         decisions=None,
         audit_only=audit_only,
+        maintenance_stats=maintenance_stats,
         now=now,
     )
 

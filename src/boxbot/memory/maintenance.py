@@ -79,11 +79,12 @@ async def run_maintenance(
 
     logger.info(
         "Maintenance complete: archived=%d memories + %d conversations, "
-        "evicted=%d archived + %d active",
+        "evicted=%d archived + %d active, fts_rebuilt=%d",
         stats["archived_memories"],
         stats["archived_conversations"],
         stats["evicted_archived"],
         stats["evicted_active"],
+        stats["fts_rebuilt"],
     )
 
     return stats

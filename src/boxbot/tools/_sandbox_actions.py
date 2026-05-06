@@ -900,6 +900,326 @@ async def _handle_integrations_action(
         return {"status": "error", "message": str(exc)}
 
 
+# ---------------------------------------------------------------------------
+# Memory action handler
+# ---------------------------------------------------------------------------
+
+
+# Lazy MemoryStore singleton for the dispatcher. The search_memory tool
+# keeps its own singleton in builtins/search_memory.py — using a separate
+# one here avoids reaching into a private API of another module. Both
+# point at the same SQLite file; aiosqlite handles concurrent writers.
+_memory_store: Any = None
+_memory_store_lock: Any = None
+
+
+async def _get_handler_memory_store() -> Any:
+    import asyncio
+
+    global _memory_store, _memory_store_lock
+    if _memory_store_lock is None:
+        _memory_store_lock = asyncio.Lock()
+    async with _memory_store_lock:
+        if _memory_store is None:
+            from boxbot.memory.store import MemoryStore
+
+            store = MemoryStore()
+            await store.initialize()
+            _memory_store = store
+    return _memory_store
+
+
+def _derive_summary(content: str, max_len: int = 80) -> str:
+    """First-sentence/line of ``content``, trimmed to ``max_len``.
+
+    Memory search reranking and conversation-start injection both lean
+    on ``summary`` being short and self-contained. Agents are encouraged
+    to pass their own; this fallback keeps a missing one from breaking
+    the write entirely.
+    """
+    text = content.strip()
+    for sep in (". ", "\n", "; "):
+        if sep in text:
+            text = text.split(sep, 1)[0].rstrip(".;").strip()
+            break
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text or "memory"
+
+
+@action_handler("memory")
+async def _handle_memory_action(
+    action_type: str,
+    payload: dict[str, Any],
+    ctx: ActionContext,  # unused; kept for uniform handler signature
+) -> dict[str, Any]:
+    """Dispatch ``memory.*`` — save, search, delete.
+
+    Routes to the same MemoryStore + search backend the search_memory
+    core tool uses, so a write here is visible to a later tool-side
+    lookup and vice-versa. Save derives ``summary`` from ``content``
+    when the agent doesn't pass one (memory rows require it).
+    """
+    sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+
+    try:
+        store = await _get_handler_memory_store()
+
+        if sub == "save":
+            content = payload.get("content")
+            if not isinstance(content, str) or not content.strip():
+                return {"status": "error", "message": "'content' is required"}
+            mem_type = payload.get("type") or "household"
+            people = payload.get("people")
+            if people is not None and not isinstance(people, list):
+                return {"status": "error", "message": "'people' must be a list"}
+            tags = payload.get("tags")
+            if tags is not None and not isinstance(tags, list):
+                return {"status": "error", "message": "'tags' must be a list"}
+            summary = payload.get("summary") or _derive_summary(content)
+            person = payload.get("person") or (
+                people[0] if people else None
+            )
+
+            # Stamp source_conversation when the call comes from inside
+            # an active conversation — useful provenance and lets the
+            # post-conversation extraction pipeline avoid re-deriving
+            # the same fact.
+            from boxbot.tools._tool_context import get_current_conversation
+
+            conv = get_current_conversation()
+            source_conversation = (
+                conv.conversation_id if conv is not None else None
+            )
+
+            try:
+                memory_id = await store.create_memory(
+                    type=mem_type,
+                    content=content,
+                    summary=summary,
+                    person=person,
+                    people=people or [],
+                    tags=tags or [],
+                    source_conversation=source_conversation,
+                )
+            except ValueError as e:
+                return {"status": "error", "message": str(e)}
+            return {"status": "ok", "id": memory_id, "summary": summary}
+
+        if sub == "search":
+            from boxbot.memory.search import search_memories
+
+            query = payload.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return {"status": "error", "message": "'query' is required"}
+            try:
+                limit = int(payload.get("limit", 10))
+            except (TypeError, ValueError):
+                return {"status": "error", "message": "'limit' must be int"}
+
+            mem_type = payload.get("type")
+            types = [mem_type] if isinstance(mem_type, str) else None
+            people = payload.get("people")
+            person = (
+                people[0]
+                if isinstance(people, list) and people
+                else None
+            )
+
+            try:
+                result = await search_memories(
+                    store,
+                    mode="lookup",
+                    query=query,
+                    types=types,
+                    person=person,
+                )
+            except ValueError as e:
+                return {"status": "error", "message": str(e)}
+
+            facts = (result.get("facts") or [])[:limit]
+            return {"status": "ok", "results": facts}
+
+        if sub == "delete":
+            memory_id = payload.get("id")
+            if not isinstance(memory_id, str) or not memory_id:
+                return {"status": "error", "message": "'id' is required"}
+            from boxbot.tools._tool_context import get_current_conversation
+
+            conv = get_current_conversation()
+            invalidated_by = (
+                conv.conversation_id if conv is not None else "agent"
+            )
+            await store.invalidate_memory(
+                memory_id, invalidated_by=invalidated_by
+            )
+            return {"status": "ok", "id": memory_id}
+
+        return {
+            "status": "error",
+            "message": f"unknown memory action '{action_type}'",
+        }
+
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("%s failed", action_type)
+        return {"status": "error", "message": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Tasks action handler
+# ---------------------------------------------------------------------------
+
+
+@action_handler("tasks")
+async def _handle_tasks_action(
+    action_type: str,
+    payload: dict[str, Any],
+    ctx: ActionContext,  # unused; kept for uniform handler signature
+) -> dict[str, Any]:
+    """Dispatch ``tasks.*`` — create_trigger, create_todo, list_*, get,
+    complete, cancel.
+
+    Mirrors the manage_tasks core tool's surface, reachable from inside
+    sandbox scripts so they can compose task management with other SDK
+    calls in one turn.
+    """
+    sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+
+    try:
+        from boxbot.core import scheduler
+
+        if sub == "create_trigger":
+            description = payload.get("description")
+            instructions = payload.get("instructions")
+            if not isinstance(description, str) or not description.strip():
+                return {
+                    "status": "error",
+                    "message": "'description' is required",
+                }
+            if not isinstance(instructions, str) or not instructions.strip():
+                return {
+                    "status": "error",
+                    "message": "'instructions' is required",
+                }
+            try:
+                trigger_id = await scheduler.create_trigger(
+                    description=description,
+                    instructions=instructions,
+                    fire_at=payload.get("fire_at"),
+                    fire_after=payload.get("fire_after"),
+                    cron=payload.get("cron"),
+                    person=payload.get("person"),
+                    for_person=payload.get("for_person"),
+                    todo_id=payload.get("todo_id"),
+                    source="agent",
+                )
+            except ValueError as e:
+                return {"status": "error", "message": str(e)}
+            return {"status": "ok", "id": trigger_id}
+
+        if sub == "create_todo":
+            description = payload.get("description")
+            if not isinstance(description, str) or not description.strip():
+                return {
+                    "status": "error",
+                    "message": "'description' is required",
+                }
+            todo_id = await scheduler.create_todo(
+                description=description,
+                notes=payload.get("notes"),
+                for_person=payload.get("for_person"),
+                due_date=payload.get("due_date"),
+                source="agent",
+            )
+            return {"status": "ok", "id": todo_id}
+
+        if sub == "list_triggers":
+            triggers = await scheduler.list_triggers(
+                status=payload.get("status"),
+                for_person=payload.get("for_person"),
+            )
+            return {"status": "ok", "results": triggers}
+
+        if sub == "list_todos":
+            todos = await scheduler.list_todos(
+                status=payload.get("status"),
+                for_person=payload.get("for_person"),
+            )
+            return {"status": "ok", "results": todos}
+
+        if sub == "get":
+            item_id = payload.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                return {"status": "error", "message": "'id' is required"}
+            if item_id.startswith("t_"):
+                trig = await scheduler.get_trigger(item_id)
+                if trig is None:
+                    return {
+                        "status": "error",
+                        "message": f"trigger {item_id} not found",
+                    }
+                return {"status": "ok", "item_type": "trigger", **trig}
+            if item_id.startswith("d_"):
+                td = await scheduler.get_todo(item_id)
+                if td is None:
+                    return {
+                        "status": "error",
+                        "message": f"to-do {item_id} not found",
+                    }
+                return {"status": "ok", "item_type": "todo", **td}
+            # Unknown prefix — try both.
+            trig = await scheduler.get_trigger(item_id)
+            if trig is not None:
+                return {"status": "ok", "item_type": "trigger", **trig}
+            td = await scheduler.get_todo(item_id)
+            if td is not None:
+                return {"status": "ok", "item_type": "todo", **td}
+            return {
+                "status": "error",
+                "message": f"item {item_id} not found",
+            }
+
+        if sub == "complete":
+            item_id = payload.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                return {"status": "error", "message": "'id' is required"}
+            ok = await scheduler.complete_todo(item_id)
+            if not ok:
+                return {
+                    "status": "error",
+                    "message": f"to-do {item_id} not found",
+                }
+            return {"status": "ok", "id": item_id}
+
+        if sub == "cancel":
+            item_id = payload.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                return {"status": "error", "message": "'id' is required"}
+            if item_id.startswith("t_"):
+                ok = await scheduler.cancel_trigger(item_id)
+            elif item_id.startswith("d_"):
+                ok = await scheduler.cancel_todo(item_id)
+            else:
+                ok = await scheduler.cancel_trigger(item_id) or (
+                    await scheduler.cancel_todo(item_id)
+                )
+            if not ok:
+                return {
+                    "status": "error",
+                    "message": f"item {item_id} not found",
+                }
+            return {"status": "ok", "id": item_id}
+
+        return {
+            "status": "error",
+            "message": f"unknown tasks action '{action_type}'",
+        }
+
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("%s failed", action_type)
+        return {"status": "error", "message": str(exc)}
+
+
 @action_handler("secrets")
 def _handle_secrets_action(
     action_type: str,

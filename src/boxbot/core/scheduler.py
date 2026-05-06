@@ -685,6 +685,39 @@ async def seed_from_config(config: BoxBotConfig) -> None:
             "Seeded dream-cycle trigger (cron=%s)",
             config.memory.dream_cron,
         )
+    else:
+        # Already-seeded dream trigger: keep its cron in sync with config
+        # so changes to ``memory.dream_cron`` propagate via deploy. Only
+        # touches rows still owned by config (source='config'); user- or
+        # agent-modified rows are left alone.
+        await _resync_dream_cron(config.memory.dream_cron)
+
+
+async def _resync_dream_cron(target_cron: str) -> None:
+    """Update the config-sourced dream trigger's cron + next fire_at if drifted."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id, cron FROM triggers "
+            "WHERE description LIKE ? AND source = 'config' "
+            "AND status = 'active'",
+            ("[dream-cycle]%",),
+        )
+        row = await cursor.fetchone()
+        if row is None or row["cron"] == target_cron:
+            return
+        next_fire = CronExpr(target_cron).next_occurrence(_now_utc()).isoformat()
+        await db.execute(
+            "UPDATE triggers SET cron = ?, fire_at = ? WHERE id = ?",
+            (target_cron, next_fire, row["id"]),
+        )
+        await db.commit()
+        logger.info(
+            "Resynced dream-cycle trigger %s: cron %s -> %s (next fire_at=%s)",
+            row["id"], row["cron"], target_cron, next_fire,
+        )
+    finally:
+        await db.close()
 
 
 # ---------------------------------------------------------------------------

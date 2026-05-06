@@ -418,10 +418,10 @@ class MemoryConfig(BaseModel):
     # to the memory store. Flip to ``False`` after a soft-launch period
     # to let the dream phase actually consolidate memories.
     dream_audit_only: bool = True
-    # Cron expression for the nightly dream cycle. Defaults to 3 AM
-    # every day (server-local interpretation of CronExpr — UTC by
-    # default unless the host is on a different TZ).
-    dream_cron: str = "0 3 * * *"
+    # Cron expression for the nightly dream cycle. CronExpr evaluates
+    # in UTC, so this is shifted to land at ~3 AM Pacific (10 UTC =
+    # 3 AM PDT / 2 AM PST — drifts an hour at DST transitions).
+    dream_cron: str = "0 10 * * *"
     # Hard ceiling on dedup pairs sent to the model in a single cycle.
     # Above this, lowest-confidence pairs are dropped before submission.
     dream_max_dedup_pairs: int = 30

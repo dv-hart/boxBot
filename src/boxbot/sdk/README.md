@@ -217,27 +217,33 @@ else:
 
 ### `memory` — Memory Store
 
-Read and write memories.
+Read and write memories. Shares the backend with the `search_memory`
+core tool — writes here are visible to later tool-side lookups.
 
 ```python
 from boxbot_sdk import memory
 
-# Save a memory
-memory.save(
+# Save a memory; returns the new id
+mem_id = memory.save(
     content="Jacob is allergic to peanuts",
-    people=["Jacob"],
+    memory_type="person",          # person|household|methodology|operational
+    person="Jacob",
+    summary="Jacob — peanut allergy",
     tags=["health", "allergy"],
-    importance=0.9
 )
 
 # Search memories
 results = memory.search("allergies", people=["Jacob"])
 for m in results:
-    print(f"{m.content} (importance: {m.importance})")
+    print(m.content)
 
-# Delete a memory
-memory.delete(memory_id="abc-123")
+# Delete a memory (soft delete via invalidation)
+memory.delete(memory_id=mem_id)
 ```
+
+`memory_type` defaults to `household`; `summary` is auto-derived from
+`content` when not provided. `save` and `delete` raise `MemoryError` if
+the main process rejects the call — no silent writes.
 
 ### `photos` — Photo Manager
 
@@ -313,22 +319,26 @@ This SDK module is for complex multi-step task management within scripts
 — batch operations, conditional logic, or combining task management
 with other SDK calls.
 
+`create_trigger` and `create_todo` return the new id. All write calls
+(`create_*`, `complete`, `cancel`) raise `RuntimeError` if the main
+process rejects them.
+
 ```python
 from boxbot_sdk import tasks
 
 # Point-in-time trigger
-tasks.create_trigger(
+trig_id = tasks.create_trigger(
     description="Dentist reminder for Jacob",
     instructions="Remind Jacob about his dentist appointment at 4pm",
     fire_at="2026-02-21T15:30:00",
-    for_person="Jacob"
+    for_person="Jacob",
 )
 
 # Timer trigger (max 24h)
 tasks.create_trigger(
     description="Check for package delivery",
     instructions="Look outside and check if a package was delivered",
-    fire_after="2h"
+    fire_after="2h",
 )
 
 # Person trigger
@@ -336,7 +346,7 @@ tasks.create_trigger(
     description="Tell Jacob about dinner",
     instructions="Tell Jacob that dinner is at 7pm. Carina asked.",
     person="Jacob",
-    for_person="Jacob"
+    for_person="Jacob",
 )
 
 # Compound trigger (timer + person, AND logic)
@@ -345,23 +355,23 @@ tasks.create_trigger(
     instructions="Remind Jacob the Amazon package arrived",
     fire_after="30m",
     person="Jacob",
-    for_person="Jacob"
+    for_person="Jacob",
 )
 
 # Recurring trigger
 tasks.create_trigger(
     description="Morning briefing",
     instructions="Check weather, review to-do list, update displays",
-    cron="0 7 * * *"
+    cron="0 7 * * *",
 )
 
-# Create a to-do item
-tasks.create_todo(
+# Create a to-do item; returns the new id (prefixed "d_")
+todo_id = tasks.create_todo(
     description="Return library books",
     notes="Jacob mentioned during breakfast. Books on kitchen counter. "
           "Due Saturday. Check if the Poe collection has a hold.",
     for_person="Jacob",
-    due_date="2026-02-22"
+    due_date="2026-02-22",
 )
 
 # List triggers and to-dos
@@ -372,14 +382,14 @@ for todo in tasks.list_todos(status="pending"):
     print(f"To-do: {todo.description}")
 
 # Get full details (includes notes)
-item = tasks.get("todo_abc123")
+item = tasks.get(todo_id)
 print(item.notes)  # detailed context loaded on demand
 
 # Complete a to-do
-tasks.complete("todo_abc123")
+tasks.complete(todo_id)
 
 # Cancel a trigger or to-do
-tasks.cancel("trigger_xyz789")
+tasks.cancel(trig_id)
 ```
 
 ## Security Properties

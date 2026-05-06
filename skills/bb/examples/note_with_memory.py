@@ -22,13 +22,14 @@ bb.workspace.write(
     ),
 )
 
-bb.memory.save(
-    kind="person",
-    subject="Erik",
+memory_id = bb.memory.save(
     content=(
         f"Erik keeps a list of his top Pokémon at {path}. "
         "Open the file whenever the subject comes up — the list changes."
     ),
+    memory_type="person",
+    person="Erik",
+    summary=f"Erik's top-Pokémon list lives at {path}",
 )
 
-print(f"wrote {path} and saved a memory pointer to it")
+print(f"wrote {path} and saved memory {memory_id} pointing to it")

@@ -61,9 +61,12 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anthropic
+
+if TYPE_CHECKING:
+    from boxbot.conversations.store import ConversationStore
 
 from boxbot.core.config import get_config
 from boxbot.cost import from_anthropic_usage, record as record_cost
@@ -518,14 +521,25 @@ class BoxBotAgent:
         memory_store: The shared MemoryStore instance for memory operations.
     """
 
-    def __init__(self, memory_store: MemoryStore) -> None:
+    def __init__(
+        self,
+        memory_store: MemoryStore,
+        *,
+        conversation_store: "ConversationStore | None" = None,
+    ) -> None:
         """Initialise the agent.
 
         Args:
             memory_store: The initialised MemoryStore for memory injection,
                 extraction, and system memory reading.
+            conversation_store: Optional persistent conversation store.
+                When provided, WhatsApp conversations route through it
+                (durable threads, sweep-based extraction). When None,
+                WhatsApp falls back to the legacy in-memory + silence-
+                timer behaviour. Voice/trigger never use it.
         """
         self._memory_store = memory_store
+        self._conversation_store = conversation_store
         self._client: anthropic.AsyncAnthropic | None = None
         # Background poller for in-flight extraction batches. Started
         # alongside the agent and runs for the agent's lifetime.
@@ -535,6 +549,10 @@ class BoxBotAgent:
         # default — flip ``memory.dream_audit_only=False`` in config to
         # enable real merges).
         self._dream_poller: DreamPoller | None = None
+        # Background sweep that closes WhatsApp threads whose rolling
+        # window has expired and queues their extraction. Runs only
+        # when ``conversation_store`` is wired.
+        self._extraction_sweep_task: asyncio.Task[None] | None = None
 
         # People currently detected by the perception pipeline.
         # Updated via PersonIdentified event subscription.
@@ -635,6 +653,26 @@ class BoxBotAgent:
         bus.subscribe(AgentSpeaking, self._on_agent_speaking)
         bus.subscribe(AgentSpeakingDone, self._on_agent_speaking_done)
 
+        # Warm-load any persistent WhatsApp threads still inside their
+        # window. Each becomes a live Conversation in LISTENING state,
+        # so the next inbound message resumes mid-thread instead of
+        # opening a fresh conversation. Best-effort: failure here just
+        # means warm-load doesn't happen, the next inbound will still
+        # rehydrate via _get_or_create_conversation.
+        if self._conversation_store is not None:
+            try:
+                await self._warm_load_whatsapp_conversations()
+            except Exception:
+                logger.exception("WhatsApp warm-load failed")
+
+            # Start the extraction sweep. It runs for the agent's
+            # lifetime and fires extraction on threads whose window
+            # has expired.
+            self._extraction_sweep_task = asyncio.create_task(
+                self._extraction_sweep_loop(),
+                name="whatsapp-extraction-sweep",
+            )
+
         self._running = True
         logger.info("BoxBotAgent started (model: %s)", config.models.large)
 
@@ -677,8 +715,152 @@ class BoxBotAgent:
             await self._dream_poller.stop()
             self._dream_poller = None
 
+        if self._extraction_sweep_task is not None:
+            self._extraction_sweep_task.cancel()
+            try:
+                await self._extraction_sweep_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._extraction_sweep_task = None
+
         self._client = None
         logger.info("BoxBotAgent stopped")
+
+    async def _warm_load_whatsapp_conversations(self) -> None:
+        """Rehydrate persistent WhatsApp threads still inside their window.
+
+        Restores each as a live Conversation in LISTENING state — no
+        ConversationStarted event is fired (the conversation already
+        existed; the restart was transparent from the user's point of
+        view).
+        """
+        store = self._conversation_store
+        if store is None:
+            return
+        config = get_config()
+        window = float(config.whatsapp.thread_window_seconds)
+        records = await store.list_active(
+            channel="whatsapp", max_inactive_seconds=window,
+        )
+        if not records:
+            return
+        for rec in records:
+            try:
+                thread = await store.get_thread(rec.conversation_id)
+                conv = Conversation(
+                    conversation_id=rec.conversation_id,
+                    channel=rec.channel,
+                    channel_key=rec.channel_key,
+                    generate_fn=self._generate_for_conversation,
+                    participants=set(rec.participants),
+                    lifecycle_mode="persistent",
+                    store=store,
+                    rehydrated_thread=thread,
+                )
+                self._conversations[rec.conversation_id] = conv
+                self._conversation_by_key[rec.channel_key] = (
+                    rec.conversation_id
+                )
+                self._attach_sandbox_runner(conv)
+                logger.info(
+                    "Warm-loaded WhatsApp conversation %s "
+                    "(key=%s, turns=%d, last_activity=%s)",
+                    rec.conversation_id, rec.channel_key,
+                    len(thread), rec.last_activity_at_iso,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to warm-load conversation %s",
+                    rec.conversation_id,
+                )
+
+    async def _extraction_sweep_loop(self) -> None:
+        """Periodically extract WhatsApp threads whose window has expired.
+
+        Runs every ``whatsapp.extraction_sweep_seconds`` (default 5
+        min). For each expired row we mark_extracted (atomic), end the
+        in-memory Conversation if it's still indexed, and queue
+        post-conversation memory extraction the same way the
+        synchronous voice/trigger path does.
+        """
+        store = self._conversation_store
+        if store is None:
+            return
+        config = get_config()
+        sweep_interval = max(30.0, float(config.whatsapp.extraction_sweep_seconds))
+        window = float(config.whatsapp.thread_window_seconds)
+        # Initial sweep right after startup catches anything that went
+        # quiet while the agent was down.
+        while self._running:
+            try:
+                await self._run_extraction_sweep(store, window)
+            except Exception:
+                logger.exception("Extraction sweep iteration failed")
+            try:
+                await asyncio.sleep(sweep_interval)
+            except asyncio.CancelledError:
+                return
+
+    async def _run_extraction_sweep(
+        self, store: "ConversationStore", window: float,
+    ) -> None:
+        """One pass of the sweep — separated for testability."""
+        expired = await store.list_extractable(
+            max_inactive_seconds=window, channel="whatsapp",
+        )
+        for rec in expired:
+            flipped = await store.mark_extracted(rec.conversation_id)
+            if not flipped:
+                # Another sweeper raced us, or the row was already
+                # extracted out-of-band.
+                continue
+            # Pull the canonical thread from the store (in-memory may
+            # be missing if we restarted between window expiry and
+            # warm-load).
+            thread = await store.get_thread(rec.conversation_id)
+            person_name = next(
+                (p for p in rec.participants
+                 if p != get_config().agent.name),
+                None,
+            )
+
+            # End the in-memory Conversation if it's still indexed —
+            # publishes ConversationEnded so anything else listening
+            # (sandbox runner teardown, etc.) cleans up.
+            async with self._index_lock:
+                conv = self._conversations.get(rec.conversation_id)
+            if conv is not None and not conv.is_ended:
+                try:
+                    await conv.end(reason="window_expired")
+                except Exception:
+                    logger.exception(
+                        "Failed to end conversation %s on sweep",
+                        rec.conversation_id,
+                    )
+
+            # Queue extraction. Counts every assistant turn — same
+            # contract as the synchronous _on_conversation_ended path.
+            turn_count = sum(
+                1 for m in thread if m.get("role") == "assistant"
+            )
+            if thread and turn_count > 0:
+                asyncio.create_task(
+                    self._post_conversation(
+                        conversation_id=rec.conversation_id,
+                        channel=rec.channel,
+                        person_name=person_name,
+                        messages=list(thread),
+                        accessed_memory_ids=[],
+                        started_at=rec.started_at_iso,
+                    ),
+                    name=f"extraction-{rec.conversation_id}",
+                )
+            logger.info(
+                "Sweep extracted conversation %s "
+                "(key=%s, turns=%d, person=%s)",
+                rec.conversation_id, rec.channel_key,
+                len(thread), person_name,
+            )
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -728,10 +910,24 @@ class BoxBotAgent:
             text = f"[{event.media_type} attached] {text}".strip()
 
         channel_key = f"whatsapp:{event.sender_phone or 'unknown'}"
+        # Persistent mode (durable thread + sweep extraction) only when
+        # the conversation store is wired. Falls back to in-memory +
+        # silence-timer behaviour if the store isn't available — keeps
+        # tests and dev runs that don't init the store working.
+        if self._conversation_store is not None:
+            lifecycle_mode = "persistent"
+            thread_window: float | None = float(
+                get_config().whatsapp.thread_window_seconds
+            )
+        else:
+            lifecycle_mode = "transient"
+            thread_window = None
         conv = await self._get_or_create_conversation(
             channel="whatsapp",
             channel_key=channel_key,
             participants={event.sender_name} if event.sender_name else None,
+            lifecycle_mode=lifecycle_mode,
+            thread_window_seconds=thread_window,
         )
         await conv.handle_input(
             text,
@@ -979,6 +1175,8 @@ class BoxBotAgent:
         channel_key: str,
         participants: set[str] | None = None,
         silence_timeout: float | None = None,
+        lifecycle_mode: str = "transient",
+        thread_window_seconds: float | None = None,
     ) -> Conversation:
         """Look up an existing Conversation by channel key, or create one.
 
@@ -986,6 +1184,11 @@ class BoxBotAgent:
         inbound events. The index itself is a dict of live, non-ended
         conversations — ended conversations are removed via
         ``_on_conversation_ended``.
+
+        For ``lifecycle_mode="persistent"`` (WhatsApp), we additionally
+        consult the persistent store: if there's an active row for this
+        channel_key still inside ``thread_window_seconds`` we rehydrate
+        the thread instead of creating a fresh one.
         """
         async with self._index_lock:
             existing_id = self._conversation_by_key.get(channel_key)
@@ -994,12 +1197,86 @@ class BoxBotAgent:
                 if conv is not None and not conv.is_ended:
                     if participants:
                         conv.participants.update(participants)
+                        if conv._store is not None:
+                            try:
+                                await conv._store.update_participants(
+                                    conv.conversation_id, conv.participants,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to update participants for %s",
+                                    conv.conversation_id,
+                                )
                     return conv
                 # Stale entry — drop it and create fresh.
                 self._conversation_by_key.pop(channel_key, None)
                 self._conversations.pop(existing_id, None)
 
-            conv_id = _generate_conversation_id()
+            # Persistent mode: try to resume an existing thread from
+            # the store before minting a fresh conversation. This is
+            # the path that survives restart.
+            store = (
+                self._conversation_store
+                if lifecycle_mode == "persistent" else None
+            )
+            rehydrated_thread: list[dict[str, Any]] | None = None
+            conv_id: str | None = None
+            if store is not None and thread_window_seconds is not None:
+                try:
+                    record = await store.get_active(
+                        channel_key,
+                        max_inactive_seconds=thread_window_seconds,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to query conversation store for %s",
+                        channel_key,
+                    )
+                    record = None
+                if record is not None:
+                    conv_id = record.conversation_id
+                    rehydrated_thread = await store.get_thread(conv_id)
+                    merged_participants = set(record.participants) | set(
+                        participants or ()
+                    )
+                    participants = merged_participants
+                    if set(record.participants) != merged_participants:
+                        try:
+                            await store.update_participants(
+                                conv_id, merged_participants,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to update store participants for %s",
+                                conv_id,
+                            )
+                    logger.info(
+                        "Conversation %s rehydrated (channel=%s, key=%s, "
+                        "turns=%d, last_activity=%s)",
+                        conv_id, channel, channel_key,
+                        len(rehydrated_thread),
+                        record.last_activity_at_iso,
+                    )
+
+            if conv_id is None:
+                conv_id = _generate_conversation_id()
+                if store is not None:
+                    try:
+                        await store.create(
+                            channel=channel,
+                            channel_key=channel_key,
+                            participants=participants,
+                            conversation_id=conv_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to create persistent conversation %s",
+                            conv_id,
+                        )
+                        # Fall through — in-memory conversation still works,
+                        # we just lose persistence for this one.
+                        store = None
+
             conv = Conversation(
                 conversation_id=conv_id,
                 channel=channel,
@@ -1007,13 +1284,17 @@ class BoxBotAgent:
                 generate_fn=self._generate_for_conversation,
                 participants=participants,
                 silence_timeout=silence_timeout,
+                lifecycle_mode=lifecycle_mode,
+                store=store,
+                rehydrated_thread=rehydrated_thread,
             )
             self._conversations[conv_id] = conv
             self._conversation_by_key[channel_key] = conv_id
-            logger.info(
-                "Conversation %s created (channel=%s, key=%s)",
-                conv_id, channel, channel_key,
-            )
+            if rehydrated_thread is None:
+                logger.info(
+                    "Conversation %s created (channel=%s, key=%s)",
+                    conv_id, channel, channel_key,
+                )
             # Eager-start the per-conversation sandbox runner so the
             # boot cost (sudo + python + import bb) is hidden behind
             # wake-word activation rather than charged to the first
@@ -1084,7 +1365,15 @@ class BoxBotAgent:
             conv.sandbox_runner = None
 
         # Fire-and-forget memory extraction on the ended thread.
-        if conv.thread and event.turn_count > 0:
+        # Persistent conversations have extraction routed through the
+        # sweep loop (see _run_extraction_sweep) so they don't need
+        # the synchronous post-conversation kick here. Without this
+        # guard a sweep-driven end() would double-extract.
+        if (
+            conv.thread
+            and event.turn_count > 0
+            and conv.lifecycle_mode != "persistent"
+        ):
             asyncio.create_task(
                 self._post_conversation(
                     conversation_id=conv_id,

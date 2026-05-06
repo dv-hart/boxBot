@@ -63,6 +63,7 @@ from boxbot.core.events import (
 from typing import TYPE_CHECKING  # noqa: E402
 
 if TYPE_CHECKING:
+    from boxbot.conversations.store import ConversationStore
     from boxbot.tools.sandbox_runner import SandboxRunner
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,15 @@ class ConversationState(Enum):
     THINKING = "thinking"    # generation_task is running; no audio yet
     SPEAKING = "speaking"    # TTS or other delivery in progress
     ENDED = "ended"          # terminated; will not accept further input
+
+
+# Lifecycle modes:
+#   "transient"  — voice/trigger default. Silence timer ends the
+#                  conversation; thread lives only in memory.
+#   "persistent" — WhatsApp default. No silence timer (the agent's
+#                  sweep loop handles end-of-life via the store).
+#                  Every turn is durably written through the store.
+LifecycleMode = str  # Literal["transient", "persistent"] kept open for tests
 
 
 @dataclass
@@ -165,19 +175,41 @@ class Conversation:
         generate_fn: GenerateFn,
         participants: Optional[set[str]] = None,
         silence_timeout: float | None = None,
+        lifecycle_mode: LifecycleMode = "transient",
+        store: "ConversationStore | None" = None,
+        rehydrated_thread: list[dict[str, Any]] | None = None,
     ) -> None:
         self.conversation_id = conversation_id
         self.channel = channel            # "voice" | "whatsapp" | "trigger"
         self.channel_key = channel_key    # "voice:room", "whatsapp:+1...", etc.
         self.participants: set[str] = set(participants or ())
-        self.silence_timeout = (
-            silence_timeout
-            if silence_timeout is not None
-            else self.DEFAULT_SILENCE_TIMEOUT
+        # Persistent conversations don't use a silence timer — the
+        # agent's extraction sweep handles end-of-life. We still hold
+        # the field so debug/logging code can read it; setting it to 0
+        # makes ``_reset_silence_timer`` a no-op.
+        self.lifecycle_mode: LifecycleMode = lifecycle_mode
+        self._store: "ConversationStore | None" = (
+            store if lifecycle_mode == "persistent" else None
         )
+        if lifecycle_mode == "persistent":
+            self.silence_timeout = 0.0
+        else:
+            self.silence_timeout = (
+                silence_timeout
+                if silence_timeout is not None
+                else self.DEFAULT_SILENCE_TIMEOUT
+            )
 
-        self._state = ConversationState.IDLE
-        self._thread: list[dict[str, Any]] = []
+        # Rehydrated conversations come back from the store with their
+        # turn history already populated. They start in LISTENING (not
+        # IDLE) so the next inbound message gets THINKING transitions
+        # without re-publishing ConversationStarted.
+        if rehydrated_thread:
+            self._thread: list[dict[str, Any]] = list(rehydrated_thread)
+            self._state = ConversationState.LISTENING
+        else:
+            self._thread = []
+            self._state = ConversationState.IDLE
         self._generate_fn = generate_fn
 
         # Current in-flight generation. None when idle or between turns.
@@ -350,6 +382,32 @@ class Conversation:
 
             # Append new user input to thread.
             self._thread.append(user_message)
+
+            # Durably persist the user turn for persistent-mode
+            # conversations BEFORE generation kicks off. This way a
+            # crash mid-generation still leaves the user message
+            # recorded; the next boot picks it up and runs generation
+            # against it.
+            if self._store is not None:
+                try:
+                    await self._store.append_turn(
+                        self.conversation_id,
+                        role="user",
+                        content=user_message,
+                        metadata={
+                            "speaker_name": speaker_name,
+                            "source": source,
+                        },
+                    )
+                    if speaker_name:
+                        await self._store.update_participants(
+                            self.conversation_id, self.participants,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Conversation %s: failed to persist user turn",
+                        self.conversation_id,
+                    )
 
             # First input: the conversation becomes active and publishes
             # ConversationStarted.
@@ -529,6 +587,24 @@ class Conversation:
             self._pending_segments = []
             last_result = result
 
+            # Persist generated turns for persistent-mode conversations.
+            # If the write fails we keep the in-memory thread (next
+            # restart will lose this batch but the user-side message
+            # was already durable, so the worst case is one missing
+            # assistant turn).
+            if self._store is not None and result.thread_additions:
+                try:
+                    await self._store.append_turns(
+                        self.conversation_id,
+                        list(result.thread_additions),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Conversation %s: failed to persist %d generated turn(s)",
+                        self.conversation_id,
+                        len(result.thread_additions),
+                    )
+
             if self._state is ConversationState.ENDED:
                 return result
 
@@ -571,6 +647,17 @@ class Conversation:
                 drained = self._pending_inputs
                 self._pending_inputs = []
                 self._thread.extend(drained)
+                if self._store is not None and drained:
+                    try:
+                        await self._store.append_turns(
+                            self.conversation_id, list(drained),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Conversation %s: failed to persist %d "
+                            "drained input(s)",
+                            self.conversation_id, len(drained),
+                        )
                 self._state = ConversationState.THINKING
                 self._current_turn_started = time.monotonic()
                 logger.info(

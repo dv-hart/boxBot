@@ -18,6 +18,7 @@ Focus areas:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -460,4 +461,242 @@ async def test_agent_speaking_done_natural_completion_is_noop(agent):
     ))
 
     assert interrupt_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp persistent-mode (ConversationStore wired)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def persistent_agent(tmp_path):
+    """Like ``agent`` but with a real ConversationStore wired in.
+
+    Loads minimal config so ``get_config().whatsapp.*`` resolves with
+    the production defaults. Uses a temp DB so tests are isolated.
+    """
+    from boxbot.conversations.store import ConversationStore
+    from boxbot.core import config as config_module
+
+    # Load defaults so get_config() works inside _on_whatsapp_message.
+    config_module._config = config_module.BoxBotConfig()
+
+    store = ConversationStore(db_path=tmp_path / "conv.db")
+    await store.initialize()
+
+    mem = MagicMock()
+    mem.read_system_memory = MagicMock(return_value="")
+    agent = BoxBotAgent(memory_store=mem, conversation_store=store)
+    agent._client = MagicMock()
+    agent._running = True
+    bus = get_event_bus()
+    bus.subscribe(WhatsAppMessage, agent._on_whatsapp_message)
+    bus.subscribe(ConversationEnded, agent._on_conversation_ended)
+    agent._generate_for_conversation = _make_stub_generate(reply="ack")
+    try:
+        yield agent, store
+    finally:
+        bus.unsubscribe(WhatsAppMessage, agent._on_whatsapp_message)
+        bus.unsubscribe(ConversationEnded, agent._on_conversation_ended)
+        await store.close()
+        config_module._config = None
+
+
+@pytest.mark.asyncio
+async def test_persistent_whatsapp_writes_thread_to_store(persistent_agent):
+    agent, store = persistent_agent
+    await agent._on_whatsapp_message(WhatsAppMessage(
+        sender_name="Jacob",
+        sender_phone="+15551111111",
+        text="hi BB",
+    ))
+    await _drain_active(agent)
+
+    rec = await store.get_active(
+        "whatsapp:+15551111111", max_inactive_seconds=3600,
+    )
+    assert rec is not None
+    thread = await store.get_thread(rec.conversation_id)
+    # User turn + stubbed assistant reply both persisted.
+    assert len(thread) == 2
+    assert thread[0]["role"] == "user"
+    assert thread[1]["role"] == "assistant"
+    assert thread[1]["content"] == "ack"
+
+
+@pytest.mark.asyncio
+async def test_persistent_whatsapp_rehydrates_after_restart(
+    persistent_agent, tmp_path,
+):
+    """Same channel_key on a fresh agent + same DB → rehydrated thread."""
+    agent, store = persistent_agent
+    await agent._on_whatsapp_message(WhatsAppMessage(
+        sender_name="Jacob",
+        sender_phone="+15551111111",
+        text="round one",
+    ))
+    await _drain_active(agent)
+    first_id = agent._conversation_by_key["whatsapp:+15551111111"]
+    first_thread_len = len(agent._conversations[first_id].thread)
+
+    # Simulate restart: drop in-memory state, build a fresh agent that
+    # shares the same store.
+    bus = get_event_bus()
+    bus.unsubscribe(WhatsAppMessage, agent._on_whatsapp_message)
+    bus.unsubscribe(ConversationEnded, agent._on_conversation_ended)
+
+    mem = MagicMock()
+    mem.read_system_memory = MagicMock(return_value="")
+    agent2 = BoxBotAgent(memory_store=mem, conversation_store=store)
+    agent2._client = MagicMock()
+    agent2._running = True
+    bus.subscribe(WhatsAppMessage, agent2._on_whatsapp_message)
+    bus.subscribe(ConversationEnded, agent2._on_conversation_ended)
+    agent2._generate_for_conversation = _make_stub_generate(reply="ack2")
+
+    try:
+        await agent2._on_whatsapp_message(WhatsAppMessage(
+            sender_name="Jacob",
+            sender_phone="+15551111111",
+            text="round two",
+        ))
+        await _drain_active(agent2)
+
+        # Same conversation id reused (rehydrated), thread grew.
+        assert agent2._conversation_by_key["whatsapp:+15551111111"] == first_id
+        conv = agent2._conversations[first_id]
+        assert len(conv.thread) == first_thread_len + 2
+        # Order: user(round one), assistant(ack), user(round two), assistant(ack2)
+        # User messages get a "[Jacob]: " prefix from _format_user_message.
+        assert conv.thread[-2]["content"].endswith("round two")
+        assert conv.thread[-1]["content"] == "ack2"
+        # Earlier turns survived the rehydration.
+        assert conv.thread[0]["content"].endswith("round one")
+        assert conv.thread[1]["content"] == "ack"
+    finally:
+        bus.unsubscribe(WhatsAppMessage, agent2._on_whatsapp_message)
+        bus.unsubscribe(ConversationEnded, agent2._on_conversation_ended)
+
+
+@pytest.mark.asyncio
+async def test_persistent_whatsapp_starts_fresh_after_window(
+    persistent_agent,
+):
+    """A message arriving past the window mints a fresh conversation."""
+    agent, store = persistent_agent
+    await agent._on_whatsapp_message(WhatsAppMessage(
+        sender_name="Jacob",
+        sender_phone="+15551111111",
+        text="morning",
+    ))
+    await _drain_active(agent)
+    first_id = agent._conversation_by_key["whatsapp:+15551111111"]
+
+    # Force the existing row's last_activity into the past, beyond
+    # the configured window (default 14400s).
+    db = store._require_db()
+    far_past = (
+        datetime.now(timezone.utc) - timedelta(seconds=20000)
+    ).isoformat()
+    await db.execute(
+        "UPDATE conversations SET last_activity_at_iso = ? "
+        "WHERE conversation_id = ?",
+        (far_past, first_id),
+    )
+    await db.commit()
+    # Drop in-memory entry to mimic the row going stale.
+    agent._conversations.pop(first_id, None)
+    agent._conversation_by_key.pop("whatsapp:+15551111111", None)
+
+    await agent._on_whatsapp_message(WhatsAppMessage(
+        sender_name="Jacob",
+        sender_phone="+15551111111",
+        text="evening, different topic",
+    ))
+    await _drain_active(agent)
+    second_id = agent._conversation_by_key["whatsapp:+15551111111"]
+    assert second_id != first_id
+
+
+@pytest.mark.asyncio
+async def test_extraction_sweep_marks_expired_active(persistent_agent):
+    """Sweep iteration flips expired rows to 'extracted'."""
+    agent, store = persistent_agent
+    # Patch _post_conversation so the test doesn't depend on real
+    # extraction infrastructure.
+    called = []
+
+    async def _fake_post(**kwargs):
+        called.append(kwargs["conversation_id"])
+
+    agent._post_conversation = _fake_post  # type: ignore[method-assign]
+
+    await agent._on_whatsapp_message(WhatsAppMessage(
+        sender_name="Jacob",
+        sender_phone="+15551111111",
+        text="hi",
+    ))
+    await _drain_active(agent)
+    conv_id = agent._conversation_by_key["whatsapp:+15551111111"]
+
+    # Force expiry.
+    db = store._require_db()
+    far_past = (
+        datetime.now(timezone.utc) - timedelta(seconds=20000)
+    ).isoformat()
+    await db.execute(
+        "UPDATE conversations SET last_activity_at_iso = ? "
+        "WHERE conversation_id = ?",
+        (far_past, conv_id),
+    )
+    await db.commit()
+
+    # Run a single sweep iteration directly (bypass the loop).
+    await agent._run_extraction_sweep(store, window=14400.0)
+    # Let the create_task'd extraction kick off.
+    await asyncio.sleep(0)
+
+    fetched = await store.get(conv_id)
+    assert fetched.state == "extracted"
+    assert conv_id in called
+
+
+@pytest.mark.asyncio
+async def test_extraction_sweep_idempotent_on_already_extracted(
+    persistent_agent,
+):
+    """A second sweep over the same expired row does not double-extract."""
+    agent, store = persistent_agent
+    called = []
+
+    async def _fake_post(**kwargs):
+        called.append(kwargs["conversation_id"])
+
+    agent._post_conversation = _fake_post  # type: ignore[method-assign]
+
+    await agent._on_whatsapp_message(WhatsAppMessage(
+        sender_name="Jacob",
+        sender_phone="+15551111111",
+        text="hi",
+    ))
+    await _drain_active(agent)
+    conv_id = agent._conversation_by_key["whatsapp:+15551111111"]
+
+    db = store._require_db()
+    far_past = (
+        datetime.now(timezone.utc) - timedelta(seconds=20000)
+    ).isoformat()
+    await db.execute(
+        "UPDATE conversations SET last_activity_at_iso = ? "
+        "WHERE conversation_id = ?",
+        (far_past, conv_id),
+    )
+    await db.commit()
+
+    await agent._run_extraction_sweep(store, window=14400.0)
+    await asyncio.sleep(0)
+    await agent._run_extraction_sweep(store, window=14400.0)
+    await asyncio.sleep(0)
+
+    assert called == [conv_id]
 

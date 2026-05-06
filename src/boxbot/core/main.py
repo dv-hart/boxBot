@@ -357,6 +357,16 @@ async def _init_memory_store() -> Any:
     return store
 
 
+async def _init_conversation_store() -> Any:
+    """Initialise and return the ConversationStore (persistent threads)."""
+    from boxbot.conversations.store import ConversationStore
+
+    store = ConversationStore()
+    await store.initialize()
+    logger.info("Conversation store initialised")
+    return store
+
+
 async def _init_photo_store() -> Any:
     """Initialise and return the PhotoStore."""
     from boxbot.photos.store import PhotoStore
@@ -591,7 +601,10 @@ async def _init_whatsapp_inbound(router: Any) -> Any | None:
     return poller
 
 
-async def _init_agent(memory_store: Any) -> Any:
+async def _init_agent(
+    memory_store: Any,
+    conversation_store: Any | None = None,
+) -> Any:
     """Initialise and start the BoxBotAgent."""
     from boxbot.core.agent import BoxBotAgent
     from boxbot.core.agent_state import get_agent_state_tracker
@@ -599,7 +612,10 @@ async def _init_agent(memory_store: Any) -> Any:
     # Start the state tracker before the agent so it sees the first events
     await get_agent_state_tracker().start()
 
-    agent = BoxBotAgent(memory_store=memory_store)
+    agent = BoxBotAgent(
+        memory_store=memory_store,
+        conversation_store=conversation_store,
+    )
     await agent.start()
     logger.info("Agent started")
     return agent
@@ -634,6 +650,7 @@ async def _shutdown(
         "display_manager",
         "scheduler",
         "photo_store",
+        "conversation_store",
         "memory_store",
         "hal",
     ]
@@ -664,6 +681,8 @@ async def _shutdown(
             elif name == "scheduler":
                 await instance.stop()
             elif name == "photo_store":
+                await instance.close()
+            elif name == "conversation_store":
                 await instance.close()
             elif name == "memory_store":
                 await instance.close()
@@ -750,6 +769,12 @@ async def _async_main() -> None:
         memory_store = await _init_memory_store()
         subsystems["memory_store"] = memory_store
 
+        # Conversation store — persistent threads for WhatsApp (voice
+        # and trigger keep their transient in-memory state). Survives
+        # restart so a deploy mid-chat doesn't drop the user's thread.
+        conversation_store = await _init_conversation_store()
+        subsystems["conversation_store"] = conversation_store
+
         # Photo store — independent of memory, needed by photo intake
         photo_store = await _init_photo_store()
         subsystems["photo_store"] = photo_store
@@ -803,7 +828,7 @@ async def _async_main() -> None:
                 subsystems["whatsapp_inbound"] = inbound
 
         # Agent — the brain, subscribes to events from all other subsystems
-        agent = await _init_agent(memory_store)
+        agent = await _init_agent(memory_store, conversation_store)
         subsystems["agent"] = agent
 
         logger.info("All subsystems initialised, boxBot is running")

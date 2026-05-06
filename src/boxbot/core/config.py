@@ -376,6 +376,28 @@ class VoiceConfig(BaseModel):
     session: SessionConfig = Field(default_factory=SessionConfig)
 
 
+class WhatsAppConfig(BaseModel):
+    """WhatsApp channel lifecycle settings.
+
+    Async-by-default text needs a different shape than voice. Voice
+    silence-times out in seconds; WhatsApp threads stay alive for
+    hours (default 4) and only close once the user has truly stopped.
+    """
+
+    # Rolling window of inactivity before a WhatsApp thread is
+    # considered closed. Reset on every inbound or outbound message —
+    # an actively-engaged exchange stays alive as long as messages
+    # keep coming. 4 hours covers normal "I stepped away" gaps
+    # without merging genuinely-separate exchanges from later in the
+    # day.
+    thread_window_seconds: int = 14400  # 4 hours
+
+    # How often the agent's background sweep scans for newly-expired
+    # threads to extract. 5 minutes is well under the window so
+    # extraction fires within a few minutes of the cutoff being met.
+    extraction_sweep_seconds: int = 300
+
+
 class PerceptionConfig(BaseModel):
     """Perception pipeline thresholds and settings."""
 
@@ -605,6 +627,7 @@ class BoxBotConfig(BaseModel):
     hardware: HardwareConfig = Field(default_factory=HardwareConfig)
     camera: CameraConfig = Field(default_factory=CameraConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
+    whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     photos: PhotosConfig = Field(default_factory=PhotosConfig)

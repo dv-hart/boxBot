@@ -271,8 +271,24 @@ sdk:
   auto_activate_displays: false
 
 # ── WhatsApp ──────────────────────────────────────────────────────────
-# WhatsApp config is in a separate file: config/whatsapp.yaml
-# See config/whatsapp.example.yaml
+# WhatsApp credentials live in a separate file: config/whatsapp.yaml
+# (see config/whatsapp.example.yaml). The lifecycle settings below
+# apply to the boxbot-side conversation handling, not the API client.
+whatsapp:
+  # Rolling window of inactivity before a WhatsApp thread is
+  # considered closed. Reset on every inbound or outbound message,
+  # so an actively-engaged exchange stays alive as long as messages
+  # keep coming. 4 hours covers normal "I stepped away" gaps without
+  # merging genuinely-separate exchanges from later in the day.
+  # Threads inside the window survive process restart (they're
+  # persisted to data/conversations/conversations.db).
+  thread_window_seconds: 14400  # 4 hours
+
+  # How often the agent's background sweep scans for expired threads
+  # and fires memory extraction on them. 5 minutes is well under the
+  # window; tune lower if you want extraction to land sooner after
+  # the cutoff.
+  extraction_sweep_seconds: 300  # 5 minutes
 
 # ── Logging ───────────────────────────────────────────────────────────
 logging:

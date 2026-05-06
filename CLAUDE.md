@@ -244,6 +244,19 @@ processes conversations independent of transport.
   deactivates it. LEDs are a pure function of the voice-room
   conversation's state — no independent timers drift from the
   conversation's reality.
+- **Per-channel lifecycle.** Voice and trigger conversations are
+  *transient*: in-memory thread, silence timer ends them, extraction
+  fires synchronously on `ConversationEnded`. WhatsApp conversations
+  are *persistent*: every turn writes through the
+  `ConversationStore` (SQLite at `data/conversations/`), no silence
+  timer, a rolling-window cutoff (default 4 hours of inactivity)
+  decides when the thread closes. Threads survive process restart;
+  on `agent.start()` any active WhatsApp threads are warm-loaded so
+  a deploy mid-chat resumes mid-thread. A background sweep (every 5
+  min) marks expired threads `extracted` and queues memory
+  extraction over the full thread. The cutoff is the feature, not a
+  bug — async-by-default text shouldn't fragment into 3-minute
+  silence-timeouts. See `boxbot.whatsapp.thread_window_seconds`.
 - **Conversation keys:** `voice:room` (one per physical room),
   `whatsapp:<phone>` (per sender), `trigger:<id>:<uuid>` (one-shot
   per firing).

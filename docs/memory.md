@@ -398,9 +398,23 @@ simultaneously:
 
 ### When Extraction Runs
 
-- **On conversation end** — primary trigger, processes full transcript
+The trigger differs by channel:
+
+- **Voice / trigger conversations** — fire extraction synchronously on
+  `ConversationEnded` (silence timeout, voice session end, or explicit
+  `conv.end()`). These are transient in-memory threads; extraction
+  needs to grab the transcript before it evaporates.
+- **WhatsApp conversations** — extraction is sweep-driven. WhatsApp
+  threads are persistent (SQLite, `data/conversations/`) with a
+  rolling 4-hour activity window (configurable). Every 5 minutes a
+  background sweep on the agent finds rows whose window has expired,
+  atomically marks them `extracted`, and queues the same extraction
+  pipeline on the full thread. This keeps memory extraction running
+  *once per coherent conversation* instead of once per voice-style
+  silence-timeout — a real WhatsApp exchange spans hours, not
+  minutes, and chunking it would dilute the extracted facts.
 - **On context compaction** — if the conversation is long enough to
-  require compaction, extract memories before compacting
+  require compaction, extract memories before compacting.
 
 ### Input to Extraction Agent
 

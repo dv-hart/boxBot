@@ -165,6 +165,36 @@ Incoming WhatsApp message
                               Rate limit check → temp/perm block
 ```
 
+## Conversation Lifecycle
+
+WhatsApp threads are **persistent and async-by-default** — different
+shape from voice. Specifically:
+
+- One conversation per sender, keyed by `whatsapp:<phone>`. Same key
+  on the next inbound message reuses the existing thread.
+- Every turn is written through to a SQLite store
+  (`data/conversations/conversations.db`). The thread survives
+  process restart — a deploy mid-chat warm-loads active threads on
+  `BoxBotAgent.start()` so the next inbound message picks up
+  mid-conversation.
+- The active window is a **rolling 4 hours of inactivity** (config:
+  `whatsapp.thread_window_seconds`). Reset on every inbound or
+  outbound message. New message inside the window = same thread;
+  new message after the window = fresh thread, prior thread closed
+  and queued for extraction.
+- A background sweep runs every 5 minutes
+  (`whatsapp.extraction_sweep_seconds`) and fires memory extraction
+  on threads whose window has just expired. Voice and trigger
+  channels keep their existing transient + silence-timer model
+  (extraction fires synchronously on `ConversationEnded`).
+
+The 4-hour rolling window is calibrated for human text pacing:
+generous enough to cover "I stepped away for lunch / a meeting / a
+kid", short enough that morning vs evening exchanges get clean
+boundaries. See `boxbot.conversations.store.ConversationStore` for
+the persistence API and `BoxBotAgent._run_extraction_sweep` for the
+sweep itself.
+
 ## What Does NOT Go Through WhatsApp
 
 These are **skills** running in the sandbox, not WhatsApp features:

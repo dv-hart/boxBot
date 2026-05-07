@@ -1540,6 +1540,9 @@ class BoxBotAgent:
         present = self._get_present_people_with_status(exclude=person_name)
         if present:
             context_lines.append(f"Also present: {', '.join(present)}")
+        display_line = self._format_active_display_line()
+        if display_line:
+            context_lines.append(display_line)
         sections.append(
             "## Current Context\n"
             + "\n".join(f"- {line}" for line in context_lines)
@@ -2321,6 +2324,34 @@ class BoxBotAgent:
         except (RuntimeError, Exception):
             # Pipeline not running
             return self._get_present_people(exclude=exclude)
+
+    def _format_active_display_line(self) -> str | None:
+        """Return a single-line summary of what is currently on the screen.
+
+        ``None`` when the display manager is not running or nothing is
+        active — keeps the prompt clean during early boot or tests.
+        """
+        try:
+            from boxbot.displays.manager import get_display_manager
+
+            mgr = get_display_manager()
+            if mgr is None:
+                return None
+            name = mgr.get_active()
+            if not name:
+                return None
+            theme = mgr.get_active_theme()
+            theme_name = getattr(theme, "name", None) if theme else None
+            args = mgr.get_active_args()
+            line = f"Display: {name}"
+            if theme_name:
+                line += f" (theme={theme_name})"
+            if args:
+                line += f" args={args}"
+            return line
+        except Exception:
+            logger.debug("Could not read active display for prompt", exc_info=True)
+            return None
 
     def _get_most_recent_person(self) -> str | None:
         """Return the name of the most recently seen person.

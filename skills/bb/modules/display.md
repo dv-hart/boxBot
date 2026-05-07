@@ -36,9 +36,11 @@ Call ``bb.display.list()`` to enumerate everything.
 | Call | Returns | Purpose |
 | --- | --- | --- |
 | ``bb.display.list()`` | ``[{name, source}, …]`` | enumerate displays |
+| ``bb.display.get_active()`` | ``{name, args, theme}`` | what's on screen right now |
+| ``bb.display.screenshot()`` | ``{path, attached, name}`` | live screen → PNG (attached to tool result) |
 | ``bb.display.load(name)`` | ``dict`` | read a spec for editing |
 | ``bb.display.save(spec)`` | ``{path, registered, warnings}`` | validate + write + register live |
-| ``bb.display.preview(spec, data=None)`` | ``{path, attached, warnings}`` | render PNG (attached to tool result) |
+| ``bb.display.preview(spec, data=None)`` | ``{path, attached, warnings}`` | render PNG with placeholder data |
 | ``bb.display.delete(name)`` | — | remove an agent-saved display |
 | ``bb.display.describe_source(name)`` | ``{fields, example}`` | data source field schema |
 | ``bb.display.schema()`` | ``{blocks, themes, …}`` | full block reference |
@@ -410,6 +412,28 @@ bb.display.update_data("focus", "session",
 
 ``update_data`` only works while the display is active and only on
 ``static`` sources.
+
+## See what's on screen right now
+
+The system prompt tells you which display is active in the
+``Current Context`` block, but for the actual pixels and live data
+state you have two calls:
+
+- ``bb.display.get_active()`` — structural read: ``{name, args, theme}``.
+  Cheap, no rendering. Use this to confirm a ``switch_display`` took
+  effect, or to know what you'd be replacing before authoring.
+- ``bb.display.screenshot()`` — pixel read: captures the live 1024x600
+  surface and attaches it as an image. Use this to verify a layout
+  looks right with **real** data flowing — ``preview()`` only sees
+  placeholders.
+
+```python
+state = bb.display.get_active()
+# {"name": "morning_brief", "args": {}, "theme": "boxbot"}
+
+bb.display.screenshot()
+# attaches the live frame so you literally see what the household sees
+```
 
 ## Preview attachment cap
 

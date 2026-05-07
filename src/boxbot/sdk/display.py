@@ -42,6 +42,8 @@ Lifecycle::
 Discovery::
 
     bb.display.list()                          # all displays + source
+    bb.display.get_active()                    # what's on screen right now
+    bb.display.screenshot()                    # live screen → PNG, attached
     bb.display.schema()                        # block reference, themes
     bb.display.describe_source("weather")      # data source field shape
 
@@ -156,6 +158,45 @@ def schema() -> dict[str, Any]:
     Use this to introspect what's available without re-reading the doc.
     """
     return _check(_transport.request("display.schema", {}))
+
+
+def get_active() -> dict[str, Any]:
+    """Return what is currently on the 7" screen.
+
+    Shape::
+
+        {
+          "name": "morning_brief" | None,    # None when nothing is active
+          "args": {...},                     # the args switch_display received
+          "theme": "boxbot" | None,
+        }
+
+    Use this before authoring or editing a display so you know what
+    you're replacing — or to confirm a ``switch_display`` actually took
+    effect.
+    """
+    return _check(_transport.request("display.get_active", {}))
+
+
+def screenshot() -> dict[str, Any]:
+    """Capture the live 1024x600 display surface and attach it as an image.
+
+    Renders the *current* state of the screen (live data and all) to a
+    PNG and attaches it to the tool result so you literally see what
+    the household sees. Use this to verify your spec looks right with
+    real data flowing — preview() shows placeholders, screenshot() is
+    the truth.
+
+    Returns ``{"path": str, "attached": bool, "name": str | None}``.
+    Subject to the per-call image-attachment cap; ``attached`` is
+    ``False`` if the cap was already hit (the PNG path is still
+    viewable via ``bb.workspace.view``).
+
+    Raises:
+        RuntimeError: If no display is currently active or the display
+            manager is not running.
+    """
+    return _check(_transport.request("display.screenshot", {}))
 
 
 def update_data(display_name: str, source_name: str, *,

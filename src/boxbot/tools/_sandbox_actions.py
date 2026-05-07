@@ -51,10 +51,11 @@ def _project_attach_roots() -> tuple[Path, ...]:
     from boxbot.core.paths import (
         PERCEPTION_CROPS_DIR,
         PHOTOS_DIR,
+        PREVIEWS_DIR,
         WORKSPACE_DIR,
     )
 
-    return (WORKSPACE_DIR, PHOTOS_DIR, PERCEPTION_CROPS_DIR)
+    return (WORKSPACE_DIR, PHOTOS_DIR, PERCEPTION_CROPS_DIR, PREVIEWS_DIR)
 
 
 def _attach_roots() -> tuple[Path, ...]:
@@ -1660,6 +1661,66 @@ async def _handle_display_action(
                     ),
                 }
             return {"status": "ok"}
+
+        if sub == "get_active":
+            mgr = get_display_manager()
+            if mgr is None:
+                return {"status": "error", "error": "display manager not running"}
+            theme = mgr.get_active_theme()
+            return {
+                "status": "ok",
+                "name": mgr.get_active(),
+                "args": mgr.get_active_args(),
+                "theme": getattr(theme, "name", None) if theme else None,
+            }
+
+        if sub == "screenshot":
+            mgr = get_display_manager()
+            if mgr is None:
+                return {"status": "error", "error": "display manager not running"}
+            active = mgr.get_active()
+            if not active:
+                return {
+                    "status": "error",
+                    "error": "no display is currently active",
+                }
+            frame = mgr.get_current_frame()
+            if frame is None:
+                return {
+                    "status": "error",
+                    "error": (
+                        "no rendered frame available yet — "
+                        "the display manager hasn't drawn the active "
+                        "display. Try again in a moment."
+                    ),
+                }
+
+            previews = _previews_dir()
+            out_path = previews / f"{active}-live-{uuid.uuid4().hex[:8]}.png"
+            try:
+                frame.save(out_path, format="PNG")
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "errors": [f"could not write screenshot PNG: {e}"],
+                }
+
+            attached = False
+            if len(ctx.image_attachments) < MAX_IMAGES_PER_CALL:
+                ctx.image_attachments.append(out_path)
+                attached = True
+            else:
+                logger.warning(
+                    "display.screenshot not attached (exceeded %d/call)",
+                    MAX_IMAGES_PER_CALL,
+                )
+
+            return {
+                "status": "ok",
+                "path": str(out_path),
+                "attached": attached,
+                "name": active,
+            }
 
         return {"status": "error", "error": f"unknown display action: {action_type}"}
 

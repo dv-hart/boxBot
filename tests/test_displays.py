@@ -403,3 +403,143 @@ class TestDataBindingResolution:
         data = {"data": {"label": "Resolved"}}
         resolved = resolve_bindings(row, data)
         assert resolved.children[0].params["content"] == "Resolved"
+
+
+# ---------------------------------------------------------------------------
+# Live-display introspection: get_active + screenshot dispatcher actions
+# ---------------------------------------------------------------------------
+
+
+class TestActiveDisplayIntrospection:
+    """The agent must be able to ask 'what's on screen right now?' and
+    'show me the pixels'. Both go through the display action dispatcher.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_active_returns_none_when_idle(self, monkeypatch):
+        from boxbot.displays.manager import (
+            DisplayManager,
+            set_display_manager,
+        )
+        from boxbot.tools._sandbox_actions import (
+            ActionContext,
+            _handle_display_action,
+        )
+
+        mgr = DisplayManager()
+        set_display_manager(mgr)
+        try:
+            ctx = ActionContext()
+            resp = await _handle_display_action(
+                "display.get_active", {}, ctx,
+            )
+            assert resp["status"] == "ok"
+            assert resp["name"] is None
+            assert resp["args"] == {}
+            assert resp["theme"] is None
+        finally:
+            set_display_manager(None)
+
+    @pytest.mark.asyncio
+    async def test_get_active_after_switch(self, tmp_path, monkeypatch):
+        from boxbot.displays.manager import (
+            DisplayManager,
+            set_display_manager,
+        )
+        from boxbot.displays.spec import DisplaySpec
+        from boxbot.displays.blocks import TextBlock
+        from boxbot.tools._sandbox_actions import (
+            ActionContext,
+            _handle_display_action,
+        )
+
+        mgr = DisplayManager()
+        spec = DisplaySpec(
+            name="hello",
+            theme="boxbot",
+            data_sources=[],
+            root_block=TextBlock(content="hi"),
+        )
+        mgr.register_spec(spec)
+        await mgr.switch("hello", args={"who": "jacob"})
+        set_display_manager(mgr)
+        try:
+            ctx = ActionContext()
+            resp = await _handle_display_action(
+                "display.get_active", {}, ctx,
+            )
+            assert resp["status"] == "ok"
+            assert resp["name"] == "hello"
+            assert resp["args"] == {"who": "jacob"}
+            assert resp["theme"] == "boxbot"
+        finally:
+            await mgr._data_manager.stop_all()
+            set_display_manager(None)
+
+    @pytest.mark.asyncio
+    async def test_screenshot_attaches_live_frame(self, tmp_path, monkeypatch):
+        # Anchor PREVIEWS_DIR inside tmp_path so the test doesn't write
+        # into the project's data/ tree.
+        monkeypatch.setenv("BOXBOT_DATA_DIR", str(tmp_path))
+        # Reload paths so PREVIEWS_DIR picks up the env override.
+        import importlib
+        import boxbot.core.paths as paths
+        importlib.reload(paths)
+        import boxbot.tools._sandbox_actions as sa
+        importlib.reload(sa)
+
+        from boxbot.displays.manager import (
+            DisplayManager,
+            set_display_manager,
+        )
+        from boxbot.displays.spec import DisplaySpec
+        from boxbot.displays.blocks import TextBlock
+
+        mgr = DisplayManager()
+        spec = DisplaySpec(
+            name="hello",
+            theme="boxbot",
+            data_sources=[],
+            root_block=TextBlock(content="hi"),
+        )
+        mgr.register_spec(spec)
+        await mgr.switch("hello")
+        set_display_manager(mgr)
+        try:
+            ctx = sa.ActionContext()
+            resp = await sa._handle_display_action(
+                "display.screenshot", {}, ctx,
+            )
+            assert resp["status"] == "ok", resp
+            assert resp["name"] == "hello"
+            assert resp["attached"] is True
+            assert len(ctx.image_attachments) == 1
+            assert ctx.image_attachments[0].exists()
+            # Path lives under the test-scoped previews dir.
+            assert paths.PREVIEWS_DIR in ctx.image_attachments[0].parents
+        finally:
+            await mgr._data_manager.stop_all()
+            set_display_manager(None)
+
+    @pytest.mark.asyncio
+    async def test_screenshot_errors_when_idle(self):
+        from boxbot.displays.manager import (
+            DisplayManager,
+            set_display_manager,
+        )
+        from boxbot.tools._sandbox_actions import (
+            ActionContext,
+            _handle_display_action,
+        )
+
+        mgr = DisplayManager()
+        set_display_manager(mgr)
+        try:
+            ctx = ActionContext()
+            resp = await _handle_display_action(
+                "display.screenshot", {}, ctx,
+            )
+            assert resp["status"] == "error"
+            assert "no display" in resp["error"]
+        finally:
+            set_display_manager(None)

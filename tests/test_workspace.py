@@ -235,13 +235,20 @@ class TestImageBlockGuards:
     def test_accepts_inside_allowlist(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        from boxbot.tools._sandbox_actions import build_image_block
+        # WORKSPACE_DIR is anchored to BOXBOT_DATA_DIR (or the project
+        # tree); chdir doesn't move the allowlist. Override the data
+        # dir and reload the modules that captured the path constants.
+        monkeypatch.setenv("BOXBOT_DATA_DIR", str(tmp_path))
+        import importlib
+        import boxbot.core.paths as paths
+        importlib.reload(paths)
+        import boxbot.tools._sandbox_actions as sa
+        importlib.reload(sa)
 
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "data" / "workspace").mkdir(parents=True)
-        img = tmp_path / "data" / "workspace" / "x.png"
+        (tmp_path / "workspace").mkdir(parents=True)
+        img = tmp_path / "workspace" / "x.png"
         img.write_bytes(b"\x89PNG" + b"\x00" * 100)
-        block = build_image_block(img)
+        block = sa.build_image_block(img)
         assert block is not None
         assert block["type"] == "image"
         assert block["source"]["media_type"] == "image/png"
@@ -249,11 +256,15 @@ class TestImageBlockGuards:
         assert block["source"]["data"]
 
     def test_refuses_oversize(self, tmp_path: Path, monkeypatch) -> None:
-        from boxbot.tools import _sandbox_actions as sa
+        monkeypatch.setenv("BOXBOT_DATA_DIR", str(tmp_path))
+        import importlib
+        import boxbot.core.paths as paths
+        importlib.reload(paths)
+        import boxbot.tools._sandbox_actions as sa
+        importlib.reload(sa)
 
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "data" / "workspace").mkdir(parents=True)
-        img = tmp_path / "data" / "workspace" / "big.jpg"
+        (tmp_path / "workspace").mkdir(parents=True)
+        img = tmp_path / "workspace" / "big.jpg"
         # Slightly over the cap
         img.write_bytes(b"\xff\xd8\xff" + b"\x00" * (sa.MAX_IMAGE_BYTES + 1))
         assert sa.build_image_block(img) is None

@@ -268,7 +268,7 @@ class IntegrationBuilder:
         if self._outputs:
             payload["outputs"] = self._outputs
         if self._secrets:
-            payload["secrets"] = list(self._secrets)
+            payload["secrets"] = [*self._secrets]
         if self._timeout is not None:
             payload["timeout"] = self._timeout
 

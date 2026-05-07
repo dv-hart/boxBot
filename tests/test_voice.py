@@ -419,6 +419,9 @@ class TestSpeaker:
             device_name="test_speaker",
             sample_rate=24000,
             default_volume=0.7,
+            # AEC reference is hardware that's never present in unit
+            # tests; opt out so start() doesn't try to enumerate it.
+            aec_reference_device=None,
         )
         defaults.update(kwargs)
         return Speaker(**defaults)
@@ -428,7 +431,7 @@ class TestSpeaker:
         from boxbot.hardware.speaker import Speaker
 
         config = HardwareSpeakerConfig(device_name="test_speaker")
-        return Speaker(config=config)
+        return Speaker(config=config, aec_reference_device=None)
 
     def test_construction_with_kwargs(self):
         spk = self._make_speaker(default_volume=0.5)
@@ -475,35 +478,18 @@ class TestSpeaker:
         assert spk._device_index is None
 
     @pytest.mark.asyncio
-    @patch("boxbot.hardware.speaker.sd")
-    @patch("boxbot.hardware.speaker._SD_AVAILABLE", True)
-    async def test_play_with_volume_scaling(self, mock_sd):
-        spk = self._make_speaker(default_volume=0.5)
-        mock_sd.query_devices.return_value = [
-            {"name": "test_speaker hdmi", "max_output_channels": 2}
-        ]
-        mock_sd.play = MagicMock()
-        mock_stream_obj = MagicMock()
-        mock_stream_obj.active = False
-        mock_sd.get_stream.return_value = mock_stream_obj
-
-        await spk.start()
-        audio = np.ones(1000, dtype=np.int16).tobytes()
-        await spk.play(audio, sample_rate=24000)
-
-        mock_sd.play.assert_called_once()
-        # Verify volume was applied — scaled samples should be different
-        played_data = mock_sd.play.call_args[0][0]
-        assert np.all(played_data <= 1)  # 1 * 0.5 = 0
-
-    @pytest.mark.asyncio
-    async def test_stop_playback_sets_stop_event(self):
+    async def test_stop_playback_clears_queue(self):
         spk = self._make_speaker()
-        spk._started = True
-        with patch("boxbot.hardware.speaker._SD_AVAILABLE", True), \
-             patch("boxbot.hardware.speaker.sd") as mock_sd:
-            await spk.stop_playback()
-            assert spk._stop_event.is_set()
+        # Pretend we're mid-playback with audio queued.
+        spk._queue.append(np.zeros((1024, 1), dtype=np.int16))
+        spk._aec_queue.append(np.zeros((512, 2), dtype=np.int16))
+        spk._drained_event = asyncio.Event()
+        spk._drained_event.clear()
+
+        await spk.stop_playback()
+        assert len(spk._queue) == 0
+        assert len(spk._aec_queue) == 0
+        assert spk._drained_event.is_set()
 
     def test_set_volume(self):
         spk = self._make_speaker()
@@ -537,7 +523,7 @@ class TestSpeaker:
     def test_is_playing_property(self):
         spk = self._make_speaker()
         assert spk.is_playing is False
-        spk._playing = True
+        spk._queue.append(np.zeros((1024, 1), dtype=np.int16))
         assert spk.is_playing is True
 
     @patch("boxbot.hardware.speaker._SD_AVAILABLE", False)
@@ -551,7 +537,9 @@ class TestSpeaker:
         assert await spk.health_check() == HealthStatus.STOPPED
 
     def test_apply_volume_at_full(self):
-        spk = self._make_speaker(default_volume=1.0)
+        # gain_db=0 isolates the volume stage from the make-up gain +
+        # soft-limiter pipeline, so this test is purely about volume.
+        spk = self._make_speaker(default_volume=1.0, gain_db=0.0)
         samples = np.array([100, 200, 300], dtype=np.int16)
         result = spk._apply_volume(samples)
         np.testing.assert_array_equal(result, samples)
@@ -563,7 +551,7 @@ class TestSpeaker:
         np.testing.assert_array_equal(result, np.zeros(3, dtype=np.int16))
 
     def test_apply_volume_at_half(self):
-        spk = self._make_speaker(default_volume=0.5)
+        spk = self._make_speaker(default_volume=0.5, gain_db=0.0)
         samples = np.array([1000, 2000, -1000], dtype=np.int16)
         result = spk._apply_volume(samples)
         assert result[0] == 500
@@ -1086,20 +1074,29 @@ class TestTTS:
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
 
-        # Simulate async iterator response
+        # ElevenLabs 4.x raw response: with_raw_response.convert(...) is
+        # an async context manager yielding an object with .headers
+        # (real dict for cost recording) and .data (async iterator).
         async def mock_chunks():
             yield b"\x00" * 1000
             yield b"\x01" * 500
 
-        mock_client.text_to_speech.convert = AsyncMock(
-            return_value=mock_chunks()
+        response = MagicMock()
+        response.headers = {"x-character-count": "5"}
+        response.data = mock_chunks()
+
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=response)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        mock_client.text_to_speech.with_raw_response.convert = MagicMock(
+            return_value=cm
         )
 
         tts = ElevenLabsTTS(api_key="key", voice_id="vid")
         result = await tts.synthesize("Hello")
 
         assert len(result) == 1500
-        mock_client.text_to_speech.convert.assert_awaited_once()
+        mock_client.text_to_speech.with_raw_response.convert.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("boxbot.communication.tts.AsyncElevenLabs")
@@ -1114,10 +1111,15 @@ class TestTTS:
             yield b"\x00" * 500
             yield b"\x01" * 500
 
-        # ElevenLabs SDK 4.x: stream() is a sync method returning an
-        # async iterator (not a coroutine). MagicMock matches that shape.
-        mock_client.text_to_speech.stream = MagicMock(
-            return_value=mock_stream_response()
+        response = MagicMock()
+        response.headers = {"x-character-count": "5"}
+        response.data = mock_stream_response()
+
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=response)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        mock_client.text_to_speech.with_raw_response.stream = MagicMock(
+            return_value=cm
         )
 
         tts = ElevenLabsTTS(api_key="key", voice_id="vid")
@@ -1617,7 +1619,9 @@ class TestVoiceSession:
 
         await session.speak("Hello there")
 
-        mock_tts_stream.speak.assert_awaited_once_with("Hello there")
+        mock_tts_stream.speak.assert_awaited_once_with(
+            "Hello there", conversation_id="voice_test"
+        )
         mock_capture.stop.assert_awaited_once()
         # STT is re-attached on natural completion so the user can
         # continue the conversation.
@@ -1681,7 +1685,12 @@ class TestVoiceSession:
         await session.initiate_conversation("Hello Jacob!", person_name="Jacob")
 
         assert session.state == VoiceSessionState.ACTIVE
-        mock_tts_stream.speak.assert_awaited_once_with("Hello Jacob!")
+        # speak() passes the active conversation_id through to the TTS
+        # stream so cost rows can be correlated to a turn.
+        from unittest.mock import ANY
+        mock_tts_stream.speak.assert_awaited_once_with(
+            "Hello Jacob!", conversation_id=ANY
+        )
 
     @pytest.mark.asyncio
     async def test_initiate_conversation_noop_when_not_idle(self):

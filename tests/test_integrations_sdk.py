@@ -21,10 +21,17 @@ _MARKER = "__BOXBOT_SDK_ACTION__:"
 
 
 def _capture(callable_, *args, **kwargs):
-    """Capture the action(s) the SDK emits + return value of the call."""
+    """Capture the action(s) the SDK emits + return value of the call.
+
+    The bidirectional transport blocks on ``select.select(sys.stdin, ...)``
+    for a reply; ``StringIO`` has no fileno so we stub the low-level
+    ``collect_response`` directly with a canned ``{"status": "ok"}``.
+    """
     fake_stdout = io.StringIO()
-    fake_stdin = io.StringIO('{"status": "ok"}\n')  # canned response
-    with patch("sys.stdout", fake_stdout), patch("sys.stdin", fake_stdin):
+    with patch("sys.stdout", fake_stdout), patch(
+        "boxbot.sdk._transport.collect_response",
+        return_value={"status": "ok"},
+    ):
         result = callable_(*args, **kwargs)
     line = fake_stdout.getvalue().strip()
     assert _MARKER in line, f"no action marker in output: {line!r}"

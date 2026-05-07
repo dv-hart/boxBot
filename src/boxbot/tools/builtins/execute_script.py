@@ -57,7 +57,7 @@ SDK_ACTION_MARKER = "__BOXBOT_SDK_ACTION__:"
 # in-tree path is the fallback for tests/dev where the runtime dir
 # doesn't exist.
 _PROJECT_BOOTSTRAP_PATH = (
-    Path(__file__).resolve().parents[3] / "scripts" / "sandbox_bootstrap.py"
+    Path(__file__).resolve().parents[4] / "scripts" / "sandbox_bootstrap.py"
 )
 
 # Fallback paths used only when the config can't be loaded (e.g. tests).

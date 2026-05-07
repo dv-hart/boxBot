@@ -1050,8 +1050,8 @@ class VoiceSession:
 
         return label_map, identity_block
 
+    @staticmethod
     def _build_attributed_transcript(
-        self,
         stt_result: STTResult,
         diarization_result: Any | None,
         speaker_identities: dict[str, str] | None = None,

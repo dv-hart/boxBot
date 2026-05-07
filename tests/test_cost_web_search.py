@@ -66,7 +66,10 @@ elevenlabs:
     monkeypatch.setenv("BOXBOT_PRICING_CONFIG", str(path))
     reload_pricing(path)
     yield
+    # Restore canonical pricing so later test files don't read this
+    # file's reduced model list out of the cached singleton.
     monkeypatch.delenv("BOXBOT_PRICING_CONFIG", raising=False)
+    reload_pricing()
 
 
 # ---------------------------------------------------------------------------

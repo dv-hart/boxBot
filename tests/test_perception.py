@@ -423,9 +423,10 @@ class TestEnrollmentManager:
         manager.buffer_embedding("Person A", emb)
 
         result = await manager.identify("Jacob", "Person A")
-        assert result["status"] == "created"
+        assert result["status"] == "ok"
+        assert result["outcome"] == "create"
         assert result["name"] == "Jacob"
-        assert result["embeddings_added"] == 1
+        assert result["embeddings_buffered"] == 1
 
         # Verify person exists in store
         person = await cloud_store.get_person_by_name("Jacob")
@@ -438,7 +439,8 @@ class TestEnrollmentManager:
         manager.buffer_embedding("Person B", emb)
 
         result = await manager.identify("Jacob", "Person B")
-        assert result["status"] == "linked"
+        assert result["status"] == "ok"
+        assert result["outcome"] == "confirm"
 
     @pytest.mark.asyncio
     async def test_identify_unknown_ref_raises(self, manager):

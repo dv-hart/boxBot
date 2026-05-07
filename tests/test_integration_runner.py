@@ -82,6 +82,30 @@ def disable_sandbox_enforcement(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def expose_boxbot_sdk_to_subprocess(monkeypatch, tmp_path_factory):
+    """Make ``import boxbot_sdk`` resolve in the subprocess.
+
+    The real sandbox venv installs ``boxbot-sdk`` (built from
+    ``src/boxbot/sdk/``) as the top-level package ``boxbot_sdk``.
+    Tests run as the test user without that install. Build a tiny
+    package shim once per session — a directory named ``boxbot_sdk``
+    that re-exports everything in ``src/boxbot/sdk`` — and prepend it
+    to ``PYTHONPATH`` so the integration subprocess can import it.
+    """
+    shim_root = tmp_path_factory.getbasetemp() / "boxbot_sdk_shim"
+    sdk_src = Path(__file__).resolve().parents[1] / "src" / "boxbot" / "sdk"
+    pkg_dir = shim_root / "boxbot_sdk"
+    if not pkg_dir.exists():
+        shim_root.mkdir(parents=True, exist_ok=True)
+        pkg_dir.symlink_to(sdk_src, target_is_directory=True)
+    existing = os.environ.get("PYTHONPATH", "")
+    new_path = (
+        f"{shim_root}{os.pathsep}{existing}" if existing else str(shim_root)
+    )
+    monkeypatch.setenv("PYTHONPATH", new_path)
+
+
+@pytest.fixture(autouse=True)
 def venv_python_points_at_test_python(monkeypatch):
     """Point the runner at whatever python is running the tests.
 
@@ -131,7 +155,7 @@ async def test_run_returns_output(tmp_path, monkeypatch, isolated_logs):
         ),
     )
     result = await run_mod.run("echo", {"msg": "hello"})
-    assert result["status"] == "ok"
+    assert result["status"] == "ok", result
     assert result["output"] == {"echoed": "hello"}
 
 

@@ -29,6 +29,7 @@ DEFAULT_ROOT = WORKSPACE_DIR
 DEFAULT_QUOTA_BYTES = 100 * 1024 * 1024  # 100 MB
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+AUDIO_EXTS = {".wav", ".flac", ".ogg", ".mp3"}
 TEXT_EXTS = {
     ".md", ".txt", ".csv", ".json", ".yaml", ".yml",
     ".log", ".tsv", ".py", ".html", ".xml",
@@ -45,7 +46,7 @@ class FileInfo:
     size: int
     modified: float      # unix ts
     is_dir: bool
-    kind: str            # "text" | "image" | "csv" | "json" | "binary" | "dir"
+    kind: str            # "text" | "image" | "audio" | "csv" | "json" | "binary" | "dir"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +74,8 @@ def _classify(p: Path) -> str:
     ext = p.suffix.lower()
     if ext in IMAGE_EXTS:
         return "image"
+    if ext in AUDIO_EXTS:
+        return "audio"
     if ext == ".csv":
         return "csv"
     if ext == ".json":
@@ -358,6 +361,16 @@ class Workspace:
                 "path": self._rel_of(abs_path),
                 "kind": kind,
                 "content": content,
+            }
+        if kind == "audio":
+            return {
+                "path": self._rel_of(abs_path),
+                "kind": "audio",
+                "size": abs_path.stat().st_size,
+                "message": (
+                    "audio file — use bb.audio.play() to play through the "
+                    "speaker"
+                ),
             }
         return {
             "path": self._rel_of(abs_path),

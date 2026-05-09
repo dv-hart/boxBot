@@ -24,6 +24,7 @@ calls.
 | `bb.workspace` | Read, write, view, search your own notes and CSVs. | You need to remember *content* (not just facts) — a list, a draft, a table, an image the user gave you. |
 | `bb.camera` | Capture stills and cropped stills from the camera. Captured images attach to the tool result so you see the pixels directly — that *is* the vision API. | You want to *see* what's in the room — a speaker you don't recognise yet, an object someone points at. |
 | `bb.photos` | Search, view, and manage the photo library. | User asks for a photo, wants one shown on the display, or wants to organise the library. |
+| `bb.audio` | Play audio files (wav/flac/ogg/mp3) stored in the workspace through the speaker. The mic detaches during playback; the wake word interrupts cleanly. | User asks to hear a song, sound effect, recorded clip, or chime. |
 | `bb.display` | Create and update displays on the 7" screen. | You want to change or preview what's on the screen, or author a new layout. |
 | `bb.memory` | Save, search, invalidate memories. | Lets you persist a durable fact or dig into prior recall. The `search_memory` tool is fine for most lookups. |
 | `bb.tasks` | Manage triggers (wake conditions) and to-do items. | Setting a reminder, scheduling a check-in, marking something done. The `manage_tasks` tool is fine for most edits. |
@@ -39,6 +40,7 @@ This file is a map. For each module, there is a deeper doc under
 `modules/`:
 
 - `modules/workspace.md` — full API and patterns for the notebook
+- `modules/audio.md` — `bb.audio` API for playing workspace audio files
 - `modules/skill.md` — `bb.skill` API for creating new skills at runtime
 - `modules/integrations.md` — `bb.integrations` API for calling and authoring data-pipe integrations
 - `modules/secrets.md` — `bb.secrets` API for storing credentials and handing them to scripts/integrations

@@ -44,6 +44,7 @@ dependencies = [
     "pyaudio",
     "httpx",
     "aioboto3>=13.0",
+    "miniaudio",
 
     # Display
     "pillow",

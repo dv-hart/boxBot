@@ -1414,6 +1414,107 @@ def _collect_unresolved_bindings(
     return warnings
 
 
+@action_handler("audio")
+async def _handle_audio_action(
+    action_type: str,
+    payload: dict[str, Any],
+    ctx: ActionContext,
+) -> dict[str, Any]:
+    """Dispatch audio.* actions.
+
+    ``audio.play`` decodes a workspace-resident audio file (wav, flac,
+    ogg, mp3) and plays it through the speaker via the voice session,
+    so the mic detaches for the duration and the wake word can
+    interrupt cleanly.
+    """
+    from boxbot.communication.audio_player import AudioPlayerError
+    from boxbot.communication.voice import get_voice_session
+    from boxbot.core.paths import WORKSPACE_DIR
+
+    if action_type != "audio.play":
+        return {
+            "status": "error",
+            "error": f"unknown audio action: {action_type}",
+        }
+
+    rel = payload.get("path")
+    if not isinstance(rel, str) or not rel.strip():
+        return {"status": "error", "error": "path must be a non-empty string"}
+    if "\x00" in rel:
+        return {"status": "error", "error": "path contains null byte"}
+
+    try:
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or any(
+            part == ".." for part in rel_path.parts
+        ):
+            return {
+                "status": "error",
+                "error": "path must be workspace-relative (no '..', no abs)",
+            }
+        abs_path = (WORKSPACE_DIR / rel_path).resolve()
+        ws_root = WORKSPACE_DIR.resolve()
+        if not str(abs_path).startswith(str(ws_root) + "/") \
+                and abs_path != ws_root:
+            return {
+                "status": "error",
+                "error": "path resolves outside workspace",
+            }
+    except OSError as e:
+        return {"status": "error", "error": f"bad path: {e}"}
+
+    if not abs_path.is_file():
+        return {"status": "error", "error": f"audio file not found: {rel}"}
+
+    ext = abs_path.suffix.lower()
+    if ext not in {".wav", ".flac", ".ogg", ".mp3"}:
+        return {
+            "status": "error",
+            "error": (
+                f"unsupported audio format {ext!r}; "
+                "supported: .wav, .flac, .ogg, .mp3"
+            ),
+        }
+
+    volume = payload.get("volume")
+    if volume is not None:
+        try:
+            volume = float(volume)
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "volume must be a number"}
+        if not 0.0 <= volume <= 1.0:
+            return {
+                "status": "error",
+                "error": "volume must be between 0.0 and 1.0",
+            }
+
+    voice = get_voice_session()
+    if voice is None:
+        return {
+            "status": "error",
+            "error": (
+                "audio playback unavailable: voice session not initialised"
+            ),
+        }
+
+    try:
+        result = await voice.play_audio(abs_path, volume=volume)
+    except AudioPlayerError as e:
+        return {"status": "error", "error": str(e)}
+    except Exception as e:
+        logger.exception("audio.play failed")
+        return {"status": "error", "error": f"playback failed: {e}"}
+
+    return {
+        "status": "interrupted" if result.interrupted else "ok",
+        "duration_ms": result.duration_ms,
+        "elapsed_ms": result.elapsed_ms,
+        "format": result.file_format,
+        "sample_rate": result.sample_rate,
+        "channels": result.channels,
+    }
+
+
 @action_handler("display")
 async def _handle_display_action(
     action_type: str,

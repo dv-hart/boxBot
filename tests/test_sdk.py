@@ -788,3 +788,97 @@ class TestSDKPackages:
         denied = PackageResult(approved=False, reason="Not needed")
         assert "denied" in repr(denied)
         assert "Not needed" in repr(denied)
+
+
+# ---------------------------------------------------------------------------
+# SDK audio module
+# ---------------------------------------------------------------------------
+
+
+class TestSDKAudio:
+    """bb.audio.play forwards to ``_transport.request("audio.play", ...)``
+    and surfaces the dispatcher response or raises ``AudioError``."""
+
+    @pytest.fixture
+    def fake_request(self, monkeypatch):
+        from boxbot.sdk import _transport
+
+        recorder = {"calls": [], "responses": {}}
+
+        def stub(action_type, payload, *, timeout=30):
+            recorder["calls"].append((action_type, payload, timeout))
+            resp = recorder["responses"].get(action_type)
+            if resp is None:
+                return {"status": "ok", "duration_ms": 0,
+                        "elapsed_ms": 0, "format": "wav",
+                        "sample_rate": 24000, "channels": 1}
+            return resp
+
+        monkeypatch.setattr(_transport, "request", stub)
+        return recorder
+
+    def test_play_forwards_path(self, fake_request):
+        from boxbot.sdk import audio
+
+        result = audio.play("audio/chime.wav")
+        action, payload, _timeout = fake_request["calls"][0]
+        assert action == "audio.play"
+        assert payload == {"path": "audio/chime.wav"}
+        assert result["status"] == "ok"
+
+    def test_play_includes_volume_when_set(self, fake_request):
+        from boxbot.sdk import audio
+
+        audio.play("audio/chime.wav", volume=0.5)
+        _, payload, _ = fake_request["calls"][0]
+        assert payload["volume"] == 0.5
+
+    def test_play_omits_volume_when_default(self, fake_request):
+        from boxbot.sdk import audio
+
+        audio.play("audio/chime.wav")
+        _, payload, _ = fake_request["calls"][0]
+        assert "volume" not in payload
+
+    def test_play_validates_volume_range(self, fake_request):
+        from boxbot.sdk import audio
+
+        with pytest.raises(ValueError):
+            audio.play("audio/chime.wav", volume=2.0)
+        with pytest.raises(ValueError):
+            audio.play("audio/chime.wav", volume=-0.1)
+
+    def test_play_requires_non_empty_path(self, fake_request):
+        from boxbot.sdk import audio
+
+        with pytest.raises(ValueError):
+            audio.play("")
+
+    def test_play_raises_audio_error_on_dispatcher_error(self, fake_request):
+        from boxbot.sdk import audio
+
+        fake_request["responses"]["audio.play"] = {
+            "status": "error", "error": "audio file not found: x"
+        }
+        with pytest.raises(audio.AudioError, match="not found"):
+            audio.play("missing.wav")
+
+    def test_play_returns_interrupted_status(self, fake_request):
+        from boxbot.sdk import audio
+
+        fake_request["responses"]["audio.play"] = {
+            "status": "interrupted", "duration_ms": 30000,
+            "elapsed_ms": 4200, "format": "mp3",
+            "sample_rate": 44100, "channels": 2,
+        }
+        result = audio.play("music/song.mp3")
+        assert result["status"] == "interrupted"
+        assert result["elapsed_ms"] == 4200
+        assert result["format"] == "mp3"
+
+    def test_play_raises_on_unexpected_status(self, fake_request):
+        from boxbot.sdk import audio
+
+        fake_request["responses"]["audio.play"] = {"status": "wat"}
+        with pytest.raises(audio.AudioError, match="unexpected"):
+            audio.play("audio/chime.wav")

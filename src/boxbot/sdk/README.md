@@ -76,6 +76,30 @@ validated registry; the agent describes **what** to show.
 
 ## Modules
 
+### `audio` — Play workspace audio files
+
+Decode and play `.wav` / `.flac` / `.ogg` / `.mp3` files stored in the
+workspace through the speaker. While playback runs, the mic's STT
+consumer is detached so household chatter and the speaker's own
+output don't enter the transcript pipeline. Saying the wake word
+stops playback and re-activates STT — same semantics as TTS.
+
+The call blocks until playback drains naturally or is interrupted.
+
+```python
+from boxbot_sdk import audio, workspace
+
+# Drop a file into the workspace, then play it
+workspace.write("audio/chime.wav", chime_bytes)
+audio.play("audio/chime.wav")
+
+# Quieter playback
+audio.play("music/favorite_song.mp3", volume=0.5)
+```
+
+Returns a dict with `status` (`"ok"` or `"interrupted"`),
+`duration_ms`, `elapsed_ms`, `format`, `sample_rate`, `channels`.
+
 ### `display` — Display specs as JSON dicts
 
 The display SDK is a thin pair of CRUD calls over JSON dicts. There

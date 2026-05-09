@@ -28,10 +28,13 @@ import asyncio
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from boxbot.communication.audio_capture import AudioCapture, Utterance
+from boxbot.communication.audio_player import AudioPlayer, PlaybackResult
 from boxbot.communication.stt import ElevenLabsSTT, STTResult
 from boxbot.communication.tts import ElevenLabsTTS, TTSStream
 from boxbot.communication.vad import VoiceActivityDetector
@@ -137,6 +140,7 @@ class VoiceSession:
         self._tts: ElevenLabsTTS | None = None
         self._tts_stream: TTSStream | None = None
         self._diarizer: SpeakerDiarizer | None = None
+        self._audio_player: AudioPlayer | None = None
 
         # Session management
         self._session_task: asyncio.Task[None] | None = None
@@ -236,6 +240,12 @@ class VoiceSession:
             logger.warning(
                 "ElevenLabs API key not configured — STT/TTS disabled"
             )
+
+        # Arbitrary audio playback (independent of ElevenLabs — works
+        # as long as we have a speaker). Reuses the speaker's TTS path
+        # so AEC + barge-in semantics are identical.
+        if self._speaker:
+            self._audio_player = AudioPlayer(self._speaker)
 
         # Diarization (lazy-loaded when person detected)
         try:
@@ -769,6 +779,79 @@ class VoiceSession:
     # Speech output
     # ------------------------------------------------------------------
 
+    @asynccontextmanager
+    async def _speaking_session(
+        self, *, label: str
+    ) -> AsyncIterator[None]:
+        """Run a block of speaker output with the SPEAKING ceremony.
+
+        - Sets the mic LED to "speaking".
+        - Publishes ``AgentSpeaking`` so the room conversation flips to
+          SPEAKING state.
+        - Detaches the STT/diarization consumer so chatter and BB's
+          residual echo cannot enter the transcript.
+        - On exit, publishes ``AgentSpeakingDone(interrupted=False)``
+          and re-attaches STT — *unless* the wake-word handler already
+          stopped playback and published ``AgentSpeakingDone(
+          interrupted=True)``. ``_tts_interrupted`` is the flag the
+          handler sets; we honour it to avoid double-publish.
+
+        Used by both :meth:`speak` (TTS) and :meth:`play_audio` (file
+        playback) so the two share identical mic / event semantics.
+        """
+        self._tts_interrupted = False
+
+        if self._microphone:
+            try:
+                await self._microphone.set_led_pattern("speaking")
+            except Exception:
+                pass
+
+        bus = get_event_bus()
+        await bus.publish(
+            AgentSpeaking(
+                conversation_id=self._conversation_id,
+                text=label,
+            )
+        )
+
+        if self._audio_capture is not None:
+            await self._audio_capture.stop()
+
+        try:
+            yield
+        finally:
+            if not self._tts_interrupted:
+                await bus.publish(
+                    AgentSpeakingDone(
+                        conversation_id=self._conversation_id,
+                        interrupted=False,
+                    )
+                )
+
+                # Natural completion: re-attach STT so the user can
+                # continue without re-saying the wake word. The
+                # interrupt path skips this — the wake-word handler
+                # re-attaches via _activate_session itself.
+                if (
+                    self._state == VoiceSessionState.ACTIVE
+                    and self._audio_capture is not None
+                    and self._microphone is not None
+                ):
+                    try:
+                        await self._audio_capture.start(self._microphone)
+                    except Exception:
+                        logger.exception(
+                            "Failed to re-attach audio_capture "
+                            "after speaker output"
+                        )
+
+            if self._state == VoiceSessionState.ACTIVE and self._microphone:
+                try:
+                    await self._microphone.set_led_pattern("listening")
+                except Exception:
+                    pass
+
     async def speak(self, text: str, priority: str = "normal") -> None:
         """Speak text through TTS and the speaker.
 
@@ -792,76 +875,58 @@ class VoiceSession:
             logger.warning("Cannot speak: TTS or speaker not available")
             return
 
-        self._tts_interrupted = False
-
         # If urgent and something is already playing, stop it
         if priority == "urgent" and self._speaker.is_playing:
             await self._speaker.stop_playback()
 
-        # Set LED pattern
-        if self._microphone:
+        async with self._speaking_session(label=text):
             try:
-                await self._microphone.set_led_pattern("speaking")
-            except Exception:
-                pass
-
-        # Publish speaking event — the agent uses this to flip the
-        # room conversation into SPEAKING state.
-        bus = get_event_bus()
-        await bus.publish(
-            AgentSpeaking(
-                conversation_id=self._conversation_id,
-                text=text,
-            )
-        )
-
-        # Detach STT/diarization: chatter and BB's residual echo cannot
-        # enter the transcript. The wake word handler is the only path
-        # back to an attached audio_capture.
-        if self._audio_capture is not None:
-            await self._audio_capture.stop()
-
-        try:
-            await self._tts_stream.speak(
-                text, conversation_id=self._conversation_id or None
-            )
-        except Exception:
-            logger.exception("TTS playback failed")
-        finally:
-            # The wake-word handler publishes AgentSpeakingDone with
-            # interrupted=True itself when it stops playback; only
-            # publish the natural-completion event when that did not
-            # happen.
-            if not self._tts_interrupted:
-                await bus.publish(
-                    AgentSpeakingDone(
-                        conversation_id=self._conversation_id,
-                        interrupted=False,
-                    )
+                await self._tts_stream.speak(
+                    text, conversation_id=self._conversation_id or None
                 )
+            except Exception:
+                logger.exception("TTS playback failed")
 
-                # Natural TTS completion: re-attach STT so the user
-                # can continue the conversation without re-saying the
-                # wake word. The interrupt path skips this — the
-                # wake-word handler re-attaches via _activate_session
-                # itself.
-                if (
-                    self._state == VoiceSessionState.ACTIVE
-                    and self._audio_capture is not None
-                    and self._microphone is not None
-                ):
-                    try:
-                        await self._audio_capture.start(self._microphone)
-                    except Exception:
-                        logger.exception(
-                            "Failed to re-attach audio_capture after TTS"
-                        )
+    async def play_audio(
+        self,
+        abs_path: Path,
+        *,
+        volume: float | None = None,
+    ) -> PlaybackResult:
+        """Play a decoded audio file through the speaker.
 
-            if self._state == VoiceSessionState.ACTIVE and self._microphone:
-                try:
-                    await self._microphone.set_led_pattern("listening")
-                except Exception:
-                    pass
+        Goes through the same SPEAKING ceremony as :meth:`speak` so the
+        mic detaches, ``AgentSpeaking``/``Done`` flow, and the wake
+        word interrupts cleanly.
+
+        Caller is responsible for path validation; this method does
+        the file decode + speaker write.
+
+        Returns:
+            :class:`PlaybackResult`. ``interrupted`` is True if the
+            wake-word handler stopped playback or the player detected
+            an early return.
+        """
+        if not self._audio_player or not self._speaker:
+            raise RuntimeError("audio playback unavailable: no speaker")
+
+        async with self._speaking_session(
+            label=f"[audio: {abs_path.name}]"
+        ):
+            result = await self._audio_player.play_file(
+                abs_path, volume=volume
+            )
+
+        if self._tts_interrupted and not result.interrupted:
+            result = PlaybackResult(
+                duration_ms=result.duration_ms,
+                elapsed_ms=result.elapsed_ms,
+                interrupted=True,
+                file_format=result.file_format,
+                sample_rate=result.sample_rate,
+                channels=result.channels,
+            )
+        return result
 
     async def initiate_conversation(
         self, text: str, person_name: str | None = None

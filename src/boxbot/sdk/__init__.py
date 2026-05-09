@@ -4,6 +4,9 @@ This SDK is the ONLY interface sandbox scripts have to boxBot internals.
 It communicates with the main process through structured JSON on stdout.
 
 Modules:
+    audio        — Play workspace-resident audio files (wav/flac/ogg/mp3)
+                   through the speaker; mic detaches and the wake word
+                   interrupts, just like during TTS
     auth         — User/admin state and registration code minting (no
                    raw secrets — RPC façade onto AuthManager)
     camera       — Capture stills from the Pi camera; images attach to
@@ -26,6 +29,7 @@ reach it via ``bb.integrations.get("calendar", action="...", ...)``.
 """
 
 from . import (
+    audio,
     auth,
     camera,
     display,
@@ -40,6 +44,7 @@ from . import (
 )
 
 __all__ = [
+    "audio",
     "auth",
     "camera",
     "display",

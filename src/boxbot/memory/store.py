@@ -180,9 +180,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     channel           TEXT NOT NULL,
     participants      TEXT NOT NULL,
     started_at        TEXT NOT NULL,
-    summary           TEXT NOT NULL,
-    topics            TEXT NOT NULL,
-    accessed_memories TEXT NOT NULL,
+    summary           TEXT NOT NULL DEFAULT '',
+    topics            TEXT NOT NULL DEFAULT '[]',
+    accessed_memories TEXT NOT NULL DEFAULT '[]',
     embedding         BLOB
 );
 
@@ -378,9 +378,25 @@ class MemoryStore:
         """Create database directory, open connection, and apply schema."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._db = await aiosqlite.connect(str(self._db_path))
+        # isolation_level=None puts sqlite3 in autocommit mode: each
+        # statement is its own implicit BEGIN/COMMIT at the SQLite layer
+        # so a raised statement (FK violation, NOT NULL, etc.) cannot
+        # leave a Python-level implicit transaction open and pin the
+        # connection. Multi-statement atomicity, where actually needed,
+        # is wrapped in explicit BEGIN/COMMIT below.
+        self._db = await aiosqlite.connect(
+            str(self._db_path), isolation_level=None,
+        )
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
+        # NORMAL is the documented pairing for WAL — durable across
+        # crashes, faster commits than the FULL default that's only
+        # meaningful in rollback-journal mode.
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+        # Wait inside SQLite's C layer instead of bouncing SQLITE_BUSY
+        # to Python on every contended write. 5s is generous given that
+        # all of our txns commit in milliseconds on a healthy DB.
+        await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.execute("PRAGMA foreign_keys=ON")
 
         # Create tables and indexes
@@ -854,18 +870,25 @@ class MemoryStore:
         topics: list[str] | None = None,
         accessed_memories: list[str] | None = None,
         started_at: str | None = None,
+        conversation_id: str | None = None,
     ) -> str:
         """Create a conversation log entry.
 
+        Args:
+            conversation_id: If provided, use this id instead of generating
+                one. Lets callers (extraction, stub creation) reuse the
+                live ``Conversation.conversation_id`` so memories created
+                during the conversation can FK-resolve cleanly.
+
         Returns:
-            The generated conversation ID.
+            The conversation ID (generated or passed-through).
         """
-        conv_id = _generate_id()
+        conv_id = conversation_id or _generate_id()
         now = started_at or _now_iso()
         topics_list = topics or []
         accessed_list = accessed_memories or []
 
-        embedding_vec = embed(summary)
+        embedding_vec = embed(summary) if summary else None
 
         await self.db.execute(
             """INSERT INTO conversations
@@ -880,13 +903,82 @@ class MemoryStore:
                 summary,
                 json.dumps(topics_list),
                 json.dumps(accessed_list),
-                _embedding_to_blob(embedding_vec),
+                _embedding_to_blob(embedding_vec) if embedding_vec is not None else None,
             ),
         )
         await self.db.commit()
 
         logger.debug("Created conversation %s (channel=%s)", conv_id, channel)
         return conv_id
+
+    async def create_conversation_stub(
+        self,
+        *,
+        conversation_id: str,
+        channel: str,
+        participants: list[str],
+        started_at: str | None = None,
+    ) -> None:
+        """Insert a placeholder conversations row when a Conversation begins.
+
+        Idempotent (``INSERT OR IGNORE``) so warm-load / replay paths do
+        not error if the row was already created. Summary, topics, and
+        accessed_memories start empty; extraction fills them in via
+        :meth:`update_conversation` when the conversation closes.
+
+        This exists so memories saved during a live conversation can
+        stamp ``source_conversation = conv.conversation_id`` and have
+        the FK resolve, without waiting for the post-conversation
+        extraction batch to land.
+        """
+        now = started_at or _now_iso()
+        await self.db.execute(
+            """INSERT OR IGNORE INTO conversations
+               (id, channel, participants, started_at, summary, topics,
+                accessed_memories, embedding)
+               VALUES (?, ?, ?, ?, '', '[]', '[]', NULL)""",
+            (
+                conversation_id,
+                channel,
+                json.dumps(participants),
+                now,
+            ),
+        )
+        await self.db.commit()
+
+    async def update_conversation(
+        self,
+        conversation_id: str,
+        *,
+        summary: str,
+        topics: list[str] | None = None,
+        accessed_memories: list[str] | None = None,
+    ) -> None:
+        """Fill in summary/topics/embedding for a previously stubbed row.
+
+        Used by extraction to upgrade an active stub into a finalized
+        log entry without changing the conversation_id (which downstream
+        memories already FK against).
+        """
+        topics_list = topics or []
+        accessed_list = accessed_memories or []
+        embedding_vec = embed(summary) if summary else None
+        await self.db.execute(
+            """UPDATE conversations
+               SET summary = ?,
+                   topics = ?,
+                   accessed_memories = ?,
+                   embedding = ?
+               WHERE id = ?""",
+            (
+                summary,
+                json.dumps(topics_list),
+                json.dumps(accessed_list),
+                _embedding_to_blob(embedding_vec) if embedding_vec is not None else None,
+                conversation_id,
+            ),
+        )
+        await self.db.commit()
 
     async def get_conversation(self, conv_id: str) -> Conversation | None:
         """Retrieve a single conversation by ID."""

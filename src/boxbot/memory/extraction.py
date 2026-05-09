@@ -539,14 +539,32 @@ async def process_extraction_result(
     """
     summary = result.conversation_summary
 
-    conv_id = await store.create_conversation(
-        channel=summary.channel,
-        participants=summary.participants,
-        summary=summary.summary,
-        topics=summary.topics,
-        accessed_memories=[],
-    )
-    logger.info("Created conversation log entry %s", conv_id)
+    # The conversations row was stubbed at conversation start with the
+    # live ``conversation_id``. Upgrade it in place so memories created
+    # during the conversation (which already FK against this id) stay
+    # resolvable. If for any reason the stub is missing — older rows
+    # from before the unified-id rollout, manual replay, etc. — fall
+    # back to creating it now under the live id.
+    existing = await store.get_conversation(conversation_id)
+    if existing is None:
+        await store.create_conversation(
+            channel=summary.channel,
+            participants=summary.participants,
+            summary=summary.summary,
+            topics=summary.topics,
+            accessed_memories=[],
+            conversation_id=conversation_id,
+        )
+        logger.info("Created conversation log entry %s", conversation_id)
+    else:
+        await store.update_conversation(
+            conversation_id,
+            summary=summary.summary,
+            topics=summary.topics,
+            accessed_memories=[],
+        )
+        logger.info("Updated conversation log entry %s", conversation_id)
+    conv_id = conversation_id
 
     created_count = 0
     updated_count = 0

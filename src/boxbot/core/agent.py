@@ -1295,6 +1295,24 @@ class BoxBotAgent:
                     "Conversation %s created (channel=%s, key=%s)",
                     conv_id, channel, channel_key,
                 )
+                # Stub the memory.db conversations row under the live
+                # conv_id so memories created mid-conversation can FK
+                # against it. Extraction fills in summary/topics later
+                # via update_conversation. Best-effort — a stub failure
+                # just degrades to "memories from this conversation
+                # won't FK-resolve until extraction runs," which is the
+                # pre-stub behavior.
+                try:
+                    await self._memory_store.create_conversation_stub(
+                        conversation_id=conv_id,
+                        channel=channel,
+                        participants=sorted(participants),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to stub memory conversations row for %s",
+                        conv_id,
+                    )
             # Eager-start the per-conversation sandbox runner so the
             # boot cost (sudo + python + import bb) is hidden behind
             # wake-word activation rather than charged to the first

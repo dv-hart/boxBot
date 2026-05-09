@@ -72,10 +72,26 @@ def _resolve_db_path(db_path: str | Path | None) -> Path:
     return _DB_PATH
 
 
+async def _connect(db_path: Path) -> aiosqlite.Connection:
+    """Open ``memory.db`` with the same pragmas MemoryStore uses.
+
+    busy_timeout + WAL + autocommit (``isolation_level=None``) keep this
+    short-lived connection compatible with the long-lived MemoryStore
+    connection on the same file: both wait inside SQLite on contention
+    instead of bouncing SQLITE_BUSY, and neither leaves an implicit
+    transaction open across an exception.
+    """
+    db = await aiosqlite.connect(str(db_path), isolation_level=None)
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
+    await db.execute("PRAGMA busy_timeout=5000")
+    return db
+
+
 async def _ensure_schema(db_path: Path) -> None:
     """Create the silent_turns table/index if they do not exist."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(str(db_path)) as db:
+    async with await _connect(db_path) as db:
         await db.executescript(_SCHEMA_SQL)
         await db.commit()
 
@@ -114,7 +130,7 @@ async def log_silent_turn(
     note_str = str(note) if note else None
     speakers_json = json.dumps(speakers) if speakers else None
 
-    async with aiosqlite.connect(str(path)) as db:
+    async with await _connect(path) as db:
         cursor = await db.execute(
             """
             INSERT INTO silent_turns (
@@ -170,7 +186,7 @@ async def get_silent_turns(
     path = _resolve_db_path(db_path)
     await _ensure_schema(path)
 
-    async with aiosqlite.connect(str(path)) as db:
+    async with await _connect(path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """

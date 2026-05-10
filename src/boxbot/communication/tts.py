@@ -27,10 +27,13 @@ from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
-# Hard upper bound on the synthesis + playback pipeline. ElevenLabs
-# normally streams first audio in ~200-400 ms; 20 s is more than enough
-# headroom for long utterances while catching a stalled HTTP stream.
-_TTS_STREAM_TIMEOUT_SECONDS = 20.0
+# Stall watchdog: maximum time we'll wait for the *next* audio chunk
+# from the TTS provider before declaring the stream dead. This is an
+# inter-chunk gap timer, not a wall-clock cap on total playback —
+# bounding total playback would cut off long-but-healthy utterances
+# (a 30s spoken response is normal). ElevenLabs streams first audio
+# in ~200-400 ms and subsequent chunks far faster on a healthy stream.
+_TTS_CHUNK_TIMEOUT_SECONDS = 10.0
 
 # HTTP response header that carries the authoritative billed character
 # count for an ElevenLabs TTS request.
@@ -41,6 +44,23 @@ try:
 except ImportError:
     AsyncElevenLabs = None  # type: ignore[assignment, misc]
     VoiceSettings = None  # type: ignore[assignment, misc]
+
+
+async def _bounded_stream(
+    src: AsyncIterator[bytes], timeout: float
+) -> AsyncIterator[bytes]:
+    """Yield from ``src`` but raise ``asyncio.TimeoutError`` if the next
+    chunk takes longer than ``timeout`` seconds to arrive. Bounds
+    inter-chunk gap, not total stream duration."""
+    iterator = src.__aiter__()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(
+                iterator.__anext__(), timeout=timeout
+            )
+        except StopAsyncIteration:
+            return
+        yield chunk
 
 
 @runtime_checkable
@@ -74,9 +94,12 @@ class TTSStream:
 
         Cancellation-safe: if the caller cancels this coroutine (e.g.
         barge-in, conversation timeout, user interruption), playback is
-        stopped on the speaker and the cancellation is propagated. Also
-        bounds synthesis to ``_TTS_STREAM_TIMEOUT_SECONDS`` so a stalled
-        upstream HTTP connection can't hang the agent.
+        stopped on the speaker and the cancellation is propagated.
+
+        Stall-safe: each upstream chunk fetch is bounded by
+        ``_TTS_CHUNK_TIMEOUT_SECONDS`` so a hung HTTP connection can't
+        block the agent — but the total playback duration is *not*
+        capped, so long utterances complete naturally.
 
         Args:
             text: Text to synthesize and play.
@@ -88,10 +111,8 @@ class TTSStream:
             stream = self._tts.synthesize_stream(
                 text, conversation_id=conversation_id
             )
-            await asyncio.wait_for(
-                self._speaker.play_stream(stream),  # type: ignore[attr-defined]
-                timeout=_TTS_STREAM_TIMEOUT_SECONDS,
-            )
+            bounded = _bounded_stream(stream, _TTS_CHUNK_TIMEOUT_SECONDS)
+            await self._speaker.play_stream(bounded)  # type: ignore[attr-defined]
         except asyncio.CancelledError:
             # Propagate cancellation, but first stop audible output so
             # we don't keep talking over the user.
@@ -102,9 +123,9 @@ class TTSStream:
             raise
         except asyncio.TimeoutError:
             logger.error(
-                "TTS playback exceeded %.0fs — stopping speaker. "
-                "Possible stalled upstream stream.",
-                _TTS_STREAM_TIMEOUT_SECONDS,
+                "TTS upstream stalled — no audio chunk for %.0fs. "
+                "Stopping speaker.",
+                _TTS_CHUNK_TIMEOUT_SECONDS,
             )
             try:
                 await self._speaker.stop_playback()  # type: ignore[attr-defined]

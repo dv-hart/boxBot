@@ -77,20 +77,30 @@ class RowBlock(Block):
 
 @dataclass
 class ColumnBlock(Block):
-    """Vertical flow — children stacked."""
+    """Vertical flow — children stacked.
+
+    ``align`` is the main-axis (vertical) packing — currently reserved.
+    ``item_align`` is the cross-axis (horizontal) alignment of each child:
+    ``stretch`` (default) gives every child the full column width,
+    matching the historical behavior; ``start``/``center``/``end`` shrink
+    each child to its natural width and pin it left/center/right.
+    """
 
     block_type: str = field(default="column", init=False)
     gap: int = 0
     align: str = "start"
+    item_align: str = "stretch"
     padding: int | list[int] = 0
 
     def __post_init__(self) -> None:
+        defaults = {"align": "start", "item_align": "stretch"}
         self.params = {
             k: v for k, v in {
                 "gap": self.gap,
                 "align": self.align,
+                "item_align": self.item_align,
                 "padding": self.padding,
-            }.items() if v != (0 if k != "align" else "start")
+            }.items() if v != defaults.get(k, 0)
         }
 
 

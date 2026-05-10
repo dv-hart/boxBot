@@ -661,13 +661,16 @@ def _render_column(ctx: RenderContext, block: Block, rect: Rect) -> None:
     """Render a column -- vertical flow with children stacked.
 
     Children flow top to bottom with configurable gap, alignment,
-    and padding.
+    and padding. ``item_align`` controls cross-axis (horizontal)
+    alignment per child: ``stretch`` gives full width (default),
+    ``start``/``center``/``end`` size to natural width and pin.
     """
     padding = _parse_padding(block.params.get("padding"))
     inner = _inner_rect(rect, padding)
     gap = block.params.get("gap", 0)
+    item_align = block.params.get("item_align", "stretch")
 
-    _render_children_vertical(ctx, block.children, inner, gap)
+    _render_children_vertical(ctx, block.children, inner, gap, item_align)
 
 
 def _render_children_vertical(
@@ -675,17 +678,19 @@ def _render_children_vertical(
     children: list[Block],
     rect: Rect,
     gap: int,
+    item_align: str = "stretch",
 ) -> None:
     """Render a list of children in vertical flow with gap spacing.
-
-    Each child gets the full width of the container. Heights are
-    estimated based on block type and content.
 
     Args:
         ctx: Render context.
         children: List of child blocks.
         rect: Available rectangle.
         gap: Vertical gap between children in pixels.
+        item_align: Cross-axis (horizontal) alignment for each child.
+            ``stretch`` gives every child the full container width
+            (historical behavior). ``start``/``center``/``end`` shrink
+            each child to its natural width and pin left/center/right.
     """
     y = rect.y
     for child in children:
@@ -694,9 +699,18 @@ def _render_children_vertical(
             y += size if size else gap
             continue
 
-        # Estimate child height for layout
         child_h = _estimate_block_height(ctx, child, rect.w)
-        child_rect = Rect(rect.x, y, rect.w, child_h)
+        if item_align == "stretch":
+            child_rect = Rect(rect.x, y, rect.w, child_h)
+        else:
+            cw = min(rect.w, _estimate_block_width(ctx, child, rect.w))
+            if item_align == "center":
+                cx = rect.x + (rect.w - cw) // 2
+            elif item_align == "end":
+                cx = rect.x + rect.w - cw
+            else:  # start
+                cx = rect.x
+            child_rect = Rect(cx, y, cw, child_h)
         _render_block(ctx, child, child_rect)
         y += child_h + gap
 

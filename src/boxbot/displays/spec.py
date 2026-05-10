@@ -320,8 +320,14 @@ _BLOCK_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
         "animation": ("none", "fade", "typewriter", "count_up", "slide_up"),
     },
     "row": {"align": ("start", "center", "end", "spread")},
-    "column": {"align": ("start", "center", "end", "spread")},
-    "stack": {"align": ("start", "center", "end", "spread")},
+    "column": {
+        "align": ("start", "center", "end", "spread"),
+        "item_align": ("stretch", "start", "center", "end"),
+    },
+    "stack": {
+        "align": ("start", "center", "end", "spread"),
+        "item_align": ("stretch", "start", "center", "end"),
+    },
     "icon": {"size": ("sm", "md", "lg", "xl")},
     "emoji": {"size": ("md", "lg", "xl")},
     "clock": {

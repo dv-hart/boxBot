@@ -62,6 +62,15 @@ class AudioCapture:
         self._silence_ms: float = 0.0
         self._sample_rate: int = 16000
 
+        # Mute: when True, drop incoming chunks at the gate so VAD never
+        # runs and no utterance is finalized. The agent flips this via
+        # the ``mute_mic`` tool when it wants to ignore the room (e.g.
+        # while focusing on a task, while ambient chatter is happening).
+        # Persists across stop/start so a TTS-time detach/reattach cycle
+        # doesn't accidentally clear it. The speech handler explicitly
+        # unmutes via ``unmute()`` at TTS-end before re-attaching.
+        self._muted = False
+
     async def start(self, microphone: object) -> None:
         """Register as microphone consumer and start capturing.
 
@@ -104,6 +113,32 @@ class AudioCapture:
         self._last_chunk_time = 0.0
         self._silence_ms = 0.0
 
+    def mute(self) -> None:
+        """Stop delivering utterances. Drops any in-flight buffer.
+
+        Idempotent. Persists across stop/start so it survives the
+        detach/reattach cycle around TTS playback. Cleared by
+        :meth:`unmute` (the speech handler does this at TTS-end).
+        """
+        if self._muted:
+            return
+        self._muted = True
+        # Drop anything mid-accumulation so the next unmute doesn't
+        # release a stale partial utterance.
+        self.reset()
+        logger.info("AudioCapture muted")
+
+    def unmute(self) -> None:
+        """Resume delivering utterances. Idempotent."""
+        if not self._muted:
+            return
+        self._muted = False
+        logger.info("AudioCapture unmuted")
+
+    @property
+    def is_muted(self) -> bool:
+        return self._muted
+
     async def _on_audio_chunk(self, chunk: AudioChunk) -> None:
         """Process chunk: VAD -> accumulate/finalize.
 
@@ -114,6 +149,11 @@ class AudioCapture:
         4. If silence exceeds threshold: finalize utterance.
         5. If duration exceeds max: force finalize.
         """
+        # Muted: drop the chunk before VAD runs. The wake-word consumer
+        # is a separate registration on the microphone and is not
+        # affected — the user can still wake BB while muted.
+        if self._muted:
+            return
         self._sample_rate = chunk.sample_rate
         speech_prob = await self._vad.process_chunk(chunk)
         chunk_duration_ms = (chunk.frames / chunk.sample_rate) * 1000

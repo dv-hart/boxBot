@@ -44,6 +44,7 @@ injects its agent-loop driver. Tests supply a fake generator.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import time
 from dataclasses import dataclass, field
@@ -819,3 +820,11 @@ class Conversation:
                 summary=summary or f"(ended: {reason})",
             )
         )
+
+        # Belt-and-suspenders: drop refs to torch tensors and other
+        # large allocations held during the conversation (pyannote
+        # embeddings, agent message buffers, sandbox handles). The
+        # caching allocator won't return pages to the OS but Python
+        # refcounts get released so they can be reused on the next
+        # session instead of forcing growth. Cheap on idle.
+        gc.collect()

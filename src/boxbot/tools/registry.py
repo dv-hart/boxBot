@@ -20,6 +20,7 @@ from boxbot.tools.builtins.execute_script import ExecuteScriptTool
 from boxbot.tools.builtins.identify_person import IdentifyPersonTool
 from boxbot.tools.builtins.load_skill import LoadSkillTool
 from boxbot.tools.builtins.manage_tasks import ManageTasksTool
+from boxbot.tools.builtins.mute_mic import MuteMicTool
 from boxbot.tools.builtins.search_memory import SearchMemoryTool
 from boxbot.tools.builtins.search_photos import SearchPhotosTool
 from boxbot.tools.builtins.switch_display import SwitchDisplayTool
@@ -53,6 +54,7 @@ def _load_tools() -> list[Tool]:
         SwitchDisplayTool(),
         IdentifyPersonTool(),
         ManageTasksTool(),
+        MuteMicTool(),
         SearchMemoryTool(),
         SearchPhotosTool(),
         WebSearchTool(),

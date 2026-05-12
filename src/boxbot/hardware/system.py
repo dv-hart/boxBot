@@ -16,6 +16,7 @@ import logging
 import shutil
 from typing import Any
 
+from boxbot.core.events import get_event_bus
 from boxbot.hardware.base import (
     HardwareModule,
     HealthStatus,

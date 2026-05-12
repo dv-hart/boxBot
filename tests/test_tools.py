@@ -61,7 +61,7 @@ class TestToolRegistry:
     """Test tool discovery and registry functions."""
 
     def test_get_tools_count_and_composition(self):
-        """9 tools. All outbound speech/text to humans flows through the
+        """10 tools. All outbound speech/text to humans flows through the
         ``message`` tool (channel='speak' or 'text'). The other tools DO
         things — they don't speak. The legacy ``speak`` and ``send_message``
         files remain on disk for reference but are not registered."""
@@ -72,12 +72,13 @@ class TestToolRegistry:
 
         from boxbot.tools.registry import get_tools
         tools = get_tools()
-        assert len(tools) == 9
+        assert len(tools) == 10
         names = {t.name for t in tools}
         assert "message" in names  # the only path to a human
         assert "speak" not in names  # subsumed by message(channel='speak')
         assert "send_message" not in names  # subsumed by message(channel='text')
         assert "load_skill" in names
+        assert "mute_mic" in names
 
     def test_get_tools_returns_tool_instances(self):
         from boxbot.tools.registry import get_tools
@@ -112,6 +113,7 @@ class TestToolRegistry:
             "switch_display",
             "identify_person",
             "manage_tasks",
+            "mute_mic",
             "search_memory",
             "search_photos",
             "web_search",

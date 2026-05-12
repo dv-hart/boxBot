@@ -194,6 +194,32 @@ class VoiceSession:
         """Update the speaker identity mapping for transcript attribution."""
         self._speaker_identities.update(identities)
 
+    def mute_mic(self) -> bool:
+        """Mute the utterance pipeline. Wake-word stays armed.
+
+        Returns True if the mic was muted, False if no audio_capture is
+        attached (e.g. session never activated). Idempotent.
+        """
+        if self._audio_capture is None:
+            return False
+        self._audio_capture.mute()
+        return True
+
+    def unmute_mic(self) -> None:
+        """Unmute the utterance pipeline. Idempotent.
+
+        Called by the speech handler at TTS-end before re-attaching
+        audio_capture, so a turn that produced spoken output always
+        re-opens the mic for follow-up.
+        """
+        if self._audio_capture is not None:
+            self._audio_capture.unmute()
+
+    @property
+    def is_mic_muted(self) -> bool:
+        """True iff the audio_capture is currently muted."""
+        return self._audio_capture is not None and self._audio_capture.is_muted
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -833,11 +859,17 @@ class VoiceSession:
                 # continue without re-saying the wake word. The
                 # interrupt path skips this — the wake-word handler
                 # re-attaches via _activate_session itself.
+                #
+                # Also clears any agent-set mute. Speech implies BB is
+                # engaging the room; the user should be able to follow
+                # up without re-saying the wake word. This is the
+                # contract documented on the ``mute_mic`` tool.
                 if (
                     self._state == VoiceSessionState.ACTIVE
                     and self._audio_capture is not None
                     and self._microphone is not None
                 ):
+                    self._audio_capture.unmute()
                     try:
                         await self._audio_capture.start(self._microphone)
                     except Exception:

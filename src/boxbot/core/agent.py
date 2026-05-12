@@ -1793,32 +1793,40 @@ class BoxBotAgent:
         while turn_count < max_turns:
             turn_count += 1
 
-            try:
-                # IMPORTANT: the exact named kwargs below are the only ones
-                # we pass. No temperature / top_p / top_k / thinking — those
-                # will 400 on Opus 4.7. See spec §3.
-                response = await self._client.messages.create(
-                    model=model,
-                    max_tokens=_MAX_TOKENS,
-                    system=system_prompt_blocks,
-                    messages=messages,
-                    tools=tool_definitions,
-                    output_config={
-                        "format": {
-                            "type": "json_schema",
-                            "schema": INTERNAL_NOTES_SCHEMA,
-                        }
-                    },
-                    cache_control={"type": "ephemeral"},
-                )
-            except anthropic.APIError as e:
-                logger.error(
-                    "Anthropic API error on turn %d: %s", turn_count, e
-                )
-                messages.append({
-                    "role": "assistant",
-                    "content": f"(API error: {e})",
-                })
+            # IMPORTANT: the exact named kwargs below are the only ones
+            # we pass. No temperature / top_p / top_k / thinking — those
+            # will 400 on Opus 4.7. See spec §3.
+            response = None
+            for attempt in range(2):
+                try:
+                    response = await self._client.messages.create(
+                        model=model,
+                        max_tokens=_MAX_TOKENS,
+                        system=system_prompt_blocks,
+                        messages=messages,
+                        tools=tool_definitions,
+                        output_config={
+                            "format": {
+                                "type": "json_schema",
+                                "schema": INTERNAL_NOTES_SCHEMA,
+                            }
+                        },
+                        cache_control={"type": "ephemeral"},
+                    )
+                    break
+                except anthropic.APIError as e:
+                    logger.error(
+                        "Anthropic API error on turn %d (attempt %d/2): %s",
+                        turn_count, attempt + 1, e,
+                    )
+                    if attempt == 0:
+                        await asyncio.sleep(3)
+                    else:
+                        messages.append({
+                            "role": "assistant",
+                            "content": f"(API error: {e})",
+                        })
+            if response is None:
                 break
 
             # Append the assistant's response to the history

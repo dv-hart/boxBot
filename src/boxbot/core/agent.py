@@ -1378,7 +1378,7 @@ class BoxBotAgent:
                     await self._memory_store.create_conversation_stub(
                         conversation_id=conv_id,
                         channel=channel,
-                        participants=sorted(participants),
+                        participants=sorted(participants) if participants else [],
                     )
                 except Exception:
                     logger.exception(

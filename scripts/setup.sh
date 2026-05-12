@@ -226,9 +226,17 @@ echo "--- Installing Python dependencies ---"
     elevenlabs \
     pyannote.audio
 
-# torchcodec pulls in CUDA deps that don't work on aarch64 — remove it
-# (sentence_transformers and pyannote work fine without it for text/audio)
-"$VENV_DIR/bin/pip" uninstall -y torchcodec --quiet 2>/dev/null
+# torchcodec pulls in CUDA libs (libnppicc.so.13 etc.) that don't
+# exist on aarch64. pyannote.audio declares it as a hard dep, so it
+# gets reinstalled any time pip resolves the dep graph — re-running
+# this script (or the deploy-time sweep in deploy.sh) is what keeps
+# it gone. sentence_transformers and pyannote work fine without it
+# for text/audio.
+if "$VENV_DIR/bin/pip" show torchcodec >/dev/null 2>&1; then
+    echo "Removing torchcodec (CUDA-only, incompatible with Pi)..."
+    "$VENV_DIR/bin/pip" uninstall -y torchcodec
+    CHANGES+=("Removed torchcodec")
+fi
 
 CHANGES+=("Installed Python dependencies")
 

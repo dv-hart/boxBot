@@ -193,6 +193,21 @@ echo "  sandbox SDK reinstalled (boxbot_sdk)"
 EOF
 fi
 
+# Belt-and-suspenders: torchcodec is a transitive dep of pyannote.audio
+# but can't load on aarch64 (wants libnppicc.so.13 from CUDA). setup.sh
+# removes it, but any pip resolve can drag it back. Cheap check, runs
+# every deploy so a stale venv on the Pi doesn't keep spamming the
+# startup log.
+ssh "$TARGET" bash <<EOF
+set -euo pipefail
+cd "$PI_PROJECT_DIR"
+VENV_PIP=".venv/bin/pip"
+if [[ -x "\$VENV_PIP" ]] && "\$VENV_PIP" show torchcodec >/dev/null 2>&1; then
+    echo "--- Removing torchcodec (CUDA-only, incompatible with Pi) ---"
+    "\$VENV_PIP" uninstall -y torchcodec
+fi
+EOF
+
 ssh "$TARGET" "cd $PI_PROJECT_DIR && bash scripts/restart-boxbot.sh"
 
 echo ""

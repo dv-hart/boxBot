@@ -204,6 +204,24 @@ class ConversationEnded(Event):
 
 
 @dataclass(frozen=True)
+class ConversationInterruptRequested(Event):
+    """User has explicitly asked to interrupt the in-flight generation.
+
+    Currently published by the voice adapter when the wake word fires
+    while a conversation is active (any state) — re-saying the wake
+    word means "drop what you're doing and listen to me now," distinct
+    from passive ambient input which queues. The agent consumer calls
+    ``Conversation.interrupt()``, which cancels-and-folds the in-flight
+    generation and clears any queued utterances.
+
+    Source: Communication (voice wake-word handler)
+    Consumers: Agent
+    """
+
+    conversation_id: str = ""
+
+
+@dataclass(frozen=True)
 class TranscriptReady(Event):
     """Attributed transcript ready for agent processing.
 

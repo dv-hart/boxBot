@@ -34,6 +34,7 @@ from boxbot.core.events import (
     AgentSpeaking,
     AgentSpeakingDone,
     ConversationEnded,
+    ConversationInterruptRequested,
     TranscriptReady,
     TriggerFired,
     VoiceSessionEnded,
@@ -83,6 +84,10 @@ async def agent():
     bus.subscribe(ConversationEnded, agent._on_conversation_ended)
     bus.subscribe(AgentSpeaking, agent._on_agent_speaking)
     bus.subscribe(AgentSpeakingDone, agent._on_agent_speaking_done)
+    bus.subscribe(
+        ConversationInterruptRequested,
+        agent._on_conversation_interrupt_requested,
+    )
     # Replace the Anthropic loop with a stub.
     agent._generate_for_conversation = _make_stub_generate()
     try:
@@ -95,6 +100,10 @@ async def agent():
         bus.unsubscribe(ConversationEnded, agent._on_conversation_ended)
         bus.unsubscribe(AgentSpeaking, agent._on_agent_speaking)
         bus.unsubscribe(AgentSpeakingDone, agent._on_agent_speaking_done)
+        bus.unsubscribe(
+            ConversationInterruptRequested,
+            agent._on_conversation_interrupt_requested,
+        )
 
 
 async def _drain_active(agent) -> None:

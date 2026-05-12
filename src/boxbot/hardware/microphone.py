@@ -104,6 +104,7 @@ _COLOR_IDLE = (20, 15, 8)  # warm amber, very dim
 _COLOR_LISTENING = (0, 120, 200)  # bright blue
 _COLOR_THINKING = (180, 100, 20)  # amber-coral (boxbot theme)
 _COLOR_SPEAKING = (40, 180, 80)  # green
+_COLOR_MUTED = (60, 30, 0)  # deep dim amber — "present but ignoring"
 _COLOR_ERROR = (200, 20, 10)  # red
 
 # Pattern types
@@ -117,6 +118,11 @@ _PATTERN_CONFIG: dict[str, dict[str, Any]] = {
     "listening": {"type": _PATTERN_PULSE, "color": _COLOR_LISTENING, "speed": 2.0},
     "thinking": {"type": _PATTERN_CHASE, "color": _COLOR_THINKING, "speed": 3.0},
     "speaking": {"type": _PATTERN_PULSE, "color": _COLOR_SPEAKING, "speed": 1.0},
+    # "muted" — agent called mute_mic. Session still active, mic gated
+    # at the audio_capture layer. Slow soft pulse distinguishes it from
+    # "listening" (faster, brighter blue) and "off" (truly inactive).
+    # Communicates "I'm here but not listening — say the wake word."
+    "muted": {"type": _PATTERN_PULSE, "color": _COLOR_MUTED, "speed": 0.6},
     # "doa" is defined but currently unused — DOA-as-listening-overlay is
     # future work (will sample get_doa() at ~5 Hz and blend into the
     # listening pulse). get_doa() itself is available for other consumers.

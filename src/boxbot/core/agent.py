@@ -80,6 +80,7 @@ from boxbot.core.events import (
     AgentSpeaking,
     AgentSpeakingDone,
     ConversationEnded,
+    ConversationInterruptRequested,
     PersonIdentified,
     SpeakerIdentified,
     TranscriptReady,
@@ -412,6 +413,15 @@ def _prompt_etiquette() -> str:
         "`message(speak)` — if nothing more arrives the conversation\n"
         "ends on its own via the silence timer.\n"
         "\n"
+        "Calling `mute_mic` also drops any utterances that were queued\n"
+        "during your current thinking (utterances that arrived while you\n"
+        "were waiting for a tool result). That is the whole point — those\n"
+        "queued utterances are the same ambient noise you are choosing\n"
+        "to ignore. Only mute when you are confident the room is not\n"
+        "addressing you. If a queued utterance might be a legitimate\n"
+        "continuation (\"oh and also...\", a correction), answer the\n"
+        "original request first and decide about muting on the next turn.\n"
+        "\n"
         "## Scenarios (memorise these patterns)\n"
         "\n"
         "- Someone at the box asks you a question you can answer immediately:\n"
@@ -679,6 +689,10 @@ class BoxBotAgent:
         bus.subscribe(ConversationEnded, self._on_conversation_ended)
         bus.subscribe(AgentSpeaking, self._on_agent_speaking)
         bus.subscribe(AgentSpeakingDone, self._on_agent_speaking_done)
+        bus.subscribe(
+            ConversationInterruptRequested,
+            self._on_conversation_interrupt_requested,
+        )
 
         # Warm-load any persistent WhatsApp threads still inside their
         # window. Each becomes a live Conversation in LISTENING state,
@@ -721,6 +735,10 @@ class BoxBotAgent:
         bus.unsubscribe(ConversationEnded, self._on_conversation_ended)
         bus.unsubscribe(AgentSpeaking, self._on_agent_speaking)
         bus.unsubscribe(AgentSpeakingDone, self._on_agent_speaking_done)
+        bus.unsubscribe(
+            ConversationInterruptRequested,
+            self._on_conversation_interrupt_requested,
+        )
 
         # End any active conversations cleanly.
         for conv in list(self._conversations.values()):
@@ -1188,6 +1206,33 @@ class BoxBotAgent:
         except Exception:
             logger.exception(
                 "Conversation interrupt failed for voice:room (conv=%s)",
+                conv.conversation_id,
+            )
+
+    async def _on_conversation_interrupt_requested(
+        self, event: ConversationInterruptRequested,
+    ) -> None:
+        """Explicit user interrupt — currently fires when the wake word
+        is heard during an active conversation.
+
+        Re-saying the wake word means "drop what you're doing and
+        listen to me now." Cancels-and-folds the in-flight generation,
+        clears queued utterances, transitions to LISTENING. This is
+        the explicit carve-out against the ambient inject-don't-
+        interrupt model: every other transcript queues; only the wake
+        word interrupts.
+
+        ``Conversation.interrupt()`` is idempotent and a no-op when
+        nothing is in flight, so it's safe to dispatch unconditionally.
+        """
+        conv = self._conversations.get(event.conversation_id)
+        if conv is None:
+            return
+        try:
+            await conv.interrupt()
+        except Exception:
+            logger.exception(
+                "Conversation interrupt-on-wake-word failed (conv=%s)",
                 conv.conversation_id,
             )
 
@@ -1923,10 +1968,26 @@ class BoxBotAgent:
                 tool_results = await self._process_tool_calls(
                     response, tools, conversation_id=conversation_id,
                 )
-                if tool_results:
+                # Inject-don't-interrupt: drain any utterances that
+                # arrived during this iteration's API call + tool
+                # dispatch and fold them into the same role:"user" turn
+                # as the tool_result blocks. The model sees both on the
+                # next API call and can react in one round-trip. This
+                # is the Claude Code / Agent SDK pattern — see
+                # Conversation.handle_input THINKING branch.
+                content_blocks: list[dict[str, Any]] = list(tool_results)
+                conv = self._conversations.get(conversation_id) \
+                    if conversation_id else None
+                if conv is not None:
+                    for item in conv.drain_pending_inputs():
+                        text = str(item.get("content") or "").strip()
+                        if not text:
+                            continue
+                        content_blocks.append({"type": "text", "text": text})
+                if content_blocks:
                     messages.append({
                         "role": "user",
-                        "content": tool_results,
+                        "content": content_blocks,
                     })
                 continue
 

@@ -140,23 +140,34 @@ async def test_participants_tracked_from_speaker():
 
 
 @pytest.mark.asyncio
-async def test_new_input_cancels_in_flight_generation():
-    """Core requirement: while the agent is thinking, a new utterance
-    cancels the current generation and starts a fresh one."""
+async def test_new_input_during_thinking_queues_no_cancel():
+    """Inject-don't-interrupt: while the agent is thinking, a new
+    utterance is appended to ``_pending_inputs`` and does NOT cancel
+    the in-flight generation. The agent loop drains pending inputs
+    at the next API-call boundary (see ``drain_pending_inputs``).
+    After the generation completes naturally, any items still queued
+    are drained via the post-turn path and a fresh turn runs for them.
+    """
     gen_started = asyncio.Event()
-    gen_cancelled = asyncio.Event()
+    gen_finished_ok = asyncio.Event()
 
     async def gen(conv):
         if conv.thread[-1]["content"].endswith("first"):
             gen_started.set()
+            # Pretend the agent loop runs for a moment, then completes
+            # cleanly. New inputs during this window must NOT cancel.
+            await asyncio.sleep(0.05)
             try:
-                # Pretend to generate forever until cancelled.
-                await asyncio.sleep(10)
+                _ = await asyncio.shield(asyncio.sleep(0))
             except asyncio.CancelledError:
-                gen_cancelled.set()
+                pytest.fail("Generation was cancelled by new input — "
+                            "THINKING should queue, not interrupt")
                 raise
-            return GenerationResult()  # unreachable
-        # Second call — return immediately.
+            gen_finished_ok.set()
+            return GenerationResult(
+                thread_additions=[{"role": "assistant", "content": "first ack"}],
+            )
+        # Second call drains the queued items.
         return GenerationResult(
             thread_additions=[{"role": "assistant", "content": "second ack"}],
         )
@@ -165,55 +176,58 @@ async def test_new_input_cancels_in_flight_generation():
     await conv.handle_input("first")
     await asyncio.wait_for(gen_started.wait(), timeout=1.0)
 
-    # Interrupt with a new input.
+    # New input mid-THINKING. Should queue silently.
     await conv.handle_input("second")
+    assert conv.state is ConversationState.THINKING
+    assert conv.is_generating is True
+    # Thread still only has the original — queued items live in _pending_inputs.
+    assert len(conv.thread) == 1
+    assert len(conv._pending_inputs) == 1
 
-    assert gen_cancelled.is_set()
-    await conv._generation_task  # type: ignore[arg-type]
+    # First gen finishes; post-turn drain triggers a second turn for "second".
+    await asyncio.wait_for(conv._generation_task, timeout=2.0)  # type: ignore[arg-type]
+    assert gen_finished_ok.is_set()
     assert conv.state is ConversationState.LISTENING
-    # Thread order: user(first), user(second), assistant(second ack).
     roles = [m["role"] for m in conv.thread]
-    assert roles == ["user", "user", "assistant"]
+    assert roles == ["user", "assistant", "user", "assistant"]
     assert "first" in conv.thread[0]["content"]
-    assert "second" in conv.thread[1]["content"]
-    assert conv.thread[2]["content"] == "second ack"
+    assert conv.thread[1]["content"] == "first ack"
+    assert "second" in conv.thread[2]["content"]
+    assert conv.thread[3]["content"] == "second ack"
 
 
 @pytest.mark.asyncio
-async def test_thinking_interrupt_folds_partial_into_thread():
-    """A new utterance during THINKING (before any TTS has started)
-    cancels the in-flight generation and folds whatever segments the
-    generator had recorded into the thread as an interrupted assistant
-    turn so the next cycle sees what the user actually heard."""
-    started = asyncio.Event()
-
+async def test_drain_pending_inputs_returns_and_clears():
+    """The agent loop calls drain_pending_inputs() between API calls
+    to fold queued utterances into the user turn that carries tool_results.
+    Verify the helper returns the queued items and empties the queue."""
     async def gen(conv):
-        if conv.thread[-1]["content"].endswith("first"):
-            # Stay in THINKING but record a segment to simulate work
-            # already done in the partial-delivery sense.
-            conv.record_segment(SpokenSegment(
-                channel="voice", to="room",
-                content="I was about to say something long",
-            ))
-            started.set()
-            await asyncio.sleep(10)  # gets cancelled
-            return GenerationResult()
-        return GenerationResult(
-            thread_additions=[{"role": "assistant", "content": "ok"}],
-        )
+        # Long-running so we can poke the queue while THINKING.
+        await asyncio.sleep(10)
+        return GenerationResult()
 
     conv = _make_conv(gen, silence_timeout=0)
-    await conv.handle_input("first")
-    await asyncio.wait_for(started.wait(), timeout=1.0)
-    await conv.handle_input("stop")
-    await conv._generation_task  # type: ignore[arg-type]
+    await conv.handle_input("hello")
+    # Wait until THINKING.
+    for _ in range(50):
+        if conv.state is ConversationState.THINKING:
+            break
+        await asyncio.sleep(0.01)
+    assert conv.state is ConversationState.THINKING
 
-    roles = [m["role"] for m in conv.thread]
-    # Expect: user(first), assistant(interrupted partial),
-    # user(stop), assistant(ok).
-    assert roles == ["user", "assistant", "user", "assistant"]
-    assert "about to say something long" in conv.thread[1]["content"]
-    assert "interrupted" in conv.thread[1]["content"].lower()
+    # Queue a few inputs.
+    await conv.handle_input("garble one", speaker_name="Kid")
+    await conv.handle_input("garble two", speaker_name="Kid")
+
+    drained = conv.drain_pending_inputs()
+    assert len(drained) == 2
+    assert "garble one" in drained[0]["content"]
+    assert "garble two" in drained[1]["content"]
+    # Second drain returns empty.
+    assert conv.drain_pending_inputs() == []
+
+    # Cleanup: cancel the long generation explicitly so the test ends.
+    await conv.end(reason="test_cleanup")
 
 
 @pytest.mark.asyncio
@@ -334,24 +348,28 @@ async def test_interrupt_is_noop_when_idle():
 
 
 @pytest.mark.asyncio
-async def test_rapid_successive_interrupts_do_not_wedge_state():
-    """Three interrupts in quick succession. Final generation must
-    still produce a clean LISTENING state."""
+async def test_rapid_successive_inputs_queue_and_drain_cleanly():
+    """Three new inputs in quick succession during THINKING. Under
+    inject-don't-interrupt, none of them cancel the in-flight
+    generation — they queue. When the generation completes, the
+    post-turn drain folds them into a single follow-up turn. State
+    must settle to LISTENING with a clean thread."""
     gen_count = 0
 
     async def gen(conv):
         nonlocal gen_count
         gen_count += 1
-        # Keep every generation but the last running "forever".
-        if conv.thread[-1]["content"].endswith("final"):
+        # First generation: hand-rolled short delay so the test can
+        # queue more inputs before it returns.
+        if gen_count == 1:
+            await asyncio.sleep(0.05)
             return GenerationResult(
-                thread_additions=[{"role": "assistant", "content": "done"}],
+                thread_additions=[{"role": "assistant", "content": "first ack"}],
             )
-        try:
-            await asyncio.sleep(5)
-        except asyncio.CancelledError:
-            raise
-        return GenerationResult()
+        # Second (drain pass): respond to whatever piled up.
+        return GenerationResult(
+            thread_additions=[{"role": "assistant", "content": "done"}],
+        )
 
     conv = _make_conv(gen, silence_timeout=0)
     await conv.handle_input("one")
@@ -364,8 +382,9 @@ async def test_rapid_successive_interrupts_do_not_wedge_state():
     await conv._generation_task  # type: ignore[arg-type]
 
     assert conv.state is ConversationState.LISTENING
-    assert gen_count == 4
-    # Last thread message is the "done" assistant turn.
+    # Two generations total: the original ("one") and the drain pass
+    # that consumed two/three/final as one folded user turn.
+    assert gen_count == 2
     assert conv.thread[-1] == {"role": "assistant", "content": "done"}
 
 

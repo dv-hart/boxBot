@@ -43,6 +43,7 @@ from boxbot.core.events import (
     AgentSpeaking,
     AgentSpeakingDone,
     AgentTurnEnded,
+    ConversationInterruptRequested,
     TranscriptReady,
     VoiceSessionEnded,
     WakeWordHeard,
@@ -199,10 +200,22 @@ class VoiceSession:
 
         Returns True if the mic was muted, False if no audio_capture is
         attached (e.g. session never activated). Idempotent.
+
+        Drives the LED ring to the ``muted`` pattern so the room has a
+        visible "BB is not listening — say the wake word" signal.
         """
         if self._audio_capture is None:
             return False
         self._audio_capture.mute()
+        # Fire-and-forget LED transition: the animation loop owns its
+        # own timing and we don't want to block tool dispatch on USB.
+        if self._microphone is not None:
+            try:
+                asyncio.create_task(
+                    self._microphone.set_led_pattern("muted")
+                )
+            except Exception:
+                logger.debug("LED transition to muted failed", exc_info=True)
         return True
 
     def unmute_mic(self) -> None:
@@ -211,9 +224,29 @@ class VoiceSession:
         Called by the speech handler at TTS-end before re-attaching
         audio_capture, so a turn that produced spoken output always
         re-opens the mic for follow-up.
+
+        Drives the LED back to ``listening`` so the room sees BB is
+        live again. No-op if the session is not ACTIVE (e.g. during
+        deactivation cleanup — the LED is already being driven to
+        off by the deactivate path).
         """
-        if self._audio_capture is not None:
-            self._audio_capture.unmute()
+        if self._audio_capture is None:
+            return
+        was_muted = self._audio_capture.is_muted
+        self._audio_capture.unmute()
+        if (
+            was_muted
+            and self._microphone is not None
+            and self._state == VoiceSessionState.ACTIVE
+        ):
+            try:
+                asyncio.create_task(
+                    self._microphone.set_led_pattern("listening")
+                )
+            except Exception:
+                logger.debug(
+                    "LED transition to listening failed", exc_info=True
+                )
 
     @property
     def is_mic_muted(self) -> bool:
@@ -605,13 +638,19 @@ class VoiceSession:
     async def _on_wake_word(self, event: WakeWordHeard) -> None:
         """Handle wake word detection.
 
-        The wake word is the unified re-engagement signal: if BB is
-        mid-TTS the playback stops and an ``AgentSpeakingDone(
-        interrupted=True)`` event is published (the agent listens for
-        this and calls ``Conversation.interrupt()`` to fold partial
-        output and clear queued utterances). STT is re-attached either
-        way — it's detached during BB's own speech, and the wake word
-        is the only path back to a hot mic.
+        The wake word is the unified re-engagement signal:
+
+        - If BB is mid-TTS, playback stops and ``AgentSpeakingDone(
+          interrupted=True)`` fires so the speaker pipeline cleans up.
+        - If a conversation is in flight in *any* state (THINKING,
+          SPEAKING, LISTENING), ``ConversationInterruptRequested``
+          fires so the agent calls ``Conversation.interrupt()`` —
+          cancels-and-folds the generation, clears queued utterances.
+          This is the explicit "drop what you're doing" carve-out
+          against the ambient inject-don't-interrupt model.
+
+        STT is re-attached either way — it's detached during BB's own
+        speech, and the wake word is the only path back to a hot mic.
         """
         if (
             self._speaker is not None
@@ -631,6 +670,25 @@ class VoiceSession:
                 logger.exception(
                     "Failed to publish AgentSpeakingDone after wake-word interrupt"
                 )
+
+        # Always publish the interrupt request when there's an active
+        # conversation. The agent's handler is idempotent and is a
+        # no-op if nothing is in flight, so this is safe to send even
+        # from IDLE — but skip the bus traffic when there's no
+        # conversation id to interrupt.
+        if self._conversation_id:
+            try:
+                await get_event_bus().publish(
+                    ConversationInterruptRequested(
+                        conversation_id=self._conversation_id,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to publish ConversationInterruptRequested "
+                    "on wake-word re-engage"
+                )
+
         await self._activate_session(event)
 
     async def _on_conversation_ended(self, event: Any) -> None:

@@ -313,16 +313,24 @@ class Conversation:
 
         - ``IDLE`` / ``LISTENING`` — append the message to the thread
           and start a fresh generation.
-        - ``THINKING`` — cancel the in-flight generation, fold any
-          partial output into the thread, then append this message and
-          restart. The model sees both the interrupted assistant turn
-          AND the fresh user message in a single cycle, so "oh and..."
-          continuations work naturally.
+        - ``THINKING`` — queue the message in ``_pending_inputs``.
+          The in-flight ``messages.create`` call runs to completion and
+          the agent's tool dispatch runs uninterrupted; between API
+          calls in the tool-use loop, queued items are folded into the
+          ``role:"user"`` turn that carries ``tool_result`` blocks.
+          This is the "inject, don't interrupt" model used by Claude
+          Code — ambient room noise can no longer livelock the agent,
+          and the first turn always gets to fire (including
+          ``mute_mic`` if the agent decides the input is garbage).
         - ``SPEAKING`` — queue the message in ``_pending_inputs``. The
           generator finishes its TTS uninterrupted; once it returns,
           the queued messages are drained into the thread and a fresh
           generation runs. The agent decides whether overheard
           utterances were directed at it or were background chatter.
+
+        Explicit interruption is still available via ``interrupt()``,
+        which the wake-word handler calls when a user re-engages
+        mid-task. That path *does* cancel-and-fold.
 
         Args:
             text: The incoming message text. Must be non-empty after
@@ -374,12 +382,29 @@ class Conversation:
                 )
                 return
 
-            # THINKING: cancel the in-flight generation. We fold its
-            # partial output into the thread before adding the new user
-            # input so the regenerated turn sees BOTH: the interrupted
-            # assistant output AND the fresh user message.
-            if self.is_generating:
-                await self._cancel_and_fold()
+            # THINKING: queue. The active agent loop will drain pending
+            # inputs at the next API-call boundary and inject them into
+            # the ``role:"user"`` turn that carries the tool_result
+            # blocks — see ``drain_pending_inputs`` and agent.py's
+            # ``_agent_loop``. After the loop terminates (no more
+            # tool_use), the post-turn drain at the bottom of
+            # ``_run_generation`` picks up any items that landed during
+            # the final API call and runs a fresh turn for them.
+            #
+            # The wake-word handler still triggers ``interrupt()`` for
+            # explicit user re-engagement.
+            if self._state is ConversationState.THINKING:
+                self._pending_inputs.append(user_message)
+                self._reset_silence_timer()
+                self._last_activity_monotonic = time.monotonic()
+                logger.info(
+                    "Conversation %s: queued input during THINKING "
+                    "(pending=%d): %s",
+                    self.conversation_id,
+                    len(self._pending_inputs),
+                    cleaned[:60],
+                )
+                return
 
             # Append new user input to thread.
             self._thread.append(user_message)
@@ -432,6 +457,25 @@ class Conversation:
                 self._run_generation(),
                 name=f"gen-{self.conversation_id}",
             )
+
+    def drain_pending_inputs(self) -> list[dict[str, Any]]:
+        """Return queued utterances and clear the queue.
+
+        Called by the agent loop between API calls (inject-don't-
+        interrupt model — see ``handle_input`` docstring). Items
+        returned are dicts in the same shape as ``_thread`` entries:
+        ``{role: "user", content: str, ...metadata}``.
+
+        Synchronous and lock-free on purpose — the agent loop runs
+        outside the conversation lock and a brief race with a new
+        ``handle_input`` is harmless: any append that beats the swap
+        below is folded into the next round-trip instead of this one.
+        """
+        if not self._pending_inputs:
+            return []
+        drained = self._pending_inputs
+        self._pending_inputs = []
+        return drained
 
     async def interrupt(self) -> None:
         """Cancel the in-flight generation and clear queued inputs.

@@ -36,7 +36,9 @@ Call ``bb.display.list()`` to enumerate everything.
 | Call | Returns | Purpose |
 | --- | --- | --- |
 | ``bb.display.list()`` | ``[{name, source}, …]`` | enumerate displays |
-| ``bb.display.get_active()`` | ``{name, args, theme}`` | what's on screen right now |
+| ``bb.display.get_active()`` | ``{name, args, theme, pinned, rotation}`` | what's on screen + pin/rotation state |
+| ``bb.display.unpin()`` | ``{pinned, rotation}`` | release the pin, resume rotation |
+| ``bb.display.set_rotation(displays=, interval=)`` | ``{pinned, rotation}`` | configure idle rotation (clears pin) |
 | ``bb.display.screenshot()`` | ``{path, attached, name}`` | live screen → PNG (attached to tool result) |
 | ``bb.display.load(name)`` | ``dict`` | read a spec for editing |
 | ``bb.display.save(spec)`` | ``{path, registered, warnings}`` | validate + write + register live |
@@ -77,6 +79,44 @@ switch_display("picture", args={"image_ids": ["abc123..."]})
 ```
 
 The ``args`` dict shows up in bindings as ``{args.<field>}``.
+
+### Pinning, rotation, and going back to idle
+
+``switch_display`` **pins by default**. The chosen display stays on
+screen, and idle rotation is paused, until you replace it with another
+``switch_display`` call or release the pin. There is no auto-revert.
+
+```python
+# What's happening right now?
+state = bb.display.get_active()
+# {"name": "picture", "args": {"image_ids": [...]},
+#  "theme": "boxbot", "pinned": True,
+#  "rotation": {"active": False, "displays": [...],
+#               "interval": 30, "next_in_sec": None}}
+
+# Release pin, resume the configured rotation list
+bb.display.unpin()
+
+# Reshape rotation for the evening (slideshow only)
+bb.display.set_rotation(displays=["picture"], interval=120)
+
+# Pass pin=False if you want to "preview" a display without taking
+# control — the next rotation tick will move past it.
+switch_display("weather_simple", pin=False)
+```
+
+A typical daily rhythm — one trigger per phase, each one calls the
+right method:
+
+| Time | Trigger fires → agent calls | Effect |
+| --- | --- | --- |
+| 07:00 | ``switch_display("morning_brief")`` | pinned digest |
+| 09:00 | ``bb.display.unpin()`` | rotation resumes |
+| 22:00 | ``switch_display("picture", args={})`` | pinned slideshow |
+
+You don't have to schedule the unpin step — when you decide to put
+something else up, ``switch_display`` already replaces the pin.
+``unpin()`` is just the explicit "go back to rotation now" lever.
 
 ## The spec shape
 
@@ -475,5 +515,7 @@ print(ref["blocks"]["chart"]["fields"])
 
 ### Back to idle
 
-The display manager auto-returns to the idle rotation when nothing
-takes control for a while; no explicit "unswitch" call is needed.
+Call ``bb.display.unpin()``. The rotation loop resumes from its
+configured list (see ``bb.display.set_rotation`` to reshape it).
+``switch_display`` does **not** auto-revert — a pinned display stays
+until you unpin it or replace it.

@@ -1773,6 +1773,42 @@ async def _handle_display_action(
                 "name": mgr.get_active(),
                 "args": mgr.get_active_args(),
                 "theme": getattr(theme, "name", None) if theme else None,
+                "pinned": mgr.is_pinned(),
+                "rotation": mgr.get_rotation_state(),
+            }
+
+        if sub == "unpin":
+            mgr = get_display_manager()
+            if mgr is None:
+                return {"status": "error", "error": "display manager not running"}
+            await mgr.unpin()
+            return {
+                "status": "ok",
+                "pinned": mgr.is_pinned(),
+                "rotation": mgr.get_rotation_state(),
+            }
+
+        if sub == "set_rotation":
+            mgr = get_display_manager()
+            if mgr is None:
+                return {"status": "error", "error": "display manager not running"}
+            displays = payload.get("displays")
+            interval = payload.get("interval")
+            if displays is not None and not isinstance(displays, list):
+                return {
+                    "status": "error",
+                    "error": "'displays' must be a list of display names",
+                }
+            if interval is not None and not isinstance(interval, int):
+                return {
+                    "status": "error",
+                    "error": "'interval' must be an integer (seconds)",
+                }
+            await mgr.set_rotation(displays=displays, interval=interval)
+            return {
+                "status": "ok",
+                "pinned": mgr.is_pinned(),
+                "rotation": mgr.get_rotation_state(),
             }
 
         if sub == "screenshot":

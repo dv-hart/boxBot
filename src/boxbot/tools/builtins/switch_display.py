@@ -21,8 +21,10 @@ class SwitchDisplayTool(Tool):
 
     name = "switch_display"
     description = (
-        "Change what's shown on the 7-inch screen. Pass the display name and "
-        "optional display-specific arguments. For example: "
+        "Change what's shown on the 7-inch screen. By default the display "
+        "is pinned — it stays until you call switch_display again or "
+        "release the pin via bb.display.unpin(). Idle rotation is paused "
+        "while pinned. Examples: "
         "switch_display('picture', args={}) for slideshow mode, "
         "switch_display('picture', args={'image_ids': ['abc', 'def']}) for "
         "specific photos, switch_display('weather') for weather display."
@@ -42,6 +44,14 @@ class SwitchDisplayTool(Tool):
                     "args it accepts."
                 ),
             },
+            "pin": {
+                "type": "boolean",
+                "description": (
+                    "Pin this display so idle rotation does not switch "
+                    "away. Default true. Use bb.display.unpin() to "
+                    "release."
+                ),
+            },
         },
         "required": ["display_name"],
         "additionalProperties": False,
@@ -50,9 +60,11 @@ class SwitchDisplayTool(Tool):
     async def execute(self, **kwargs: Any) -> str:
         display_name: str = kwargs["display_name"]
         args: dict[str, Any] = kwargs.get("args") or {}
+        pin: bool = kwargs.get("pin", True)
 
         logger.info(
-            "switch_display: %s (args=%s)", display_name, list(args.keys())
+            "switch_display: %s (args=%s, pin=%s)",
+            display_name, list(args.keys()), pin,
         )
 
         from boxbot.displays.manager import get_display_manager
@@ -76,10 +88,11 @@ class SwitchDisplayTool(Tool):
                 "available_displays": available,
             })
 
-        ok = await mgr.switch(display_name, args=args)
+        ok = await mgr.switch(display_name, args=args, pin=pin)
         return json.dumps({
             "status": "ok" if ok else "error",
             "display_name": display_name,
             "args": args,
+            "pinned": pin and ok,
             "available_displays": available,
         })

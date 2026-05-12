@@ -117,6 +117,12 @@ class DisplayManager:
         self._active_args: dict[str, Any] = {}
         self._active_theme: Theme | None = None
 
+        # Pin flag: when True, the active display was chosen explicitly
+        # by the agent (or another caller) and idle rotation is paused.
+        # Cleared by ``unpin()`` or by ``start_rotation()``.
+        self._pinned: bool = False
+        self._last_switch_ts: float = 0.0
+
         # Data source management
         self._data_manager = DataSourceManager()
 
@@ -388,12 +394,13 @@ class DisplayManager:
         self,
         name: str,
         args: dict[str, Any] | None = None,
+        pin: bool = True,
     ) -> bool:
         """Switch to a named display.
 
         This is the primary method for changing what's on screen. It:
         1. Validates the display name
-        2. Stops rotation if running
+        2. If pin=True, pauses idle rotation (default for agent calls)
         3. Tears down data sources for the old display
         4. Sets up data sources for the new display
         5. Performs an initial render
@@ -403,6 +410,9 @@ class DisplayManager:
             name: Display name to activate.
             args: Display-specific arguments (e.g. {"image_ids": [...]} for
                   the picture display).
+            pin: When True (default), mark this as an explicit pin so the
+                  rotation loop will not clobber it. Internal callers (the
+                  rotation loop) pass ``pin=False``.
 
         Returns:
             True if the switch succeeded.
@@ -412,8 +422,11 @@ class DisplayManager:
             logger.warning("Display '%s' not found. Available: %s", name, self.list_available())
             return False
 
-        # Stop rotation (agent explicitly chose a display)
-        if not self._rotation_active:
+        # Explicit pin: stop rotation and mark pinned. Internal calls
+        # from the rotation loop pass pin=False to avoid stopping
+        # themselves.
+        if pin:
+            self._pinned = True
             self.stop_rotation()
 
         # Stop old data sources
@@ -440,7 +453,60 @@ class DisplayManager:
         # Render the initial frame
         self._render_and_update_frame()
 
-        logger.info("Switched to display '%s' (args=%s)", name, self._active_args)
+        import time as _time
+        self._last_switch_ts = _time.monotonic()
+
+        logger.info(
+            "Switched to display '%s' (args=%s, pinned=%s)",
+            name, self._active_args, self._pinned,
+        )
+        return True
+
+    async def unpin(self) -> bool:
+        """Release the pin and resume idle rotation.
+
+        After ``switch(..., pin=True)`` (the default), the display stays
+        put until the agent calls ``unpin()`` or replaces it with
+        another ``switch``. ``unpin`` clears the pin flag and starts the
+        configured idle rotation if one exists. If no rotation list is
+        configured, the current display simply stays on screen with the
+        pin flag cleared.
+
+        Returns:
+            True on success.
+        """
+        self._pinned = False
+
+        # Restart rotation from config so the next tick switches away.
+        displays, interval = self._get_rotation_config()
+        if displays:
+            self.start_rotation(displays, interval)
+            logger.info("Unpinned; rotation resumed")
+        else:
+            logger.info("Unpinned; no rotation configured, holding current display")
+        return True
+
+    async def set_rotation(
+        self,
+        displays: list[str] | None = None,
+        interval: int | None = None,
+    ) -> bool:
+        """Configure and start idle rotation.
+
+        Clears the pin flag (the caller is explicitly opting into
+        rotation now). ``displays=None`` and ``interval=None`` reuse the
+        config defaults. If ``displays`` is an empty list, rotation is
+        stopped and the pin remains cleared.
+
+        Returns:
+            True on success.
+        """
+        self._pinned = False
+        if displays is not None and not displays:
+            self.stop_rotation()
+            logger.info("Rotation cleared")
+            return True
+        self.start_rotation(displays, interval)
         return True
 
     async def _setup_data_sources(self, spec: DisplaySpec) -> None:
@@ -516,6 +582,8 @@ class DisplayManager:
         self._rotation_interval = interval
         self._rotation_index = 0
         self._rotation_active = True
+        # Caller is opting into rotation — clear any prior pin.
+        self._pinned = False
 
         self._rotation_task = asyncio.create_task(
             self._rotation_loop(),
@@ -536,16 +604,20 @@ class DisplayManager:
     async def _rotation_loop(self) -> None:
         """Periodically switch to the next display in the rotation list.
 
-        Runs until cancelled. Each iteration switches to the next display
-        and waits for the configured interval.
+        Runs until cancelled or until the active display gets pinned by
+        an external caller. Each iteration switches with ``pin=False``
+        so the rotation does not stop itself.
         """
         try:
             while self._running and self._rotation_active:
+                if self._pinned:
+                    # Defensive: rotation should already be stopped, but
+                    # if it somehow wasn't, bail rather than clobber the
+                    # pinned display.
+                    return
                 if self._rotation_displays:
                     name = self._rotation_displays[self._rotation_index]
-                    self._rotation_active = True  # Keep flag set during switch
-                    await self.switch(name)
-                    self._rotation_active = True  # Re-set after switch (switch may clear it)
+                    await self.switch(name, pin=False)
                     self._rotation_index = (
                         (self._rotation_index + 1) % len(self._rotation_displays)
                     )
@@ -606,6 +678,33 @@ class DisplayManager:
     def is_rotating(self) -> bool:
         """True if idle rotation is currently active."""
         return self._rotation_active and self._rotation_task is not None
+
+    def is_pinned(self) -> bool:
+        """True if the current display was set by an explicit pin."""
+        return self._pinned
+
+    def get_rotation_state(self) -> dict[str, Any]:
+        """Snapshot of the rotation subsystem for the agent.
+
+        Returns:
+            ``{"active": bool, "displays": [...], "interval": int,
+              "next_in_sec": float | None}``
+            where ``next_in_sec`` is roughly how many seconds remain
+            until the next rotation tick (None if rotation isn't
+            active).
+        """
+        active = self.is_rotating()
+        next_in: float | None = None
+        if active and self._last_switch_ts > 0:
+            import time as _time
+            elapsed = _time.monotonic() - self._last_switch_ts
+            next_in = max(0.0, self._rotation_interval - elapsed)
+        return {
+            "active": active,
+            "displays": list(self._rotation_displays),
+            "interval": self._rotation_interval,
+            "next_in_sec": next_in,
+        }
 
     # ------------------------------------------------------------------
     # Data access

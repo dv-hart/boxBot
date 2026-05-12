@@ -42,13 +42,27 @@ Lifecycle::
 Discovery::
 
     bb.display.list()                          # all displays + source
-    bb.display.get_active()                    # what's on screen right now
+    bb.display.get_active()                    # what's on screen + pin/rotation state
     bb.display.screenshot()                    # live screen → PNG, attached
     bb.display.schema()                        # block reference, themes
     bb.display.describe_source("weather")      # data source field shape
 
+Control::
+
+    bb.display.unpin()                         # release pin, resume rotation
+    bb.display.set_rotation(displays=[...],    # configure idle rotation
+                            interval=30)       #   (also clears pin)
+
 The server validates on save and preview; errors come back as a list
 the agent reads and acts on.
+
+Pinning model:
+    ``switch_display(name, args)`` is pinned by default — the display
+    stays put until you call ``switch_display`` again or
+    ``bb.display.unpin()``. While pinned, idle rotation is paused.
+    ``unpin()`` resumes the configured rotation; ``set_rotation()`` is
+    how you reshape that list at runtime (e.g. swap in a slideshow
+    list at night, then back in the morning).
 """
 
 from __future__ import annotations
@@ -161,7 +175,7 @@ def schema() -> dict[str, Any]:
 
 
 def get_active() -> dict[str, Any]:
-    """Return what is currently on the 7" screen.
+    """Return what is currently on the 7" screen, plus pin/rotation state.
 
     Shape::
 
@@ -169,13 +183,54 @@ def get_active() -> dict[str, Any]:
           "name": "morning_brief" | None,    # None when nothing is active
           "args": {...},                     # the args switch_display received
           "theme": "boxbot" | None,
+          "pinned": True | False,            # was this set explicitly?
+          "rotation": {
+              "active": False,               # is the rotation loop running?
+              "displays": [...],             # rotation list
+              "interval": 30,                # seconds between switches
+              "next_in_sec": null,           # ~time until next tick (None if inactive)
+          },
         }
 
-    Use this before authoring or editing a display so you know what
-    you're replacing — or to confirm a ``switch_display`` actually took
-    effect.
+    Use this to inspect state before deciding what to do: e.g. ``if
+    state["pinned"] and state["name"] == "picture": ...``. Also handy
+    to confirm a ``switch_display`` actually took effect.
     """
     return _check(_transport.request("display.get_active", {}))
+
+
+def unpin() -> dict[str, Any]:
+    """Release the pin so idle rotation resumes.
+
+    After ``switch_display(...)`` (which pins by default), the screen
+    holds the chosen display until ``unpin()`` is called or another
+    ``switch_display`` replaces it. ``unpin()`` clears the pin flag and
+    restarts the configured idle rotation. If no rotation list is
+    configured, the current display simply stays on screen unpinned.
+    """
+    return _check(_transport.request("display.unpin", {}))
+
+
+def set_rotation(
+    displays: list[str] | None = None,
+    interval: int | None = None,
+) -> dict[str, Any]:
+    """Configure and start idle rotation. Clears any pin.
+
+    Args:
+        displays: List of display names to cycle through. ``None`` uses
+            the config defaults. An empty list stops rotation
+            altogether (display sits unpinned on whatever was last
+            shown).
+        interval: Seconds between switches. ``None`` keeps the current
+            interval (or config default).
+    """
+    payload: dict[str, Any] = {}
+    if displays is not None:
+        payload["displays"] = displays
+    if interval is not None:
+        payload["interval"] = interval
+    return _check(_transport.request("display.set_rotation", payload))
 
 
 def screenshot() -> dict[str, Any]:

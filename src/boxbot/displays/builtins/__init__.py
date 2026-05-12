@@ -139,22 +139,21 @@ def _picture_display() -> DisplaySpec:
     Called via:
         mgr.switch("picture", args={"image_ids": ["abc123...", ...]})
 
-    For v1, shows the first id full-screen with "contain" fit. The
-    photo: source is pre-resolved to an absolute file path by the
-    display manager (``_resolve_photo_sources``) before rendering.
+    Shows the first id full-screen with "contain" fit. The image block
+    is the root so it receives the full 1024x600 canvas — wrapping it
+    in a column made the image-height estimator cap it at 200 px.
+    ``_render_image`` then scales the photo to fit and centers it
+    inside the rect. The ``photo:`` source is pre-resolved to an
+    absolute file path by the display manager (``_resolve_photo_sources``)
+    before rendering.
     """
-    root = ColumnBlock(gap=0, align="center", padding=[0, 0, 0, 0])
-    root.children = [
-        ImageBlock(
-            source="photo:{args.image_ids[0]}",
-            fit="contain",
-        ),
-    ]
-
     return DisplaySpec(
         name="picture",
         theme="boxbot",
         data_sources=[],
-        root_block=root,
+        root_block=ImageBlock(
+            source="photo:{args.image_ids[0]}",
+            fit="contain",
+        ),
         transition="crossfade",
     )

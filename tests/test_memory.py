@@ -112,7 +112,7 @@ class TestMemoryStoreCRUD:
     @pytest.mark.asyncio
     async def test_get_memory_updates_last_relevant_at(self, memory_store):
         mid = await memory_store.create_memory(
-            type="operational",
+            type="methodology",
             content="Test relevance",
             summary="Test",
         )
@@ -180,7 +180,7 @@ class TestMemoryStoreCRUD:
     @pytest.mark.asyncio
     async def test_delete_memory_removes_permanently(self, memory_store):
         mid = await memory_store.create_memory(
-            type="operational",
+            type="methodology",
             content="Delete me",
             summary="Delete",
         )

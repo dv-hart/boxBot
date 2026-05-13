@@ -47,7 +47,10 @@ SYSTEM_MEMORY_MAX_VERSIONS = 20
 TRANSCRIPT_RETENTION_DAYS = 14
 
 # Valid values
-MEMORY_TYPES = {"person", "household", "methodology", "operational"}
+# Legitimate memory types for newly-created rows. Legacy rows in the
+# DB may still carry ``operational`` from before lifecycle step 7 —
+# reads tolerate that, but new memories must use one of these three.
+MEMORY_TYPES = {"person", "household", "methodology"}
 MEMORY_STATUSES = {"active", "archived", "invalidated"}
 PENDING_STATUSES = {"queued", "submitted", "applied", "failed"}
 
@@ -148,6 +151,12 @@ class PendingExtraction:
     error: str | None
     attempts: int
     transcript_purge_at: str
+    # Rendered [Active Memories] block from the conversation start —
+    # full memory summaries, not just IDs. Persisted so the extraction
+    # model can apply the "ONLY invalidate memories listed here" rule
+    # against real content instead of opaque IDs. Empty string for
+    # legacy rows; the batch poller falls back to ID-only rendering.
+    injected_memories_block: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -204,19 +213,20 @@ CREATE TABLE IF NOT EXISTS system_memory_versions (
 -- kept (provenance for the memories produced) but the transcript
 -- column is nulled out by maintenance.
 CREATE TABLE IF NOT EXISTS pending_extractions (
-    conversation_id     TEXT PRIMARY KEY,
-    transcript          TEXT,                  -- nulled after transcript_purge_at
-    accessed_memory_ids TEXT NOT NULL,         -- JSON list
-    channel             TEXT NOT NULL,
-    participants        TEXT NOT NULL,         -- JSON list
-    started_at          TEXT NOT NULL,
-    status              TEXT NOT NULL,         -- queued|submitted|applied|failed
-    batch_id            TEXT,
-    submitted_at        TEXT,
-    completed_at        TEXT,
-    error               TEXT,
-    attempts            INTEGER NOT NULL DEFAULT 0,
-    transcript_purge_at TEXT NOT NULL
+    conversation_id         TEXT PRIMARY KEY,
+    transcript              TEXT,                  -- nulled after transcript_purge_at
+    accessed_memory_ids     TEXT NOT NULL,         -- JSON list
+    channel                 TEXT NOT NULL,
+    participants            TEXT NOT NULL,         -- JSON list
+    started_at              TEXT NOT NULL,
+    status                  TEXT NOT NULL,         -- queued|submitted|applied|failed
+    batch_id                TEXT,
+    submitted_at            TEXT,
+    completed_at            TEXT,
+    error                   TEXT,
+    attempts                INTEGER NOT NULL DEFAULT 0,
+    transcript_purge_at     TEXT NOT NULL,
+    injected_memories_block TEXT NOT NULL DEFAULT ''  -- rendered [Active Memories] block
 );
 
 -- Durable log of dream-phase consolidation cycles. One row per nightly
@@ -445,6 +455,14 @@ class MemoryStore:
             ("cost_log", "audio_seconds", "REAL NOT NULL DEFAULT 0"),
             ("cost_log", "iterations", "INTEGER NOT NULL DEFAULT 0"),
             ("cost_log", "correlation_id", "TEXT"),
+            # Lifecycle plan step 4 — persist the rendered [Active
+            # Memories] block so post-conversation extraction can
+            # invalidate stale memories with full content visibility.
+            (
+                "pending_extractions",
+                "injected_memories_block",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
         ]
         for table, col, col_type in migrations:
             try:
@@ -482,7 +500,7 @@ class MemoryStore:
         """Create a new fact memory with auto-generated embedding.
 
         Args:
-            type: One of person, household, methodology, operational.
+            type: One of person, household, methodology.
             content: Full memory content.
             summary: One-line summary for injection.
             person: Primary person (null for household/methodology).
@@ -1175,6 +1193,7 @@ class MemoryStore:
         channel: str,
         participants: list[str],
         started_at: str,
+        injected_memories_block: str = "",
         retention_days: int = TRANSCRIPT_RETENTION_DAYS,
     ) -> None:
         """Insert a new pending-extraction row in queued status."""
@@ -1185,8 +1204,9 @@ class MemoryStore:
             """INSERT OR REPLACE INTO pending_extractions (
                    conversation_id, transcript, accessed_memory_ids,
                    channel, participants, started_at, status,
-                   transcript_purge_at, attempts
-               ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 0)""",
+                   transcript_purge_at, attempts,
+                   injected_memories_block
+               ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?)""",
             (
                 conversation_id,
                 transcript,
@@ -1195,6 +1215,7 @@ class MemoryStore:
                 json.dumps(participants),
                 started_at,
                 purge_at,
+                injected_memories_block,
             ),
         )
         await self.db.commit()
@@ -1573,6 +1594,11 @@ def _row_to_pending_dream(row: aiosqlite.Row) -> dict:
 
 def _row_to_pending(row: aiosqlite.Row) -> PendingExtraction:
     """Convert a database row to a PendingExtraction dataclass."""
+    try:
+        block = row["injected_memories_block"] or ""
+    except (IndexError, KeyError):
+        # Legacy DBs that haven't run the migration yet.
+        block = ""
     return PendingExtraction(
         conversation_id=row["conversation_id"],
         transcript=row["transcript"],
@@ -1587,6 +1613,7 @@ def _row_to_pending(row: aiosqlite.Row) -> PendingExtraction:
         error=row["error"],
         attempts=row["attempts"],
         transcript_purge_at=row["transcript_purge_at"],
+        injected_memories_block=block,
     )
 
 

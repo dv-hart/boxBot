@@ -89,7 +89,7 @@ def save(content: str, *,
 
     Args:
         content: The memory content text.
-        memory_type: person, household, methodology, operational.
+        memory_type: person, household, methodology.
         summary: One-line summary used for retrieval injection. Auto-
             derived from ``content`` when omitted.
         person: Primary person this memory is about. Defaults to the

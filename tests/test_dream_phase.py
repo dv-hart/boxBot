@@ -433,30 +433,12 @@ class TestFindNearDuplicates:
         )
         assert pairs == []
 
-    @pytest.mark.asyncio
-    async def test_operational_memories_excluded(self, fresh_store):
-        from boxbot.memory.dream import (
-            CandidateSet, find_near_duplicates,
-        )
-
-        v_a = _unit([1.0, 0.0, 0.0])
-        v_b = _unit([0.97, 0.243, 0.0])
-        id_a = await _seed(
-            fresh_store, type_="operational",
-            content="op a", summary="op a", embedding_vec=v_a,
-        )
-        id_b = await _seed(
-            fresh_store, type_="operational",
-            content="op b", summary="op b", embedding_vec=v_b,
-        )
-        mems = [
-            await fresh_store.get_memory_no_touch(id_a),
-            await fresh_store.get_memory_no_touch(id_b),
-        ]
-        pairs = await find_near_duplicates(
-            fresh_store, CandidateSet(new_today=mems, revisits=[]),
-        )
-        assert pairs == []
+    # Lifecycle step 7 retired the ``operational`` type and removed
+    # the dream-phase exemption that excluded it from dedup. The old
+    # ``test_operational_memories_excluded`` test, which asserted the
+    # opposite behaviour, has been deleted. The step-7 test suite
+    # (``tests/test_drop_operational_type.py``) covers the new
+    # contract: no skip, no enum entry.
 
 
 # ---------------------------------------------------------------------------

@@ -435,11 +435,16 @@ class MemoryConfig(BaseModel):
     archive_threshold: float = 0.1
 
     # Dream phase (PR1: deterministic clustering + dedup batch).
-    # Default ON for the audit-only soft-launch — dream cycles run,
-    # candidates and decisions are logged, but NO mutations are applied
-    # to the memory store. Flip to ``False`` after a soft-launch period
-    # to let the dream phase actually consolidate memories.
-    dream_audit_only: bool = True
+    # Lifecycle plan step 8: audit-only flipped OFF. The dream cycle's
+    # candidate selection now expands via nearest-neighbour search
+    # over the full active pool (not just 6 revisits), so dedup
+    # decisions can actually catch back-catalogue duplicates. The
+    # confidence gate at ``DEDUP_CONFIDENCE_THRESHOLD = 0.8`` and the
+    # ``MAX_DEDUP_PAIRS_DEFAULT = 30`` cap keep runaway changes
+    # bounded. Flip back to True if you want a soft-launch window
+    # again — the existing audit log + ``scripts/undo_last_dream.py``
+    # rollback path is unchanged.
+    dream_audit_only: bool = False
     # Cron expression for the nightly dream cycle. CronExpr evaluates
     # in UTC, so this is shifted to land at ~3 AM Pacific (10 UTC =
     # 3 AM PDT / 2 AM PST — drifts an hour at DST transitions).

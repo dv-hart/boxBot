@@ -407,50 +407,105 @@ async def find_near_duplicates(
 ) -> list[NearDupPair]:
     """Pair memories at cosine ≥ NEAR_DUP_THRESHOLD that were NOT co-injected.
 
-    "Co-injected" is determined by the conversation each memory cites as
-    its source. If conversation X already recorded both memories as
-    accessed (e.g. they were both in the [Active Memories] block), the
-    daytime extraction had a chance to invalidate one in favour of the
-    other — we don't want the dream phase to second-guess that.
+    Two-pass:
+
+    1. **Within-candidate pairs** — the historical behaviour. Cheap;
+       catches near-dups between today's new memories and the 6
+       refresh-sampled revisits.
+
+    2. **Nearest-neighbour expansion of today's new memories** — for
+       each new-today memory, find its top-K cosine neighbours in the
+       full active pool. This is the load-bearing addition: without
+       it, back-catalogue dupes only get caught if the matching pair
+       lands in the same narrow revisit window (probability ~7% per
+       night on a 90-memory corpus), so they accumulate forever.
+
+    "Co-injected" is determined by the conversation each memory cites
+    as its source. If conversation X already recorded both memories
+    as accessed, the daytime extraction had a chance to invalidate
+    one in favour of the other — we don't want the dream phase to
+    second-guess that.
     """
-    memories = [m for m in candidates.all_memories if m.embedding is not None]
-    pairs: list[NearDupPair] = []
-    n = len(memories)
-    if n < 2:
-        return pairs
+    cand_memories = [
+        m for m in candidates.all_memories if m.embedding is not None
+    ]
+    if len(cand_memories) == 0:
+        return []
 
-    # Build a co-injection map: memory_id -> set of conversation_ids that
-    # listed it in accessed_memories.
-    co_inject_index = await _build_co_injection_index(store, memories)
+    # Build a co-injection map over a superset of memories we might
+    # touch — today's candidates AND any active memory we'll compare
+    # in the nearest-neighbour expansion. Cheaper to build once.
+    active_pool = await store.list_memories(status="active", limit=10_000)
+    active_with_embed = [
+        m for m in active_pool if m.embedding is not None
+    ]
+    co_inject_index = await _build_co_injection_index(
+        store, active_with_embed,
+    )
 
-    # Operational memories are never deduped (append-only). Skip them.
-    is_op = {m.id for m in memories if m.type == "operational"}
+    new_today_ids = {m.id for m in candidates.new_today}
 
-    for i in range(n):
-        a = memories[i]
-        if a.id in is_op:
-            continue
-        for j in range(i + 1, n):
-            b = memories[j]
-            if b.id in is_op:
-                continue
-            sim = cosine_similarity(a.embedding, b.embedding)
-            if sim < NEAR_DUP_THRESHOLD:
-                continue
-            shared = co_inject_index.get(a.id, set()) & co_inject_index.get(b.id, set())
-            if shared:
-                # They were co-injected in some conversation — daytime
-                # extraction owns this case. Skip.
-                continue
-            pairs.append(
-                NearDupPair(
-                    memory_id_a=a.id, memory_id_b=b.id, cosine=float(sim),
-                )
+    pairs_by_key: dict[tuple[str, str], NearDupPair] = {}
+
+    def _record(a: Memory, b: Memory, sim: float) -> None:
+        """Record a near-dup pair if it's novel + above threshold +
+        not already-co-injected. Order the IDs so each pair is unique
+        regardless of which side surfaced it first."""
+        if sim < NEAR_DUP_THRESHOLD:
+            return
+        if a.id == b.id:
+            return
+        shared = (
+            co_inject_index.get(a.id, set())
+            & co_inject_index.get(b.id, set())
+        )
+        if shared:
+            return
+        key = (a.id, b.id) if a.id < b.id else (b.id, a.id)
+        if key not in pairs_by_key:
+            pairs_by_key[key] = NearDupPair(
+                memory_id_a=key[0],
+                memory_id_b=key[1],
+                cosine=float(sim),
             )
 
-    # Stable order: highest cosine first so any cap-by-budget step keeps
-    # the most-confident pairs.
-    pairs.sort(key=lambda p: p.cosine, reverse=True)
+    # Pass 1: within-candidate all-pairs (cheap — ~9 memories).
+    n = len(cand_memories)
+    for i in range(n):
+        a = cand_memories[i]
+        for j in range(i + 1, n):
+            b = cand_memories[j]
+            sim = cosine_similarity(a.embedding, b.embedding)
+            _record(a, b, sim)
+
+    # Pass 2: nearest-neighbour expansion. For each new-today memory,
+    # score against every active memory and keep top-K above threshold.
+    # On a corpus of <10K memories this is fine in-process; if we ever
+    # scale past that, swap in a vector index.
+    for new_mem in candidates.new_today:
+        if new_mem.embedding is None:
+            continue
+        # Score against every active memory (excluding self).
+        scored: list[tuple[float, Memory]] = []
+        for other in active_with_embed:
+            if other.id == new_mem.id:
+                continue
+            sim = cosine_similarity(new_mem.embedding, other.embedding)
+            if sim >= NEAR_DUP_THRESHOLD:
+                scored.append((sim, other))
+        # Top-K above threshold. K=10 is generous; in practice
+        # most memories have 0-2 above-threshold neighbours.
+        scored.sort(key=lambda t: t[0], reverse=True)
+        for sim, other in scored[:10]:
+            _record(new_mem, other, sim)
+
+    # Cap by global budget so we never submit a runaway batch even on
+    # a particularly noisy day.
+    pairs = sorted(
+        pairs_by_key.values(), key=lambda p: p.cosine, reverse=True,
+    )
+    if len(pairs) > MAX_DEDUP_PAIRS_DEFAULT:
+        pairs = pairs[:MAX_DEDUP_PAIRS_DEFAULT]
     return pairs
 
 

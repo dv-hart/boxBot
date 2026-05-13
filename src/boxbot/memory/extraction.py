@@ -49,7 +49,7 @@ class ConversationSummary:
 
 @dataclass
 class ExtractedMemory:
-    type: str  # person, household, methodology, operational
+    type: str  # person, household, methodology
     person: str | None
     content: str
     summary: str
@@ -197,7 +197,7 @@ EXTRACTION_TOOL: dict[str, Any] = {
                     "required": ["type", "content", "summary", "tags"],
                     "properties": {
                         "type": {"enum": [
-                            "person", "household", "methodology", "operational",
+                            "person", "household", "methodology",
                         ]},
                         "person": {"type": ["string", "null"]},
                         "content": {"type": "string"},
@@ -299,12 +299,13 @@ When a problem RESOLVES during the conversation:
 
 # Memory taxonomy
 
-- **person**: a fact about a specific individual that future conversations should recognise. ("Jacob is allergic to shellfish.", "Erik's school pickup is 3:15 PM weekdays.") Set `person` to the primary subject.
-- **household**: a fact about the shared environment that doesn't belong to one person. ("The WiFi password is on the fridge.", "Family car is a blue 2022 Subaru.")
-- **methodology**: a durable lesson BB itself learned and might re-use. ("Pandas read_csv needs encoding='utf-8-sig' for Jacob's bank exports.", "Use bb.integrations.get('calendar', ...) — calendar is not its own top-level SDK module.") Save sparingly — only insights that will save BB time on a similar future task.
-- **operational**: ONLY for pointers to **workspace artifacts BB just created**. The summary must name the artifact and its workspace path ("Weekly weight log at workspace/data/weight.csv (date, lbs)."). The agent should normally save these itself during the conversation via `bb.memory.save`; only emit one here if the agent forgot.
+Three types, all for facts BB should *recognise* in future conversations:
 
-Do not use `operational` as a generic "things BB did today" bucket. Activity logs are not memories. If you are tempted to write "Sent grocery list to Carina on 4/29" as operational, stop — that is conversation-log territory.
+- **person**: a fact about a specific individual. ("Jacob is allergic to shellfish.", "Erik's school pickup is 3:15 PM weekdays.") Set `person` to the primary subject.
+- **household**: a fact about the shared environment that doesn't belong to one person. ("The WiFi password is on the fridge.", "Family car is a blue 2022 Subaru.")
+- **methodology**: a durable lesson BB itself learned and might re-use. ("Pandas read_csv needs encoding='utf-8-sig' for Jacob's bank exports.", "Use bb.integrations.get('calendar', ...) — calendar is not its own top-level SDK module.", "Weekly weight log lives at workspace/data/weight.csv (date, lbs).") Pointers to workspace artifacts are methodology — the *pattern* of where to look is the lesson. Save sparingly: only insights that will save BB time on a similar future task.
+
+There is no "operational" type. Activity logs ("I sent the briefing today") are not memories — they live in the conversation log. If you are tempted to write "Sent grocery list to Carina on 4/29" as a memory, stop — that is conversation-log territory.
 
 # Bias toward fewer, higher-quality memories
 
@@ -323,7 +324,7 @@ Aim for 0-2 memories per conversation. Even technical sessions usually warrant 0
 - `content`: full prose, complete enough to make sense without surrounding context. 1-3 sentences.
 - `summary`: one short line, suitable for injection into a future system prompt. <80 chars.
 - `tags`: 1-4 lowercase topic words. Reuse existing tags when possible.
-- For `operational` workspace-artifact pointers: the summary MUST name the workspace path (e.g. "Weekly weight log at workspace/data/weight.csv").
+- For workspace-artifact methodology pointers: the summary MUST name the workspace path (e.g. "Weekly weight log at workspace/data/weight.csv").
 - Do NOT embed transient state ("X is broken right now", "N todos open today") inside any memory's content. That state will be stale by the next conversation, but the memory will keep surfacing.
 
 # Invalidations
@@ -560,6 +561,7 @@ async def process_extraction_result(
     store: MemoryStore,
     result: ExtractionResult,
     conversation_id: str,
+    accessed_memory_ids: list[str] | None = None,
 ) -> str:
     """Apply the parsed extraction result to the memory store.
 
@@ -568,8 +570,15 @@ async def process_extraction_result(
     Returns the conversation log entry ID. Idempotency note: callers
     should mark the pending_extraction row applied AFTER this returns
     so a crash mid-apply doesn't double-write on resume.
+
+    ``accessed_memory_ids`` is the list of memory IDs surfaced to the
+    in-conversation model via [Active Memories] injection. Persisted
+    on the conversations row so the dream phase's co-injection check
+    ("these were already considered together by daytime extraction")
+    has real data to work with.
     """
     summary = result.conversation_summary
+    accessed = list(accessed_memory_ids or [])
 
     # The conversations row was stubbed at conversation start with the
     # live ``conversation_id``. Upgrade it in place so memories created
@@ -584,7 +593,7 @@ async def process_extraction_result(
             participants=summary.participants,
             summary=summary.summary,
             topics=summary.topics,
-            accessed_memories=[],
+            accessed_memories=accessed,
             conversation_id=conversation_id,
         )
         logger.info("Created conversation log entry %s", conversation_id)
@@ -593,7 +602,7 @@ async def process_extraction_result(
             conversation_id,
             summary=summary.summary,
             topics=summary.topics,
-            accessed_memories=[],
+            accessed_memories=accessed,
         )
         logger.info("Updated conversation log entry %s", conversation_id)
     conv_id = conversation_id

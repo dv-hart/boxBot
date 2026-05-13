@@ -251,6 +251,14 @@ class Conversation:
         # so the model knows which memories to consider for invalidation.
         self.accessed_memory_ids: list[str] = []
 
+        # The fully-rendered [Active Memories] block from the most
+        # recent turn — includes each memory's summary text, not just
+        # its ID. Persisted to ``pending_extractions`` on conversation
+        # end so the extraction model can apply its "ONLY invalidate
+        # memories listed here" rule against real content rather than
+        # opaque IDs. Empty string if no memories were ever injected.
+        self.injected_memories_block: str = ""
+
         # Wall-clock start of the conversation (UTC ISO 8601). Recorded
         # at construction so post-conversation extraction has a stable
         # ``started_at`` independent of how long the conversation ran.

@@ -163,15 +163,17 @@ class BatchPoller:
             )
             return
 
-        # Find the [Active Memories] block by reconstructing from accessed_ids.
-        # The agent's injection block is dropped after the conversation
-        # ends; we don't have it verbatim here. Build a minimal block
-        # from the IDs alone — the model will treat missing summaries
-        # as "I was told these were active but cannot see their content
-        # in this prompt", which limits invalidation accuracy. The full
-        # inject block could be persisted alongside the transcript in a
-        # future refinement.
-        block = _format_minimal_active_memories(row.accessed_memory_ids)
+        # Prefer the rendered [Active Memories] block captured when the
+        # conversation was live — it carries each memory's full
+        # summary text, which is what the extraction prompt's
+        # invalidation rule keys off of. Fall back to the ID-only
+        # minimal format for legacy rows (pre-lifecycle-step-4) and
+        # for sweep-driven persistent conversations whose live state
+        # was already discarded.
+        if row.injected_memories_block.strip():
+            block = row.injected_memories_block
+        else:
+            block = _format_minimal_active_memories(row.accessed_memory_ids)
 
         try:
             batch_id = await submit_extraction_batch(
@@ -358,7 +360,10 @@ class BatchPoller:
         # boot, but apply only inserts new memories. Acceptable for v1.
         try:
             await process_extraction_result(
-                self._store, extraction, row.conversation_id,
+                self._store,
+                extraction,
+                row.conversation_id,
+                accessed_memory_ids=row.accessed_memory_ids,
             )
         except Exception:
             logger.exception(

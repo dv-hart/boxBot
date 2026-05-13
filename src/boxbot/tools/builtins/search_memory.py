@@ -66,7 +66,7 @@ class SearchMemoryTool(Tool):
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "enum": ["person", "household", "methodology", "operational"],
+                    "enum": ["person", "household", "methodology"],
                 },
                 "description": "Optional: filter by memory types.",
             },

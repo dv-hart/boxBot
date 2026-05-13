@@ -1019,6 +1019,11 @@ class BoxBotAgent:
                 1 for m in thread if m.get("role") == "assistant"
             )
             if thread and turn_count > 0:
+                # Persistent (WhatsApp) conversations may be swept long
+                # after the live Conversation object was discarded, so
+                # we don't have an in-memory injection block to forward
+                # here. The batch poller's legacy fallback handles
+                # ID-only rendering for these.
                 asyncio.create_task(
                     self._post_conversation(
                         conversation_id=rec.conversation_id,
@@ -1027,6 +1032,7 @@ class BoxBotAgent:
                         messages=list(thread),
                         accessed_memory_ids=[],
                         started_at=rec.started_at_iso,
+                        injected_memories_block="",
                     ),
                     name=f"extraction-{rec.conversation_id}",
                 )
@@ -1602,6 +1608,7 @@ class BoxBotAgent:
                     messages=list(conv.thread),
                     accessed_memory_ids=list(conv.accessed_memory_ids),
                     started_at=conv.started_at_iso(),
+                    injected_memories_block=conv.injected_memories_block,
                 ),
                 name=f"extraction-{conv_id}",
             )
@@ -1876,6 +1883,13 @@ class BoxBotAgent:
                 if mid not in seen:
                     conv.accessed_memory_ids.append(mid)
                     seen.add(mid)
+            # Stash the rendered block so post-conversation extraction
+            # can apply invalidation rules against real summaries
+            # (not just IDs). Multi-turn conversations overwrite each
+            # other; we keep the latest because injection refreshes
+            # the candidate set as the conversation evolves.
+            if memory_block:
+                conv.injected_memories_block = memory_block
 
         return "\n\n".join(sections)
 
@@ -2318,6 +2332,7 @@ class BoxBotAgent:
         messages: list[dict[str, Any]],
         accessed_memory_ids: list[str],
         started_at: str,
+        injected_memories_block: str = "",
     ) -> None:
         """Persist transcript + queue extraction batch for this conversation.
 
@@ -2364,6 +2379,7 @@ class BoxBotAgent:
                 channel=channel,
                 participants=participants,
                 started_at=started_at,
+                injected_memories_block=injected_memories_block,
             )
 
             poller = self._batch_poller

@@ -318,6 +318,53 @@ class TestCostLog:
 # ---------------------------------------------------------------------------
 
 
+class TestExtractionPromptContract:
+    """Lock in the new lifecycle rules so future prompt edits don't
+    silently regress them. These are the behaviours we want the model
+    to follow — if a rule needs to change, update both the prompt and
+    this test, intentionally."""
+
+    def test_prompt_directs_state_assertions_to_todos(self):
+        """Open-issue state ('reauth pending', 'X is broken') must be
+        steered to todos, not memory. This was the root of the
+        'calendar still down' memory loop."""
+        from boxbot.memory.extraction import EXTRACTION_SYSTEM_PROMPT
+        text = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "todo" in text
+        assert "in-flight" in text or "in flight" in text or "open issue" in text
+        # Must explicitly call out the bad patterns we kept seeing
+        assert "reauth" in text or "token expired" in text
+        assert "broken" in text and "pending" in text
+
+    def test_prompt_restricts_operational_to_workspace_pointers(self):
+        """Operational was the noise bucket. Restrict it to pointing
+        at workspace artifacts the agent just created."""
+        from boxbot.memory.extraction import EXTRACTION_SYSTEM_PROMPT
+        text = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "operational" in text
+        assert "workspace" in text
+        # Activity-log mention warning the model NOT to use that pattern
+        assert "activity log" in text or "activity-log" in text or "play-by-play" in text
+
+    def test_prompt_separates_history_from_memory(self):
+        """History (what BB did) lives in conversation log + workspace,
+        not in memory. The prompt must make this distinction
+        explicitly."""
+        from boxbot.memory.extraction import EXTRACTION_SYSTEM_PROMPT
+        text = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "conversation log" in text or "conversation-log" in text
+        assert "rings a bell" in text or "recognition" in text
+
+    def test_prompt_keeps_invalidation_rules_conservative(self):
+        """Until step 4 lands the full injection block, the extraction
+        model can only see memory IDs. Invalidation rules must remain
+        conservative."""
+        from boxbot.memory.extraction import EXTRACTION_SYSTEM_PROMPT
+        text = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "only invalidate memories listed" in text
+        assert "do not invalidate based on inference" in text
+
+
 class TestExtractionParser:
     def test_parse_full_payload(self, sample_payload):
         from boxbot.memory.extraction import parse_extraction_result

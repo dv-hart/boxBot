@@ -139,7 +139,7 @@ class AgentConfig(BaseModel):
 
     name: str = "boxBot"
     wake_word: str = "hey box"
-    max_turns: int = 20
+    max_turns: int = 25
 
 
 class WakeCycleEntry(BaseModel):

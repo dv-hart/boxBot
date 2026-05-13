@@ -110,7 +110,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Maximum number of API round-trips (tool use loops) per conversation
-_DEFAULT_MAX_TURNS = 20
+_DEFAULT_MAX_TURNS = 25
 
 # Opus 4.7 needs more headroom than Sonnet 4. Spec §3 mandates 8192.
 _MAX_TOKENS = 8192
@@ -1668,11 +1668,16 @@ class BoxBotAgent:
         additions = messages[len(conv.thread):]
         summary = self._extract_summary(messages)
 
+        # ``completed_cleanly`` is False when the loop ran out of turns
+        # — even though we dispatched a graceful close-out, the
+        # conversation did not end on its own terms. Memory extraction
+        # and any future consumers can decide what to do with that.
+        max_turns = get_config().agent.max_turns
         return GenerationResult(
             thread_additions=additions,
             turn_count=turn_count,
             summary=summary,
-            completed_cleanly=True,
+            completed_cleanly=(turn_count < max_turns),
         )
 
     # ------------------------------------------------------------------
@@ -1966,6 +1971,18 @@ class BoxBotAgent:
         ``message`` tool calls (run by ``_process_tool_calls``)
         are how the agent reaches a person.
 
+        Turn cap (``max_turns``): if the model would otherwise loop
+        past the cap, the **penultimate** iteration appends a
+        ``[system]`` note to its tool-result user block telling the
+        model the next response is final and only ``message`` is
+        available. The **final** iteration is called with ``tools``
+        filtered to just the ``message`` definition — the API
+        forecloses every other tool call. After that turn, the loop
+        exits; if no ``message`` was dispatched, a post-loop fallback
+        sends a hardcoded close-out so the user is never left hanging.
+        ``GenerationResult.completed_cleanly`` is set to ``False`` when
+        the cap was hit.
+
         Args:
             conversation_id: Conversation ID for logging.
             channel: Active conversation channel (voice / whatsapp / trigger),
@@ -2006,8 +2023,25 @@ class BoxBotAgent:
 
         turn_count = 0
 
+        # Tracks whether the model emitted a ``message`` tool call on the
+        # final allowed turn. If False after the loop ends because we hit
+        # the cap, the post-loop fallback dispatches a hardcoded closing
+        # line so the user is never left hanging.
+        final_turn_message_dispatched = False
+
         while turn_count < max_turns:
             turn_count += 1
+
+            # On the final allowed turn, restrict tools to ``message``
+            # only. The agent gets one round to address the user; all
+            # other tools are foreclosed at the API level so the model
+            # cannot defy the cap. See _agent_loop docstring §"Turn cap".
+            is_final_turn = turn_count == max_turns
+            turn_tools = (
+                [t for t in tool_definitions
+                 if t.get("name") == "message"]
+                if is_final_turn else tool_definitions
+            )
 
             # IMPORTANT: the exact named kwargs below are the only ones
             # we pass. No temperature / top_p / top_k / thinking — those
@@ -2020,7 +2054,7 @@ class BoxBotAgent:
                         max_tokens=_MAX_TOKENS,
                         system=system_prompt_blocks,
                         messages=messages,
-                        tools=tool_definitions,
+                        tools=turn_tools,
                         output_config={
                             "format": {
                                 "type": "json_schema",
@@ -2141,6 +2175,43 @@ class BoxBotAgent:
                         if not text:
                             continue
                         content_blocks.append({"type": "text", "text": text})
+
+                # Final turn: the model just used its only remaining
+                # tool (must be ``message`` — see is_final_turn filter
+                # above). Record whether a ``message`` actually went out
+                # so the post-loop fallback knows whether the user heard
+                # anything, then exit without queuing another API call.
+                if is_final_turn:
+                    for block in response.content or []:
+                        if (getattr(block, "type", None) == "tool_use"
+                                and getattr(block, "name", None) == "message"):
+                            final_turn_message_dispatched = True
+                            break
+                    break
+
+                # Penultimate iteration: prime the model for its last
+                # turn. The text rides the existing user-side content
+                # block so it lands in the same place as drained inputs
+                # — the inject-don't-interrupt seam already in place.
+                if turn_count + 1 == max_turns:
+                    content_blocks.append({
+                        "type": "text",
+                        "text": (
+                            "[system] You have reached the conversation "
+                            f"turn cap ({max_turns} turns). Your next "
+                            "response is your last, and the only tool "
+                            "available will be ``message`` — every "
+                            "other tool is disabled. Send one closing "
+                            "message to the user (via ``message``) "
+                            "summarizing what you accomplished, what "
+                            "you tried, and where you got stuck. Be "
+                            "honest about uncertainty (e.g. \"I tried "
+                            "X but couldn't verify it worked\"). Do "
+                            "not attempt further work — anything other "
+                            "than ``message`` will be blocked."
+                        ),
+                    })
+
                 if content_blocks:
                     messages.append({
                         "role": "user",
@@ -2172,10 +2243,76 @@ class BoxBotAgent:
 
         if turn_count >= max_turns:
             logger.warning(
-                "Conversation reached max turns (%d)", max_turns
+                "Conversation reached max turns (%d, message_dispatched=%s)",
+                max_turns, final_turn_message_dispatched,
             )
+            if not final_turn_message_dispatched:
+                await self._dispatch_max_turns_fallback(
+                    conversation_id=conversation_id,
+                    channel=channel,
+                    person_name=person_name,
+                    max_turns=max_turns,
+                )
 
         return messages, turn_count
+
+    async def _dispatch_max_turns_fallback(
+        self,
+        *,
+        conversation_id: str,
+        channel: str,
+        person_name: str | None,
+        max_turns: int,
+    ) -> None:
+        """Send a hardcoded closing line when the loop hit its cap silently.
+
+        The agent loop tries to coax a graceful close-out via the
+        penultimate-turn heads-up + final-turn ``message``-only filter.
+        If that still fails to dispatch a ``message`` (e.g. the model
+        produces text only, refuses, or errors), we owe the user some
+        acknowledgement rather than radio silence. This bypasses the
+        ``message`` tool and calls ``dispatch_outputs`` directly.
+        """
+        from boxbot.core.output_dispatcher import dispatch_outputs
+
+        conv = self._conversations.get(conversation_id) \
+            if conversation_id else None
+
+        # Choose the dispatcher channel:
+        # - voice/trigger conversations → "voice" (speak it in the room)
+        # - whatsapp → "text"
+        # Trigger conversations may have no one in the room; speaking
+        # there is still the right call because that's where any user
+        # presence would be.
+        out_channel = "text" if channel == "whatsapp" else "voice"
+
+        # Recipient: the person we're addressing, or "current_speaker"
+        # so the dispatcher resolves it from the conversation's
+        # participants. WhatsApp needs an explicit phone number.
+        if out_channel == "text":
+            to = person_name or "current_speaker"
+        else:
+            to = "current_speaker"
+
+        content = (
+            f"I hit my turn limit ({max_turns}) while working on this "
+            "and couldn't get to a clean summary. Let me know if you "
+            "want me to try again or take a different approach."
+        )
+
+        try:
+            await dispatch_outputs(
+                [{"to": to, "channel": out_channel, "content": content}],
+                conversation_id=conversation_id,
+                channel_context=channel,
+                current_speaker=person_name,
+                segment_recorder=conv.record_segment if conv else None,
+            )
+        except Exception:
+            logger.exception(
+                "Max-turns fallback dispatch failed (conv=%s)",
+                conversation_id,
+            )
 
     # ------------------------------------------------------------------
     # Tool handling

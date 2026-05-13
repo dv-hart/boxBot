@@ -132,9 +132,11 @@ class GenerationResult:
     # One-line summary extracted from the assistant's last text block.
     summary: str = ""
 
-    # False if the cycle was cancelled mid-run (the conversation will
-    # still apply thread_additions and spoken_segments on cancel so the
-    # next cycle has an honest view).
+    # False if the cycle didn't end on its own terms — either
+    # cancelled mid-run, or the agent loop hit its turn cap (in which
+    # case a hardcoded close-out was already dispatched). The
+    # conversation still applies thread_additions and spoken_segments
+    # so the next cycle has an honest view.
     completed_cleanly: bool = True
 
 

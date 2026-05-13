@@ -123,6 +123,11 @@ class DisplayManager:
         self._pinned: bool = False
         self._last_switch_ts: float = 0.0
 
+        # Slideshow tick (picture display with len(image_ids) > 1).
+        # Lives next to the active display state because it's a
+        # per-active-display behavior, not a global rotation.
+        self._slideshow_task: asyncio.Task[None] | None = None
+
         # Data source management
         self._data_manager = DataSourceManager()
 
@@ -202,6 +207,9 @@ class DisplayManager:
 
         # Stop rotation
         self.stop_rotation()
+
+        # Stop slideshow tick if running
+        self._stop_slideshow()
 
         # Stop live tick task
         if self._live_tick_task and not self._live_tick_task.done():
@@ -456,11 +464,82 @@ class DisplayManager:
         import time as _time
         self._last_switch_ts = _time.monotonic()
 
+        # If the new display is a multi-photo picture slideshow,
+        # start the per-photo tick. Always tear down any prior
+        # slideshow first so switching away (or to a single photo)
+        # cancels cleanly.
+        self._stop_slideshow()
+        self._maybe_start_slideshow()
+
         logger.info(
             "Switched to display '%s' (args=%s, pinned=%s)",
             name, self._active_args, self._pinned,
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Picture-display slideshow
+    # ------------------------------------------------------------------
+
+    def _maybe_start_slideshow(self) -> None:
+        """Start a per-photo tick when the picture display has >1 id.
+
+        Reads ``interval`` (seconds, default 8) from ``args``. Rotates
+        ``args.image_ids`` left on each tick so the display spec
+        (``photo:{args.image_ids[0]}``) stays unchanged — only the
+        underlying list shifts, and a re-render shows the next photo.
+        """
+        if self._active_display != "picture":
+            return
+        ids = self._active_args.get("image_ids")
+        if not isinstance(ids, list) or len(ids) < 2:
+            return
+
+        raw_interval = self._active_args.get("interval", 8)
+        try:
+            interval_s = float(raw_interval)
+        except (TypeError, ValueError):
+            interval_s = 8.0
+        interval_s = max(1.0, interval_s)
+
+        self._slideshow_task = asyncio.create_task(
+            self._slideshow_loop(interval_s),
+            name="picture-slideshow",
+        )
+        logger.info(
+            "Started picture slideshow: %d photos every %.1fs",
+            len(ids), interval_s,
+        )
+
+    def _stop_slideshow(self) -> None:
+        """Cancel any running slideshow tick."""
+        if self._slideshow_task and not self._slideshow_task.done():
+            self._slideshow_task.cancel()
+        self._slideshow_task = None
+
+    async def _slideshow_loop(self, interval: float) -> None:
+        """Cycle ``args.image_ids`` on the picture display.
+
+        On each tick: rotate the id list left by one, then re-render
+        so the bound source picks up the new ``image_ids[0]``.
+        Exits silently if the display is switched away from
+        ``picture`` or the id list shrinks below 2.
+        """
+        try:
+            while self._running:
+                await asyncio.sleep(interval)
+                if self._active_display != "picture":
+                    return
+                ids = self._active_args.get("image_ids")
+                if not isinstance(ids, list) or len(ids) < 2:
+                    return
+                # Rotate left: [a, b, c] -> [b, c, a]
+                self._active_args["image_ids"] = ids[1:] + ids[:1]
+                self._render_and_update_frame()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Slideshow loop error")
 
     async def unpin(self) -> bool:
         """Release the pin and resume idle rotation.

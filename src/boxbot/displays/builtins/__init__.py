@@ -137,15 +137,23 @@ def _picture_display() -> DisplaySpec:
     """Full-screen photo viewer, parameterized by ``args.image_ids``.
 
     Called via:
-        mgr.switch("picture", args={"image_ids": ["abc123...", ...]})
+        mgr.switch("picture", args={"image_ids": ["abc123..."]})
+        mgr.switch("picture", args={"image_ids": ["a", "b", "c"],
+                                     "interval": 8})  # slideshow
 
-    Shows the first id full-screen with "contain" fit. The image block
-    is the root so it receives the full 1024x600 canvas — wrapping it
-    in a column made the image-height estimator cap it at 200 px.
-    ``_render_image`` then scales the photo to fit and centers it
-    inside the rect. The ``photo:`` source is pre-resolved to an
+    Shows ``args.image_ids[0]`` full-screen with "contain" fit. The
+    image block is the root so it receives the full 1024x600 canvas —
+    wrapping it in a column made the image-height estimator cap it at
+    200 px. ``_render_image`` then scales the photo to fit and centers
+    it inside the rect. The ``photo:`` source is pre-resolved to an
     absolute file path by the display manager (``_resolve_photo_sources``)
     before rendering.
+
+    Slideshow: when ``image_ids`` has more than one entry, the display
+    manager starts a per-photo tick that rotates the id list every
+    ``args.interval`` seconds (default 8). The spec stays unchanged;
+    only the list rotates and the manager re-renders. Switching to
+    another display (or to picture with a single id) stops the tick.
     """
     return DisplaySpec(
         name="picture",

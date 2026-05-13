@@ -24,7 +24,9 @@ seven SDK calls that load, preview, save, and list them.
 
 - ``clock`` — full-screen time + date.
 - ``weather_simple`` — current conditions.
-- ``picture`` — one photo, parameterized by ``args.image_ids``.
+- ``picture`` — photo viewer. Single id → static; multiple ids → slideshow.
+  ``args.image_ids: [str, ...]`` (required), ``args.interval: int``
+  (seconds, default 8, only used when there are 2+ ids).
 - ``notice`` — short centered card (``args.title`` + ``args.lines``).
 - Plus anything in ``displays/`` and any agent-saved displays in
   ``data/displays/``.
@@ -112,7 +114,18 @@ right method:
 | --- | --- | --- |
 | 07:00 | ``switch_display("morning_brief")`` | pinned digest |
 | 09:00 | ``bb.display.unpin()`` | rotation resumes |
-| 22:00 | ``switch_display("picture", args={})`` | pinned slideshow |
+| 22:00 | ``switch_display("picture", args={"image_ids": [...], "interval": 10})`` | pinned slideshow |
+
+For a slideshow, pass two or more ids in ``image_ids``; the display
+manager rotates through them every ``interval`` seconds (default 8).
+A single id renders static. To cycle "all photos tagged for the
+slideshow," gather the ids first with ``bb.photos.search(...)``,
+then pass the list.
+
+Do **not** try to build a slideshow with the ``rotate`` block — that
+block isn't currently driven by the renderer (it renders only its
+first child). The picture display's built-in cycle is the supported
+path.
 
 You don't have to schedule the unpin step — when you decide to put
 something else up, ``switch_display`` already replaces the pin.

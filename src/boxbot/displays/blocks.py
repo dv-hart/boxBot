@@ -495,7 +495,16 @@ class CalendarWidget(Block):
 class RotateBlock(Block):
     """Cycles through items in a data array on a timer.
 
-    Makes {current} available as a binding prefix for the active item.
+    Makes ``{current}`` available as a binding prefix for the active
+    item.
+
+    .. warning:: **Not yet implemented at runtime.** The renderer
+       currently renders the first child only; no timer drives the
+       active index and ``{current}`` does not resolve. Tracked
+       separately. For a multi-photo slideshow, use the built-in
+       ``picture`` display with ``args.image_ids`` (multi-entry list)
+       and an optional ``args.interval`` — the display manager
+       handles that cycle natively.
     """
 
     block_type: str = field(default="rotate", init=False)

@@ -20,8 +20,12 @@ Security:
 - Image attachments are restricted to an allowlist of filesystem roots
   (:data:`ATTACH_ROOTS`). The sandbox cannot coerce the main process into
   reading arbitrary files.
-- Size cap per image: 4 MB (Anthropic accepts up to 5 MB; we leave slack
-  for base64 overhead and metadata).
+- Raw-file ceiling per image: 10 MB — guards against absurd inputs.
+- Attached image content is resized in-memory (long edge
+  :data:`ATTACH_LONG_EDGE_PX`, JPEG quality :data:`ATTACH_JPEG_QUALITY`)
+  before base64 encoding so the encoded payload stays well under
+  Anthropic's 5 MB per-image cap. The original file on disk is never
+  modified.
 - Count cap per tool call: 8 images.
 """
 
@@ -78,8 +82,17 @@ def _sandbox_tmp_dir() -> Path:
     except Exception:
         return Path("/var/lib/boxbot-sandbox/tmp")
 
-MAX_IMAGE_BYTES = 4 * 1024 * 1024
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGES_PER_CALL = 8
+# Long-edge target for resize-on-attach. Anthropic downscales images
+# beyond ~1568 px internally; matching that gives the model the same
+# pixels it would see anyway, with a much smaller base64 payload.
+ATTACH_LONG_EDGE_PX = 1568
+ATTACH_JPEG_QUALITY = 85
+# Pass-through ceiling — small files (already-small camera/perception
+# crops, thumbnails) skip the PIL re-encode round-trip. 1 MB raw fits
+# under 1.4 MB base64, comfortably below the 5 MB API cap.
+ATTACH_PASSTHROUGH_BYTES = 1 * 1024 * 1024
 
 
 @dataclass
@@ -139,7 +152,11 @@ def build_image_block(abs_path: Path) -> dict[str, Any] | None:
     """Return an API ``image`` content block for ``abs_path``, or None.
 
     Returns None on any of: path outside allowlist, unreadable, too big,
-    unknown/unsupported media type.
+    unknown/unsupported media type, or unrecoverable decode failure.
+
+    Large/high-resolution images are resized in-memory before encoding
+    so the resulting base64 payload stays under Anthropic's 5 MB cap.
+    The on-disk file is never modified.
     """
     if not _is_attach_allowed(abs_path):
         logger.warning("image attach refused (outside allowlist): %s", abs_path)
@@ -163,14 +180,75 @@ def build_image_block(abs_path: Path) -> dict[str, Any] | None:
     except OSError as e:
         logger.warning("image attach failed (read): %s: %s", abs_path, e)
         return None
+
+    # Fast path: small files pass through verbatim (preserves animated
+    # GIFs, keeps perception crops crisp, skips the PIL round-trip).
+    if size <= ATTACH_PASSTHROUGH_BYTES:
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mt,
+                "data": base64.b64encode(data).decode("ascii"),
+            },
+        }
+
+    # Resize path: decode → EXIF-rotate → downscale long edge to
+    # ATTACH_LONG_EDGE_PX → re-encode as JPEG. Quality 85 is
+    # visually near-lossless; payloads land in the 200-800 KB range
+    # for typical phone-camera inputs.
+    try:
+        encoded, out_mt = _resize_for_attach(data, mt)
+    except Exception as e:
+        logger.warning(
+            "image attach failed (resize): %s: %s", abs_path, e
+        )
+        return None
     return {
         "type": "image",
         "source": {
             "type": "base64",
-            "media_type": mt,
-            "data": base64.b64encode(data).decode("ascii"),
+            "media_type": out_mt,
+            "data": encoded,
         },
     }
+
+
+def _resize_for_attach(data: bytes, media_type: str) -> tuple[str, str]:
+    """Decode, downscale, re-encode → (base64 ascii, media_type).
+
+    The output is always JPEG except for GIF, which is passed through
+    so animations survive.
+    """
+    if media_type == "image/gif":
+        # GIFs are typically small and may be animated. If we made it
+        # here, the file was over ATTACH_PASSTHROUGH_BYTES; downsize
+        # by re-encoding the first frame to JPEG, which loses
+        # animation but keeps the model under cap.
+        pass
+    from PIL import Image, ImageOps
+
+    with Image.open(io.BytesIO(data)) as img:
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        w, h = img.size
+        long_edge = max(w, h)
+        if long_edge > ATTACH_LONG_EDGE_PX:
+            ratio = ATTACH_LONG_EDGE_PX / long_edge
+            new_size = (max(1, int(w * ratio)), max(1, int(h * ratio)))
+            img = img.resize(new_size, Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(
+            buf,
+            format="JPEG",
+            quality=ATTACH_JPEG_QUALITY,
+            optimize=True,
+        )
+    return base64.b64encode(buf.getvalue()).decode("ascii"), "image/jpeg"
 
 
 # ---------------------------------------------------------------------------

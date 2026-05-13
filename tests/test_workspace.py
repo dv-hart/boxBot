@@ -268,3 +268,76 @@ class TestImageBlockGuards:
         # Slightly over the cap
         img.write_bytes(b"\xff\xd8\xff" + b"\x00" * (sa.MAX_IMAGE_BYTES + 1))
         assert sa.build_image_block(img) is None
+
+    def test_resizes_large_image_under_api_cap(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A high-res photo must resize so encoded payload stays under
+        Anthropic's 5 MB cap. Real-world failure: a 3.98 MB raw JPEG
+        from WhatsApp blew the cap at ~5.3 MB after base64."""
+        import base64 as _b64
+        import io
+        from PIL import Image
+
+        monkeypatch.setenv("BOXBOT_DATA_DIR", str(tmp_path))
+        import importlib
+        import boxbot.core.paths as paths
+        importlib.reload(paths)
+        import boxbot.tools._sandbox_actions as sa
+        importlib.reload(sa)
+
+        (tmp_path / "workspace").mkdir(parents=True)
+        img_path = tmp_path / "workspace" / "huge.jpg"
+        # Write a real 4000x3000 JPEG. Use a noisy pattern so JPEG
+        # can't trivially compress it to near-zero — we want a file
+        # that's genuinely a few MB, like a real phone photo.
+        big = Image.new("RGB", (4000, 3000))
+        pixels = big.load()
+        for y in range(0, 3000, 4):
+            for x in range(0, 4000, 4):
+                pixels[x, y] = ((x * 7) % 256, (y * 11) % 256, ((x + y) * 5) % 256)
+        big.save(img_path, format="JPEG", quality=95)
+        raw_size = img_path.stat().st_size
+        assert raw_size > sa.ATTACH_PASSTHROUGH_BYTES, (
+            "test fixture didn't produce a large-enough file"
+        )
+
+        block = sa.build_image_block(img_path)
+        assert block is not None
+        assert block["type"] == "image"
+        # After resize-on-attach we always re-encode as JPEG
+        assert block["source"]["media_type"] == "image/jpeg"
+
+        encoded_bytes = len(_b64.b64decode(block["source"]["data"]))
+        # 5 MB is the API cap; we should be comfortably below it
+        assert encoded_bytes < 5 * 1024 * 1024
+        # And the resized image's long edge must be <= the target
+        with Image.open(io.BytesIO(_b64.b64decode(block["source"]["data"]))) as decoded:
+            assert max(decoded.size) <= sa.ATTACH_LONG_EDGE_PX
+
+    def test_small_image_passes_through_verbatim(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Files under the pass-through ceiling should not be re-encoded
+        — preserves animated GIFs, keeps perception crops crisp."""
+        import base64 as _b64
+        from PIL import Image
+
+        monkeypatch.setenv("BOXBOT_DATA_DIR", str(tmp_path))
+        import importlib
+        import boxbot.core.paths as paths
+        importlib.reload(paths)
+        import boxbot.tools._sandbox_actions as sa
+        importlib.reload(sa)
+
+        (tmp_path / "workspace").mkdir(parents=True)
+        img_path = tmp_path / "workspace" / "small.png"
+        Image.new("RGB", (320, 240), color=(50, 100, 150)).save(img_path)
+        assert img_path.stat().st_size < sa.ATTACH_PASSTHROUGH_BYTES
+
+        block = sa.build_image_block(img_path)
+        assert block is not None
+        # Pass-through path preserves original media type
+        assert block["source"]["media_type"] == "image/png"
+        # And the raw bytes round-trip exactly
+        assert _b64.b64decode(block["source"]["data"]) == img_path.read_bytes()

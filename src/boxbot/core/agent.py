@@ -58,6 +58,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -536,6 +537,135 @@ def _render_static_system_prompt(name: str, wake_word: str) -> str:
     if skills.strip():
         parts.append(skills.strip())
     return "\n\n".join(parts)
+
+
+# Matches an Anthropic 400 saying a tool_result image exceeded the API
+# cap. Captures the message index + tool_result-content index so we can
+# scrub just that block.
+_OVERSIZE_IMAGE_RE = re.compile(
+    r"messages\.(\d+)\.content\.(\d+)\.tool_result\.content\.(\d+)\."
+    r"image[^:]*:\s*image exceeds"
+)
+
+
+# The initial user message synthesised by `_on_trigger_fired` starts
+# with this prefix; we use it both to recognise trigger threads and to
+# extract the human-readable trigger description for the journal.
+_TRIGGER_PREFIX = "[Trigger fired:"
+_TRIGGER_DESC_RE = re.compile(r"\[Trigger fired:\s*(.+?)\]")
+
+
+def _has_human_reply(messages: list[dict[str, Any]]) -> bool:
+    """True if any user turn after the trigger initial message is a
+    real human reply (not a synthetic trigger fire and not a
+    tool_result returning to the model).
+
+    Trigger conversations don't usually accept follow-up — they're
+    one-shot per firing per the channel-key contract — but if a
+    human ever does land on a trigger thread, we let the full
+    extraction path run rather than collapsing them to a stub.
+    """
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if i == 0 and isinstance(content, str) and content.startswith(
+            _TRIGGER_PREFIX
+        ):
+            # synthetic trigger-initiation message
+            continue
+        if isinstance(content, list):
+            # tool_result responses come back as user-role list content;
+            # they don't count as human replies.
+            if all(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            ):
+                continue
+        # Anything else (string body, list with non-tool_result blocks)
+        # is a real inbound message.
+        return True
+    return False
+
+
+def _summarize_trigger_thread(messages: list[dict[str, Any]]) -> str:
+    """Build a deterministic summary line for a routine trigger thread.
+
+    Captures: the trigger description (from the synthetic initial
+    message), and where the agent's `message` tool calls were
+    delivered. That's enough for the [Recent Conversations] block in
+    future injections to surface what the firing did, without spawning
+    a fact memory.
+    """
+    description = "trigger"
+    recipients: list[str] = []
+    if messages:
+        first = messages[0]
+        if first.get("role") == "user":
+            content = first.get("content")
+            if isinstance(content, str):
+                m = _TRIGGER_DESC_RE.search(content)
+                if m:
+                    description = m.group(1).strip()
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_use":
+                continue
+            if block.get("name") != "message":
+                continue
+            to = (block.get("input") or {}).get("to")
+            if to and to not in recipients:
+                recipients.append(to)
+    if recipients:
+        return f"Trigger fired: {description}. Delivered to {', '.join(recipients)}."
+    return f"Trigger fired: {description}. No outbound messages."
+
+
+def _scrub_oversize_images(
+    messages: list[dict[str, Any]], error_message: str
+) -> int:
+    """Drop oversize image blocks named in a 400 error from the history.
+
+    The Anthropic API surfaces "image exceeds 5 MB maximum" with the
+    exact path of the offending block, e.g.
+    ``messages.50.content.0.tool_result.content.1.image.source.base64``.
+    We pull those indices out and replace the image block with a text
+    marker so the retry can succeed without the model losing context.
+
+    Returns the number of blocks scrubbed (0 if the error didn't match
+    or the indices were out of range).
+    """
+    scrubbed = 0
+    for match in _OVERSIZE_IMAGE_RE.finditer(error_message):
+        try:
+            msg_i, content_i, tr_i = (int(g) for g in match.groups())
+        except ValueError:
+            continue
+        if msg_i >= len(messages):
+            continue
+        msg_content = messages[msg_i].get("content")
+        if not isinstance(msg_content, list) or content_i >= len(msg_content):
+            continue
+        tr_block = msg_content[content_i]
+        tr_content = tr_block.get("content") if isinstance(tr_block, dict) else None
+        if not isinstance(tr_content, list) or tr_i >= len(tr_content):
+            continue
+        inner = tr_content[tr_i]
+        if not isinstance(inner, dict) or inner.get("type") != "image":
+            continue
+        tr_content[tr_i] = {
+            "type": "text",
+            "text": "[image dropped: exceeded 5 MB after encoding]",
+        }
+        scrubbed += 1
+    return scrubbed
 
 
 # ---------------------------------------------------------------------------
@@ -1892,6 +2022,19 @@ class BoxBotAgent:
                         turn_count, attempt + 1, e,
                     )
                     if attempt == 0:
+                        # If the failure is "image too large", surgically
+                        # drop the offending image block(s) from the
+                        # message history before retrying so we don't
+                        # just hit the same 400 again. The error message
+                        # looks like:
+                        #   messages.<i>.content.<j>.tool_result.content.<k>.image…: image exceeds 5 MB maximum
+                        scrubbed = _scrub_oversize_images(messages, str(e))
+                        if scrubbed:
+                            logger.warning(
+                                "Scrubbed %d oversize image block(s) "
+                                "from turn %d history before retry",
+                                scrubbed, turn_count,
+                            )
                         await asyncio.sleep(3)
                     else:
                         messages.append({
@@ -2184,9 +2327,27 @@ class BoxBotAgent:
         up the result when it lands (typically <30 min) and applies the
         memories.
 
+        **Trigger-fired conversations are special-cased**: when the
+        channel is ``trigger`` and no human reply landed on the thread,
+        the conversation is a routine wake-up (morning brief, midday
+        check, evening review). We write a deterministic conversation
+        summary directly and skip the extraction batch entirely —
+        otherwise every firing accumulates a near-duplicate operational
+        "I sent the briefing today" memory that crowds out
+        load-bearing methodology/person facts at injection time.
+
         On any failure, the row is left in queued status with no batch
         id, and the next boot's poller resume will retry submission.
         """
+        if channel == "trigger" and not _has_human_reply(messages):
+            await self._write_trigger_summary(
+                conversation_id=conversation_id,
+                person_name=person_name,
+                messages=messages,
+                started_at=started_at,
+            )
+            return
+
         try:
             transcript = self._build_transcript(messages, person_name)
 
@@ -2225,6 +2386,55 @@ class BoxBotAgent:
             logger.exception(
                 "Post-conversation processing failed for %s",
                 conversation_id,
+            )
+
+    async def _write_trigger_summary(
+        self,
+        *,
+        conversation_id: str,
+        person_name: str | None,
+        messages: list[dict[str, Any]],
+        started_at: str,
+    ) -> None:
+        """Write a deterministic summary for a routine trigger conversation.
+
+        Avoids the extraction batch + memory creation entirely. The
+        conversations table still gets a usable journal row so
+        `inject_memories`' [Recent Conversations] block surfaces what
+        the trigger did, without polluting the fact-memory store.
+        """
+        try:
+            summary = _summarize_trigger_thread(messages)
+            participants = [get_config().agent.name]
+            if person_name:
+                participants.append(person_name)
+            existing = await self._memory_store.get_conversation(
+                conversation_id
+            )
+            if existing is None:
+                await self._memory_store.create_conversation(
+                    channel="trigger",
+                    participants=participants,
+                    summary=summary,
+                    topics=["trigger"],
+                    accessed_memories=[],
+                    conversation_id=conversation_id,
+                    started_at=started_at,
+                )
+            else:
+                await self._memory_store.update_conversation(
+                    conversation_id,
+                    summary=summary,
+                    topics=["trigger"],
+                    accessed_memories=[],
+                )
+            logger.info(
+                "Trigger conversation %s summarised (no extraction): %s",
+                conversation_id, summary[:80],
+            )
+        except Exception:
+            logger.exception(
+                "Failed to write trigger summary for %s", conversation_id,
             )
 
     @staticmethod

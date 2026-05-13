@@ -55,15 +55,21 @@ WORKSPACE_POINTER_RE = re.compile(
 )
 
 # Signals that the operational row carries a durable lesson worth
-# preserving as methodology. Pulled from the actual Pi corpus (DST
-# recheck note, SDK shape lessons, configuration changes).
+# preserving as methodology. Tight by design — we'd rather leave
+# something as type=operational (budget=0, invisible) than mis-promote
+# a stale bug observation into a recurring injection.
+#
+# These patterns are the ones that proved themselves on the Pi corpus:
+# - "use bb.X / use the Y": SDK-shape methodology
+# - "DST", "recheck", "shift in november": calendar/cron forward-looking
+# - "do not / don't / never / always": user-stated standing rules
+# - explicit "no <thing>" SDK-shape lessons: "no vision API in SDK"
 LESSON_SIGNAL_RE = re.compile(
     r"\b("
-    r"use\s+bb\.|use\s+the\s+|recheck|re-check|dst|"
-    r"shift\s+in\s+november|"
-    r"trigger\s+(?:id|ids|cron|cancelled|recreated)|"
-    r"do\s+not|don't|never|always|"
-    r"requires|need to|must be"
+    r"use\s+bb\.|use\s+the\s+|"
+    r"recheck|re-check|dst|shift\s+in\s+november|"
+    r"do\s+not\b|don't|never\b|always\b|"
+    r"no\s+(?:vision|onboarding|generator|api|module)\s+(?:in|for)\b"
     r")\b",
     re.IGNORECASE,
 )

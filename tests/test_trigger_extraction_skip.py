@@ -134,8 +134,26 @@ class TestHasHumanReply:
         assert _has_human_reply([]) is False
 
 
+def _tool_result_with_sdk_actions(actions: list) -> dict:
+    """A user-role tool_result whose JSON body carries sdk_actions —
+    mirrors what execute_script returns."""
+    import json as _json
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "x",
+                "content": _json.dumps(
+                    {"status": "success", "sdk_actions": actions}
+                ),
+            }
+        ],
+    }
+
+
 class TestSummarizeTriggerThread:
-    def test_extracts_description_and_recipients(self) -> None:
+    def test_receipt_has_description_recipients_and_date(self) -> None:
         msgs = [
             _trigger_initial_msg("Morning briefing"),
             _assistant_message_tool_use("Jacob"),
@@ -143,16 +161,62 @@ class TestSummarizeTriggerThread:
             _assistant_message_tool_use("Carina"),
             _tool_result_user_msg(),
         ]
-        summary = _summarize_trigger_thread(msgs)
+        summary = _summarize_trigger_thread(
+            msgs, started_at="2026-05-14T14:00:00+00:00",
+        )
+        assert "Delivered" in summary
         assert "Morning briefing" in summary
         assert "Jacob" in summary
         assert "Carina" in summary
+        assert "5/14" in summary
 
-    def test_no_outbound_messages(self) -> None:
+    def test_receipt_is_a_receipt_not_content(self) -> None:
+        """The receipt must NOT carry weather/calendar/todo content —
+        that's the earworm vector. Only: what ran, when, where it went."""
+        msgs = [
+            _trigger_initial_msg("Morning briefing"),
+            _assistant_message_tool_use(
+                "Jacob",
+                "Weather: rain, high 65. Calendar down pending reauth.",
+            ),
+            _tool_result_user_msg(),
+        ]
+        summary = _summarize_trigger_thread(
+            msgs, started_at="2026-05-14T14:00:00+00:00",
+        )
+        # The delivered message BODY must not leak into the receipt.
+        assert "rain" not in summary.lower()
+        assert "reauth" not in summary.lower()
+        assert "calendar" not in summary.lower()
+
+    def test_no_outbound_messages_is_ran_nothing_delivered(self) -> None:
         msgs = [_trigger_initial_msg("Midday check")]
-        summary = _summarize_trigger_thread(msgs)
+        summary = _summarize_trigger_thread(
+            msgs, started_at="2026-05-14T19:00:00+00:00",
+        )
+        assert "Ran" in summary
         assert "Midday check" in summary
-        assert "No outbound messages" in summary
+        assert "nothing delivered" in summary
+
+    def test_receipt_carries_workspace_pointer(self) -> None:
+        """A trigger that wrote a work-product to the workspace gets a
+        pointer in the receipt — that's how 'how did the job review go?'
+        stays answerable via deliberate lookup."""
+        msgs = [
+            _trigger_initial_msg("Job listing review"),
+            _assistant_message_tool_use("Jacob"),
+            _tool_result_with_sdk_actions([
+                {
+                    "action": "workspace.write",
+                    "status": "ok",
+                    "path": "notes/job-review/2026-05-14.md",
+                }
+            ]),
+        ]
+        summary = _summarize_trigger_thread(
+            msgs, started_at="2026-05-14T14:00:00+00:00",
+        )
+        assert "notes/job-review/2026-05-14.md" in summary
 
     def test_dedupes_repeated_recipient(self) -> None:
         msgs = [
@@ -162,20 +226,21 @@ class TestSummarizeTriggerThread:
             _assistant_message_tool_use("Jacob", "second line"),
             _tool_result_user_msg(),
         ]
-        summary = _summarize_trigger_thread(msgs)
-        # Recipient should appear exactly once
+        summary = _summarize_trigger_thread(
+            msgs, started_at="2026-05-14T03:00:00+00:00",
+        )
         assert summary.count("Jacob") == 1
 
-    def test_falls_back_to_generic_label_when_no_prefix(self) -> None:
-        """If somehow we end up summarising a non-trigger thread (e.g.
-        a future caller misuses this), don't crash — just label it
-        generically."""
+    def test_handles_missing_started_at(self) -> None:
+        """started_at is optional — no date clause, no crash."""
         msgs = [
-            {"role": "user", "content": "Hey BB, status?"},
+            _trigger_initial_msg("Morning briefing"),
             _assistant_message_tool_use("Jacob"),
+            _tool_result_user_msg(),
         ]
         summary = _summarize_trigger_thread(msgs)
-        assert "Trigger fired" in summary
+        assert "Morning briefing" in summary
+        assert "Jacob" in summary
 
 
 class TestPostConversationTriggerSkip:

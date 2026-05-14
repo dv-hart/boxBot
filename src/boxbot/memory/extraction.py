@@ -183,9 +183,13 @@ EXTRACTION_TOOL: dict[str, Any] = {
                     "summary": {
                         "type": "string",
                         "description": (
-                            "Ultra-compact summary. Preserve who/what/"
-                            "decisions/actions/outcomes. Strip filler. "
-                            "Use shorthand. 1-3 sentences typical."
+                            "A RECEIPT, not a recap. One short line "
+                            "naming what was DISCUSSED — not what was "
+                            "concluded or asserted. An index entry that "
+                            "lets a future agent decide whether to go "
+                            "read this conversation. Do NOT restate "
+                            "facts, system state, or claims. <=1 "
+                            "sentence."
                         ),
                     },
                 },
@@ -269,6 +273,18 @@ EXTRACTION_SYSTEM_PROMPT = """\
 You are the post-conversation memory extractor for boxBot, a household assistant.
 
 Your job: read the transcript and decide what — if anything — is worth saving to long-term memory for future conversations. Emit the result via the `emit_extraction` tool exactly once.
+
+# The conversation_summary is a RECEIPT, not a recap
+
+`conversation_summary.summary` is a one-line index entry — its only job is to let a future agent decide *whether to go read this conversation*. It is NOT a place to record what was concluded.
+
+This matters because conversation summaries get injected into future conversations. If you write the agent's own claims into the summary ("calendar is down", "the weather is X", "BB flagged a discrepancy"), those claims get fed back into the next run as if they were established fact — a self-replicating earworm with nothing to correct it. The agent then repeats them, you summarise them again, and a wrong belief becomes permanent.
+
+So:
+- Name the TOPIC, not the conclusion. GOOD: "Discussed calendar integration status and the reauth todo." BAD: "Calendar is still down pending reauth." GOOD: "Looked at date-night reservation options." BAD: "Booked the 7pm table at Nostrana."
+- Never restate system/world state, never editorialise, never invent analysis ("BB suspected...", "flagged a discrepancy").
+- It's an index entry. If the details matter, the agent re-reads the transcript. Durable *facts* go in `extracted_memories`, not the summary.
+- Keep it to one short line. The `topics` array carries the keywords; the summary carries the gist.
 
 # Memory is for recognition, not history
 

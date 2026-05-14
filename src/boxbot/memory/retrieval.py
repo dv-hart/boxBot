@@ -88,8 +88,11 @@ async def inject_memories(
         query_parts.append(utterance)
     query = " ".join(query_parts)
 
-    # Over-fetch by 2x per category so per-type budgets have real
-    # ranking room. hybrid_search returns mixed types; we bucket below.
+    # Over-fetch: 3x memory candidates so per-type budgets have ranking
+    # room, and 4x conversation candidates because trigger conversations
+    # get filtered out post-search (hybrid_search has no channel-exclude
+    # param) — the wider net keeps enough human conversations to fill
+    # max_conversations after the trigger rows are dropped.
     candidates = await hybrid_search(
         store,
         query,
@@ -97,14 +100,25 @@ async def inject_memories(
         include_conversations=True,
         include_archived=False,
         memory_limit=total_budget * 3,
-        conversation_limit=max_conversations * 2,
+        conversation_limit=max_conversations * 4,
     )
 
     if not candidates:
         return "", []
 
     fact_candidates = [c for c in candidates if c.source == "memory"]
-    conv_candidates = [c for c in candidates if c.source == "conversation"]
+    # Conversation candidates: ambient injection EXCLUDES trigger
+    # conversations. A trigger conversation is the agent talking to
+    # itself — injecting its receipt back into the next run is an
+    # earworm vector with no human in the loop to dampen it. The
+    # receipt still lives in the conversations table and is fully
+    # searchable via `search_memory` (deliberate lookup) — it just
+    # never gets fed in unprompted. Searchable, not injected.
+    conv_candidates = [
+        c for c in candidates
+        if c.source == "conversation"
+        and c.metadata.get("channel") != "trigger"
+    ]
 
     # Bucket facts by type. Within a bucket, candidates retain their
     # hybrid-search ranking (hybrid_search returns sorted output).

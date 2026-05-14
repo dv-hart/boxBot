@@ -482,6 +482,19 @@ def _prompt_capabilities() -> str:
         "display, run a sandbox script, look up the web. None of them speak.\n"
         "Without a message call, the user hears silence.\n"
         "\n"
+        "## Injected context is not ground truth\n"
+        "- `[Recent Conversations]` entries are RECEIPTS — pointers to\n"
+        "  what was discussed, not statements of current fact. \"Discussed\n"
+        "  the calendar\" does not mean the calendar is broken. If a\n"
+        "  receipt looks relevant, go read the actual conversation.\n"
+        "- For current state — weather, calendar, the to-do list, what's\n"
+        "  on the display — query the live source every time. Never report\n"
+        "  state from an injected summary or from your own past output.\n"
+        "- Your own past words are never authoritative. A briefing you\n"
+        "  sent yesterday, a summary you wrote, an observation you logged —\n"
+        "  none of it is evidence. Evidence is: live data, the human's\n"
+        "  words, and curated memories.\n"
+        "\n"
         "## Guidelines\n"
         "- Be concise when speaking — no one wants a lecture from a box.\n"
         "- Prefer text for long, detailed information (easier to re-read);\n"
@@ -597,14 +610,76 @@ def _has_human_reply(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _summarize_trigger_thread(messages: list[dict[str, Any]]) -> str:
-    """Build a deterministic summary line for a routine trigger thread.
+def _workspace_artifacts_from_thread(
+    messages: list[dict[str, Any]],
+) -> list[str]:
+    """Best-effort: collect workspace paths the run wrote to.
 
-    Captures: the trigger description (from the synthetic initial
-    message), and where the agent's `message` tool calls were
-    delivered. That's enough for the [Recent Conversations] block in
-    future injections to surface what the firing did, without spawning
-    a fact memory.
+    Scans tool_result blocks for ``execute_script`` ``sdk_actions``
+    entries whose action is ``workspace.write`` / ``workspace.append``
+    / ``workspace.csv_write`` and pulls their ``path``. Defensive — a
+    parse miss just means no pointer in the receipt, never a crash.
+    """
+    paths: list[str] = []
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tr = block.get("content")
+            # tool_result content is a JSON string, or a list whose
+            # first text block holds the JSON.
+            raw: str | None = None
+            if isinstance(tr, str):
+                raw = tr
+            elif isinstance(tr, list):
+                for inner in tr:
+                    if isinstance(inner, dict) and inner.get("type") == "text":
+                        raw = inner.get("text")
+                        break
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            for action in parsed.get("sdk_actions", []) or []:
+                if not isinstance(action, dict):
+                    continue
+                name = action.get("action", "")
+                if not name.startswith("workspace."):
+                    continue
+                if name.split(".", 1)[1] not in (
+                    "write", "append", "csv_write", "csv_append"
+                ):
+                    continue
+                path = action.get("path")
+                if path and path not in paths:
+                    paths.append(path)
+    return paths
+
+
+def _summarize_trigger_thread(
+    messages: list[dict[str, Any]], started_at: str = "",
+) -> str:
+    """Build a deterministic RECEIPT line for a routine trigger thread.
+
+    A receipt — not a transcript. It records *that* the trigger ran,
+    *what* it was, *when*, and *where its output went* — never the
+    content (weather, calendar status, todo counts). The content of a
+    trigger run is recoverable elsewhere: dispatched messages land in
+    the recipient's real conversation thread (dispatch-as-bridge), and
+    deliberately-saved work-products live in the workspace. The
+    trigger's internal reasoning is intentionally not retained.
+
+    This receipt goes in the conversations table as a queryable
+    journal entry. It is NOT ambient-injected — `inject_memories`
+    excludes trigger conversations — so it can't earworm; but
+    `search_memory` can still surface it on a deliberate lookup.
     """
     description = "trigger"
     recipients: list[str] = []
@@ -632,9 +707,25 @@ def _summarize_trigger_thread(messages: list[dict[str, Any]]) -> str:
             to = (block.get("input") or {}).get("to")
             if to and to not in recipients:
                 recipients.append(to)
+
+    # Date stamp — "5/14" form, matching how a human refers to it.
+    date_str = ""
+    if started_at:
+        try:
+            dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            date_str = f" for {dt.month}/{dt.day}"
+        except (ValueError, TypeError):
+            date_str = ""
+
+    artifacts = _workspace_artifacts_from_thread(messages)
+
     if recipients:
-        return f"Trigger fired: {description}. Delivered to {', '.join(recipients)}."
-    return f"Trigger fired: {description}. No outbound messages."
+        receipt = f"Delivered {description}{date_str} → {', '.join(recipients)}"
+    else:
+        receipt = f"Ran {description}{date_str} — nothing delivered"
+    if artifacts:
+        receipt += f" (saved {', '.join(artifacts)})"
+    return receipt
 
 
 def _scrub_oversize_images(
@@ -2558,15 +2649,17 @@ class BoxBotAgent:
         messages: list[dict[str, Any]],
         started_at: str,
     ) -> None:
-        """Write a deterministic summary for a routine trigger conversation.
+        """Write a deterministic receipt for a routine trigger conversation.
 
         Avoids the extraction batch + memory creation entirely. The
-        conversations table still gets a usable journal row so
-        `inject_memories`' [Recent Conversations] block surfaces what
-        the trigger did, without polluting the fact-memory store.
+        conversations table gets a queryable journal row (a receipt,
+        not content). It is NOT ambient-injected — `inject_memories`
+        excludes trigger conversations — so it can't earworm, but
+        `search_memory` can still surface it on a deliberate lookup
+        ("how did the morning briefing go?").
         """
         try:
-            summary = _summarize_trigger_thread(messages)
+            summary = _summarize_trigger_thread(messages, started_at)
             participants = [get_config().agent.name]
             if person_name:
                 participants.append(person_name)

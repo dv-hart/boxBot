@@ -364,6 +364,34 @@ class TestExtractionPromptContract:
         assert "only invalidate memories listed" in text
         assert "do not invalidate based on inference" in text
 
+    def test_prompt_conversation_summary_is_a_receipt(self):
+        """The conversation_summary must be a topic index entry, not a
+        recap of conclusions. This is the earworm guard: summaries get
+        injected into future runs, so a summary that restates the
+        agent's own claims becomes a self-replicating wrong belief."""
+        from boxbot.memory.extraction import EXTRACTION_SYSTEM_PROMPT
+        text = EXTRACTION_SYSTEM_PROMPT.lower()
+        # The receipt framing must be present and explicit
+        assert "receipt" in text
+        assert "earworm" in text or "self-replicating" in text
+        # Must steer toward topic, away from conclusion/assertion
+        assert "topic" in text
+        assert "editorialise" in text or "editorialize" in text
+
+    def test_summary_schema_description_says_receipt_not_recap(self):
+        """The tool schema's summary field description must also carry
+        the receipt framing — the model reads the schema, not just the
+        system prompt."""
+        from boxbot.memory.extraction import EXTRACTION_TOOL
+        desc = (
+            EXTRACTION_TOOL["input_schema"]["properties"]
+            ["conversation_summary"]["properties"]["summary"]["description"]
+        ).lower()
+        assert "receipt" in desc
+        assert "discussed" in desc
+        # Explicitly warns against restating conclusions/claims
+        assert "concluded" in desc or "assert" in desc
+
 
 class TestExtractionParser:
     def test_parse_full_payload(self, sample_payload):

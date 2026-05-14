@@ -663,6 +663,45 @@ def _workspace_artifacts_from_thread(
     return paths
 
 
+def _delivered_text_messages_from_thread(
+    messages: list[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    """Extract (recipient, content) pairs for every text-channel
+    `message` tool call in the thread.
+
+    Used by dispatch-as-bridge: after a trigger conversation finishes,
+    each text it delivered is recorded into the recipient's real
+    conversation. Voice deliveries are skipped — voice:room is
+    transient and a spoken reply already lands there. Entries
+    addressed to "current_speaker"/"room"/"unknown" are skipped too:
+    a wake-cycle trigger has no current_speaker, so a real delivery
+    always names a registered user explicitly.
+    """
+    out: list[tuple[str, str]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_use" or block.get("name") != "message":
+                continue
+            inp = block.get("input") or {}
+            if inp.get("channel") != "text":
+                continue
+            to = str(inp.get("to") or "").strip()
+            body = str(inp.get("content") or "").strip()
+            if not to or not body:
+                continue
+            if to in ("current_speaker", "room", "unknown"):
+                continue
+            out.append((to, body))
+    return out
+
+
 def _summarize_trigger_thread(
     messages: list[dict[str, Any]], started_at: str = "",
 ) -> str:
@@ -2690,6 +2729,112 @@ class BoxBotAgent:
         except Exception:
             logger.exception(
                 "Failed to write trigger summary for %s", conversation_id,
+            )
+
+        # Dispatch-as-bridge: record each text the trigger delivered
+        # into the recipient's real conversation, so a reply continues
+        # a thread that contains the briefing. Runs after the receipt
+        # write and is independently fault-isolated — a bridge failure
+        # must not lose the receipt.
+        for recipient, content in _delivered_text_messages_from_thread(
+            messages
+        ):
+            try:
+                await self._bridge_trigger_delivery(recipient, content)
+            except Exception:
+                logger.exception(
+                    "Failed to bridge trigger delivery to %s (conv=%s)",
+                    recipient, conversation_id,
+                )
+
+    async def _bridge_trigger_delivery(
+        self, recipient: str, content: str,
+    ) -> None:
+        """Record one trigger-delivered text into the recipient's own
+        conversation thread (dispatch-as-bridge).
+
+        If the recipient has a live in-memory conversation, the
+        delivery folds into it via ``Conversation.ingest_trigger_delivery``
+        (which handles the mid-generation race). Otherwise it goes
+        straight to the store via ``get_or_create_active`` —
+        resurrecting their thread if it's still inside the rolling
+        window, or starting a fresh persistent one — so the next
+        inbound rehydrates a thread that already contains the briefing.
+        """
+        store = self._conversation_store
+        if store is None:
+            logger.debug(
+                "No conversation store; cannot bridge delivery to %s",
+                recipient,
+            )
+            return
+
+        # Resolve recipient name → phone (same path _dispatch_text uses).
+        from boxbot.communication.auth import get_auth_manager
+        auth = get_auth_manager()
+        if auth is None:
+            logger.warning(
+                "No auth manager; cannot bridge delivery to %s", recipient,
+            )
+            return
+        phone: str | None = None
+        try:
+            for user in await auth.list_users():
+                if user.name.strip().lower() == recipient.strip().lower():
+                    phone = user.phone
+                    break
+        except Exception:
+            logger.exception("Failed to resolve %s for bridge", recipient)
+            return
+        if phone is None:
+            logger.warning(
+                "Cannot bridge delivery — '%s' is not a registered user",
+                recipient,
+            )
+            return
+
+        channel_key = f"whatsapp:{phone}"
+        window = float(get_config().whatsapp.thread_window_seconds)
+        agent_name = get_config().agent.name
+
+        # Hold the index lock so a concurrent _get_or_create_conversation
+        # can't rehydrate the same thread mid-bridge.
+        async with self._index_lock:
+            existing_id = self._conversation_by_key.get(channel_key)
+            conv = (
+                self._conversations.get(existing_id)
+                if existing_id else None
+            )
+            if conv is not None and not conv.is_ended:
+                recorded = await conv.ingest_trigger_delivery(
+                    recipient=recipient, content=content,
+                )
+                if recorded:
+                    logger.info(
+                        "Bridged trigger delivery into live conversation "
+                        "%s (%s)", conv.conversation_id, channel_key,
+                    )
+                    return
+                # conv was ENDED between the check and the call — fall
+                # through to the store path.
+
+            # Store-only path: no live conversation. Resurrect the
+            # recipient's thread within the window, or start a fresh
+            # persistent one, and append the delivery turns.
+            record, created = await store.get_or_create_active(
+                channel="whatsapp",
+                channel_key=channel_key,
+                max_inactive_seconds=window,
+                participants={recipient, agent_name},
+            )
+            turns = Conversation.build_trigger_delivery_turns(
+                recipient, content,
+            )
+            await store.append_turns(record.conversation_id, turns)
+            logger.info(
+                "Bridged trigger delivery into %s conversation %s (%s)",
+                "new" if created else "stored",
+                record.conversation_id, channel_key,
             )
 
     @staticmethod

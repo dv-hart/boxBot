@@ -278,6 +278,54 @@ class ConversationStore:
         row = await cursor.fetchone()
         return ConversationRecord._from_row(row) if row else None
 
+    async def get_or_create_active(
+        self,
+        *,
+        channel: str,
+        channel_key: str,
+        max_inactive_seconds: float,
+        participants: set[str] | None = None,
+    ) -> tuple[ConversationRecord, bool]:
+        """Return the active conversation for ``channel_key``, creating a
+        fresh one if none is inside the rolling window.
+
+        Returns ``(record, created)`` — ``created`` is True when a new
+        row was minted. Used by dispatch-as-bridge: a trigger's outbound
+        message needs a persistent home for the recipient — their live
+        thread if one's still open, else a fresh thread — so that a
+        later reply lands in a conversation that contains the delivery.
+
+        On an existing thread, any new ``participants`` are merged in.
+        """
+        existing = await self.get_active(
+            channel_key, max_inactive_seconds=max_inactive_seconds,
+        )
+        if existing is not None:
+            if participants:
+                merged = set(existing.participants) | participants
+                if merged != set(existing.participants):
+                    await self.update_participants(
+                        existing.conversation_id, merged,
+                    )
+                    existing = ConversationRecord(
+                        conversation_id=existing.conversation_id,
+                        channel=existing.channel,
+                        channel_key=existing.channel_key,
+                        started_at_iso=existing.started_at_iso,
+                        last_activity_at_iso=existing.last_activity_at_iso,
+                        participants=sorted(merged),
+                        state=existing.state,
+                        extracted_at_iso=existing.extracted_at_iso,
+                        summary=existing.summary,
+                    )
+            return existing, False
+        record = await self.create(
+            channel=channel,
+            channel_key=channel_key,
+            participants=participants,
+        )
+        return record, True
+
     async def list_active(
         self,
         *,

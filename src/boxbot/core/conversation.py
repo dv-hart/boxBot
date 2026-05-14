@@ -227,6 +227,15 @@ class Conversation:
         # how overheard utterances reach the model without forcing a
         # mid-TTS cancel-and-restart.
         self._pending_inputs: list[dict[str, Any]] = []
+        # Turns delivered into this conversation from OUTSIDE its own
+        # generation loop — specifically dispatch-as-bridge, where a
+        # trigger conversation's outbound message is recorded into the
+        # recipient's thread so a reply continues a conversation that
+        # contains the delivery. Unlike _pending_inputs, draining these
+        # does NOT start a fresh generation — they are history only.
+        # Populated only when the conversation is mid-generation;
+        # folded into _thread at the next generation-complete boundary.
+        self._pending_external_turns: list[dict[str, Any]] = []
         self._current_turn_started: float = 0.0
 
         # Per-conversation lock: serialises handle_input / end so input
@@ -487,6 +496,95 @@ class Conversation:
         self._pending_inputs = []
         return drained
 
+    @staticmethod
+    def build_trigger_delivery_turns(
+        recipient: str, content: str,
+    ) -> list[dict[str, Any]]:
+        """The turn pair recording a trigger-delivered message.
+
+        A ``[trigger]`` framing turn (so it's marked as a proactive
+        delivery, not a human reply, and role-alternation holds) plus
+        an assistant turn carrying the delivered text. Shared by both
+        dispatch-as-bridge paths — the live-conversation path
+        (``ingest_trigger_delivery``) and the store-only path in the
+        agent — so the recorded shape is identical either way.
+        """
+        return [
+            {
+                "role": "user",
+                "content": (
+                    f"[trigger] Scheduled delivery — the assistant sent "
+                    f"the message below to {recipient}."
+                ),
+            },
+            {"role": "assistant", "content": content},
+        ]
+
+    async def ingest_trigger_delivery(
+        self, *, recipient: str, content: str,
+    ) -> bool:
+        """Record a trigger-delivered message into this conversation's
+        thread (dispatch-as-bridge).
+
+        When a trigger conversation sends ``recipient`` a text, that
+        delivery is also recorded here — in the recipient's own real
+        conversation — so a later reply continues a thread that
+        actually contains the briefing, rather than landing in a fresh
+        conversation with no context.
+
+        The delivery is recorded as a ``[trigger]`` framing turn plus
+        an assistant turn carrying the delivered text — preserving
+        role-alternation and marking it as a proactive delivery, not a
+        reply. It is history only: it never starts a generation.
+
+        Concurrency: if the conversation is mid-generation
+        (THINKING / SPEAKING) the turns are persisted to the store
+        immediately but the in-memory ``_thread`` fold-in is deferred
+        to the next generation-complete boundary, so we never mutate
+        the thread under an in-flight API call.
+
+        Returns True if recorded, False if the conversation has ENDED
+        (the caller should fall back to a fresh store-backed thread).
+        """
+        turns = self.build_trigger_delivery_turns(recipient, content)
+        async with self._lock:
+            if self._state is ConversationState.ENDED:
+                return False
+
+            # Persist immediately. The store has its own locking, and
+            # persisting now means the delivery survives even if the
+            # conversation ends before the in-memory fold-in.
+            if self._store is not None:
+                try:
+                    await self._store.append_turns(
+                        self.conversation_id, list(turns),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Conversation %s: failed to persist trigger "
+                        "delivery", self.conversation_id,
+                    )
+
+            if self._state in (
+                ConversationState.IDLE, ConversationState.LISTENING,
+            ):
+                # Not generating — safe to fold into the live thread now.
+                self._thread.extend(turns)
+                self._last_activity_monotonic = time.monotonic()
+                # A persistent thread that had gone idle is "live" again
+                # for the rolling window — a reply now continues it.
+                self._reset_silence_timer()
+            else:
+                # THINKING / SPEAKING — defer the in-memory fold-in.
+                # Already persisted above.
+                self._pending_external_turns.extend(turns)
+            logger.info(
+                "Conversation %s: ingested trigger delivery to %s "
+                "(state=%s)",
+                self.conversation_id, recipient, self._state.value,
+            )
+            return True
+
     async def interrupt(self) -> None:
         """Cancel the in-flight generation and clear queued inputs.
 
@@ -546,6 +644,11 @@ class Conversation:
                 await self._cancel_and_fold()
             # Drop any queued utterances — the conversation is over.
             self._pending_inputs = []
+            # Deferred trigger-delivery turns were already persisted by
+            # ingest_trigger_delivery; only the in-memory fold-in is
+            # lost, which is fine — a rehydrate picks them up from the
+            # store. Clear so a stale reference can't leak.
+            self._pending_external_turns = []
 
             # Don't cancel the silence timer if we ARE the silence
             # timer — self-cancel would abort the publish_ended below.
@@ -664,6 +767,21 @@ class Conversation:
                 return result
 
             async with self._lock:
+                # Fold in any trigger deliveries that landed mid-
+                # generation (dispatch-as-bridge). Already persisted by
+                # ingest_trigger_delivery — here we only sync the in-
+                # memory thread. History only: this does NOT start a
+                # fresh generation, unlike _pending_inputs below.
+                if self._pending_external_turns:
+                    self._thread.extend(self._pending_external_turns)
+                    logger.info(
+                        "Conversation %s: folded %d deferred trigger-"
+                        "delivery turn(s) into thread",
+                        self.conversation_id,
+                        len(self._pending_external_turns),
+                    )
+                    self._pending_external_turns = []
+
                 if not self._pending_inputs:
                     self._state = ConversationState.LISTENING
                     # Restart the silence countdown from end-of-turn so the

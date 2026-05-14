@@ -243,6 +243,88 @@ async def test_append_turn_bumps_last_activity(store):
 
 
 @pytest.mark.asyncio
+async def test_get_or_create_active_returns_existing_within_window(store):
+    """dispatch-as-bridge: a trigger's outbound delivery to someone
+    with a live thread should land in THAT thread, not a new one."""
+    rec = await store.create(
+        channel="whatsapp", channel_key="whatsapp:+15551111111",
+    )
+    await store.append_turn(
+        rec.conversation_id, role="user",
+        content={"role": "user", "content": "hi"},
+    )
+    got, created = await store.get_or_create_active(
+        channel="whatsapp",
+        channel_key="whatsapp:+15551111111",
+        max_inactive_seconds=3600,
+    )
+    assert created is False
+    assert got.conversation_id == rec.conversation_id
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_active_creates_when_none(store):
+    """No live thread for the recipient → a fresh persistent thread is
+    minted so the delivery has a home and a reply can continue it."""
+    got, created = await store.get_or_create_active(
+        channel="whatsapp",
+        channel_key="whatsapp:+15559999999",
+        max_inactive_seconds=3600,
+        participants={"Carina"},
+    )
+    assert created is True
+    assert got.channel_key == "whatsapp:+15559999999"
+    assert got.participants == ["Carina"]
+    # And it's immediately findable as the active thread.
+    found = await store.get_active(
+        "whatsapp:+15559999999", max_inactive_seconds=3600,
+    )
+    assert found is not None
+    assert found.conversation_id == got.conversation_id
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_active_creates_when_stale(store):
+    """An out-of-window thread doesn't count — a delivery starts fresh
+    rather than resurrecting a long-dead conversation."""
+    old = await store.create(
+        channel="whatsapp", channel_key="whatsapp:+15551111111",
+    )
+    await _shift_last_activity(store, old.conversation_id, seconds_ago=7200)
+    got, created = await store.get_or_create_active(
+        channel="whatsapp",
+        channel_key="whatsapp:+15551111111",
+        max_inactive_seconds=3600,
+    )
+    assert created is True
+    assert got.conversation_id != old.conversation_id
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_active_merges_participants(store):
+    """Delivering into an existing thread folds in any new participant
+    without losing the ones already there."""
+    rec = await store.create(
+        channel="whatsapp", channel_key="whatsapp:+15551111111",
+        participants={"Jacob"},
+    )
+    await store.append_turn(
+        rec.conversation_id, role="user",
+        content={"role": "user", "content": "hi"},
+    )
+    got, created = await store.get_or_create_active(
+        channel="whatsapp",
+        channel_key="whatsapp:+15551111111",
+        max_inactive_seconds=3600,
+        participants={"boxBot"},
+    )
+    assert created is False
+    assert set(got.participants) == {"Jacob", "boxBot"}
+    persisted = await store.get(rec.conversation_id)
+    assert set(persisted.participants) == {"Jacob", "boxBot"}
+
+
+@pytest.mark.asyncio
 async def test_delete_cascades_turns(store):
     rec = await store.create(
         channel="whatsapp", channel_key="whatsapp:+15551111111",

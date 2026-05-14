@@ -21,9 +21,17 @@ from boxbot.core.agent import (
 
 
 def _trigger_initial_msg(description: str = "Morning briefing") -> dict:
+    # Mirror the EXACT wire format produced by
+    # Conversation._format_user_message for source="trigger":
+    #   {"role": "user", "content": f"[trigger] {text}"}
+    # where ``text`` is the "[Trigger fired: ...]\nInstructions: ..."
+    # string built in agent._on_trigger_fired. Earlier this fixture
+    # used the un-prefixed form, which is why the _has_human_reply
+    # bug (matching "[Trigger fired:" instead of "[trigger]") slipped
+    # through — the test didn't reproduce the real thread content.
     return {
         "role": "user",
-        "content": f"[Trigger fired: {description}]\nInstructions: do stuff",
+        "content": f"[trigger] [Trigger fired: {description}]\nInstructions: do stuff",
     }
 
 
@@ -51,6 +59,38 @@ def _assistant_message_tool_use(to: str, content: str = "hi") -> dict:
 
 
 class TestHasHumanReply:
+    def test_recognises_real_format_user_message_output(self) -> None:
+        """Regression guard: exercise the ACTUAL
+        Conversation._format_user_message so the fixture can never
+        drift from the real wire format again. The original
+        _has_human_reply bug was exactly this drift — it matched
+        "[Trigger fired:" while the thread stores "[trigger] ...".
+        """
+        from boxbot.core.conversation import Conversation
+
+        # _format_user_message is a pure method; we only need an
+        # instance, not a fully wired conversation.
+        conv = object.__new__(Conversation)
+        trigger_msg = conv._format_user_message(
+            "[Trigger fired: Morning briefing]\nInstructions: do stuff",
+            speaker_name="Jacob",
+            source="trigger",
+        )
+        # A thread of just the synthetic trigger message + tool traffic
+        # must NOT count as a human reply.
+        msgs = [
+            trigger_msg,
+            _assistant_message_tool_use("Jacob"),
+            _tool_result_user_msg(),
+        ]
+        assert _has_human_reply(msgs) is False
+
+        # And a real human voice line through the same formatter MUST.
+        human_msg = conv._format_user_message(
+            "what about Carina?", speaker_name="Jacob", source="user",
+        )
+        assert _has_human_reply([trigger_msg, human_msg]) is True
+
     def test_pure_trigger_thread_has_no_human_reply(self) -> None:
         msgs = [
             _trigger_initial_msg(),

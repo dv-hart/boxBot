@@ -548,29 +548,38 @@ _OVERSIZE_IMAGE_RE = re.compile(
 )
 
 
-# The initial user message synthesised by `_on_trigger_fired` starts
-# with this prefix; we use it both to recognise trigger threads and to
-# extract the human-readable trigger description for the journal.
-_TRIGGER_PREFIX = "[Trigger fired:"
+# Synthetic trigger messages land in the thread via
+# `Conversation._format_user_message`, which prefixes them with
+# ``"[trigger] "`` — NOT the raw ``"[Trigger fired:"`` text from
+# `_on_trigger_fired`. ``_has_human_reply`` must match the wire
+# format, not the pre-formatting string. (`_TRIGGER_DESC_RE` still
+# works either way because it `.search`es for the inner fragment.)
+_TRIGGER_WIRE_PREFIX = "[trigger]"
 _TRIGGER_DESC_RE = re.compile(r"\[Trigger fired:\s*(.+?)\]")
 
 
 def _has_human_reply(messages: list[dict[str, Any]]) -> bool:
-    """True if any user turn after the trigger initial message is a
-    real human reply (not a synthetic trigger fire and not a
-    tool_result returning to the model).
+    """True if any user turn in the thread is a real human reply
+    (not a synthetic trigger fire, not a tool_result returning to
+    the model).
 
     Trigger conversations don't usually accept follow-up — they're
     one-shot per firing per the channel-key contract — but if a
     human ever does land on a trigger thread, we let the full
     extraction path run rather than collapsing them to a stub.
+
+    Synthetic trigger messages are recognised by the ``[trigger]``
+    wire prefix that ``Conversation._format_user_message`` stamps
+    on them — checked at any position, since a real human message
+    never starts that way (human input is either raw text or
+    ``[Name]:`` attributed).
     """
-    for i, msg in enumerate(messages):
+    for msg in messages:
         if msg.get("role") != "user":
             continue
         content = msg.get("content")
-        if i == 0 and isinstance(content, str) and content.startswith(
-            _TRIGGER_PREFIX
+        if isinstance(content, str) and content.startswith(
+            _TRIGGER_WIRE_PREFIX
         ):
             # synthetic trigger-initiation message
             continue

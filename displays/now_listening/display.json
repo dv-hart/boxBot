@@ -1,0 +1,87 @@
+{
+  "name": "now_listening",
+  "theme": "boxbot",
+  "transition": "crossfade",
+  "data_sources": [
+    { "name": "agent_status", "type": "builtin" },
+    { "name": "people", "type": "builtin" }
+  ],
+  "layout": {
+    "type": "column",
+    "padding": [36, 48, 36, 48],
+    "gap": 0,
+    "children": [
+      {
+        "type": "row",
+        "align": "start",
+        "gap": 0,
+        "children": [
+          {
+            "type": "row",
+            "gap": 10,
+            "align": "start",
+            "children": [
+              { "type": "icon", "name": "mic", "size": "sm", "color": "accent" },
+              { "type": "text", "content": "{agent_status.state}", "size": "caption", "color": "accent", "weight": "semibold" }
+            ]
+          },
+          { "type": "spacer" },
+          { "type": "clock", "size": "md", "show_date": false, "show_seconds": false }
+        ]
+      },
+      { "type": "spacer", "size": 80 },
+      {
+        "type": "column",
+        "gap": 8,
+        "align": "center",
+        "children": [
+          { "type": "text", "content": "{people.present[0].name}", "size": "title", "weight": "bold", "align": "center" },
+          { "type": "text", "content": "present · {people.present[0].since}", "size": "body", "color": "muted", "align": "center" }
+        ]
+      },
+      { "type": "spacer", "size": 48 },
+      { "type": "divider", "color": "dim" },
+      { "type": "spacer", "size": 20 },
+      {
+        "type": "row",
+        "align": "spread",
+        "children": [
+          {
+            "type": "column",
+            "gap": 4,
+            "children": [
+              { "type": "text", "content": "LAST HEARD", "size": "small", "color": "muted", "weight": "semibold" },
+              { "type": "text", "content": "{agent_status.last_active}", "size": "body" }
+            ]
+          },
+          {
+            "type": "column",
+            "gap": 4,
+            "align": "center",
+            "children": [
+              { "type": "text", "content": "IN THE ROOM", "size": "small", "color": "muted", "weight": "semibold", "align": "center" },
+              {
+                "type": "row",
+                "gap": 8,
+                "align": "center",
+                "children": [
+                  { "type": "icon", "name": "users", "size": "sm", "color": "text" },
+                  { "type": "text", "content": "{people.count}", "size": "body", "weight": "medium" }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "column",
+            "gap": 4,
+            "align": "end",
+            "children": [
+              { "type": "text", "content": "NEXT WAKE", "size": "small", "color": "muted", "weight": "semibold", "align": "right" },
+              { "type": "text", "content": "{agent_status.next_wake}", "size": "body", "align": "right" }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

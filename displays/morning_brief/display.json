@@ -1,0 +1,198 @@
+{
+  "name": "morning_brief",
+  "theme": "boxbot",
+  "transition": "crossfade",
+  "data_sources": [
+    { "name": "weather", "type": "integration", "refresh": 3600 },
+    { "name": "calendar", "type": "integration", "inputs": { "action": "list_upcoming_events", "max_results": 5 }, "refresh": 600 },
+    { "name": "tasks", "type": "builtin", "refresh": 300 },
+    { "name": "people", "type": "builtin" },
+    { "name": "clock", "type": "builtin" }
+  ],
+  "layout": {
+    "type": "column",
+    "padding": [24, 32, 24, 32],
+    "gap": 18,
+    "children": [
+      {
+        "type": "row",
+        "align": "spread",
+        "children": [
+          { "type": "text", "content": "Good morning, {people.present[0].name}", "size": "heading", "weight": "bold" },
+          {
+            "type": "column",
+            "align": "end",
+            "children": [
+              { "type": "clock", "size": "md", "show_date": false, "show_seconds": false },
+              { "type": "text", "content": "{clock.day_of_week}, {clock.date}", "size": "caption", "color": "muted", "align": "right" }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "columns",
+        "ratios": [5, 4],
+        "gap": 18,
+        "children": [
+          {
+            "type": "card",
+            "padding": 24,
+            "children": [
+              {
+                "type": "column",
+                "gap": 14,
+                "children": [
+                  { "type": "text", "content": "WEATHER", "size": "small", "color": "muted", "weight": "semibold" },
+                  {
+                    "type": "row",
+                    "gap": 18,
+                    "align": "start",
+                    "children": [
+                      { "type": "icon", "name": "{weather.icon}", "size": "xl", "color": "accent" },
+                      {
+                        "type": "column",
+                        "gap": 2,
+                        "children": [
+                          { "type": "text", "content": "{weather.temp}°", "size": "title", "weight": "bold" },
+                          { "type": "text", "content": "{weather.condition}", "size": "body", "color": "muted" }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "type": "row",
+                    "gap": 18,
+                    "align": "spread",
+                    "children": [
+                      {
+                        "type": "column",
+                        "gap": 2,
+                        "align": "center",
+                        "children": [
+                          { "type": "text", "content": "{weather.forecast[0].day}", "size": "caption", "color": "muted" },
+                          { "type": "icon", "name": "{weather.forecast[0].icon}", "size": "sm", "color": "muted" },
+                          { "type": "text", "content": "{weather.forecast[0].high}", "size": "caption" }
+                        ]
+                      },
+                      {
+                        "type": "column",
+                        "gap": 2,
+                        "align": "center",
+                        "children": [
+                          { "type": "text", "content": "{weather.forecast[1].day}", "size": "caption", "color": "muted" },
+                          { "type": "icon", "name": "{weather.forecast[1].icon}", "size": "sm", "color": "muted" },
+                          { "type": "text", "content": "{weather.forecast[1].high}", "size": "caption" }
+                        ]
+                      },
+                      {
+                        "type": "column",
+                        "gap": 2,
+                        "align": "center",
+                        "children": [
+                          { "type": "text", "content": "{weather.forecast[2].day}", "size": "caption", "color": "muted" },
+                          { "type": "icon", "name": "{weather.forecast[2].icon}", "size": "sm", "color": "muted" },
+                          { "type": "text", "content": "{weather.forecast[2].high}", "size": "caption" }
+                        ]
+                      },
+                      {
+                        "type": "column",
+                        "gap": 2,
+                        "align": "center",
+                        "children": [
+                          { "type": "text", "content": "{weather.forecast[3].day}", "size": "caption", "color": "muted" },
+                          { "type": "icon", "name": "{weather.forecast[3].icon}", "size": "sm", "color": "muted" },
+                          { "type": "text", "content": "{weather.forecast[3].high}", "size": "caption" }
+                        ]
+                      },
+                      {
+                        "type": "column",
+                        "gap": 2,
+                        "align": "center",
+                        "children": [
+                          { "type": "text", "content": "{weather.forecast[4].day}", "size": "caption", "color": "muted" },
+                          { "type": "icon", "name": "{weather.forecast[4].icon}", "size": "sm", "color": "muted" },
+                          { "type": "text", "content": "{weather.forecast[4].high}", "size": "caption" }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "column",
+            "gap": 14,
+            "children": [
+              {
+                "type": "card",
+                "padding": 18,
+                "children": [
+                  {
+                    "type": "column",
+                    "gap": 10,
+                    "children": [
+                      { "type": "text", "content": "NEXT UP", "size": "small", "color": "muted", "weight": "semibold" },
+                      {
+                        "type": "row",
+                        "gap": 14,
+                        "align": "start",
+                        "children": [
+                          { "type": "text", "content": "{calendar.events[0].time}", "size": "subtitle", "color": "accent", "weight": "bold" },
+                          {
+                            "type": "column",
+                            "gap": 0,
+                            "children": [
+                              { "type": "text", "content": "{calendar.events[0].title}", "size": "body", "weight": "medium" },
+                              { "type": "text", "content": "{calendar.events[0].location}", "size": "caption", "color": "muted" }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": "card",
+                "padding": 18,
+                "children": [
+                  {
+                    "type": "column",
+                    "gap": 10,
+                    "children": [
+                      {
+                        "type": "row",
+                        "align": "spread",
+                        "children": [
+                          { "type": "text", "content": "TO-DO", "size": "small", "color": "muted", "weight": "semibold" },
+                          { "type": "badge", "text": "{tasks.count}", "color": "accent" }
+                        ]
+                      },
+                      {
+                        "type": "repeat",
+                        "source": "{tasks.items}",
+                        "max": 3,
+                        "children": [
+                          {
+                            "type": "columns",
+                            "ratios": [1, 14],
+                            "gap": 10,
+                            "children": [
+                              { "type": "icon", "name": "circle", "size": "sm", "color": "muted" },
+                              { "type": "text", "content": "{.description}", "size": "body", "max_lines": 1 }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -73,6 +73,13 @@ integrations/*/
 !integrations/calendar/
 displays/*/
 !displays/example_display/
+# Pre-seeded displays ship with the repo. Custom user/agent-authored
+# displays land in displays/<name>/ on the Pi and stay gitignored —
+# add them here individually if they should become pre-seeded too.
+!displays/morning_brief/
+!displays/focus_clock/
+!displays/home_metrics/
+!displays/now_listening/
 data/credentials/
 
 # Agent workspace — directory committed, runtime contents ignored

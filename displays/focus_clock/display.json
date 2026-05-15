@@ -1,0 +1,34 @@
+{
+  "name": "focus_clock",
+  "theme": "boxbot",
+  "transition": "crossfade",
+  "data_sources": [
+    { "name": "weather", "type": "integration", "refresh": 3600 },
+    { "name": "calendar", "type": "integration", "inputs": { "action": "list_upcoming_events", "max_results": 5 }, "refresh": 600 }
+  ],
+  "layout": {
+    "type": "column",
+    "padding": [0, 0, 0, 0],
+    "gap": 0,
+    "align": "center",
+    "children": [
+      { "type": "spacer", "size": 120 },
+      { "type": "clock", "format": "12h", "show_date": false, "show_seconds": false, "size": "xl" },
+      { "type": "spacer", "size": 24 },
+      { "type": "text", "content": "Thursday, April 23", "size": "subtitle", "color": "muted", "align": "center" },
+      { "type": "spacer", "size": 52 },
+      {
+        "type": "row",
+        "gap": 14,
+        "align": "center",
+        "children": [
+          { "type": "icon", "name": "{weather.icon}", "size": "sm", "color": "muted" },
+          { "type": "text", "content": "{weather.temp}° {weather.condition}", "size": "caption", "color": "muted" },
+          { "type": "text", "content": " ·  ", "size": "caption", "color": "dim" },
+          { "type": "icon", "name": "calendar-clock", "size": "sm", "color": "muted" },
+          { "type": "text", "content": "{calendar.events[0].time} {calendar.events[0].title}", "size": "caption", "color": "muted" }
+        ]
+      }
+    ]
+  }
+}

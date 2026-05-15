@@ -1,0 +1,203 @@
+{
+  "name": "home_metrics",
+  "theme": "boxbot",
+  "transition": "crossfade",
+  "data_sources": [
+    { "name": "weather", "type": "integration", "refresh": 3600 }
+  ],
+  "layout": {
+    "type": "column",
+    "padding": [20, 28, 20, 28],
+    "gap": 14,
+    "children": [
+      {
+        "type": "row",
+        "align": "start",
+        "gap": 0,
+        "children": [
+          { "type": "text", "content": "Home", "size": "heading", "weight": "bold" },
+          { "type": "spacer" },
+          { "type": "clock", "size": "md", "show_date": false, "show_seconds": false }
+        ]
+      },
+      {
+        "type": "columns",
+        "ratios": [1, 1, 1, 1],
+        "gap": 14,
+        "children": [
+          {
+            "type": "card",
+            "padding": 16,
+            "children": [
+              {
+                "type": "column",
+                "gap": 6,
+                "children": [
+                  {
+                    "type": "row",
+                    "align": "start",
+                    "gap": 8,
+                    "children": [
+                      { "type": "icon", "name": "{weather.icon}", "size": "sm", "color": "accent" },
+                      { "type": "text", "content": "OUTSIDE", "size": "small", "color": "muted", "weight": "semibold" }
+                    ]
+                  },
+                  { "type": "text", "content": "{weather.temp}°", "size": "title", "weight": "bold" },
+                  { "type": "text", "content": "{weather.condition}", "size": "caption", "color": "muted", "max_lines": 1 }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "card",
+            "padding": 16,
+            "children": [
+              {
+                "type": "column",
+                "gap": 6,
+                "children": [
+                  {
+                    "type": "row",
+                    "align": "start",
+                    "gap": 8,
+                    "children": [
+                      { "type": "icon", "name": "home", "size": "sm", "color": "accent" },
+                      { "type": "text", "content": "INSIDE", "size": "small", "color": "muted", "weight": "semibold" }
+                    ]
+                  },
+                  { "type": "text", "content": "68°", "size": "title", "weight": "bold" },
+                  { "type": "text", "content": "Living room", "size": "caption", "color": "muted" }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "card",
+            "padding": 16,
+            "children": [
+              {
+                "type": "column",
+                "gap": 6,
+                "children": [
+                  {
+                    "type": "row",
+                    "align": "start",
+                    "gap": 8,
+                    "children": [
+                      { "type": "icon", "name": "wifi", "size": "sm", "color": "success" },
+                      { "type": "text", "content": "NETWORK", "size": "small", "color": "muted", "weight": "semibold" }
+                    ]
+                  },
+                  { "type": "text", "content": "112", "size": "title", "weight": "bold" },
+                  { "type": "text", "content": "ms · 1 Gbps", "size": "caption", "color": "muted" }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "card",
+            "padding": 16,
+            "children": [
+              {
+                "type": "column",
+                "gap": 6,
+                "children": [
+                  {
+                    "type": "row",
+                    "align": "start",
+                    "gap": 8,
+                    "children": [
+                      { "type": "icon", "name": "battery-full", "size": "sm", "color": "success" },
+                      { "type": "text", "content": "POWER", "size": "small", "color": "muted", "weight": "semibold" }
+                    ]
+                  },
+                  { "type": "text", "content": "87%", "size": "title", "weight": "bold" },
+                  { "type": "text", "content": "UPS · on mains", "size": "caption", "color": "muted" }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "columns",
+        "ratios": [3, 2],
+        "gap": 14,
+        "children": [
+          {
+            "type": "card",
+            "padding": 18,
+            "children": [
+              {
+                "type": "column",
+                "gap": 10,
+                "children": [
+                  {
+                    "type": "row",
+                    "align": "start",
+                    "gap": 0,
+                    "children": [
+                      { "type": "text", "content": "POWER DRAW", "size": "small", "color": "muted", "weight": "semibold" },
+                      { "type": "spacer" },
+                      { "type": "text", "content": "7 days · 38W avg", "size": "small", "color": "dim" }
+                    ]
+                  },
+                  { "type": "chart", "chart_type": "area", "data": [32, 28, 35, 41, 38, 44, 40], "height": 170, "show_dots": true, "x_labels": ["Fri","Sat","Sun","Mon","Tue","Wed","Thu"] }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "card",
+            "padding": 18,
+            "children": [
+              {
+                "type": "column",
+                "gap": 12,
+                "children": [
+                  { "type": "text", "content": "SYSTEM", "size": "small", "color": "muted", "weight": "semibold" },
+                  {
+                    "type": "columns",
+                    "ratios": [2, 3],
+                    "gap": 12,
+                    "children": [
+                      { "type": "text", "content": "CPU", "size": "body", "color": "muted" },
+                      { "type": "text", "content": "23%", "size": "body", "weight": "medium" }
+                    ]
+                  },
+                  {
+                    "type": "columns",
+                    "ratios": [2, 3],
+                    "gap": 12,
+                    "children": [
+                      { "type": "text", "content": "SoC · Hailo", "size": "body", "color": "muted" },
+                      { "type": "text", "content": "51° · 44°", "size": "body", "weight": "medium" }
+                    ]
+                  },
+                  {
+                    "type": "columns",
+                    "ratios": [2, 3],
+                    "gap": 12,
+                    "children": [
+                      { "type": "text", "content": "Memory", "size": "body", "color": "muted" },
+                      { "type": "text", "content": "3.2 / 8.0 GB", "size": "body", "weight": "medium" }
+                    ]
+                  },
+                  {
+                    "type": "columns",
+                    "ratios": [2, 3],
+                    "gap": 12,
+                    "children": [
+                      { "type": "text", "content": "Uptime", "size": "body", "color": "muted" },
+                      { "type": "text", "content": "3d 14h", "size": "body", "weight": "medium" }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

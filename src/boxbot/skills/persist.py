@@ -51,6 +51,14 @@ _SCRIPTS_INIT_HEADER = (
     '"""\n'
 )
 
+# Sentinel file stamped into every skill directory written by
+# :func:`write_skill`. ``delete_skill`` refuses to remove any skill that
+# lacks this marker so built-in skills (shipped under ``<repo>/skills/``
+# without the marker) can never be deleted by the agent. Pre-existing
+# agent-authored skills that pre-date this marker need a manual one-time
+# ``touch`` of this file to become deletable.
+_AGENT_MARKER = ".agent-authored"
+
 
 class SkillWriteError(Exception):
     """Raised when a skill payload is invalid or the target conflicts."""
@@ -239,6 +247,11 @@ def write_skill(
     target.mkdir(parents=True, exist_ok=False)
     written: list[str] = []
 
+    # Stamp the agent-authored marker first so even a partial write
+    # leaves the dir clearly identifiable as agent-owned (and therefore
+    # deletable).
+    (target / _AGENT_MARKER).write_text("", encoding="utf-8")
+
     skill_md = target / _SKILL_FILE
     skill_md.write_text(_render_skill_md(name, description, body), encoding="utf-8")
     written.append(_SKILL_FILE)
@@ -266,4 +279,65 @@ def write_skill(
         "name": name,
         "path": str(target),
         "files": written,
+    }
+
+
+def delete_skill(
+    payload: dict[str, Any],
+    *,
+    skills_root: Path | None = None,
+) -> dict[str, Any]:
+    """Remove an agent-authored skill directory.
+
+    Refuses to delete skills that lack the ``.agent-authored`` marker —
+    that is, anything that wasn't created by :func:`write_skill`. This
+    is the only thing keeping ``bb.skill.delete("bb")`` from wiping a
+    built-in.
+
+    Result shapes mirror :func:`write_skill`:
+
+    - ``{"status": "ok", "name": ..., "path": ...}`` — removed
+    - ``{"status": "not_found", "name": ..., "path": ...}`` — no such dir
+    - ``{"status": "forbidden", "name": ..., "path": ...}`` — exists but
+      not agent-authored
+    - ``{"status": "error", "message": ...}`` — validation or I/O error
+    """
+    try:
+        name = _validate_name(payload.get("name"))
+    except SkillWriteError as exc:
+        return {"status": exc.status, "message": exc.message}
+
+    root = (skills_root or _DEFAULT_SKILLS_ROOT)
+    try:
+        target = _resolve_target(name, root)
+    except SkillWriteError as exc:
+        return {"status": exc.status, "message": exc.message}
+
+    if not target.exists():
+        return {
+            "status": "not_found",
+            "name": name,
+            "path": str(target),
+            "message": f"skill '{name}' does not exist",
+        }
+
+    marker = target / _AGENT_MARKER
+    if not marker.exists():
+        return {
+            "status": "forbidden",
+            "name": name,
+            "path": str(target),
+            "message": (
+                f"skill '{name}' is not agent-authored (no {_AGENT_MARKER} "
+                "marker); only skills created via bb.skill.save can be deleted"
+            ),
+        }
+
+    import shutil
+    shutil.rmtree(target)
+    logger.info("Deleted skill '%s' at %s", name, target)
+    return {
+        "status": "ok",
+        "name": name,
+        "path": str(target),
     }

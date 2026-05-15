@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from boxbot.skills import loader as skills_loader
-from boxbot.skills.persist import write_skill
+from boxbot.skills.persist import _AGENT_MARKER, delete_skill, write_skill
 from boxbot.tools._sandbox_actions import ActionContext, process_action
 
 
@@ -224,7 +224,88 @@ class TestDispatcherRouting:
     async def test_unknown_skill_subaction_returns_error(self):
         ctx = ActionContext()
         result = await process_action(
-            {"_sdk": "skill.delete", "name": "x"}, ctx
+            {"_sdk": "skill.frobnicate", "name": "x"}, ctx
         )
         assert result["status"] == "error"
-        assert "skill.delete" in result["message"]
+        assert "skill.frobnicate" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_skill_delete_routes_to_handler(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from boxbot.skills import persist as persist_mod
+
+        monkeypatch.setattr(persist_mod, "_DEFAULT_SKILLS_ROOT", tmp_path)
+
+        # First save a skill so there's something to delete. The save
+        # path stamps the agent-authored marker so delete will accept it.
+        await process_action(
+            {
+                "_sdk": "skill.save",
+                "name": "to-delete",
+                "description": "Will be deleted.",
+                "body": "# Bye\n",
+            },
+            ActionContext(),
+        )
+        assert (tmp_path / "to-delete" / _AGENT_MARKER).exists()
+
+        ctx = ActionContext()
+        result = await process_action(
+            {"_sdk": "skill.delete", "name": "to-delete"}, ctx
+        )
+        assert result["status"] == "ok", result
+        assert not (tmp_path / "to-delete").exists()
+
+
+# ---------------------------------------------------------------------------
+# Delete writer — protects built-ins, removes agent-authored
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteSkill:
+    def test_save_stamps_agent_marker(self, tmp_path: Path):
+        write_skill(
+            {
+                "name": "marked",
+                "description": "Stamps the agent-authored marker.",
+                "body": "# x\n",
+            },
+            skills_root=tmp_path,
+        )
+        assert (tmp_path / "marked" / _AGENT_MARKER).is_file()
+
+    def test_delete_removes_agent_authored_skill(self, tmp_path: Path):
+        write_skill(
+            {
+                "name": "doomed",
+                "description": "Going away.",
+                "body": "# x\n",
+            },
+            skills_root=tmp_path,
+        )
+        assert (tmp_path / "doomed").is_dir()
+
+        result = delete_skill({"name": "doomed"}, skills_root=tmp_path)
+        assert result["status"] == "ok"
+        assert result["name"] == "doomed"
+        assert not (tmp_path / "doomed").exists()
+
+    def test_delete_refuses_skill_without_marker(self, tmp_path: Path):
+        # Hand-stage a "built-in"-style skill: directory exists, no marker.
+        (tmp_path / "builtin").mkdir()
+        (tmp_path / "builtin" / "SKILL.md").write_text("---\nname: builtin\n---\n")
+
+        result = delete_skill({"name": "builtin"}, skills_root=tmp_path)
+        assert result["status"] == "forbidden"
+        # Skill files survived the refused delete.
+        assert (tmp_path / "builtin" / "SKILL.md").exists()
+
+    def test_delete_missing_skill_returns_not_found(self, tmp_path: Path):
+        result = delete_skill({"name": "ghost"}, skills_root=tmp_path)
+        assert result["status"] == "not_found"
+
+    def test_delete_validates_name(self, tmp_path: Path):
+        result = delete_skill({"name": "../escape"}, skills_root=tmp_path)
+        assert result["status"] == "error"
+        assert "[a-z0-9_-]" in result["message"]

@@ -135,8 +135,45 @@ s.save()
 
 `save()` returns immediately. The loader picks the skill up on the next
 discovery scan (typically next conversation). If a skill named `weather`
-already exists, save fails with `status: "exists"` — delete it first
-(or pick a different name) instead of overwriting.
+already exists, save fails with `status: "exists"` — call
+`bb.skill.delete("weather")` first (or pick a different name) instead of
+overwriting.
+
+## Iterating on a skill you wrote
+
+You'll occasionally discover a bug in a skill you authored — usually a
+bundled script that throws when it runs. Two things you need to know:
+
+**Read your own script.** Skills live under `<repo>/skills/<name>/`,
+which the sandbox can't browse directly. Use `load_skill` with `subpath`
+to pull a specific file into the conversation:
+
+```python
+# In a tool call, not execute_script
+load_skill(name="refresh_weekly_glance_agenda", subpath="scripts/refresh.py")
+```
+
+The body comes back as text you can read, diagnose, and rewrite.
+
+**Replace it via delete + create.** `bb.skill.save()` will not overwrite
+an existing skill. The flow is:
+
+```python
+import boxbot_sdk as bb
+
+bb.skill.delete("refresh_weekly_glance_agenda")  # only agent-authored skills
+s = bb.skill.create("refresh_weekly_glance_agenda")
+s.description = "..."
+s.body = "..."
+s.add_script("refresh.py", fixed_source)
+s.save()
+```
+
+`delete` refuses to remove built-in skills (`bb`, `skill_authoring`,
+`onboarding`, `hal-sandbox-ref`, anything shipped under `<repo>/skills/`
+in git) — it requires the `.agent-authored` marker that `save` stamps.
+If you get `status: "forbidden"`, you're trying to delete a built-in;
+pick a different name instead.
 
 ## Skill vs. integration
 

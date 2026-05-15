@@ -804,11 +804,18 @@ class DisplayManager:
         display_name: str,
         source_name: str,
         value: dict[str, Any],
-    ) -> bool:
-        """Update a static data source without rebuilding the display.
+    ) -> dict[str, Any]:
+        """Update a static data source on any registered display.
 
-        The agent can change what flows through the data pipe without
-        touching the layout. No preview or approval needed.
+        Works whether or not the display is currently active. The spec's
+        matching ``data_sources[i].value`` is always mutated in memory so
+        the next activation initializes the source with the fresh value;
+        if the display is also currently active, the live source
+        instance is updated and a re-render is triggered immediately.
+
+        The caller is responsible for persisting the updated spec to disk
+        for agent-saved displays so the change survives a process
+        restart (the sandbox action handler does this).
 
         Args:
             display_name: The display that owns the source.
@@ -816,31 +823,71 @@ class DisplayManager:
             value: New data value.
 
         Returns:
-            True if the update succeeded.
+            ``{"ok": True, "live": bool}`` on success, where ``live``
+            indicates whether the display was active and the in-memory
+            source was updated (vs. only the spec). On failure, returns
+            ``{"ok": False, "error": "..."}``.
         """
-        if display_name != self._active_display:
+        spec = self._specs.get(display_name)
+        if spec is None:
+            return {
+                "ok": False,
+                "error": f"display '{display_name}' is not registered",
+            }
+
+        # Find the matching static source declaration on the spec. The
+        # type check happens against the declared type, not a runtime
+        # instance, so this works for inactive displays too.
+        target = None
+        for src in spec.data_sources:
+            if src.name == source_name:
+                target = src
+                break
+        if target is None:
+            return {
+                "ok": False,
+                "error": (
+                    f"display '{display_name}' has no source named "
+                    f"'{source_name}'"
+                ),
+            }
+        if target.source_type != "static":
+            return {
+                "ok": False,
+                "error": (
+                    f"source '{source_name}' is type '{target.source_type}', "
+                    "not 'static'"
+                ),
+            }
+
+        # Always update the spec so a later switch sees the new value.
+        target.value = value
+
+        # Live update + re-render only when this display is on screen.
+        if display_name == self._active_display:
+            source = self._data_manager.get_source(source_name)
+            if isinstance(source, StaticSource):
+                source.update(value)
+                self._render_and_update_frame()
+                logger.debug(
+                    "Updated static data for active '%s.%s'",
+                    display_name, source_name,
+                )
+                return {"ok": True, "live": True}
+            # The display claims to be active but its source isn't
+            # registered with the data manager — shouldn't happen, but
+            # don't lie about live update.
             logger.warning(
-                "Cannot update data for inactive display '%s'", display_name
+                "Active display '%s' missing static source '%s' on data manager",
+                display_name, source_name,
             )
-            return False
-
-        source = self._data_manager.get_source(source_name)
-        if not isinstance(source, StaticSource):
-            logger.warning(
-                "Source '%s' is not a static source (type: %s)",
-                source_name, type(source).__name__,
-            )
-            return False
-
-        source.update(value)
-
-        # Re-render with the updated data
-        self._render_and_update_frame()
+            return {"ok": True, "live": False}
 
         logger.debug(
-            "Updated static data for '%s.%s'", display_name, source_name
+            "Updated static data on inactive spec '%s.%s'",
+            display_name, source_name,
         )
-        return True
+        return {"ok": True, "live": False}
 
     # ------------------------------------------------------------------
     # Frame buffer (thread-safe)

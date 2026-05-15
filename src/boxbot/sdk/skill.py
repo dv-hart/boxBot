@@ -60,6 +60,38 @@ def create(name: str) -> SkillBuilder:
     return SkillBuilder(name)
 
 
+def delete(name: str) -> dict[str, Any]:
+    """Remove an agent-authored skill directory.
+
+    Use this to iterate on a skill you authored — delete the existing
+    copy, then ``create(name).save()`` with the fix. Built-in skills
+    (shipped under ``<repo>/skills/``) cannot be deleted; the writer
+    refuses any skill that lacks an ``.agent-authored`` marker stamped
+    by :func:`SkillBuilder.save`.
+
+    Args:
+        name: The skill name. Must match the same constraints as
+            :func:`create`.
+
+    Returns:
+        On success: ``{"status": "ok", "name": ..., "path": ...}``.
+
+    Raises:
+        RuntimeError: If the skill does not exist, is built-in (not
+            agent-authored), or the name fails validation. The error
+            message tells you which.
+    """
+    v.validate_skill_name(name)
+    resp = _transport.request("skill.delete", {"name": name})
+    status = resp.get("status")
+    if status == "ok":
+        return resp
+    raise RuntimeError(
+        resp.get("message")
+        or f"skill.delete returned status={status!r}"
+    )
+
+
 class SkillBuilder:
     """Builder for defining skills declaratively.
 

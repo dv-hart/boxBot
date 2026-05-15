@@ -256,13 +256,22 @@ def screenshot() -> dict[str, Any]:
 
 def update_data(display_name: str, source_name: str, *,
                 value: Any) -> dict[str, Any]:
-    """Push a new value into a ``static`` source on the active display.
+    """Push a new value into a ``static`` source on any registered display.
 
-    Returns the response dict on success.
+    Works whether or not the display is currently active. If active, the
+    update is applied to the live source and the screen re-renders. If
+    inactive, the spec is mutated so the next activation picks up the
+    new value; for agent-saved displays the spec is also persisted to
+    ``data/displays/<name>.json`` so the value survives a restart.
+
+    Returns ``{"status": "ok", "live": bool, "persisted": bool}`` where
+    ``live`` is True if the on-screen source was updated and ``persisted``
+    is True if the spec on disk was rewritten.
 
     Raises:
-        RuntimeError: If the display is not active or the source isn't
-            of type ``static``.
+        RuntimeError: If the display isn't registered, the source name
+            doesn't exist on the spec, or the source isn't of type
+            ``static``.
     """
     return _check(_transport.request("display.update_data", {
         "display": display_name,

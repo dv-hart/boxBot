@@ -895,24 +895,31 @@ def _handle_skill_action(
     payload: dict[str, Any],
     ctx: ActionContext,  # unused; kept for uniform handler signature
 ) -> dict[str, Any]:
-    """Dispatch skill.* actions. Currently only ``skill.save``.
+    """Dispatch skill.* actions — ``save`` and ``delete``.
 
-    The writer lives in :mod:`boxbot.skills.persist` so the file-layout
+    Both writers live in :mod:`boxbot.skills.persist` so the file-layout
     contract is reusable from elsewhere (tests, future ``skill.update``).
     """
-    if action_type != "skill.save":
-        return {
-            "status": "error",
-            "message": f"unknown skill action '{action_type}'",
-        }
+    from boxbot.skills.persist import delete_skill, write_skill
 
-    from boxbot.skills.persist import write_skill
+    if action_type == "skill.save":
+        try:
+            return write_skill(payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("skill.save failed")
+            return {"status": "error", "message": str(exc)}
 
-    try:
-        return write_skill(payload)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("skill.save failed")
-        return {"status": "error", "message": str(exc)}
+    if action_type == "skill.delete":
+        try:
+            return delete_skill(payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("skill.delete failed")
+            return {"status": "error", "message": str(exc)}
+
+    return {
+        "status": "error",
+        "message": f"unknown skill action '{action_type}'",
+    }
 
 
 @action_handler("integrations")
@@ -1854,20 +1861,44 @@ async def _handle_display_action(
             mgr = get_display_manager()
             if mgr is None:
                 return {"status": "error", "error": "display manager not running"}
-            ok = mgr.update_static_data(
-                payload.get("display", ""),
+            display_name = payload.get("display", "")
+            result = mgr.update_static_data(
+                display_name,
                 payload.get("source", ""),
                 payload.get("value"),
             )
-            if not ok:
+            if not result.get("ok"):
                 return {
                     "status": "error",
-                    "error": (
-                        "update_data failed — display must be active and "
-                        "source must be of type 'static'."
-                    ),
+                    "error": result.get("error", "update_data failed"),
                 }
-            return {"status": "ok"}
+
+            # Persist the updated spec to disk for agent-saved displays so
+            # the change survives restart. Inactive updates rely on this:
+            # otherwise the next process boot reloads the stale value
+            # from disk and the in-memory spec mutation is lost.
+            persisted = False
+            agent_dir = _agent_displays_dir()
+            spec_path = agent_dir / f"{display_name}.json"
+            if spec_path.exists():
+                spec = mgr.get_spec(display_name)
+                if spec is not None:
+                    try:
+                        spec_path.write_text(
+                            json.dumps(_spec_to_dict(spec), indent=2)
+                        )
+                        persisted = True
+                    except Exception as e:
+                        logger.warning(
+                            "update_data: failed to persist %s: %s",
+                            spec_path, e,
+                        )
+
+            return {
+                "status": "ok",
+                "live": bool(result.get("live")),
+                "persisted": persisted,
+            }
 
         if sub == "get_active":
             mgr = get_display_manager()

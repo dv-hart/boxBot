@@ -397,14 +397,14 @@ class TestDisplaySDK:
             "value": {"task": "writing", "minutes": 12},
         }
 
-    def test_update_data_raises_when_inactive(self, fake_request):
+    def test_update_data_raises_on_dispatcher_error(self, fake_request):
         from boxbot.sdk import display
 
         fake_request["responses"]["display.update_data"] = {
             "status": "error",
-            "error": "display must be active",
+            "error": "source 'session' is type 'builtin', not 'static'",
         }
-        with pytest.raises(RuntimeError, match="must be active"):
+        with pytest.raises(RuntimeError, match="not 'static'"):
             display.update_data("focus", "session", value={})
 
 
@@ -635,6 +635,44 @@ class TestSkillBuilder:
         s.body = "# x"
         with pytest.raises(ValueError, match="reserved"):
             s.add_resource("SKILL.md", "x")
+
+    def test_delete_emits_action_and_returns_response(self, monkeypatch):
+        from boxbot.sdk import _transport, skill
+
+        calls: list[tuple[str, dict]] = []
+
+        def stub(action_type, payload, *, timeout=30):
+            calls.append((action_type, payload))
+            return {
+                "status": "ok",
+                "name": payload["name"],
+                "path": f"/tmp/skills/{payload['name']}",
+            }
+
+        monkeypatch.setattr(_transport, "request", stub)
+        result = skill.delete("doomed")
+        assert calls == [("skill.delete", {"name": "doomed"})]
+        assert result["status"] == "ok"
+        assert result["name"] == "doomed"
+
+    def test_delete_validates_name(self):
+        from boxbot.sdk import skill
+
+        with pytest.raises(ValueError):
+            skill.delete("../escape")
+
+    def test_delete_raises_on_dispatcher_error(self, monkeypatch):
+        from boxbot.sdk import _transport, skill
+
+        def stub(action_type, payload, *, timeout=30):
+            return {
+                "status": "forbidden",
+                "message": "skill 'bb' is not agent-authored",
+            }
+
+        monkeypatch.setattr(_transport, "request", stub)
+        with pytest.raises(RuntimeError, match="not agent-authored"):
+            skill.delete("bb")
 
 
 # ---------------------------------------------------------------------------

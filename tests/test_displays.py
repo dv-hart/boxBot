@@ -543,3 +543,196 @@ class TestActiveDisplayIntrospection:
             assert "no display" in resp["error"]
         finally:
             set_display_manager(None)
+
+
+class TestUpdateData:
+    """Refresh triggers pre-stage data for displays that aren't on screen
+    yet, so update_data has to work whether the display is active or not.
+    Active updates re-render live; inactive updates mutate the spec
+    (and persist to disk for agent-saved displays).
+    """
+
+    @staticmethod
+    def _static_spec(name: str = "weekly_glance") -> DisplaySpec:
+        return DisplaySpec(
+            name=name,
+            theme="boxbot",
+            data_sources=[
+                DataSourceSpec(
+                    name="agenda",
+                    source_type="static",
+                    value={"entries": []},
+                ),
+            ],
+            root_block=TextBlock(content="{agenda.entries[0]}"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_inactive_mutates_spec(self):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._static_spec())
+
+        result = mgr.update_static_data(
+            "weekly_glance", "agenda", {"entries": ["Tue: oil change"]},
+        )
+
+        assert result == {"ok": True, "live": False}
+        spec = mgr.get_spec("weekly_glance")
+        assert spec is not None
+        assert spec.data_sources[0].value == {"entries": ["Tue: oil change"]}
+
+    @pytest.mark.asyncio
+    async def test_update_active_updates_live_source(self):
+        from boxbot.displays.manager import DisplayManager
+        from boxbot.displays.data_sources import StaticSource
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._static_spec())
+        await mgr.switch("weekly_glance")
+        try:
+            result = mgr.update_static_data(
+                "weekly_glance", "agenda", {"entries": ["fresh"]},
+            )
+            assert result == {"ok": True, "live": True}
+            source = mgr._data_manager.get_source("agenda")
+            assert isinstance(source, StaticSource)
+            assert await source.fetch() == {"entries": ["fresh"]}
+            assert mgr.get_spec("weekly_glance").data_sources[0].value == {
+                "entries": ["fresh"],
+            }
+        finally:
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_update_unknown_display_returns_error(self):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        result = mgr.update_static_data("nope", "x", {})
+        assert result["ok"] is False
+        assert "not registered" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_unknown_source_returns_error(self):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._static_spec())
+        result = mgr.update_static_data("weekly_glance", "ghost", {})
+        assert result["ok"] is False
+        assert "no source named" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_non_static_source_returns_error(self):
+        from boxbot.displays.manager import DisplayManager
+
+        spec = DisplaySpec(
+            name="brief",
+            theme="boxbot",
+            data_sources=[
+                DataSourceSpec(name="weather", source_type="builtin"),
+            ],
+            root_block=TextBlock(content="hi"),
+        )
+        mgr = DisplayManager()
+        mgr.register_spec(spec)
+        result = mgr.update_static_data("brief", "weather", {})
+        assert result["ok"] is False
+        assert "not 'static'" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_persists_inactive_update_for_agent_display(
+        self, tmp_path, monkeypatch,
+    ):
+        # Point the agent displays dir at a tmp path so we don't write
+        # into the real data/ tree. Reload sandbox_actions so the helper
+        # _agent_displays_dir picks up the override.
+        monkeypatch.setenv("BOXBOT_DATA_DIR", str(tmp_path))
+        import importlib
+        import boxbot.core.paths as paths
+        importlib.reload(paths)
+        import boxbot.tools._sandbox_actions as sa
+        importlib.reload(sa)
+
+        from boxbot.displays.manager import (
+            DisplayManager,
+            set_display_manager,
+        )
+
+        mgr = DisplayManager()
+        spec = self._static_spec()
+        mgr.register_spec(spec)
+        # Simulate an agent-saved display: a JSON file already exists at
+        # the canonical path so the dispatcher knows to persist updates.
+        import json as _json
+        agent_path = paths.DISPLAYS_DIR / "weekly_glance.json"
+        agent_path.parent.mkdir(parents=True, exist_ok=True)
+        agent_path.write_text(_json.dumps({"name": "weekly_glance"}))
+
+        set_display_manager(mgr)
+        try:
+            ctx = sa.ActionContext()
+            resp = await sa._handle_display_action(
+                "display.update_data",
+                {
+                    "display": "weekly_glance",
+                    "source": "agenda",
+                    "value": {"entries": ["Mon: dentist"]},
+                },
+                ctx,
+            )
+            assert resp["status"] == "ok", resp
+            assert resp["live"] is False
+            assert resp["persisted"] is True
+
+            on_disk = _json.loads(agent_path.read_text())
+            # The dispatcher round-trips the spec through _spec_to_dict
+            # before writing, so the persisted shape matches what
+            # display.load would see.
+            assert on_disk["name"] == "weekly_glance"
+            agenda = next(
+                s for s in on_disk["data_sources"] if s["name"] == "agenda"
+            )
+            assert agenda["value"] == {"entries": ["Mon: dentist"]}
+        finally:
+            set_display_manager(None)
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_skips_persist_for_non_agent_display(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("BOXBOT_DATA_DIR", str(tmp_path))
+        import importlib
+        import boxbot.core.paths as paths
+        importlib.reload(paths)
+        import boxbot.tools._sandbox_actions as sa
+        importlib.reload(sa)
+
+        from boxbot.displays.manager import (
+            DisplayManager,
+            set_display_manager,
+        )
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._static_spec("builtin_glance"))
+
+        set_display_manager(mgr)
+        try:
+            ctx = sa.ActionContext()
+            resp = await sa._handle_display_action(
+                "display.update_data",
+                {
+                    "display": "builtin_glance",
+                    "source": "agenda",
+                    "value": {"entries": ["x"]},
+                },
+                ctx,
+            )
+            assert resp["status"] == "ok", resp
+            assert resp["persisted"] is False
+            # No file was created in the agent dir.
+            assert not (paths.DISPLAYS_DIR / "builtin_glance.json").exists()
+        finally:
+            set_display_manager(None)

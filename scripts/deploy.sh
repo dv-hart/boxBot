@@ -34,8 +34,12 @@
 #      the SDK into the sandbox venv (needed because the SDK is
 #      installed non-editable; source edits don't otherwise reach the
 #      sandbox).
-#   5. Run ``scripts/restart-boxbot.sh`` on the Pi.
-#   6. Show the last 25 startup log lines.
+#   5. If integrations/*/manifest.yaml or script.py changed, rsync the
+#      staged copy under /var/lib/boxbot-sandbox/integrations/ (the
+#      sandbox can't traverse the in-tree path; runner reads from
+#      stage).
+#   6. Run ``scripts/restart-boxbot.sh`` on the Pi.
+#   7. Show the last 25 startup log lines.
 #
 # There is no rsync escape hatch. The Pi only ever runs committed
 # code. To test uncommitted changes, do it in dev or push to a
@@ -192,6 +196,36 @@ fi
 echo "  sandbox SDK reinstalled (boxbot_sdk)"
 EOF
 fi
+
+# Refresh staged integrations every deploy. The sandbox runner reads
+# from /var/lib/boxbot-sandbox/integrations/ (sandbox user can't
+# traverse 0700 /home/<user> to the in-tree path). rsync -a is a
+# no-op when nothing changed, so this is cheap and avoids the past
+# failure mode where an integration script edit silently shadowed by
+# a stale stage. Staged dir is owned by the deploy user per
+# setup-sandbox.sh, so no sudo needed.
+ssh "$TARGET" bash <<EOF
+set -euo pipefail
+cd "$PI_PROJECT_DIR"
+SANDBOX_INTEG="/var/lib/boxbot-sandbox/integrations"
+if [[ ! -d "\$SANDBOX_INTEG" ]]; then
+    echo "--- Skip staged integrations refresh (run setup-sandbox.sh) ---"
+    exit 0
+fi
+RSYNC_OUT="\$(rsync -a --delete --itemize-changes \\
+    --include='*/' \\
+    --include='manifest.yaml' \\
+    --include='script.py' \\
+    --exclude='*' \\
+    integrations/ "\$SANDBOX_INTEG/")"
+if [[ -n "\$RSYNC_OUT" ]]; then
+    echo ""
+    echo "--- Refresh staged integrations ---"
+    echo "\$RSYNC_OUT" | sed 's/^/  /'
+    find "\$SANDBOX_INTEG" -type d -exec chmod 750 {} +
+    find "\$SANDBOX_INTEG" -type f -exec chmod 640 {} +
+fi
+EOF
 
 # Belt-and-suspenders: torchcodec is a transitive dep of pyannote.audio
 # but can't load on aarch64 (wants libnppicc.so.13 from CUDA). setup.sh

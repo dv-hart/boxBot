@@ -4,11 +4,13 @@ inputs:
   lat:
     type: float
     required: true
-    description: Latitude in decimal degrees.
+    default_env: BOXBOT_WEATHER_LAT
+    description: Latitude in decimal degrees. Falls back to BOXBOT_WEATHER_LAT env var when caller doesn't pass one.
   lon:
     type: float
     required: true
-    description: Longitude in decimal degrees (negative for west).
+    default_env: BOXBOT_WEATHER_LON
+    description: Longitude in decimal degrees (negative for west). Falls back to BOXBOT_WEATHER_LON env var.
   forecast_days:
     type: int
     default: 5

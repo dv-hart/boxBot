@@ -5,8 +5,9 @@ called from anywhere in the main process:
 
 - The dispatcher's ``integrations.get`` handler (when an agent script
   in the sandbox calls ``bb.integrations.get(...)``).
-- Display data sources (``WeatherSource`` and friends) on their own
-  refresh cadence.
+- Display data sources (``IntegrationSource``) on their own refresh
+  cadence — same path whether the integration was pre-seeded
+  (weather, calendar) or agent-authored.
 - Future scheduler triggers.
 
 Pipe model: every call spawns a fresh sandbox subprocess, runs the
@@ -59,13 +60,33 @@ class IntegrationRunError(RuntimeError):
 def _validate_inputs(meta: IntegrationMeta, supplied: dict[str, Any]) -> dict[str, Any]:
     """Apply manifest defaults and check required fields.
 
-    Type coercion is intentionally absent — the manifest is descriptive
-    in v1, and the script can do its own coercion if it cares.
+    Resolution order, per input:
+
+    1. Value supplied by the caller.
+    2. ``default_env: BOXBOT_FOO``: read ``os.environ["BOXBOT_FOO"]``
+       in the main process, when set. Lets a manifest declare
+       device-level config (lat/lon, household id) without forcing
+       every caller to thread it through. Type coercion: numeric
+       declared types (``float``/``int``) get coerced; strings pass
+       through as-is.
+    3. ``default``: the manifest's literal default.
+    4. Otherwise, required inputs raise; non-required are left out.
+
+    Type coercion is intentionally absent for caller-supplied values —
+    the manifest is descriptive in v1 and the script can do its own
+    coercion if it cares. ``default_env`` coerces because env vars are
+    always strings.
     """
     out: dict[str, Any] = dict(supplied)
     for name, spec in meta.inputs.items():
         if name in out:
             continue
+        env_name = spec.get("default_env")
+        if isinstance(env_name, str) and env_name:
+            env_value = os.environ.get(env_name)
+            if env_value is not None and env_value != "":
+                out[name] = _coerce_env_value(env_value, spec.get("type"))
+                continue
         if "default" in spec:
             out[name] = spec["default"]
         elif spec.get("required"):
@@ -82,6 +103,27 @@ def _validate_inputs(meta: IntegrationMeta, supplied: dict[str, Any]) -> dict[st
                 f"{sorted(unknown)} (declared: {sorted(meta.inputs.keys())})"
             )
     return out
+
+
+def _coerce_env_value(raw: str, declared_type: Any) -> Any:
+    """Coerce a string env value to the manifest's declared type.
+
+    Falls through to the raw string on coercion failure — the script
+    will see a bad value rather than the input being silently dropped.
+    """
+    if declared_type in ("float", "number"):
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+    if declared_type in ("int", "integer"):
+        try:
+            return int(raw)
+        except ValueError:
+            return raw
+    if declared_type in ("bool", "boolean"):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return raw
 
 
 # ---------------------------------------------------------------------------

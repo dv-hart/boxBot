@@ -225,6 +225,74 @@ async def test_default_input_applied(tmp_path, monkeypatch, isolated_logs):
 
 
 @pytest.mark.asyncio
+async def test_default_env_input_fallback(tmp_path, monkeypatch, isolated_logs):
+    """``default_env`` lets device-level config (lat/lon, household id)
+    flow through without each caller threading it. Numeric declared
+    types get coerced from the string env var."""
+    _patch_integrations_root(monkeypatch, tmp_path)
+    _make_integration(
+        tmp_path,
+        "weather",
+        inputs=(
+            "lat:\n  type: float\n  required: true\n  default_env: TEST_WX_LAT\n"
+            "lon:\n  type: float\n  required: true\n  default_env: TEST_WX_LON\n"
+        ),
+        script=(
+            "from boxbot_sdk.integration import inputs, return_output\n"
+            "a = inputs()\n"
+            "return_output({'lat': a['lat'], 'lon': a['lon']})\n"
+        ),
+    )
+    monkeypatch.setenv("TEST_WX_LAT", "47.6062")
+    monkeypatch.setenv("TEST_WX_LON", "-122.3321")
+    result = await run_mod.run("weather", {})
+    assert result["status"] == "ok"
+    # Coerced to float because the manifest declared type=float.
+    assert result["output"] == {"lat": 47.6062, "lon": -122.3321}
+
+
+@pytest.mark.asyncio
+async def test_default_env_overridden_by_explicit_input(tmp_path, monkeypatch, isolated_logs):
+    """Caller-supplied input wins over default_env."""
+    _patch_integrations_root(monkeypatch, tmp_path)
+    _make_integration(
+        tmp_path,
+        "weather",
+        inputs=(
+            "lat:\n  type: float\n  required: true\n  default_env: TEST_WX_LAT\n"
+        ),
+        script=(
+            "from boxbot_sdk.integration import inputs, return_output\n"
+            "return_output({'lat': inputs()['lat']})\n"
+        ),
+    )
+    monkeypatch.setenv("TEST_WX_LAT", "10.0")
+    result = await run_mod.run("weather", {"lat": 99.9})
+    assert result["output"] == {"lat": 99.9}
+
+
+@pytest.mark.asyncio
+async def test_default_env_missing_still_raises_required(tmp_path, monkeypatch, isolated_logs):
+    """When ``default_env`` is declared but the env var is unset and
+    the input is required, the runner raises as if no default existed."""
+    _patch_integrations_root(monkeypatch, tmp_path)
+    _make_integration(
+        tmp_path,
+        "weather",
+        inputs=(
+            "lat:\n  type: float\n  required: true\n  default_env: TEST_WX_LAT_MISSING\n"
+        ),
+        script=(
+            "from boxbot_sdk.integration import return_output\n"
+            "return_output({'ok': True})\n"
+        ),
+    )
+    monkeypatch.delenv("TEST_WX_LAT_MISSING", raising=False)
+    with pytest.raises(run_mod.IntegrationRunError, match="lat|required"):
+        await run_mod.run("weather", {})
+
+
+@pytest.mark.asyncio
 async def test_unknown_input_rejected(tmp_path, monkeypatch, isolated_logs):
     _patch_integrations_root(monkeypatch, tmp_path)
     _make_integration(

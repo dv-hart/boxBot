@@ -19,7 +19,9 @@ when called.**
 - You're about to build the same fetcher twice — make it an
   integration so future-you and other consumers can reuse it.
 - A display data source needs server-side data on a refresh
-  schedule (the data-source manager calls integrations).
+  schedule. Wire it in as ``{"type": "integration", "inputs": {...}}``
+  in the display spec — same path whether the integration was
+  pre-seeded or you just authored it.
 
 ## When NOT to use it
 
@@ -150,7 +152,41 @@ manifest.
 
 If you want recurring fetches, register a **trigger** (`bb.tasks`)
 that fires on a cadence and calls the integration. If you're a
-display, the data-source manager already handles refresh cadence.
+display, declare it as an ``integration`` data source and the
+data-source manager handles refresh cadence:
+
+```json
+{"name": "solar", "type": "integration",
+ "inputs": {"date": "2026-05-15"}, "refresh": 3600}
+```
+
+The manager calls ``bb.integrations.get(<name>, **inputs)`` on each
+tick and binds the output dict to the source name. See
+[display.md](display.md) for the full spec form.
+
+## Device-level config: ``default_env``
+
+For inputs that are per-device rather than per-call (location, home
+zip code, household kW capacity), declare a ``default_env`` on the
+input. The runner reads ``os.environ[default_env]`` when the caller
+didn't supply a value, so every consumer — agent, display, scheduled
+trigger — picks up the same device default without threading it
+through each call site.
+
+```yaml
+inputs:
+  lat:
+    type: float
+    required: true
+    default_env: BOXBOT_WEATHER_LAT
+    description: Latitude. Falls back to BOXBOT_WEATHER_LAT env var.
+```
+
+The env var is read in the main process at validation time, before
+the sandbox spawn — so non-secret env (lat/lon, household ids) flows
+through without being added to the sandbox's safe-env allowlist.
+Use ``bb.secrets`` for actually-secret values; this is for
+configuration that's neither secret nor per-call.
 
 ## Conflict and lifecycle
 

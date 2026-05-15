@@ -4,18 +4,27 @@ Data sources fetch, cache, and normalize external data for display blocks.
 The display manager schedules async fetches per source on each source's
 refresh interval. Blocks bind to source fields using {source.field} syntax.
 
-Built-in sources tap into boxBot subsystems (weather, calendar, tasks, etc.)
-and deliver display-ready data including resolved icon names and semantic
-color tokens.
+Built-in sources tap into in-process subsystems that aren't integrations:
+the clock, the scheduler's to-do list, the perception pipeline's present
+people, and the agent state tracker.
 
-Custom sources (http_json, http_text, static, memory_query) support field
-extraction and value mapping via the 'fields' + 'map' transform system.
+External data — weather, calendar, anything an agent authors — flows
+through ``IntegrationSource``: a generic wrapper that calls
+:func:`boxbot.integrations.runner.run` on each refresh and binds the
+integration's ``output`` to the source name. Pre-seeded integrations
+(weather, calendar) and agent-authored ones share this single path.
+
+The other custom sources (``http_json``, ``http_text``, ``static``,
+``memory_query``) cover narrower cases: agent-pushed values via
+``static`` + ``update_data``, and quick HTTP/memory probes that don't
+warrant a full integration.
 
 Usage:
-    from boxbot.displays.data_sources import DataSourceManager
+    from boxbot.displays.data_sources import DataSourceManager, create_source
 
     mgr = DataSourceManager()
-    mgr.register("weather", WeatherSource())
+    mgr.register(create_source("weather", "integration",
+                               {"inputs": {"lat": 45.5, "lon": -122.7}}))
     await mgr.start_all()
     data = mgr.get_data("weather")
 """
@@ -119,82 +128,36 @@ class ClockSource(DataSource):
         }
 
 
-class WeatherSource(DataSource):
-    """Weather data from NOAA api.weather.gov.
+class IntegrationSource(DataSource):
+    """Generic source backed by a registered integration.
 
-    Reads ``lat``/``lon`` from the source config or, as a fallback, from
-    the ``BOXBOT_WEATHER_LAT`` / ``BOXBOT_WEATHER_LON`` environment
-    variables. NOAA covers US territory only — outside that, the source
-    falls back to placeholder data with a warning.
+    The display's data-source manager calls
+    :func:`boxbot.integrations.runner.run` on this source's refresh
+    interval and binds the integration's ``output`` dict to the source
+    name. Inputs are passed through verbatim — the integration manifest
+    declares its own defaults (including ``default_env`` for
+    device-level config like lat/lon).
+
+    Spec form::
+
+        {"name": "weather", "type": "integration",
+         "inputs": {"forecast_days": 7}, "refresh": 3600}
+
+        {"name": "solar", "type": "integration",
+         "integration": "solar",   # optional; defaults to ``name``
+         "inputs": {"date": "2026-05-15"}, "refresh": 3600}
+
+    On error (unknown integration, non-``ok`` status, runner exception)
+    the source returns an empty dict so the renderer falls through to
+    its placeholder paths. The error is logged once per fetch.
     """
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
-        super().__init__("weather", config)
-
-    @property
-    def refresh_interval(self) -> int:
-        return self.config.get("refresh", 3600)
-
-    async def fetch(self) -> dict[str, Any]:
-        import os
-
-        from boxbot.integrations.runner import IntegrationRunError, run
-
-        lat = self.config.get("lat")
-        lon = self.config.get("lon")
-        if lat is None or lon is None:
-            lat = os.environ.get("BOXBOT_WEATHER_LAT")
-            lon = os.environ.get("BOXBOT_WEATHER_LON")
-
-        if lat is None or lon is None:
-            logger.debug(
-                "Weather source has no lat/lon configured; using placeholder. "
-                "Set 'lat'/'lon' in the source config or BOXBOT_WEATHER_LAT/LON env vars."
-            )
-            return _weather_placeholder()
-
-        try:
-            result = await run(
-                "weather",
-                {
-                    "lat": float(lat),
-                    "lon": float(lon),
-                    "forecast_days": int(self.config.get("forecast_days", 5)),
-                },
-            )
-        except IntegrationRunError as e:
-            logger.warning("Weather integration not registered: %s", e)
-            return _weather_placeholder()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Weather integration call failed: %s", e)
-            return _weather_placeholder()
-
-        if result.get("status") != "ok":
-            logger.warning(
-                "Weather integration returned %s: %s",
-                result.get("status"),
-                result.get("error", "no error message"),
-            )
-            return _weather_placeholder()
-
-        data = result.get("output") or {}
-        if not data:
-            return _weather_placeholder()
-        return data
-
-
-class CalendarSource(DataSource):
-    """Calendar events from Google Calendar.
-
-    Reads the next ``max_results`` upcoming events via the ``calendar``
-    integration (sandbox-runnable, OAuth handled by the integration's
-    script). Falls back to placeholder data when the integration
-    returns an error — typically "token not stored" before the
-    operator runs scripts/calendar_auth.py.
-    """
-
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
-        super().__init__("calendar", config)
+    def __init__(self, name: str, config: dict[str, Any] | None = None) -> None:
+        super().__init__(name, config)
+        self._integration_name: str = (
+            (config or {}).get("integration") or name
+        )
+        self._inputs: dict[str, Any] = dict((config or {}).get("inputs") or {})
 
     @property
     def refresh_interval(self) -> int:
@@ -203,40 +166,38 @@ class CalendarSource(DataSource):
     async def fetch(self) -> dict[str, Any]:
         from boxbot.integrations.runner import IntegrationRunError, run
 
-        max_results = int(self.config.get("max_results", 5))
-        calendar_id = self.config.get("calendar_id")
-        inputs: dict[str, Any] = {
-            "action": "list_upcoming_events",
-            "max_results": max_results,
-        }
-        if calendar_id:
-            inputs["calendar_id"] = calendar_id
-
         try:
-            result = await run("calendar", inputs)
+            result = await run(self._integration_name, self._inputs)
         except IntegrationRunError as e:
-            logger.warning("Calendar integration not registered: %s", e)
-            return _calendar_placeholder()
+            logger.warning(
+                "Integration source '%s' (-> '%s') not registered: %s",
+                self.name, self._integration_name, e,
+            )
+            return {}
         except Exception as e:  # noqa: BLE001
-            logger.warning("Calendar integration call failed: %s", e)
-            return {"events": []}
+            logger.warning(
+                "Integration source '%s' (-> '%s') call failed: %s",
+                self.name, self._integration_name, e,
+            )
+            return {}
 
         if result.get("status") != "ok":
             logger.debug(
-                "Calendar integration returned %s: %s",
+                "Integration source '%s' (-> '%s') returned %s: %s",
+                self.name, self._integration_name,
                 result.get("status"),
-                result.get("error", result.get("output", {}).get("error", "")),
+                result.get("error", "no error message"),
             )
-            return _calendar_placeholder()
+            return {}
 
         output = result.get("output") or {}
-        if "error" in output:
-            logger.debug("Calendar integration error: %s", output["error"])
-            return _calendar_placeholder()
-        return {
-            "events": output.get("events", []),
-            "count": output.get("count", 0),
-        }
+        if isinstance(output, dict) and output.get("error"):
+            logger.debug(
+                "Integration source '%s' (-> '%s') script reported error: %s",
+                self.name, self._integration_name, output["error"],
+            )
+            return {}
+        return output if isinstance(output, dict) else {"value": output}
 
 
 class TasksSource(DataSource):
@@ -454,11 +415,15 @@ class MemoryQuerySource(DataSource):
 # Source registry and factory
 # ---------------------------------------------------------------------------
 
-_BUILTIN_SOURCES = {
-    "clock", "weather", "calendar", "tasks", "people", "agent_status",
-}
+# Built-ins are the four sources that read live in-process state and
+# can't be expressed as integrations: the clock, the scheduler's todo
+# list, the perception pipeline's present-people view, and the agent's
+# state machine. Everything else — weather, calendar, anything the
+# agent authors — flows through ``IntegrationSource``.
+_BUILTIN_SOURCES = {"clock", "tasks", "people", "agent_status"}
 
 _CUSTOM_SOURCE_TYPES: dict[str, type[DataSource]] = {
+    "integration": IntegrationSource,
     "http_json": HttpJsonSource,
     "http_text": HttpTextSource,
     "static": StaticSource,
@@ -472,16 +437,28 @@ def create_source(name: str, source_type: str = "builtin",
 
     Args:
         name: Source name (e.g. 'weather', 'stocks').
-        source_type: 'builtin' or one of the custom types.
+        source_type: 'builtin', 'integration', or one of the other
+            custom types.
         config: Source-specific configuration.
 
     Returns:
         A DataSource instance.
+
+    Backward compat: a bare ``{"name": "weather"}`` (no ``type``) or
+    ``{"name": "weather", "type": "builtin"}`` is silently promoted to
+    an ``IntegrationSource`` pointing at the integration of the same
+    name. Drops the bifurcation between pre-seeded and agent-authored
+    integrations without breaking existing display specs in the wild.
     """
     config = config or {}
 
-    if source_type == "builtin" or name in _BUILTIN_SOURCES:
-        return _create_builtin_source(name, config)
+    if source_type == "builtin" or (source_type == "" and name in _BUILTIN_SOURCES):
+        if name in _BUILTIN_SOURCES:
+            return _create_builtin_source(name, config)
+        # Unknown built-in name → assume it's a registered integration.
+        # This keeps `{"name": "weather", "type": "builtin"}` working
+        # after the weather/calendar collapse.
+        return IntegrationSource(name, config)
 
     cls = _CUSTOM_SOURCE_TYPES.get(source_type)
     if cls is None:
@@ -496,8 +473,6 @@ def _create_builtin_source(name: str, config: dict[str, Any]) -> DataSource:
     """Create a built-in data source by name."""
     sources: dict[str, type[DataSource]] = {
         "clock": ClockSource,
-        "weather": WeatherSource,
-        "calendar": CalendarSource,
         "tasks": TasksSource,
         "people": PeopleSource,
         "agent_status": AgentStatusSource,

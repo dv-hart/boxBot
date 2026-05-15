@@ -170,12 +170,39 @@ class TestValidators:
             v.validate_name("my display!", "display name")
 
     def test_validate_data_source_builtin(self):
-        config = v.validate_data_source_config("weather")
-        assert config["name"] == "weather"
+        # Only the live-in-process sources are built-ins now. Weather
+        # and calendar moved to ``type: "integration"``.
+        config = v.validate_data_source_config("tasks")
+        assert config["name"] == "tasks"
 
     def test_validate_data_source_unknown_builtin_raises(self):
         with pytest.raises(ValueError, match="Unknown built-in"):
             v.validate_data_source_config("unknown_source")
+
+    def test_validate_data_source_weather_no_longer_builtin(self):
+        """Regression guard: weather/calendar must NOT validate as
+        builtins. Forces specs to use the unified integration path."""
+        with pytest.raises(ValueError, match="Unknown built-in"):
+            v.validate_data_source_config("weather")
+        with pytest.raises(ValueError, match="Unknown built-in"):
+            v.validate_data_source_config("calendar")
+
+    def test_validate_data_source_integration(self):
+        config = v.validate_data_source_config(
+            "weather", source_type="integration",
+            inputs={"forecast_days": 7}, refresh=3600,
+        )
+        assert config["type"] == "integration"
+        assert config["inputs"] == {"forecast_days": 7}
+        assert config["refresh"] == 3600
+
+    def test_validate_data_source_integration_with_override(self):
+        config = v.validate_data_source_config(
+            "solar_today", source_type="integration",
+            integration="solar", inputs={"date": "2026-05-15"},
+        )
+        assert config["integration"] == "solar"
+        assert config["inputs"]["date"] == "2026-05-15"
 
     def test_validate_data_source_http_json(self):
         config = v.validate_data_source_config(

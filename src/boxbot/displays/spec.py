@@ -44,7 +44,13 @@ class DataSourceSpec:
     """Declaration of a data source within a display spec."""
 
     name: str
-    source_type: str = "builtin"  # builtin, http_json, http_text, static, memory_query
+    # builtin, integration, http_json, http_text, static, memory_query
+    source_type: str = "builtin"
+    # For `integration` sources. Optional override of which integration
+    # to call; defaults to ``name``. Lets a display use the same
+    # integration under multiple bindings.
+    integration: str | None = None
+    inputs: dict[str, Any] = field(default_factory=dict)
     url: str | None = None
     params: dict[str, Any] = field(default_factory=dict)
     secret: str | None = None
@@ -108,6 +114,8 @@ def _parse_data_source(data: dict[str, Any]) -> DataSourceSpec:
     return DataSourceSpec(
         name=data.get("name", ""),
         source_type=data.get("type", "builtin"),
+        integration=data.get("integration"),
+        inputs=data.get("inputs", {}),
         url=data.get("url"),
         params=data.get("params", {}),
         secret=data.get("secret"),

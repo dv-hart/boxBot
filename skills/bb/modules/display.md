@@ -139,9 +139,10 @@ something else up, ``switch_display`` already replaces the pin.
   "theme": "boxbot",
   "transition": "crossfade",
   "data_sources": [
-    {"name": "weather", "type": "builtin", "refresh": 3600},
-    {"name": "calendar", "type": "builtin"},
-    {"name": "tasks", "type": "builtin"}
+    {"name": "weather", "type": "integration", "refresh": 3600},
+    {"name": "calendar", "type": "integration",
+     "inputs": {"action": "list_upcoming_events", "max_results": 5}},
+    {"name": "tasks"}
   ],
   "layout": {
     "type": "column",
@@ -252,17 +253,56 @@ Declare them once at the top level, bind anywhere with
 ### Built-ins (zero config)
 
 ```json
-{"name": "weather"}
-{"name": "calendar", "refresh": 600}
 {"name": "tasks"}
 {"name": "people"}
 {"name": "agent_status"}
 {"name": "clock"}
 ```
 
-Use ``bb.display.describe_source("weather")`` to see what fields each
-exposes (``temp``, ``icon``, ``forecast[].high``, etc.). The doc rots;
-the schema doesn't.
+Built-ins read live in-process state — the scheduler's to-do list,
+present people from the perception pipeline, agent state, the clock.
+They can't be expressed as integrations because the data never leaves
+the main process.
+
+Use ``bb.display.describe_source("tasks")`` to see fields each
+exposes (``items[].description``, ``count``, etc.). The doc rots; the
+schema doesn't.
+
+### External data: ``integration``
+
+Anything that talks to the outside world — weather, calendar, the
+solar integration you just authored — flows through one source type:
+
+```json
+{"name": "weather", "type": "integration", "refresh": 3600}
+{"name": "calendar", "type": "integration",
+ "inputs": {"action": "list_upcoming_events", "max_results": 5},
+ "refresh": 600}
+{"name": "solar", "type": "integration",
+ "inputs": {"date": "2026-05-15"}, "refresh": 3600}
+```
+
+The data-source manager calls
+``bb.integrations.get(<name>, **inputs)`` on the refresh cadence and
+binds the integration's output dict to the source name (so
+``{weather.temp}``, ``{calendar.events[0].title}``,
+``{solar.kwh}`` work as expected).
+
+Optional fields:
+
+- ``integration``: override which integration to call (defaults to
+  ``name``). Lets the same integration appear under multiple bindings.
+- ``inputs``: passed verbatim. The integration manifest declares
+  defaults and ``default_env`` fallbacks for device-level config like
+  ``lat``/``lon`` (``BOXBOT_WEATHER_LAT`` / ``BOXBOT_WEATHER_LON``) so
+  you usually don't repeat them per display.
+- ``refresh``: seconds between fetches. Defaults to 300.
+
+Pre-seeded integrations (``weather``, ``calendar``) and ones you
+author with ``bb.integrations.create(...)`` use this same path —
+there is no privileged track. ``bb.integrations.list()`` enumerates
+what's available, and ``bb.display.describe_source(name)`` reads the
+integration manifest's ``outputs`` so you don't have to.
 
 ### Custom: ``http_json``
 
@@ -374,8 +414,9 @@ spec = {
     "name": "morning_glance",
     "theme": "boxbot",
     "data_sources": [
-        {"name": "calendar"},
-        {"name": "weather"},
+        {"name": "calendar", "type": "integration",
+         "inputs": {"action": "list_upcoming_events", "max_results": 5}},
+        {"name": "weather", "type": "integration"},
     ],
     "layout": {
         "type": "column",

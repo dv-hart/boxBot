@@ -40,8 +40,11 @@ VALID_TRANSITIONS = {"crossfade", "slide_left", "slide_right", "none"}
 
 VALID_DIVIDER_ORIENTATIONS = {"horizontal", "vertical"}
 
-VALID_DATA_SOURCE_TYPES = {"http_json", "http_text", "static", "memory_query"}
-VALID_BUILTIN_SOURCES = {"clock", "weather", "calendar", "tasks", "people", "agent_status"}
+VALID_DATA_SOURCE_TYPES = {"integration", "http_json", "http_text", "static", "memory_query"}
+# Built-ins read live in-process state (the clock, scheduler todos,
+# present people, agent state). Weather and calendar are integrations
+# now — declare them as ``type: "integration"`` in the display spec.
+VALID_BUILTIN_SOURCES = {"clock", "tasks", "people", "agent_status"}
 
 VALID_MEMORY_TYPES = {"person", "household", "methodology", "operational"}
 
@@ -244,7 +247,15 @@ def validate_data_source_config(name: str, source_type: str | None = None,
 
     config: dict[str, Any] = {"name": name, "type": source_type}
 
-    if source_type in ("http_json", "http_text"):
+    if source_type == "integration":
+        if "integration" in kwargs:
+            config["integration"] = require_str(kwargs["integration"], "integration")
+        if "inputs" in kwargs:
+            config["inputs"] = require_dict(kwargs["inputs"], "inputs")
+        if "refresh" in kwargs:
+            config["refresh"] = require_int(kwargs["refresh"], "refresh", min_val=1)
+
+    elif source_type in ("http_json", "http_text"):
         if "url" not in kwargs:
             raise ValueError(f"'{source_type}' data source requires 'url'")
         config["url"] = require_str(kwargs["url"], "url")

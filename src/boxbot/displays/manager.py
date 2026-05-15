@@ -599,6 +599,8 @@ class DisplayManager:
         """
         for src_spec in spec.data_sources:
             config: dict[str, Any] = {
+                "integration": src_spec.integration,
+                "inputs": src_spec.inputs,
                 "url": src_spec.url,
                 "params": src_spec.params,
                 "secret": src_spec.secret,

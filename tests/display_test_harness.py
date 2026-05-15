@@ -13,7 +13,7 @@ Typical use from an authoring script::
     spec = {
         "name": "demo",
         "theme": "boxbot",
-        "data_sources": [{"name": "weather"}],
+        "data_sources": [{"name": "weather", "type": "integration"}],
         "layout": {"type": "text", "content": "{weather.temp}",
                    "size": "title"},
     }

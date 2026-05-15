@@ -18,9 +18,9 @@ from boxbot.core.events import (
 )
 from boxbot.displays.data_sources import (
     AgentStatusSource,
-    CalendarSource,
+    IntegrationSource,
     TasksSource,
-    WeatherSource,
+    create_source,
 )
 
 
@@ -70,6 +70,22 @@ class TestTasksSourceWiring:
 # ---------------------------------------------------------------------------
 
 
+def _calendar_source(inputs=None):
+    """Build an IntegrationSource pointed at the calendar integration.
+
+    Replaces the old standalone ``CalendarSource`` class. Inputs default
+    to a ``list_upcoming_events`` call so the existing tests don't need
+    to repeat the action everywhere.
+    """
+    return IntegrationSource(
+        "calendar",
+        {
+            "inputs": inputs or {"action": "list_upcoming_events",
+                                 "max_results": 5},
+        },
+    )
+
+
 class TestCalendarSourceWiring:
     async def test_returns_events_from_integration(self):
         events = [
@@ -86,12 +102,16 @@ class TestCalendarSourceWiring:
             return {"status": "ok", "output": {"events": events, "count": 1}}
 
         with patch("boxbot.integrations.runner.run", new=fake_run):
-            data = await CalendarSource().fetch()
+            data = await _calendar_source().fetch()
 
         assert data["count"] == 1
         assert data["events"][0]["title"] == "Team Standup"
 
-    async def test_falls_back_to_placeholder_when_token_missing(self):
+    async def test_returns_empty_when_script_reports_error(self):
+        """Unified behavior: script-reported errors come back empty so the
+        renderer falls through to its preview placeholder. The old
+        CalendarSource synthesised placeholder events here; that
+        special-case was the bifurcation we just removed."""
         async def fake_run(name, inputs, **_kwargs):
             return {
                 "status": "ok",
@@ -99,23 +119,20 @@ class TestCalendarSourceWiring:
             }
 
         with patch("boxbot.integrations.runner.run", new=fake_run):
-            data = await CalendarSource().fetch()
+            data = await _calendar_source().fetch()
 
-        assert "events" in data
-        assert len(data["events"]) >= 1  # placeholder data
-        assert data["events"][0]["title"] == "Team Standup"
+        assert data == {}
 
-    async def test_falls_back_to_placeholder_when_integration_missing(self):
+    async def test_returns_empty_when_integration_missing(self):
         from boxbot.integrations.runner import IntegrationRunError
 
         async def fake_run(name, inputs, **_kwargs):
             raise IntegrationRunError("unknown integration 'calendar'")
 
         with patch("boxbot.integrations.runner.run", new=fake_run):
-            data = await CalendarSource().fetch()
+            data = await _calendar_source().fetch()
 
-        assert "events" in data
-        assert data["events"][0]["title"] == "Team Standup"
+        assert data == {}
 
 
 # ---------------------------------------------------------------------------
@@ -215,13 +232,16 @@ class TestAgentStateTracker:
 # ---------------------------------------------------------------------------
 
 
-class TestWeatherSourceWiring:
-    """WeatherSource now goes through the integration runner.
+def _weather_source(inputs=None):
+    """Build an IntegrationSource pointed at the weather integration."""
+    return IntegrationSource("weather", {"inputs": inputs or {}})
 
-    The pure-data logic (icon mapping, day/night forecast pairing)
-    moved into ``integrations/weather/script.py``. End-to-end coverage
-    of that logic lives in ``tests/test_integration_runner.py`` once
-    the weather integration is registered against a test root.
+
+class TestWeatherSourceWiring:
+    """Weather flows through ``IntegrationSource`` like every other
+    integration. Lat/lon defaults live in the manifest's ``default_env``
+    (BOXBOT_WEATHER_LAT/LON); see test_integration_runner for that
+    coverage.
     """
 
     async def test_returns_data_from_runner(self):
@@ -243,7 +263,7 @@ class TestWeatherSourceWiring:
             }
 
         with patch.object(runner_mod, "run", new=fake_run):
-            data = await WeatherSource(
+            data = await _weather_source(
                 {"lat": 47.6062, "lon": -122.3321}
             ).fetch()
 
@@ -251,38 +271,80 @@ class TestWeatherSourceWiring:
         assert data["icon"] == "cloud"
         assert len(data["forecast"]) == 1
 
-    async def test_falls_back_to_placeholder_on_no_coords(self):
-        # No env vars, no config — should return placeholder
-        with patch.dict("os.environ", {}, clear=False):
-            for var in ("BOXBOT_WEATHER_LAT", "BOXBOT_WEATHER_LON"):
-                if var in __import__("os").environ:
-                    del __import__("os").environ[var]
-            data = await WeatherSource().fetch()
-        assert "icon" in data  # placeholder has icon
-
-    async def test_falls_back_to_placeholder_on_runner_error(self):
+    async def test_returns_empty_on_runner_error(self):
         from boxbot.integrations import runner as runner_mod
 
         async def boom(name, inputs, *, timeout_override=None):
             return {"status": "error", "error": "API down"}
 
         with patch.object(runner_mod, "run", new=boom):
-            data = await WeatherSource(
+            data = await _weather_source(
                 {"lat": 47.6062, "lon": -122.3321}
             ).fetch()
-        assert "icon" in data  # placeholder fallback
+        assert data == {}
 
-    async def test_falls_back_to_placeholder_on_unregistered_integration(self):
+    async def test_returns_empty_on_unregistered_integration(self):
         from boxbot.integrations import runner as runner_mod
 
         async def absent(name, inputs, *, timeout_override=None):
             raise runner_mod.IntegrationRunError(f"unknown integration '{name}'")
 
         with patch.object(runner_mod, "run", new=absent):
-            data = await WeatherSource(
+            data = await _weather_source(
                 {"lat": 47.6062, "lon": -122.3321}
             ).fetch()
-        assert "icon" in data
+        assert data == {}
+
+
+class TestIntegrationSourceGeneric:
+    """Generic IntegrationSource behavior — applies to any integration,
+    pre-seeded or agent-authored. Pulled out to assert the unified
+    path explicitly (no two-tracks regression)."""
+
+    async def test_routes_integration_name_override(self):
+        """``integration`` field overrides which integration is called
+        while keeping the source name (and binding) distinct."""
+        async def fake_run(name, inputs, **_kwargs):
+            assert name == "solar"   # the integration, not the binding
+            return {"status": "ok", "output": {"kwh": 42.0}}
+
+        with patch("boxbot.integrations.runner.run", new=fake_run):
+            src = IntegrationSource(
+                "solar_today",
+                {"integration": "solar", "inputs": {"date": "2026-05-15"}},
+            )
+            data = await src.fetch()
+        assert data == {"kwh": 42.0}
+
+    async def test_default_integration_name_is_source_name(self):
+        async def fake_run(name, inputs, **_kwargs):
+            assert name == "stocks"
+            return {"status": "ok", "output": {"price": 184.20}}
+
+        with patch("boxbot.integrations.runner.run", new=fake_run):
+            data = await IntegrationSource("stocks", {}).fetch()
+        assert data["price"] == 184.20
+
+    async def test_refresh_interval_defaults_to_300(self):
+        assert IntegrationSource("foo").refresh_interval == 300
+        assert IntegrationSource("foo", {"refresh": 60}).refresh_interval == 60
+
+    def test_create_source_routes_integration_type(self):
+        """The spec form ``{"type": "integration"}`` produces an
+        IntegrationSource. This is the agent-facing path."""
+        src = create_source(
+            "solar", "integration",
+            {"inputs": {"date": "2026-05-15"}, "refresh": 600},
+        )
+        assert isinstance(src, IntegrationSource)
+        assert src.refresh_interval == 600
+
+    def test_unknown_builtin_name_promotes_to_integration(self):
+        """Backward compat: a bare ``{"name": "weather"}`` (no type)
+        from old specs becomes an IntegrationSource since weather is
+        no longer in the builtin allowlist."""
+        src = create_source("weather", "builtin", {})
+        assert isinstance(src, IntegrationSource)
 
 
 class TestCalendarIntegrationNormalization:

@@ -808,28 +808,6 @@ async def _handle_auth_action(
 # Field schemas for built-in data sources. Lets the agent discover what
 # bindings a source exposes without reading source code.
 _BUILTIN_SOURCE_SCHEMAS: dict[str, dict[str, Any]] = {
-    "weather": {
-        "fields": {
-            "temp": "string — current temperature, e.g. '72'",
-            "condition": "string — human label, e.g. 'Partly Cloudy'",
-            "icon": "string — Lucide icon name, e.g. 'cloud-sun'",
-            "humidity": "string — percent, e.g. '65'",
-            "wind": "string — wind speed, e.g. '12 mph'",
-            "forecast": (
-                "array of {day, icon, high, low} — next ~5 days. "
-                "Bind individual days as {weather.forecast[0].high}."
-            ),
-        },
-    },
-    "calendar": {
-        "fields": {
-            "events": (
-                "array of {time, title, duration, location} — upcoming "
-                "events. Bind as {calendar.events[0].title}."
-            ),
-            "count": "int — total events fetched",
-        },
-    },
     "tasks": {
         "fields": {
             "items": (
@@ -867,6 +845,48 @@ _BUILTIN_SOURCE_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+
+def _describe_integration_source(name: str) -> dict[str, Any] | None:
+    """Build a describe_source response from an integration manifest.
+
+    The integration's manifest is the source of truth for what an
+    ``integration`` data source exposes. ``outputs`` becomes
+    ``fields``; the placeholder is built from output names with empty
+    values so the agent can see the shape before the first fetch.
+
+    Returns ``None`` if no integration of that name is registered.
+    """
+    from boxbot.integrations.loader import get_integration
+
+    meta = get_integration(name)
+    if meta is None:
+        return None
+
+    fields: dict[str, str] = {}
+    example: dict[str, Any] = {}
+    for field_name, spec in (meta.outputs or {}).items():
+        if isinstance(spec, dict):
+            type_str = spec.get("type", "any")
+            desc = spec.get("description", "")
+            fields[field_name] = f"{type_str}{' — ' + desc if desc else ''}"
+        else:
+            fields[field_name] = str(spec)
+        example[field_name] = None
+
+    return {
+        "status": "ok",
+        "kind": "integration",
+        "integration": meta.name,
+        "description": meta.description,
+        "fields": fields,
+        "example": example,
+        "note": (
+            "Source-name 'fields' come from the integration manifest's "
+            "outputs. Inputs go in the display spec under 'inputs'; "
+            "manifest declares defaults and default_env fallbacks."
+        ),
+    }
 
 
 @action_handler("skill")
@@ -1805,18 +1825,26 @@ async def _handle_display_action(
             from boxbot.displays.data_sources import get_placeholder_data
 
             schema = _BUILTIN_SOURCE_SCHEMAS.get(name)
-            if schema is None:
+            if schema is not None:
                 return {
-                    "status": "error",
-                    "error": (
-                        f"no schema for source '{name}'. Built-in "
-                        f"sources: {sorted(_BUILTIN_SOURCE_SCHEMAS)}"
-                    ),
+                    "status": "ok",
+                    "kind": "builtin",
+                    "fields": schema["fields"],
+                    "example": get_placeholder_data(name),
                 }
+            # Not a built-in — try to describe an integration with the
+            # same name. The manifest's `outputs` section is the schema.
+            integ_schema = _describe_integration_source(name)
+            if integ_schema is not None:
+                return integ_schema
+            from boxbot.integrations.loader import discover_integrations
             return {
-                "status": "ok",
-                "fields": schema["fields"],
-                "example": get_placeholder_data(name),
+                "status": "error",
+                "error": (
+                    f"no source named '{name}'. Built-in sources: "
+                    f"{sorted(_BUILTIN_SOURCE_SCHEMAS)}; integrations: "
+                    f"{sorted(i.name for i in discover_integrations())}"
+                ),
             }
 
         if sub == "schema":
@@ -2102,6 +2130,9 @@ def _data_source_schema() -> dict[str, Any]:
     the built-in source names so the agent can introspect what's
     available without re-reading the doc.
     """
+    from boxbot.integrations.loader import discover_integrations
+
+    integrations = sorted(i.name for i in discover_integrations())
     return {
         "builtin": {
             "kind": "builtin",
@@ -2111,8 +2142,41 @@ def _data_source_schema() -> dict[str, Any]:
             },
             "available_names": sorted(_BUILTIN_SOURCE_SCHEMAS),
             "describe": (
+                "Built-ins read live in-process state: clock, the "
+                "scheduler's to-do list, present people, agent state. "
                 "Use bb.display.describe_source(name) to see fields a "
                 "specific built-in exposes."
+            ),
+        },
+        "integration": {
+            "kind": "custom",
+            "fields": {
+                "name": {"type": "str", "required": True,
+                         "describe": "Binding name in the display spec."},
+                "integration": {"type": "str", "required": False,
+                                "describe": (
+                                    "Registered integration to call. "
+                                    "Defaults to `name`."
+                                )},
+                "inputs": {"type": "dict", "required": False,
+                           "describe": (
+                               "Inputs passed to the integration. "
+                               "Manifest declares defaults and "
+                               "default_env fallbacks for device-level "
+                               "config (e.g. lat/lon)."
+                           )},
+                "refresh": {"type": "int (seconds)", "required": False,
+                            "default": 300},
+            },
+            "available_integrations": integrations,
+            "describe": (
+                "Generic wrapper: call a registered integration on a "
+                "refresh interval and bind its output dict to the "
+                "source name. Same path whether the integration was "
+                "pre-seeded (weather, calendar) or agent-authored. "
+                "Use bb.integrations.list() to see what's registered "
+                "and bb.display.describe_source(name) to see a specific "
+                "integration's output fields."
             ),
         },
         "http_json": {
@@ -2201,6 +2265,10 @@ def _spec_to_dict(spec: Any) -> dict[str, Any]:
         d: dict[str, Any] = {"name": src.name}
         if src.source_type and src.source_type != "builtin":
             d["type"] = src.source_type
+        if src.integration:
+            d["integration"] = src.integration
+        if src.inputs:
+            d["inputs"] = dict(src.inputs)
         if src.url:
             d["url"] = src.url
         if src.params:

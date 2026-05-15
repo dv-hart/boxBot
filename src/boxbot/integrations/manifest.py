@@ -152,6 +152,9 @@ def validate_secrets(value: Any) -> tuple[str, ...]:
     return tuple(deduped)
 
 
+_ENV_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
 def _validate_input_spec(name: str, spec: Any) -> dict[str, Any]:
     """One input declaration — informational shape, lightly validated."""
     if not isinstance(spec, dict):
@@ -167,6 +170,13 @@ def _validate_input_spec(name: str, spec: Any) -> dict[str, Any]:
             )
     if "required" in out and not isinstance(out["required"], bool):
         raise ManifestError(f"input '{name}' required must be a bool")
+    if "default_env" in out:
+        env_name = out["default_env"]
+        if not isinstance(env_name, str) or not _ENV_NAME_PATTERN.match(env_name):
+            raise ManifestError(
+                f"input '{name}' default_env must be SCREAMING_SNAKE_CASE "
+                f"(got {env_name!r})"
+            )
     return out
 
 

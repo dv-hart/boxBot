@@ -184,8 +184,52 @@ secret needs refreshing.
 | `weather` | NOAA `api.weather.gov` forecasts for a US lat/lon. No API key required. |
 | `calendar` | Google Calendar v3 — `list_upcoming_events`, `create_event`, `update_event`, `delete_event`. Reads OAuth token from secret `GOOGLE_CALENDAR_TOKEN_JSON`; auto-refreshes and persists the rotated token back. |
 
-The display system's `WeatherSource` calls `weather` via the runner;
-`CalendarSource` calls `calendar` the same way.
+Display specs reach them both through the generic ``integration``
+data source type — there is no special class for pre-seeded
+integrations any more. ``IntegrationSource`` in
+``src/boxbot/displays/data_sources.py`` handles every integration the
+same way: read inputs from the spec, call
+``boxbot.integrations.runner.run``, bind the output dict to the
+source name.
+
+```json
+{"name": "weather", "type": "integration", "refresh": 3600}
+{"name": "calendar", "type": "integration",
+ "inputs": {"action": "list_upcoming_events", "max_results": 5},
+ "refresh": 600}
+```
+
+Lat/lon for the weather integration aren't carried in the display
+spec — the manifest declares ``default_env: BOXBOT_WEATHER_LAT`` /
+``BOXBOT_WEATHER_LON`` so device-level config stays in ``.env``. See
+**Device-level config via default_env** below.
+
+## Device-level config via ``default_env``
+
+Some integration inputs are per-device, not per-call: home lat/lon,
+zip code, household solar capacity. Declaring them in every display
+spec would force every device install to edit checked-in JSON. Inline
+in the manifest:
+
+```yaml
+inputs:
+  lat:
+    type: float
+    required: true
+    default_env: BOXBOT_WEATHER_LAT
+    description: Latitude. Falls back to BOXBOT_WEATHER_LAT env var.
+```
+
+The runner reads ``os.environ[default_env]`` during input validation
+(main process, before sandbox spawn) when the caller doesn't supply
+the input. Numeric declared types (``float``/``int``) get coerced;
+booleans accept ``1/true/yes/on``; strings pass through. Set the env
+var in the device's ``.env`` once and every consumer — agent,
+display, trigger — picks it up.
+
+This is **not** a secret mechanism — secrets stay in the secret store
+and are injected as ``BOXBOT_SECRET_<NAME>``. ``default_env`` is for
+non-sensitive device configuration.
 
 ## Calendar migration runbook (one-time, per device)
 

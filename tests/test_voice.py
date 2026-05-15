@@ -1431,6 +1431,27 @@ class TestVoiceSession:
         session._audio_capture.start.assert_awaited_once_with(mic)
 
     @pytest.mark.asyncio
+    async def test_activate_session_clears_prior_mute(self):
+        """A wake-word activation must unmute capture so follow-up
+        speech actually reaches VAD. Regression: a sticky ``mute_mic``
+        from an earlier conversation would silently drop everything
+        after the wake word, leaving the box looking unresponsive."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.IDLE
+        session._vad = MagicMock()
+        session._audio_capture = MagicMock()
+        session._audio_capture.start = AsyncMock()
+        # Simulate a mute that's outlived its conversation.
+        session._audio_capture.is_muted = True
+
+        await session._activate_session()
+
+        session._audio_capture.unmute.assert_called_once()
+        assert session.state == VoiceSessionState.ACTIVE
+
+    @pytest.mark.asyncio
     async def test_conversation_ended_voice_deactivates_adapter(self):
         """The adapter subscribes to ConversationEnded and deactivates
         capture/LED when the room conversation ends (silence or agent-

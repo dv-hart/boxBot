@@ -421,9 +421,20 @@ class VoiceSession:
         From DORMANT the existing voice session id is preserved so the
         agent routes the next transcript into the same room
         conversation — wake word resumes, it does not restart.
+
+        Also clears any prior ``mute_mic`` state. The wake word means a
+        human is engaging us right now; if a previous turn muted the
+        capture pipeline, follow-up speech would otherwise be dropped
+        and the session would silently grace-timeout. This is the
+        third bullet of ``mute_mic``'s documented contract — "the
+        wake word fires and starts a fresh session" unmutes.
         """
         self._last_speech_time = time.monotonic()
         prev_state = self._state
+
+        # Run before the state transition so unmute_mic stays silent on
+        # the LED — the listening pattern is set unconditionally below.
+        self.unmute_mic()
 
         if prev_state is VoiceSessionState.IDLE:
             self._state = VoiceSessionState.ACTIVE

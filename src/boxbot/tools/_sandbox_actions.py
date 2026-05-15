@@ -982,6 +982,41 @@ async def _handle_integrations_action(
                 return {"status": "error", "message": "'limit' must be a positive integer"}
             return {"status": "ok", "runs": list_runs(name, limit=limit)}
 
+        if sub == "get_source":
+            from boxbot.integrations.loader import get_integration
+
+            name = payload.get("name")
+            if not isinstance(name, str) or not name:
+                return {"status": "error", "message": "'name' is required"}
+            meta = get_integration(name)
+            if meta is None:
+                return {
+                    "status": "missing",
+                    "name": name,
+                    "message": f"integration '{name}' is not registered",
+                }
+            try:
+                script_text = meta.script_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                return {
+                    "status": "error",
+                    "message": f"could not read script for '{name}': {exc}",
+                }
+            manifest = {
+                "name": meta.name,
+                "description": meta.description,
+                "inputs": meta.inputs,
+                "outputs": meta.outputs,
+                "secrets": list(meta.secrets),
+                "timeout": meta.timeout,
+            }
+            return {
+                "status": "ok",
+                "name": meta.name,
+                "manifest": manifest,
+                "script": script_text,
+            }
+
         if sub == "create":
             from boxbot.integrations.persist import create_integration
 

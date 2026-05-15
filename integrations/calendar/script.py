@@ -177,6 +177,37 @@ def _format_time(dt: datetime) -> str:
     return local.strftime("%-I:%M %p")
 
 
+def _format_day(dt: datetime, *, today: datetime | None = None) -> str:
+    """Day prefix for the ``when`` field.
+
+    Uses "Today" / "Tomorrow" for the next 48 hours, the weekday name
+    for the rest of the current week, and "Mon May 19" otherwise. All
+    comparisons happen in the local zone so a 9pm event tonight isn't
+    silently "Tomorrow" because UTC rolled over.
+    """
+    local = dt.astimezone()
+    base = (today or datetime.now()).astimezone()
+    today_d = base.date()
+    diff_days = (local.date() - today_d).days
+    if diff_days == 0:
+        return "Today"
+    if diff_days == 1:
+        return "Tomorrow"
+    if 2 <= diff_days <= 6:
+        return local.strftime("%a")
+    return local.strftime("%a %b %-d")
+
+
+def _format_when(start: datetime | None, *, all_day: bool) -> str:
+    """Day-prefixed string for display rows. Empty if start is unknown."""
+    if start is None:
+        return ""
+    day = _format_day(start)
+    if all_day:
+        return f"{day} · all day"
+    return f"{day} · {_format_time(start)}"
+
+
 def _format_duration(start: datetime | None, end: datetime | None) -> str:
     if start is None or end is None:
         return ""
@@ -210,6 +241,7 @@ def _normalize_event(event: dict[str, Any]) -> dict[str, Any]:
         "id": event.get("id", ""),
         "title": event.get("summary", "(no title)"),
         "time": time_str,
+        "when": _format_when(start_dt, all_day=all_day),
         "start": start_dt.isoformat() if start_dt else None,
         "end": end_dt.isoformat() if end_dt else None,
         "duration": duration,

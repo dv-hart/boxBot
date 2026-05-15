@@ -436,3 +436,79 @@ class TestCalendarIntegrationNormalization:
         assert time_field(
             "2026-04-25T15:00:00+00:00", False
         ) == {"dateTime": "2026-04-25T15:00:00+00:00"}
+
+    def test_when_field_today(self):
+        """Timed events on today's date prefix with "Today"."""
+        mod = self._load_script()
+        # Build a start datetime that's "today" in local zone, 4pm.
+        now_local = datetime.now().astimezone()
+        start_local = now_local.replace(hour=16, minute=0, second=0, microsecond=0)
+        raw = {
+            "id": "t",
+            "summary": "Standup",
+            "start": {"dateTime": start_local.isoformat()},
+            "end": {"dateTime": start_local.isoformat()},
+        }
+        result = mod._normalize_event(raw)
+        assert result["when"].startswith("Today · ")
+        assert "4:00 PM" in result["when"] or "16:00" in result["when"]
+
+    def test_when_field_tomorrow_all_day(self):
+        mod = self._load_script()
+        # Use _format_day directly so we don't depend on tomorrow being a
+        # specific date when the test runs.
+        from datetime import timedelta
+        now_local = datetime.now().astimezone()
+        tomorrow_local = (now_local + timedelta(days=1)).replace(
+            hour=12, minute=0, second=0, microsecond=0,
+        )
+        assert mod._format_day(tomorrow_local) == "Tomorrow"
+        assert mod._format_when(tomorrow_local, all_day=True) == "Tomorrow · all day"
+
+    def test_when_field_far_future(self):
+        """Events more than a week out use absolute Mon Mmm D format."""
+        mod = self._load_script()
+        from datetime import timedelta
+        now_local = datetime.now().astimezone()
+        far = (now_local + timedelta(days=30)).replace(
+            hour=10, minute=0, second=0, microsecond=0,
+        )
+        day = mod._format_day(far)
+        # Should be "Mon May 15" style — three-letter day, three-letter month, day-of-month.
+        parts = day.split()
+        assert len(parts) == 3, f"expected 3 tokens, got {day!r}"
+        assert len(parts[0]) == 3
+        assert len(parts[1]) == 3
+        assert parts[2].isdigit()
+
+    def test_when_field_empty_when_start_unknown(self):
+        mod = self._load_script()
+        assert mod._format_when(None, all_day=False) == ""
+        assert mod._format_when(None, all_day=True) == ""
+
+    def test_normalize_event_includes_when(self):
+        """_normalize_event surfaces ``when`` alongside ``time``."""
+        mod = self._load_script()
+        raw = {
+            "id": "a",
+            "summary": "Meeting",
+            "start": {"dateTime": "2026-04-23T09:00:00+00:00"},
+            "end": {"dateTime": "2026-04-23T09:30:00+00:00"},
+        }
+        out = mod._normalize_event(raw)
+        assert "when" in out
+        assert isinstance(out["when"], str)
+        assert out["when"]  # non-empty
+        # Both fields coexist — old consumers reading `time` still work.
+        assert out["time"]
+
+    def test_all_day_event_when_includes_all_day_marker(self):
+        mod = self._load_script()
+        raw = {
+            "id": "h",
+            "summary": "Holiday",
+            "start": {"date": "2026-04-25"},
+            "end": {"date": "2026-04-26"},
+        }
+        out = mod._normalize_event(raw)
+        assert "all day" in out["when"]

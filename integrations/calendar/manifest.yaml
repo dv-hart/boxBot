@@ -37,7 +37,7 @@ inputs:
 outputs:
   events:
     type: array
-    description: For list_upcoming_events — display-ready event dicts (id, title, time, start, end, location, duration, all_day, description).
+    description: For list_upcoming_events — display-ready event dicts (id, title, time, when, start, end, location, duration, all_day, description). The "when" field is a day-prefixed string ("Today · 4:00 PM", "Mon May 19 · all day") suitable for one-line agenda rows; "time" remains the bare time without a day prefix.
   count:
     type: int
     description: For list_upcoming_events — number of events returned.

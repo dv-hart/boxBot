@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from boxbot.sdk import integrations as bb_integrations
+from boxbot.tools._sandbox_actions import ActionContext, process_action
 
 
 # The SDK's action marker is the same constant the dispatcher reads.
@@ -57,6 +59,17 @@ class TestGet:
     def test_get_requires_name(self):
         with pytest.raises(ValueError):
             _capture(bb_integrations.get, "")
+
+
+class TestGetSource:
+    def test_emits_get_source_action(self):
+        payload, _ = _capture(bb_integrations.get_source, "weather")
+        assert payload["_sdk"] == "integrations.get_source"
+        assert payload["name"] == "weather"
+
+    def test_get_source_requires_name(self):
+        with pytest.raises(ValueError):
+            _capture(bb_integrations.get_source, "")
 
 
 class TestLogs:
@@ -161,3 +174,86 @@ class TestUpdateDelete:
         payload, _ = _capture(bb_integrations.delete, "weather")
         assert payload["_sdk"] == "integrations.delete"
         assert payload["name"] == "weather"
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher routing — exercises the main-side handler for get_source.
+# ---------------------------------------------------------------------------
+
+
+def _seed_integration(root: Path, name: str = "demo") -> tuple[str, str]:
+    """Write a minimal manifest+script under ``root/<name>/`` and return them."""
+    target = root / name
+    target.mkdir(parents=True)
+    manifest_yaml = (
+        f"name: {name}\n"
+        "description: Demo integration for dispatcher tests.\n"
+        "inputs: {}\n"
+        "outputs: {}\n"
+        "secrets: []\n"
+        "timeout: 10\n"
+    )
+    script_text = (
+        "from boxbot_sdk.integration import return_output\n"
+        "return_output({'ok': True})\n"
+    )
+    (target / "manifest.yaml").write_text(manifest_yaml, encoding="utf-8")
+    (target / "script.py").write_text(script_text, encoding="utf-8")
+    return manifest_yaml, script_text
+
+
+class TestGetSourceDispatcher:
+    @pytest.mark.asyncio
+    async def test_returns_manifest_and_script(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from boxbot.integrations import loader as integ_loader
+
+        monkeypatch.setattr(
+            integ_loader, "_DEFAULT_INTEGRATIONS_ROOT", tmp_path
+        )
+        _, script_text = _seed_integration(tmp_path, name="demo")
+
+        result = await process_action(
+            {"_sdk": "integrations.get_source", "name": "demo"},
+            ActionContext(),
+        )
+        assert result["status"] == "ok"
+        assert result["name"] == "demo"
+        assert result["script"] == script_text
+        assert result["manifest"]["name"] == "demo"
+        assert result["manifest"]["timeout"] == 10
+        assert result["manifest"]["inputs"] == {}
+        assert result["manifest"]["secrets"] == []
+
+    @pytest.mark.asyncio
+    async def test_missing_integration_reports_missing(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from boxbot.integrations import loader as integ_loader
+
+        monkeypatch.setattr(
+            integ_loader, "_DEFAULT_INTEGRATIONS_ROOT", tmp_path
+        )
+
+        result = await process_action(
+            {"_sdk": "integrations.get_source", "name": "nope"},
+            ActionContext(),
+        )
+        assert result["status"] == "missing"
+        assert "nope" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_blank_name(self, tmp_path: Path, monkeypatch):
+        from boxbot.integrations import loader as integ_loader
+
+        monkeypatch.setattr(
+            integ_loader, "_DEFAULT_INTEGRATIONS_ROOT", tmp_path
+        )
+
+        result = await process_action(
+            {"_sdk": "integrations.get_source", "name": ""},
+            ActionContext(),
+        )
+        assert result["status"] == "error"
+        assert "name" in result["message"]

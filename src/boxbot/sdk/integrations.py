@@ -36,6 +36,11 @@ The full lifecycle::
     bb.integrations.logs("weather", limit=5)
     # → [{"started_at": …, "status": "error", "error": "401 Unauthorized"}, …]
 
+    # Inspect the source before patching — read the current manifest + script
+    # so you can make a small diff instead of rewriting from scratch.
+    src = bb.integrations.get_source("solar")
+    # → {"manifest": {...}, "script": "..."}
+
     # Update or remove
     bb.integrations.update("solar", script="…new script…")
     bb.integrations.delete("solar")
@@ -75,6 +80,22 @@ def get(name: str, **inputs: Any) -> Any:
     """
     v.require_str(name, "name")
     return _transport.request("integrations.get", {"name": name, "inputs": inputs})
+
+
+def get_source(name: str) -> Any:
+    """Return the current manifest and script of integration ``name``.
+
+    Read-only introspection — pairs with :func:`update` so the agent
+    can read what's there, make a small change, and write it back
+    instead of rewriting from scratch.
+
+    Returns the dispatcher response::
+
+        {"status": "ok", "manifest": {...}, "script": "..."}
+        {"status": "missing", "message": "..."}
+    """
+    v.require_str(name, "name")
+    return _transport.request("integrations.get_source", {"name": name})
 
 
 def logs(name: str, *, limit: int = 20) -> Any:

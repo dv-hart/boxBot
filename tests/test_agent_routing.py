@@ -709,3 +709,80 @@ async def test_extraction_sweep_idempotent_on_already_extracted(
 
     assert called == [conv_id]
 
+
+@pytest.mark.asyncio
+async def test_rehydrate_stubs_memory_conversations_row(tmp_path):
+    """Dispatch-as-bridge mints a persistent conversation in the
+    conversation store without touching memory.db. On the recipient's
+    next inbound, ``_get_or_create_conversation`` rehydrates that
+    thread — and must also stub the memory.conversations row so
+    in-conversation ``memory.save`` calls can FK against it.
+
+    Regression for the FOREIGN KEY constraint storm seen in production
+    after PR 2 (dispatch-as-bridge) — the stub call used to be gated
+    on ``rehydrated_thread is None`` and was skipped on the revive
+    path.
+    """
+    from boxbot.conversations.store import ConversationStore
+    from boxbot.core import config as config_module
+    from boxbot.memory.store import MemoryStore
+
+    config_module._config = config_module.BoxBotConfig()
+    conv_store = ConversationStore(db_path=tmp_path / "conv.db")
+    await conv_store.initialize()
+    mem_store = MemoryStore(db_path=tmp_path / "mem.db")
+    await mem_store.initialize()
+
+    bus = get_event_bus()
+    try:
+        # Simulate _bridge_trigger_delivery: a fresh persistent
+        # conversation lands in the store with no memory.db row.
+        record, created = await conv_store.get_or_create_active(
+            channel="whatsapp",
+            channel_key="whatsapp:+15551111111",
+            max_inactive_seconds=14400.0,
+            participants={"Jacob", "boxBot"},
+        )
+        assert created
+        bridged_id = record.conversation_id
+        assert await mem_store.get_conversation(bridged_id) is None
+
+        agent = BoxBotAgent(
+            memory_store=mem_store, conversation_store=conv_store,
+        )
+        agent._client = MagicMock()
+        agent._running = True
+        bus.subscribe(WhatsAppMessage, agent._on_whatsapp_message)
+        bus.subscribe(ConversationEnded, agent._on_conversation_ended)
+        agent._generate_for_conversation = _make_stub_generate(reply="ack")
+
+        await agent._on_whatsapp_message(WhatsAppMessage(
+            sender_name="Jacob",
+            sender_phone="+15551111111",
+            text="thanks for the briefing",
+        ))
+        await _drain_active(agent)
+
+        # Same conversation rehydrated, not a fresh one.
+        assert (
+            agent._conversation_by_key["whatsapp:+15551111111"]
+            == bridged_id
+        )
+
+        # And the stub now exists, so the FK from memories.source_conversation
+        # resolves and a mid-conversation memory.save succeeds.
+        assert await mem_store.get_conversation(bridged_id) is not None
+        mem_id = await mem_store.create_memory(
+            type="household",
+            content="standing instruction: text Carina on calendar adds",
+            summary="standing instruction: text Carina on calendar adds",
+            source_conversation=bridged_id,
+        )
+        assert mem_id
+    finally:
+        bus.unsubscribe(WhatsAppMessage, agent._on_whatsapp_message)
+        bus.unsubscribe(ConversationEnded, agent._on_conversation_ended)
+        await mem_store.close()
+        await conv_store.close()
+        config_module._config = None
+

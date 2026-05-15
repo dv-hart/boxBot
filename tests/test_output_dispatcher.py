@@ -7,6 +7,7 @@ import pytest
 
 from boxbot.core.output_dispatcher import (
     INTERNAL_NOTES_SCHEMA,
+    DispatchResult,
     dispatch_outputs,
     parse_internal_notes,
 )
@@ -165,13 +166,14 @@ class TestDispatchOutputs:
 
     @pytest.mark.asyncio
     async def test_voice_to_current_speaker(self, fake_voice):
-        await dispatch_outputs(
+        results = await dispatch_outputs(
             [{"to": "current_speaker", "channel": "voice", "content": "Hi Jacob."}],
             conversation_id="c1",
             channel_context="voice",
             current_speaker="Jacob",
         )
         assert fake_voice.spoken == ["Hi Jacob."]
+        assert [r.status for r in results] == ["delivered"]
 
     @pytest.mark.asyncio
     async def test_voice_to_room(self, fake_voice):
@@ -185,13 +187,14 @@ class TestDispatchOutputs:
 
     @pytest.mark.asyncio
     async def test_text_to_named_user(self, fake_voice, fake_auth, fake_whatsapp):
-        await dispatch_outputs(
+        results = await dispatch_outputs(
             [{"to": "Sarah", "channel": "text", "content": "He's home."}],
             conversation_id="c3",
             channel_context="trigger",
             current_speaker=None,
         )
         assert fake_whatsapp.sent == [("+15552222222", "He's home.")]
+        assert [r.status for r in results] == ["delivered"]
 
     @pytest.mark.asyncio
     async def test_text_name_resolution_is_case_insensitive(
@@ -209,25 +212,36 @@ class TestDispatchOutputs:
     async def test_text_to_unknown_user_is_dropped(
         self, fake_voice, fake_auth, fake_whatsapp
     ):
-        await dispatch_outputs(
+        results = await dispatch_outputs(
             [{"to": "Nobody", "channel": "text", "content": "lost"}],
             conversation_id="c4",
             channel_context="trigger",
             current_speaker=None,
         )
         assert fake_whatsapp.sent == []
+        assert len(results) == 1
+        result = results[0]
+        assert result.status == "dropped"
+        assert "unknown recipient 'Nobody'" in result.reason
+        # The agent gets the valid names back so it can retry.
+        assert result.valid_recipients == ["Jacob", "Sarah"]
+        assert "Jacob" in result.reason and "Sarah" in result.reason
 
     @pytest.mark.asyncio
     async def test_text_to_room_is_dropped(
         self, fake_voice, fake_auth, fake_whatsapp
     ):
-        await dispatch_outputs(
+        results = await dispatch_outputs(
             [{"to": "room", "channel": "text", "content": "nope"}],
             conversation_id="c5",
             channel_context="voice",
             current_speaker=None,
         )
         assert fake_whatsapp.sent == []
+        assert results[0].status == "dropped"
+        assert "room" in results[0].reason
+        # "room" is not an unresolved name — no recipient list to suggest.
+        assert results[0].valid_recipients is None
 
     @pytest.mark.asyncio
     async def test_multiple_outputs_same_turn(
@@ -251,13 +265,15 @@ class TestDispatchOutputs:
 
     @pytest.mark.asyncio
     async def test_unknown_channel_is_dropped(self, fake_voice):
-        await dispatch_outputs(
+        results = await dispatch_outputs(
             [{"to": "current_speaker", "channel": "smoke_signal", "content": "??"}],
             conversation_id="c7",
             channel_context="voice",
             current_speaker="Jacob",
         )
         assert fake_voice.spoken == []
+        assert results[0].status == "dropped"
+        assert "smoke_signal" in results[0].reason
 
     @pytest.mark.asyncio
     async def test_empty_outputs_is_noop(
@@ -276,7 +292,7 @@ class TestDispatchOutputs:
     async def test_malformed_entries_are_dropped(
         self, fake_voice, fake_auth, fake_whatsapp
     ):
-        await dispatch_outputs(
+        results = await dispatch_outputs(
             [
                 {"to": "", "channel": "voice", "content": "empty to"},
                 {"to": "Jacob", "channel": "", "content": "empty channel"},
@@ -289,3 +305,20 @@ class TestDispatchOutputs:
         )
         # Only the well-formed "good" entry gets through.
         assert fake_voice.spoken == ["good"]
+        # One result per input entry, in order.
+        assert [r.status for r in results] == [
+            "dropped", "dropped", "dropped", "delivered",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_no_voice_session_is_reported_dropped(self, monkeypatch):
+        import boxbot.communication.voice as voice_mod
+        monkeypatch.setattr(voice_mod, "_voice_session", None, raising=False)
+        results = await dispatch_outputs(
+            [{"to": "room", "channel": "voice", "content": "anyone?"}],
+            conversation_id="c10",
+            channel_context="voice",
+            current_speaker=None,
+        )
+        assert results[0].status == "dropped"
+        assert "voice session" in results[0].reason

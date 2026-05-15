@@ -101,6 +101,31 @@ class MessageTool(Tool):
         "additionalProperties": False,
     }
 
+    @staticmethod
+    def _result_json(results: list[Any], to: str, channel: str) -> str:
+        """Turn the dispatcher's per-entry result into a tool result.
+
+        ``message`` always dispatches exactly one entry, so we inspect
+        ``results[0]``. A dropped delivery comes back as a ``status:
+        error`` the agent can act on (e.g. retry with a valid recipient
+        name) — never a false ``delivered``.
+        """
+        result = results[0] if results else None
+        if result is not None and result.status == "delivered":
+            return json.dumps({
+                "status": "delivered", "to": to, "channel": channel,
+            })
+        payload: dict[str, Any] = {
+            "status": "error",
+            "message": (
+                result.reason if result and result.reason
+                else "message could not be delivered"
+            ),
+        }
+        if result is not None and result.valid_recipients is not None:
+            payload["valid_recipients"] = result.valid_recipients
+        return json.dumps(payload)
+
     async def execute(self, **kwargs: Any) -> str:
         from boxbot.core.output_dispatcher import dispatch_outputs
         from boxbot.tools._tool_context import get_current_conversation
@@ -136,18 +161,14 @@ class MessageTool(Tool):
                 "dispatching with no segment recorder. to=%s channel=%s",
                 to, channel,
             )
-            await dispatch_outputs(
+            results = await dispatch_outputs(
                 [{"to": to, "channel": dispatcher_channel, "content": content}],
                 conversation_id="ad-hoc",
                 channel_context="unknown",
                 current_speaker=None,
                 segment_recorder=None,
             )
-            return json.dumps({
-                "status": "delivered",
-                "to": to,
-                "channel": channel,
-            })
+            return self._result_json(results, to, channel)
 
         # Resolve current_speaker from the conversation's participants.
         # Mirrors how _publish_started picks primary_person.
@@ -156,7 +177,7 @@ class MessageTool(Tool):
             current_speaker = p
             break
 
-        await dispatch_outputs(
+        results = await dispatch_outputs(
             [{"to": to, "channel": dispatcher_channel, "content": content}],
             conversation_id=conv.conversation_id,
             channel_context=conv.channel,
@@ -164,8 +185,4 @@ class MessageTool(Tool):
             segment_recorder=conv.record_segment,
         )
 
-        return json.dumps({
-            "status": "delivered",
-            "to": to,
-            "channel": channel,
-        })
+        return self._result_json(results, to, channel)

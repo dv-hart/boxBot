@@ -183,6 +183,79 @@ class TestExecuteScriptTool:
 
 
 # ---------------------------------------------------------------------------
+# MessageTool
+# ---------------------------------------------------------------------------
+
+
+class TestMessageTool:
+    """The message tool must report the dispatcher's *real* outcome.
+
+    Regression: it used to return ``status: delivered`` unconditionally,
+    so when the agent addressed a message to an unresolvable recipient
+    (its own name, "Jarvis") the drop was invisible — it "delivered"
+    three messages that nobody received.
+    """
+
+    def test_result_json_delivered(self):
+        from boxbot.core.output_dispatcher import DispatchResult
+        from boxbot.tools.builtins.message import MessageTool
+
+        out = json.loads(MessageTool._result_json(
+            [DispatchResult(to="Jacob", channel="text", status="delivered")],
+            "Jacob", "text",
+        ))
+        assert out == {"status": "delivered", "to": "Jacob", "channel": "text"}
+
+    def test_result_json_unknown_recipient_surfaces_valid_names(self):
+        from boxbot.core.output_dispatcher import DispatchResult
+        from boxbot.tools.builtins.message import MessageTool
+
+        dropped = DispatchResult(
+            to="Jarvis", channel="text", status="dropped",
+            reason=(
+                "unknown recipient 'Jarvis'. Valid recipients: Jacob, "
+                "Carina. Use one of those names, or 'current_speaker'."
+            ),
+            valid_recipients=["Jacob", "Carina"],
+        )
+        out = json.loads(MessageTool._result_json(dropped and [dropped],
+                                                  "Jarvis", "text"))
+        assert out["status"] == "error"
+        assert "Jarvis" in out["message"]
+        assert out["valid_recipients"] == ["Jacob", "Carina"]
+
+    def test_result_json_empty_results(self):
+        from boxbot.tools.builtins.message import MessageTool
+
+        out = json.loads(MessageTool._result_json([], "Jacob", "text"))
+        assert out["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_execute_returns_dispatcher_drop(self):
+        """End to end: a dropped delivery becomes a tool-level error."""
+        from boxbot.core.output_dispatcher import DispatchResult
+        from boxbot.tools.builtins.message import MessageTool
+
+        drop = DispatchResult(
+            to="Jarvis", channel="text", status="dropped",
+            reason="unknown recipient 'Jarvis'. Valid recipients: Jacob.",
+            valid_recipients=["Jacob"],
+        )
+        with patch(
+            "boxbot.core.output_dispatcher.dispatch_outputs",
+            new=AsyncMock(return_value=[drop]),
+        ), patch(
+            "boxbot.tools._tool_context.get_current_conversation",
+            return_value=None,
+        ):
+            result = json.loads(await MessageTool().execute(
+                to="Jarvis", channel="text", content="the display is ready",
+            ))
+        assert result["status"] == "error"
+        assert result["valid_recipients"] == ["Jacob"]
+
+
+# ---------------------------------------------------------------------------
 # ManageTasksTool
 # ---------------------------------------------------------------------------
 

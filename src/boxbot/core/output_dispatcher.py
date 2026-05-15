@@ -31,9 +31,11 @@ Routing:
   the WhatsApp client.
 
 Invalid combinations (e.g. ``to: "room"`` with ``channel: "text"``, or
-an unknown name with ``channel: "text"``) are logged and dropped. The
-agent learns from the tool description + dispatcher warnings; the run
-does not crash.
+an unknown name with ``channel: "text"``) are logged and dropped — the
+run does not crash. ``dispatch_outputs`` returns one ``DispatchResult``
+per entry so the caller (the ``message`` tool) can tell the agent what
+actually happened, including the list of valid recipients when a name
+fails to resolve.
 
 The dispatcher is stateless; all dependencies come from module
 singletons that ``main.py`` sets up at boot (``get_voice_session``,
@@ -44,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,24 @@ logger = logging.getLogger(__name__)
 # lazily to avoid a circular dependency — output_dispatcher is imported
 # by agent.py which imports conversation.
 SegmentRecorder = Callable[[Any], None]
+
+
+@dataclass
+class DispatchResult:
+    """Outcome of dispatching one ``{to, channel, content}`` entry.
+
+    ``status`` is ``"delivered"`` or ``"dropped"``. On a drop, ``reason``
+    is a human-readable explanation safe to hand back to the agent as a
+    tool result. ``valid_recipients`` is populated only when the drop was
+    caused by an unresolvable recipient name, so the agent can retry with
+    a real name.
+    """
+
+    to: str
+    channel: str
+    status: str
+    reason: str = ""
+    valid_recipients: Optional[list[str]] = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -156,11 +177,15 @@ async def dispatch_outputs(
     channel_context: str,
     current_speaker: str | None,
     segment_recorder: Optional[SegmentRecorder] = None,
-) -> None:
+) -> list[DispatchResult]:
     """Dispatch each output entry to its appropriate channel.
 
     Called by the ``message`` tool (one entry per call) and by
     trigger-fired turns (potentially multiple entries in a batch).
+
+    Returns one ``DispatchResult`` per input entry, in order. The
+    ``message`` tool uses this to report real delivery status back to
+    the agent; trigger-fired callers may ignore it.
 
     Args:
         outputs: List of ``{to, channel, content}`` dicts.
@@ -177,6 +202,8 @@ async def dispatch_outputs(
     # Import lazily to avoid circular import with agent -> conversation.
     from boxbot.core.conversation import SpokenSegment
 
+    results: list[DispatchResult] = []
+
     for i, entry in enumerate(outputs):
         to = str(entry.get("to") or "").strip()
         channel = str(entry.get("channel") or "").strip()
@@ -187,6 +214,13 @@ async def dispatch_outputs(
                 "Dropping malformed output entry (conv=%s idx=%d): %r",
                 conversation_id, i, entry,
             )
+            results.append(DispatchResult(
+                to=to, channel=channel, status="dropped",
+                reason=(
+                    "malformed output: to, channel, and content must all "
+                    "be non-empty"
+                ),
+            ))
             continue
 
         # Resolve "current_speaker" alias
@@ -206,7 +240,7 @@ async def dispatch_outputs(
                 except Exception:
                     logger.debug("segment_recorder raised", exc_info=True)
             try:
-                await _dispatch_voice(
+                result = await _dispatch_voice(
                     to=resolved_to,
                     content=content,
                     conversation_id=conversation_id,
@@ -217,6 +251,7 @@ async def dispatch_outputs(
                 # aborted (CancelledError, KeyboardInterrupt, etc.).
                 segment.interrupted = True
                 raise
+            results.append(result)
         elif channel == "text":
             if resolved_to in ("room", "unknown"):
                 logger.warning(
@@ -225,6 +260,14 @@ async def dispatch_outputs(
                     "user for text.",
                     resolved_to, conversation_id,
                 )
+                results.append(DispatchResult(
+                    to=resolved_to, channel="text", status="dropped",
+                    reason=(
+                        f"cannot send text to '{resolved_to}'. Text needs a "
+                        "registered user's name; use channel='speak' to "
+                        "reach whoever is in the room."
+                    ),
+                ))
                 continue
             segment = SpokenSegment(
                 channel="text", to=resolved_to, content=content,
@@ -235,7 +278,7 @@ async def dispatch_outputs(
                 except Exception:
                     logger.debug("segment_recorder raised", exc_info=True)
             try:
-                await _dispatch_text(
+                result = await _dispatch_text(
                     to=resolved_to,
                     content=content,
                     conversation_id=conversation_id,
@@ -244,11 +287,18 @@ async def dispatch_outputs(
             except BaseException:
                 segment.interrupted = True
                 raise
+            results.append(result)
         else:
             logger.warning(
                 "Unknown channel %r in output entry (conv=%s); dropping: %r",
                 channel, conversation_id, entry,
             )
+            results.append(DispatchResult(
+                to=resolved_to, channel=channel, status="dropped",
+                reason=f"unknown channel '{channel}'; use 'speak' or 'text'",
+            ))
+
+    return results
 
 
 async def _dispatch_voice(
@@ -257,7 +307,7 @@ async def _dispatch_voice(
     content: str,
     conversation_id: str,
     channel_context: str,
-) -> None:
+) -> DispatchResult:
     """Speak ``content`` through the active voice session's TTS.
 
     ``to`` is logged for audit but does not change routing — the speaker
@@ -272,7 +322,13 @@ async def _dispatch_voice(
             "(conv=%s chan=%s)",
             to, conversation_id, channel_context,
         )
-        return
+        return DispatchResult(
+            to=to, channel="voice", status="dropped",
+            reason=(
+                "no active voice session — the box speaker is not "
+                "available right now"
+            ),
+        )
 
     logger.info(
         "output: voice → %s (conv=%s chan=%s): %s",
@@ -284,6 +340,11 @@ async def _dispatch_voice(
         logger.exception(
             "Voice dispatch failed (conv=%s to=%s)", conversation_id, to
         )
+        return DispatchResult(
+            to=to, channel="voice", status="dropped",
+            reason="voice playback failed",
+        )
+    return DispatchResult(to=to, channel="voice", status="delivered")
 
 
 async def _dispatch_text(
@@ -292,7 +353,7 @@ async def _dispatch_text(
     content: str,
     conversation_id: str,
     channel_context: str,
-) -> None:
+) -> DispatchResult:
     """Resolve ``to`` to a registered user's phone and send via WhatsApp."""
     from boxbot.communication.auth import get_auth_manager
     from boxbot.communication.whatsapp import get_whatsapp_client
@@ -306,14 +367,20 @@ async def _dispatch_text(
             "to=%s (conv=%s)",
             auth is not None, wa is not None, to, conversation_id,
         )
-        return
+        return DispatchResult(
+            to=to, channel="text", status="dropped",
+            reason="text delivery is unavailable (WhatsApp not configured)",
+        )
 
     # Resolve name → phone. Exact case-insensitive name match on the user list.
     try:
         users = await auth.list_users()
     except Exception:
         logger.exception("Failed to list users for text dispatch")
-        return
+        return DispatchResult(
+            to=to, channel="text", status="dropped",
+            reason="could not look up registered users",
+        )
 
     phone: str | None = None
     for user in users:
@@ -325,13 +392,21 @@ async def _dispatch_text(
             break
 
     if phone is None:
-        known = ", ".join(u.name for u in users) or "(no registered users)"
+        names = [u.name for u in users]
+        known = ", ".join(names) or "(no registered users)"
         logger.warning(
             "Cannot resolve '%s' to a registered user; dropping text output "
             "(conv=%s). Known: %s",
             to, conversation_id, known,
         )
-        return
+        return DispatchResult(
+            to=to, channel="text", status="dropped",
+            reason=(
+                f"unknown recipient '{to}'. Valid recipients: {known}. "
+                "Use one of those names, or 'current_speaker'."
+            ),
+            valid_recipients=names,
+        )
 
     logger.info(
         "output: text → %s (%s) (conv=%s chan=%s): %s",
@@ -344,3 +419,8 @@ async def _dispatch_text(
             "Text dispatch failed (conv=%s to=%s phone=%s)",
             conversation_id, to, phone,
         )
+        return DispatchResult(
+            to=to, channel="text", status="dropped",
+            reason="WhatsApp send failed",
+        )
+    return DispatchResult(to=to, channel="text", status="delivered")

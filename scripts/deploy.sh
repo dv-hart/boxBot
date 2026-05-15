@@ -218,12 +218,19 @@ RSYNC_OUT="\$(rsync -a --delete --itemize-changes \\
     --include='script.py' \\
     --exclude='*' \\
     integrations/ "\$SANDBOX_INTEG/")"
+# Always reconcile ownership + mode, even when rsync was a no-op.
+# rsync running as deploy-user creates files as <user>:<user>'s primary
+# group, not the sandbox-readable 'boxbot' group. chgrp without sudo
+# works because the deploy user is in 'boxbot' per setup-sandbox.sh.
+# 750 dirs / 640 files so the boxbot-sandbox user (also in 'boxbot')
+# can read but nobody outside the group can. Idempotent + cheap.
+chgrp -R boxbot "\$SANDBOX_INTEG"
+find "\$SANDBOX_INTEG" -type d -exec chmod 750 {} +
+find "\$SANDBOX_INTEG" -type f -exec chmod 640 {} +
 if [[ -n "\$RSYNC_OUT" ]]; then
     echo ""
     echo "--- Refresh staged integrations ---"
     echo "\$RSYNC_OUT" | sed 's/^/  /'
-    find "\$SANDBOX_INTEG" -type d -exec chmod 750 {} +
-    find "\$SANDBOX_INTEG" -type f -exec chmod 640 {} +
 fi
 EOF
 

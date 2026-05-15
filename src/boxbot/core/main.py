@@ -28,6 +28,7 @@ import logging.handlers
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -720,6 +721,13 @@ async def _async_main() -> None:
     from boxbot.core.config import load_config
 
     config = load_config(args.config)
+
+    # 2a. Apply timezone override before any date formatting runs. ``TZ``
+    # is inherited by child processes (sandbox runner preserves it), so
+    # this single tzset propagates to integrations as well.
+    if config.system.timezone:
+        os.environ["TZ"] = config.system.timezone
+        time.tzset()
 
     # 3. Set up logging (CLI --log-level overrides config)
     log_level = args.log_level or config.logging.level

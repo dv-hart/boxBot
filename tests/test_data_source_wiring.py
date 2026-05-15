@@ -512,3 +512,48 @@ class TestCalendarIntegrationNormalization:
         }
         out = mod._normalize_event(raw)
         assert "all day" in out["when"]
+
+    def test_all_day_date_is_naive(self):
+        """All-day events parse without a UTC tzinfo so subsequent
+        ``astimezone()`` calls don't shift them across midnight.
+        """
+        mod = self._load_script()
+        parsed = mod._parse_date("2026-05-22")
+        assert parsed is not None
+        assert parsed.tzinfo is None
+        assert parsed.date().isoformat() == "2026-05-22"
+
+    def test_format_day_no_shift_for_all_day_in_negative_offset_zone(
+        self, monkeypatch
+    ):
+        """The original bug: an all-day event on day D was rendered as
+        D-1 because UTC midnight converted to the previous day in
+        zones west of UTC. With naive datetimes, the day stays put.
+        """
+        mod = self._load_script()
+        from datetime import datetime as _dt
+
+        # All-day "Camp Sherman" on Fri May 22 — naive.
+        all_day = mod._parse_date("2026-05-22")
+        # Reference "today" in PDT (UTC-7) on Wed May 20.
+        today = _dt(2026, 5, 20, 9, 0, 0)  # naive local
+        day = mod._format_day(all_day, today=today)
+        # 2 days out → weekday name. Must be Fri, not Thu.
+        assert day == "Fri"
+
+    def test_format_day_aware_event_normalizes_to_local(self):
+        """Timed events keep tzinfo and get normalized via ``astimezone``.
+
+        Sanity check that we didn't break the aware-datetime branch
+        while adding the naive branch.
+        """
+        mod = self._load_script()
+        from datetime import datetime as _dt, timezone, timedelta
+
+        # 7am Mountain (UTC-6 in DST) on a future Tuesday.
+        tz = timezone(timedelta(hours=-6))
+        evt = _dt(2026, 6, 9, 7, 0, 0, tzinfo=tz)
+        today = _dt(2026, 6, 8, 12, 0, 0)  # naive local
+        day = mod._format_day(evt, today=today)
+        # 1 day out from today → "Tomorrow".
+        assert day == "Tomorrow"

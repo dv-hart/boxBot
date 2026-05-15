@@ -164,10 +164,20 @@ def _parse_iso(s: str | None) -> datetime | None:
 
 
 def _parse_date(s: str | None) -> datetime | None:
+    """Parse YYYY-MM-DD as a naive (zone-less) datetime at midnight.
+
+    Google Calendar all-day events use date-only strings with no zone.
+    Attaching UTC and then converting to local in ``_format_day``
+    shifts the day backward across midnight (e.g. May 23 all-day
+    rendering as Thursday in PDT). Treating the value as a calendar
+    date — independent of zone — keeps it on the day the event
+    actually belongs to. Downstream consumers detect this case by
+    checking ``dt.tzinfo is None``.
+    """
     if not s:
         return None
     try:
-        return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return datetime.strptime(s, "%Y-%m-%d")
     except ValueError:
         return None
 
@@ -181,12 +191,21 @@ def _format_day(dt: datetime, *, today: datetime | None = None) -> str:
     """Day prefix for the ``when`` field.
 
     Uses "Today" / "Tomorrow" for the next 48 hours, the weekday name
-    for the rest of the current week, and "Mon May 19" otherwise. All
-    comparisons happen in the local zone so a 9pm event tonight isn't
-    silently "Tomorrow" because UTC rolled over.
+    for the rest of the current week, and "Mon May 19" otherwise.
+
+    Aware datetimes (timed events) get normalized to the local zone so
+    a 9pm event tonight isn't silently "Tomorrow" because UTC rolled
+    over. Naive datetimes (all-day events from
+    :func:`_parse_date`) are treated as calendar dates — already in
+    the local frame — and used as-is.
     """
-    local = dt.astimezone()
-    base = (today or datetime.now()).astimezone()
+    if dt.tzinfo is None:
+        local = dt
+    else:
+        local = dt.astimezone()
+    base = today or datetime.now()
+    if base.tzinfo is not None:
+        base = base.astimezone()
     today_d = base.date()
     diff_days = (local.date() - today_d).days
     if diff_days == 0:

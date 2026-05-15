@@ -134,6 +134,18 @@ def _overlay_env(data: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+class SystemConfig(BaseModel):
+    """Box-level system settings — TZ, locale, etc."""
+
+    # IANA timezone name (e.g. "America/Los_Angeles"). ``None`` =
+    # autodetect from /etc/timezone or the system clock. Setting this
+    # propagates to all child processes via ``TZ`` env (the sandbox
+    # runner preserves TZ), so the calendar integration and any other
+    # date-formatting code line up with the box's physical location
+    # regardless of the underlying OS configuration.
+    timezone: str | None = None
+
+
 class AgentConfig(BaseModel):
     """Agent identity and conversation settings."""
 
@@ -626,6 +638,7 @@ class BoxBotConfig(BaseModel):
     and model selection.
     """
 
+    system: SystemConfig = Field(default_factory=SystemConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)

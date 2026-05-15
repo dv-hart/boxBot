@@ -1,6 +1,15 @@
 # boxBot Configuration
 # Copy this file to config.yaml and customize for your setup.
 
+# ── System ────────────────────────────────────────────────────────────
+system:
+  # IANA timezone name (e.g. "America/Los_Angeles"). null = inherit
+  # from /etc/timezone or the system clock. Set this explicitly when
+  # the OS clock is wrong or the box has moved. The value propagates
+  # to all child processes via the TZ environment variable so the
+  # calendar integration and other date-formatting code stay aligned.
+  timezone: null
+
 # ── Agent ─────────────────────────────────────────────────────────────
 agent:
   name: "boxBot"

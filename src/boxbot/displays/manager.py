@@ -42,6 +42,70 @@ def get_display_manager() -> "DisplayManager | None":
 def set_display_manager(mgr: "DisplayManager | None") -> None:
     global _display_manager_instance
     _display_manager_instance = mgr
+
+
+# ---------------------------------------------------------------------------
+# Rotation state persistence
+# ---------------------------------------------------------------------------
+
+
+def _rotation_state_path() -> "Path":
+    """Resolve ``data/displays/rotation.json``.
+
+    Anchored to ``boxbot.core.paths.DISPLAYS_DIR`` so the resolved
+    path is independent of cwd and honors ``BOXBOT_DATA_DIR`` overrides
+    (tests, alternate deployments).
+    """
+    from boxbot.core.paths import DISPLAYS_DIR
+    return DISPLAYS_DIR / "rotation.json"
+
+
+def _load_rotation_state() -> dict | None:
+    """Read persisted rotation state, or None if absent / malformed.
+
+    Returns a dict ``{"displays": list[str], "interval": int}`` on
+    success. Missing file, bad JSON, or shape mismatch all return
+    ``None`` so the caller falls back to config — never raises so a
+    corrupt file can't take down the display manager.
+    """
+    import json as _json
+    path = _rotation_state_path()
+    if not path.is_file():
+        return None
+    try:
+        data = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, _json.JSONDecodeError) as exc:
+        logger.warning("Could not read rotation state at %s: %s", path, exc)
+        return None
+    displays = data.get("displays")
+    interval = data.get("interval")
+    if not isinstance(displays, list) or not all(isinstance(d, str) for d in displays):
+        return None
+    if not isinstance(interval, int) or interval < 1:
+        return None
+    return {"displays": displays, "interval": interval}
+
+
+def _persist_rotation_state(state: dict | None) -> None:
+    """Write rotation state to disk (or delete when ``state`` is None).
+
+    Atomically replaces the file via tmp+rename so a partial write
+    can't corrupt the persisted record. Best-effort: I/O failures are
+    logged but don't fail the SDK call.
+    """
+    import json as _json
+    path = _rotation_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if state is None:
+            if path.exists():
+                path.unlink()
+            return
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        logger.warning("Could not persist rotation state to %s: %s", path, exc)
 import threading
 from pathlib import Path
 from typing import Any
@@ -546,20 +610,24 @@ class DisplayManager:
 
         After ``switch(..., pin=True)`` (the default), the display stays
         put until the agent calls ``unpin()`` or replaces it with
-        another ``switch``. ``unpin`` clears the pin flag and starts the
-        configured idle rotation if one exists. If no rotation list is
-        configured, the current display simply stays on screen with the
-        pin flag cleared.
+        another ``switch``. ``unpin`` clears the pin flag and restarts
+        the rotation loop with the *current* rotation list — whatever
+        ``set_rotation`` was last called with, or the config defaults
+        if it never was. If the rotation list is empty, the current
+        display simply stays on screen with the pin flag cleared.
 
         Returns:
             True on success.
         """
         self._pinned = False
 
-        # Restart rotation from config so the next tick switches away.
-        displays, interval = self._get_rotation_config()
-        if displays:
-            self.start_rotation(displays, interval)
+        # Use the in-memory rotation list, not the config defaults —
+        # otherwise unpin silently undoes any prior ``set_rotation``.
+        if self._rotation_displays:
+            self.start_rotation(
+                list(self._rotation_displays),
+                self._rotation_interval,
+            )
             logger.info("Unpinned; rotation resumed")
         else:
             logger.info("Unpinned; no rotation configured, holding current display")
@@ -577,15 +645,30 @@ class DisplayManager:
         config defaults. If ``displays`` is an empty list, rotation is
         stopped and the pin remains cleared.
 
+        The chosen ``(displays, interval)`` is persisted to
+        ``data/displays/rotation.json`` so it survives a restart;
+        startup prefers this file over the config defaults.
+
         Returns:
             True on success.
         """
         self._pinned = False
         if displays is not None and not displays:
             self.stop_rotation()
+            _persist_rotation_state(None)
             logger.info("Rotation cleared")
             return True
         self.start_rotation(displays, interval)
+        # Persist after start_rotation so we save the resolved values
+        # (None inputs already filled from config, list filtered to
+        # registered displays). Saving raw inputs would re-introduce
+        # the bug if a stale display name was supplied.
+        _persist_rotation_state(
+            {
+                "displays": list(self._rotation_displays),
+                "interval": self._rotation_interval,
+            }
+        )
         return True
 
     async def _setup_data_sources(self, spec: DisplaySpec) -> None:
@@ -709,11 +792,19 @@ class DisplayManager:
             logger.exception("Display rotation loop error")
 
     def _get_rotation_config(self) -> tuple[list[str], int]:
-        """Get rotation settings from config, with safe fallbacks.
+        """Get rotation settings — persisted state first, config fallback.
+
+        Persisted state at ``data/displays/rotation.json`` overrides
+        config defaults so agent-set rotation lists survive a restart.
+        Same "config seeds, runtime DB/state authoritative" pattern as
+        the scheduler.
 
         Returns:
             Tuple of (display_names, interval_seconds).
         """
+        persisted = _load_rotation_state()
+        if persisted is not None:
+            return persisted["displays"], persisted["interval"]
         try:
             from boxbot.core.config import get_config
             config = get_config()

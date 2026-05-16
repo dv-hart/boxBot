@@ -92,8 +92,10 @@ class TestPersonDetector:
         preprocessed, params = det.preprocess(frame)
         assert preprocessed.shape == (1, 640, 640, 3)
         assert preprocessed.dtype == np.float32
+        # HEF quant is scale=1.0 zp=0; float32 must stay in native uint8 range.
         assert preprocessed.min() >= 0.0
-        assert preprocessed.max() <= 1.0
+        assert preprocessed.max() <= 255.0
+        assert preprocessed.max() > 1.0  # guard against the /255 regression
 
     def test_preprocess_letterbox_params(self):
         det = self._make_detector()

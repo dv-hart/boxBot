@@ -143,7 +143,11 @@ class PersonDetector:
 
         Returns:
             (preprocessed, letterbox_params)
-            preprocessed: (1, H, W, 3) float32 normalized [0, 1]
+            preprocessed: (1, H, W, 3) float32 in [0, 255]. The HEFs ship
+                with input quant scale=1.0, zp=0, so HailoRT's FLOAT32→UINT8
+                conversion expects the native uint8 range. Dividing by 255
+                here would quantize every pixel to 0/1 and make the model
+                see a black screen.
             letterbox_params: For coordinate remapping in postprocess.
         """
         target_h, target_w = self._input_size
@@ -177,8 +181,8 @@ class PersonDetector:
             value=(114, 114, 114),
         )
 
-        # Normalize to [0, 1] float32 and add batch dimension
-        preprocessed = letterboxed.astype(np.float32) / 255.0
+        # HEF expects native uint8 range — see docstring.
+        preprocessed = letterboxed.astype(np.float32)
         preprocessed = np.expand_dims(preprocessed, axis=0)
 
         params = LetterboxParams(scale=scale, pad_x=pad_x, pad_y=pad_y)
@@ -409,8 +413,9 @@ class PersonDetector:
             bbox: (x1, y1, x2, y2) bounding box.
 
         Returns:
-            (1, 128, 256, 3) float32 normalized [0, 1] crop, or None if
-            the crop is degenerate.
+            (1, 128, 256, 3) float32 in [0, 255], or None if the crop is
+            degenerate. ReID HEF input quant is scale=1.0 zp=0, same as
+            YOLO — see ``preprocess`` for why we don't divide by 255.
         """
         x1, y1, x2, y2 = bbox
         if x2 <= x1 or y2 <= y1:
@@ -425,6 +430,6 @@ class PersonDetector:
         reid_h, reid_w = self.REID_INPUT_SIZE
         resized = cv2.resize(cropped, (reid_w, reid_h), interpolation=cv2.INTER_LINEAR)
 
-        # Normalize to [0, 1] float32 and add batch dimension
-        normalized = resized.astype(np.float32) / 255.0
-        return np.expand_dims(normalized, axis=0)
+        # HEF expects native uint8 range — see preprocess() docstring.
+        as_float = resized.astype(np.float32)
+        return np.expand_dims(as_float, axis=0)

@@ -29,6 +29,7 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -188,7 +189,11 @@ def _parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-async def _init_hal(config: Any) -> dict[str, Any]:
+async def _init_hal(
+    config: Any,
+    *,
+    shutdown_callback: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     """Initialise Hardware Abstraction Layer modules.
 
     Starts system monitor, Hailo NPU, and camera in dependency order.
@@ -205,7 +210,16 @@ async def _init_hal(config: Any) -> dict[str, Any]:
     # System monitor (always available)
     from boxbot.hardware.system import System
 
-    system = System()
+    diag = config.diagnostics.memory
+    system = System(
+        shutdown_callback=shutdown_callback,
+        diagnostics_enabled=diag.enabled,
+        diagnostics_log_every_tick=diag.log_every_tick,
+        rss_shutdown_mb=diag.rss_shutdown_mb,
+        tracemalloc_enabled=diag.tracemalloc_enabled,
+        tracemalloc_interval_minutes=diag.tracemalloc_interval_minutes,
+        tracemalloc_top_n=diag.tracemalloc_top_n,
+    )
     await system.start()
     modules["system"] = system
     logger.info("System monitor started")
@@ -769,8 +783,12 @@ async def _async_main() -> None:
 
     # 5. Initialise subsystems in dependency order
     try:
-        # HAL — hardware abstraction layer (system, hailo, camera)
-        hal_modules = await _init_hal(config)
+        # HAL — hardware abstraction layer (system, hailo, camera).
+        # Hand the shutdown event to system so its RSS guardrail can
+        # request a graceful exit before the kernel OOM-kills us.
+        hal_modules = await _init_hal(
+            config, shutdown_callback=shutdown_event.set
+        )
         subsystems["hal"] = hal_modules
 
         # Memory store — foundation for the agent and many other subsystems
@@ -838,6 +856,13 @@ async def _async_main() -> None:
         # Agent — the brain, subscribes to events from all other subsystems
         agent = await _init_agent(memory_store, conversation_store)
         subsystems["agent"] = agent
+
+        # Register the agent with the diagnostics module so the system
+        # monitor's RSS snapshots can include per-conversation thread
+        # sizes and sandbox-runner counts.
+        from boxbot.diagnostics.memory import set_agent_ref
+
+        set_agent_ref(agent)
 
         logger.info("All subsystems initialised, boxBot is running")
 

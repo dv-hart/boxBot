@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
+from collections.abc import Callable
 from typing import Any
 
 from boxbot.core.events import get_event_bus
@@ -25,6 +27,15 @@ from boxbot.hardware.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _format_snapshot_safe(snap: Any) -> str:
+    try:
+        from boxbot.diagnostics.memory import format_snapshot
+
+        return format_snapshot(snap)
+    except Exception:
+        return repr(snap)
 
 
 class System(HardwareModule):
@@ -44,6 +55,14 @@ class System(HardwareModule):
         throttle_temp: float = 80.0,
         critical_temp: float = 85.0,
         poll_interval: float = 30.0,
+        *,
+        shutdown_callback: Callable[[], None] | None = None,
+        diagnostics_enabled: bool = True,
+        diagnostics_log_every_tick: bool = True,
+        rss_shutdown_mb: int = 5500,
+        tracemalloc_enabled: bool = False,
+        tracemalloc_interval_minutes: int = 60,
+        tracemalloc_top_n: int = 20,
     ) -> None:
         super().__init__()
         self._warning_temp = warning_temp
@@ -58,6 +77,17 @@ class System(HardwareModule):
         # Track thermal state to emit events only on threshold crossings
         self._last_thermal_level: str = "normal"
 
+        # Memory guardrail + diagnostics
+        self._shutdown_callback = shutdown_callback
+        self._diag_enabled = diagnostics_enabled
+        self._diag_log_every_tick = diagnostics_log_every_tick
+        self._rss_shutdown_mb = rss_shutdown_mb
+        self._rss_shutdown_fired = False
+        self._tracemalloc_enabled = tracemalloc_enabled
+        self._tracemalloc_interval_s = max(60, tracemalloc_interval_minutes * 60)
+        self._tracemalloc_top_n = tracemalloc_top_n
+        self._last_tracemalloc_run: float = 0.0
+
     # ── Lifecycle ──────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -69,11 +99,27 @@ class System(HardwareModule):
         event was never set, leaving the process running after a
         SIGTERM. Signals are owned by main now.
         """
+        # Bring up tracemalloc as early as possible if requested, so the
+        # baseline snapshot captures real startup allocations rather than
+        # only what happens after the first poll.
+        if self._diag_enabled and self._tracemalloc_enabled:
+            from boxbot.diagnostics.memory import enable_tracemalloc
+
+            enable_tracemalloc()
+            self._last_tracemalloc_run = time.monotonic()
+
         # Start thermal monitoring background task
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         self._started = True
         await self._emit_health(HealthStatus.OK)
-        logger.info("System monitor started (poll=%.0fs)", self._poll_interval)
+        logger.info(
+            "System monitor started (poll=%.0fs, diagnostics=%s, "
+            "rss_shutdown_mb=%d, tracemalloc=%s)",
+            self._poll_interval,
+            self._diag_enabled,
+            self._rss_shutdown_mb,
+            self._tracemalloc_enabled,
+        )
 
     async def stop(self) -> None:
         """Stop thermal monitoring."""
@@ -177,13 +223,73 @@ class System(HardwareModule):
     # ── Thermal monitoring ─────────────────────────────────────────
 
     async def _monitor_loop(self) -> None:
-        """Background task: poll temperatures and emit events on crossings."""
+        """Background task: poll temperatures, run diagnostics, enforce RSS cap."""
         while True:
             try:
                 await self._check_thermals()
             except Exception:
                 logger.exception("Error in thermal monitoring loop")
+            if self._diag_enabled:
+                try:
+                    await self._run_memory_diagnostics()
+                except Exception:
+                    logger.exception("Error in memory diagnostics")
             await asyncio.sleep(self._poll_interval)
+
+    async def _run_memory_diagnostics(self) -> None:
+        """Snapshot RSS / conversations / runners and enforce the RSS cap."""
+        from boxbot.diagnostics.memory import (
+            log_tracemalloc_top,
+            snapshot,
+        )
+
+        snap = snapshot()
+        if snap is None:
+            return
+
+        if self._diag_log_every_tick:
+            from boxbot.diagnostics.memory import format_snapshot
+
+            logger.info("memory: %s", format_snapshot(snap))
+
+        # tracemalloc cadence — separate from the snapshot cadence so we
+        # can keep the snapshot at 30s while letting allocator reports
+        # run every hour (or whatever was configured).
+        if self._tracemalloc_enabled:
+            now = time.monotonic()
+            if now - self._last_tracemalloc_run >= self._tracemalloc_interval_s:
+                log_tracemalloc_top(self._tracemalloc_top_n)
+                self._last_tracemalloc_run = now
+
+        # RSS guardrail. Fires once: we set the flag before invoking the
+        # callback so a slow shutdown can't cause us to spam the log on
+        # subsequent ticks while the process is still winding down.
+        if (
+            self._rss_shutdown_mb > 0
+            and not self._rss_shutdown_fired
+            and snap.rss_mb >= self._rss_shutdown_mb
+        ):
+            self._rss_shutdown_fired = True
+            logger.critical(
+                "RSS guardrail tripped: rss=%.0fMB ≥ %dMB — requesting graceful "
+                "shutdown. snapshot: %s",
+                snap.rss_mb,
+                self._rss_shutdown_mb,
+                _format_snapshot_safe(snap),
+            )
+            # Emit one final tracemalloc report (if enabled) so the leak
+            # is captured in the log of the dying process, not lost to
+            # the next start.
+            if self._tracemalloc_enabled:
+                try:
+                    log_tracemalloc_top(self._tracemalloc_top_n)
+                except Exception:
+                    logger.exception("Final tracemalloc dump failed")
+            if self._shutdown_callback is not None:
+                try:
+                    self._shutdown_callback()
+                except Exception:
+                    logger.exception("RSS-guardrail shutdown callback failed")
 
     async def _check_thermals(self) -> None:
         """Check SoC temperature and emit events on threshold crossings."""

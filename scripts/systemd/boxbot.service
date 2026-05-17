@@ -1,0 +1,38 @@
+[Unit]
+Description=boxBot — ambient Claude agent
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jhart
+Group=jhart
+WorkingDirectory=/home/jhart/software/boxBot
+ExecStart=/home/jhart/software/boxBot/.venv/bin/boxbot
+
+# Restart on crash, but not when the process exits cleanly (deploy /
+# explicit stop / RSS-guardrail shutdown all use SIGTERM → exit 0).
+Restart=on-failure
+RestartSec=5s
+
+# Cgroup memory limits. MemoryHigh exerts pressure but doesn't kill;
+# our in-process RSS guardrail (config.diagnostics.memory.rss_shutdown_mb)
+# is expected to trip well before MemoryMax does. MemoryMax is the hard
+# backstop so a runaway never takes down the whole box.
+MemoryHigh=6G
+MemoryMax=7G
+
+# Surface stdout/stderr for crashes that happen before the Python logger
+# is initialised (or that bypass it entirely — tracebacks on import,
+# kernel OOM messages, etc.). Application logs continue to go to
+# logs/boxbot.log via RotatingFileHandler in Python.
+StandardOutput=append:/home/jhart/software/boxBot/logs/boxbot-systemd.log
+StandardError=inherit
+
+# Give the agent time to flush memory extraction, close DB connections,
+# and stop sandbox runners on shutdown. The graceful path in main.py
+# walks the subsystems in reverse order.
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

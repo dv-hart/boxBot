@@ -305,3 +305,32 @@ logging:
   file: "logs/boxbot.log"
   max_size_mb: 50
   backup_count: 5
+
+# ── Diagnostics ───────────────────────────────────────────────────────
+# Observability for the long-running process. The defaults are dev-mode
+# (everything except tracemalloc is on) — turn log_every_tick off once
+# the memory profile is well-understood.
+diagnostics:
+  memory:
+    # Master switch. When false, the system monitor behaves as before.
+    enabled: true
+
+    # Emit a one-line `memory: ...` summary on every system-monitor
+    # tick (currently every 30 s). Includes RSS, VSZ, swap, live
+    # Conversation count and total thread bytes, live SandboxRunner
+    # count, photo intake queue depth, and the largest conversation.
+    log_every_tick: true
+
+    # RSS (MB) at which we request a graceful shutdown of the process.
+    # systemd's MemoryHigh (boxbot.service: 6 GB) should exert pressure
+    # first, then this guardrail trips, then MemoryMax (7 GB) is the
+    # hard backstop. 0 disables the guardrail entirely.
+    rss_shutdown_mb: 5500
+
+    # tracemalloc — top-N retained allocators with hour-over-hour diff.
+    # Adds ~10-25% memory overhead so leave off unless actively chasing
+    # a leak. The interval is in minutes; first snapshot one interval
+    # after startup.
+    tracemalloc_enabled: false
+    tracemalloc_interval_minutes: 60
+    tracemalloc_top_n: 20

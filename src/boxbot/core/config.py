@@ -626,6 +626,36 @@ class LoggingConfig(BaseModel):
     backup_count: int = 5
 
 
+class MemoryDiagnosticsConfig(BaseModel):
+    """Memory diagnostics — RSS sampling, leak tracing, graceful self-shutdown."""
+
+    # Master switch. When false, the system monitor behaves as before.
+    enabled: bool = True
+
+    # Log a summary line (RSS, VSZ, live conversations, sandbox runners,
+    # photo intake depth, thread sizes) on every system-monitor tick.
+    log_every_tick: bool = True
+
+    # RSS (MB) at which the process asks the main shutdown event to fire.
+    # Set so that systemd's MemoryHigh pressure-signal fires first, then
+    # this self-shutdown takes the process down cleanly before MemoryMax
+    # hard-kills it. 0 disables the guardrail.
+    rss_shutdown_mb: int = 5500
+
+    # tracemalloc periodic top-N retained allocators. Adds ~10-25% memory
+    # overhead, so leave off unless actively chasing a leak. The interval
+    # is in minutes; first snapshot is taken one interval after startup.
+    tracemalloc_enabled: bool = False
+    tracemalloc_interval_minutes: int = 60
+    tracemalloc_top_n: int = 20
+
+
+class DiagnosticsConfig(BaseModel):
+    """Dev/observability settings."""
+
+    memory: MemoryDiagnosticsConfig = Field(default_factory=MemoryDiagnosticsConfig)
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -654,3 +684,4 @@ class BoxBotConfig(BaseModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     api_keys: ApiKeysConfig = Field(default_factory=ApiKeysConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)

@@ -68,9 +68,11 @@ skills/*/
 !skills/onboarding/
 !skills/hal-sandbox-ref/
 !skills/skill_authoring/
+!skills/home/
 integrations/*/
 !integrations/weather/
 !integrations/calendar/
+!integrations/home_assistant/
 displays/*/
 !displays/example_display/
 # Pre-seeded displays ship with the repo. Custom user/agent-authored

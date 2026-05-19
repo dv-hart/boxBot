@@ -1,0 +1,51 @@
+name: home_assistant
+description: Talk to a Home Assistant instance over its REST API. Reads device states, calls services (turn on lights, run scenes, change media), fetches camera snapshots. Use this for any home control or home-state question — Alarm.com panel + sensors + smart bulbs all flow through HA as entities.
+inputs:
+  action:
+    type: string
+    required: true
+    description: One of get_states, get_state, call_service, camera_snapshot, list_services.
+  entity_id:
+    type: string
+    description: For get_state / call_service / camera_snapshot — the HA entity (e.g. "light.living_room", "camera.front_door").
+  domain:
+    type: string
+    description: For get_states / list_services — filter to one domain (e.g. "light", "switch"). For call_service — the service domain.
+  service:
+    type: string
+    description: For call_service — the service name (e.g. "turn_on", "turn_off", "set_temperature").
+  service_data:
+    type: dict
+    description: For call_service — extra parameters (rgb_color, brightness, temperature, etc.). Merged with entity_id if both provided.
+outputs:
+  entities:
+    type: array
+    description: For get_states / list_services — list of entity/service dicts.
+  state:
+    type: string
+    description: For get_state — the entity's current state ("on", "off", "armed_home", etc.).
+  attributes:
+    type: dict
+    description: For get_state — full attribute dict from HA.
+  last_changed:
+    type: string
+    description: For get_state — ISO timestamp of last state change.
+  ok:
+    type: bool
+    description: For call_service — true if HA accepted the call.
+  affected:
+    type: array
+    description: For call_service — entity IDs HA reports as changed.
+  image_path:
+    type: string
+    description: For camera_snapshot — workspace-relative path of the saved JPEG (e.g. "tmp/ha/camera_front_door_2026-05-17T143052Z.jpg"). The integration does NOT interpret the image — caller chooses bb.workspace.view (agent sees pixels), small-model tagging, or bb.display.show.
+  captured_at:
+    type: string
+    description: For camera_snapshot — ISO timestamp when the snapshot was fetched.
+  error:
+    type: string
+    description: Human-readable error when status != ok.
+secrets:
+  - HOME_ASSISTANT_URL
+  - HOME_ASSISTANT_TOKEN
+timeout: 20

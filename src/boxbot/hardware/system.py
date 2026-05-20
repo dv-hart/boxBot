@@ -63,6 +63,8 @@ class System(HardwareModule):
         tracemalloc_enabled: bool = False,
         tracemalloc_interval_minutes: int = 60,
         tracemalloc_top_n: int = 20,
+        log_malloc_stats: bool = True,
+        malloc_trim_each_tick: bool = True,
     ) -> None:
         super().__init__()
         self._warning_temp = warning_temp
@@ -87,6 +89,8 @@ class System(HardwareModule):
         self._tracemalloc_interval_s = max(60, tracemalloc_interval_minutes * 60)
         self._tracemalloc_top_n = tracemalloc_top_n
         self._last_tracemalloc_run: float = 0.0
+        self._log_malloc_stats = log_malloc_stats
+        self._malloc_trim_each_tick = malloc_trim_each_tick
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -240,10 +244,11 @@ class System(HardwareModule):
         """Snapshot RSS / conversations / runners and enforce the RSS cap."""
         from boxbot.diagnostics.memory import (
             log_tracemalloc_top,
+            malloc_trim,
             snapshot,
         )
 
-        snap = snapshot()
+        snap = snapshot(include_malloc=self._log_malloc_stats)
         if snap is None:
             return
 
@@ -251,6 +256,12 @@ class System(HardwareModule):
             from boxbot.diagnostics.memory import format_snapshot
 
             logger.info("memory: %s", format_snapshot(snap))
+
+        # Hand free heap pages back to the OS. glibc otherwise hoards freed
+        # blocks in per-arena free lists (the malloc_free_held figure above),
+        # which is the fragmentation that builds RSS across conversations.
+        if self._malloc_trim_each_tick:
+            malloc_trim()
 
         # tracemalloc cadence — separate from the snapshot cadence so we
         # can keep the snapshot at 30s while letting allocator reports

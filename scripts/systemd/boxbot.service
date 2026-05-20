@@ -8,6 +8,15 @@ Type=simple
 User=jhart
 Group=jhart
 WorkingDirectory=/home/jhart/software/boxBot
+
+# Cap glibc malloc arenas. Default is 8*ncores (32 on the Pi 5), which
+# fragments badly under concurrent mixed-size allocation across the
+# voice/perception/agent subsystems — freed memory ends up stranded in
+# per-arena free lists and never returns to the OS, building RSS across
+# conversations until OOM. 2 arenas keeps fragmentation bounded; the
+# in-process malloc_trim() (diagnostics.memory) returns the rest.
+Environment=MALLOC_ARENA_MAX=2
+
 ExecStart=/home/jhart/software/boxBot/.venv/bin/boxbot
 
 # Restart on crash, but not when the process exits cleanly (deploy /

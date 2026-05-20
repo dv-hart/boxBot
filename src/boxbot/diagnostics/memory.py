@@ -12,6 +12,7 @@ registered at boot via :func:`set_agent_ref`.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import tracemalloc
@@ -22,6 +23,76 @@ if TYPE_CHECKING:
     from boxbot.core.agent import BoxBotAgent
 
 logger = logging.getLogger(__name__)
+
+
+# ── glibc malloc introspection (ctypes) ───────────────────────────────
+# These talk to the C runtime directly. The leak we're chasing is native
+# (every Python-level subsystem tested clean in isolation, yet the live
+# process retains ~700 MB after a conversation), which points at glibc
+# heap fragmentation: freed blocks that malloc holds in per-arena free
+# lists instead of returning to the OS. mallinfo2 exposes exactly that.
+
+try:
+    _libc: ctypes.CDLL | None = ctypes.CDLL("libc.so.6", use_errno=True)
+except OSError:
+    _libc = None
+
+
+class _MallInfo2(ctypes.Structure):
+    """glibc struct mallinfo2 (glibc >= 2.33; size_t fields, no overflow)."""
+
+    _fields_ = [
+        ("arena", ctypes.c_size_t),     # non-mmapped space allocated (heap)
+        ("ordblks", ctypes.c_size_t),   # number of free chunks
+        ("smblks", ctypes.c_size_t),    # number of fastbin blocks
+        ("hblks", ctypes.c_size_t),     # number of mmapped regions
+        ("hblkhd", ctypes.c_size_t),    # space in mmapped regions
+        ("usmblks", ctypes.c_size_t),   # always 0 (legacy)
+        ("fsmblks", ctypes.c_size_t),   # space in fastbin free blocks
+        ("uordblks", ctypes.c_size_t),  # total allocated space (in use)
+        ("fordblks", ctypes.c_size_t),  # total free space (held, not returned)
+        ("keepcost", ctypes.c_size_t),  # releasable (top-most) free space
+    ]
+
+
+@dataclass(frozen=True)
+class MallocStats:
+    arena_mb: float       # heap (non-mmapped) reserved by malloc
+    in_use_mb: float      # actually allocated and live (uordblks)
+    free_held_mb: float   # freed but NOT returned to OS (fordblks) — fragmentation
+    mmap_mb: float        # large allocations via mmap (hblkhd)
+
+
+def read_malloc_stats() -> MallocStats | None:
+    """Read glibc mallinfo2. None if unavailable (non-glibc / old glibc)."""
+    if _libc is None or not hasattr(_libc, "mallinfo2"):
+        return None
+    try:
+        _libc.mallinfo2.restype = _MallInfo2
+        mi = _libc.mallinfo2()
+    except Exception:
+        return None
+    return MallocStats(
+        arena_mb=mi.arena / 1024.0 / 1024.0,
+        in_use_mb=mi.uordblks / 1024.0 / 1024.0,
+        free_held_mb=mi.fordblks / 1024.0 / 1024.0,
+        mmap_mb=mi.hblkhd / 1024.0 / 1024.0,
+    )
+
+
+def malloc_trim() -> bool:
+    """Ask glibc to return free heap pages at the top of each arena to the OS.
+
+    Returns True if memory was actually released. Cheap to call; the
+    counterpart to MALLOC_ARENA_MAX — the arena cap limits how badly the
+    heap fragments, malloc_trim hands back what's already free.
+    """
+    if _libc is None or not hasattr(_libc, "malloc_trim"):
+        return False
+    try:
+        return bool(_libc.malloc_trim(0))
+    except Exception:
+        return False
 
 
 # ── Agent reference ────────────────────────────────────────────────────
@@ -90,9 +161,10 @@ class MemorySnapshot:
     largest_conv: tuple[str, int, int] | None  # (conv_id, msgs, bytes)
     sandbox_runners_live: int
     photo_intake_depth: int
+    malloc: MallocStats | None = None
 
 
-def snapshot() -> MemorySnapshot | None:
+def snapshot(include_malloc: bool = True) -> MemorySnapshot | None:
     """Take one diagnostics snapshot. Returns None if /proc is unavailable."""
     proc = read_process_memory()
     if proc is None:
@@ -149,6 +221,7 @@ def snapshot() -> MemorySnapshot | None:
         largest_conv=largest,
         sandbox_runners_live=sandbox_live,
         photo_intake_depth=photo_depth,
+        malloc=read_malloc_stats() if include_malloc else None,
     )
 
 
@@ -160,6 +233,15 @@ def format_snapshot(snap: MemorySnapshot) -> str:
         if largest is not None
         else ""
     )
+    m = snap.malloc
+    malloc_part = (
+        f" malloc_arena={m.arena_mb:.0f}MB "
+        f"malloc_inuse={m.in_use_mb:.0f}MB "
+        f"malloc_free_held={m.free_held_mb:.0f}MB "
+        f"malloc_mmap={m.mmap_mb:.0f}MB"
+        if m is not None
+        else ""
+    )
     return (
         f"rss={snap.rss_mb:.0f}MB "
         f"vsz={snap.vsz_mb:.0f}MB "
@@ -169,6 +251,7 @@ def format_snapshot(snap: MemorySnapshot) -> str:
         f"thread_bytes={snap.conv_thread_bytes_total/1024:.0f}KB "
         f"sandbox_runners={snap.sandbox_runners_live} "
         f"photo_intake_q={snap.photo_intake_depth}"
+        f"{malloc_part}"
         f"{largest_part}"
     )
 

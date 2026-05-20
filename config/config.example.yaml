@@ -334,3 +334,14 @@ diagnostics:
     tracemalloc_enabled: false
     tracemalloc_interval_minutes: 60
     tracemalloc_top_n: 20
+
+    # glibc heap accounting via mallinfo2 — adds malloc_arena / malloc_inuse
+    # / malloc_free_held / malloc_mmap to the per-tick line. Cheap. When
+    # malloc_free_held climbs while malloc_inuse stays flat, that's heap
+    # fragmentation (freed memory glibc won't return to the OS).
+    log_malloc_stats: true
+
+    # Call malloc_trim(0) each monitor tick to return free heap pages to
+    # the OS. Runtime counterpart to the MALLOC_ARENA_MAX=2 set in the
+    # launch env (restart-boxbot.sh / boxbot.service). Disable to A/B.
+    malloc_trim_each_tick: true

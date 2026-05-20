@@ -219,6 +219,8 @@ async def _init_hal(
         tracemalloc_enabled=diag.tracemalloc_enabled,
         tracemalloc_interval_minutes=diag.tracemalloc_interval_minutes,
         tracemalloc_top_n=diag.tracemalloc_top_n,
+        log_malloc_stats=diag.log_malloc_stats,
+        malloc_trim_each_tick=diag.malloc_trim_each_tick,
     )
     await system.start()
     modules["system"] = system

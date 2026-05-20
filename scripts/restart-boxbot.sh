@@ -58,6 +58,15 @@ mkdir -p logs
 LOG="logs/boxbot-$(date +%Y%m%d-%H%M%S).log"
 echo "Starting boxbot, logging to $LOG"
 
+# Cap glibc malloc arenas (default 8*ncores = 32 on the Pi 5). Without
+# this, concurrent mixed-size allocation across the voice/perception/
+# agent subsystems fragments the heap so freed memory is stranded in
+# per-arena free lists and never returns to the OS — RSS climbs across
+# conversations until OOM. 2 arenas bounds fragmentation; the in-process
+# malloc_trim() (diagnostics.memory) hands back the rest. Mirrors the
+# Environment= line in scripts/systemd/boxbot.service.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+
 nohup setsid "$VENV_BOXBOT" > "$LOG" 2>&1 < /dev/null &
 NEW_PID=$!
 disown

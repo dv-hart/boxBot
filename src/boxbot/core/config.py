@@ -660,6 +660,17 @@ class MemoryDiagnosticsConfig(BaseModel):
     tracemalloc_interval_minutes: int = 60
     tracemalloc_top_n: int = 20
 
+    # glibc heap accounting via mallinfo2. Adds malloc_arena / malloc_inuse
+    # / malloc_free_held / malloc_mmap to the per-tick log line. Cheap.
+    # malloc_free_held growing while malloc_inuse stays flat == fragmentation.
+    log_malloc_stats: bool = True
+
+    # Call malloc_trim(0) each monitor tick to hand free heap pages back to
+    # the OS. Runtime counterpart to MALLOC_ARENA_MAX (set in the launch
+    # env). Cheap; trims top-of-arena free space glibc otherwise hoards.
+    # Disable to A/B the effect.
+    malloc_trim_each_tick: bool = True
+
 
 class DiagnosticsConfig(BaseModel):
     """Dev/observability settings."""

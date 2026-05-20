@@ -39,6 +39,7 @@ from boxbot.communication.stt import ElevenLabsSTT, STTResult
 from boxbot.communication.tts import ElevenLabsTTS, TTSStream
 from boxbot.communication.vad import VoiceActivityDetector
 from boxbot.communication.wake_word import WakeWordDetector
+from boxbot.core import latency
 from boxbot.core.events import (
     AgentSpeaking,
     AgentSpeakingDone,
@@ -742,6 +743,18 @@ class VoiceSession:
             self._active_timeout_task.cancel()
             self._active_timeout_task = None
 
+    async def _timed_diarize(self, utterance: Utterance) -> Any:
+        """Run diarization, recording its wall time on the latency tracker.
+
+        Diarization runs concurrently with STT, so this span overlaps the
+        ``stt`` span — the breakdown reports them side by side, not summed.
+        """
+        with latency.span(self._conversation_id, "diarize"):
+            return await self._diarizer.diarize(
+                utterance.audio,
+                utterance.sample_rate,
+            )
+
     async def _on_utterance(self, utterance: Utterance) -> None:
         """Process a finalized utterance: run STT + diarization, publish transcript."""
         if self._state is not VoiceSessionState.ACTIVE:
@@ -757,6 +770,14 @@ class VoiceSession:
 
         self._last_speech_time = time.monotonic()
 
+        # Open the round-trip latency tracker at *true* speech-end
+        # (utterance.timestamp_end is on the time.monotonic() clock, same
+        # as every downstream mark). t0 here deliberately predates this
+        # handler so the headline includes the VAD silence-hold — the
+        # gap between the user finishing and the system noticing is a
+        # real, tunable slice of perceived latency.
+        latency.begin(self._conversation_id, t0=utterance.timestamp_end)
+
         # Set LED pattern to "thinking"
         if self._microphone:
             try:
@@ -768,7 +789,10 @@ class VoiceSession:
         if self._diarizer and not self._diarizer_loaded:
             await self._ensure_diarizer_loaded()
 
-        # Run STT and diarization in parallel
+        # Run STT and diarization in parallel. STT records its own span
+        # from inside transcribe(); diarization is wrapped here. They
+        # overlap, so the breakdown shows them separately rather than
+        # summed.
         stt_task = None
         diarize_task = None
 
@@ -784,10 +808,7 @@ class VoiceSession:
 
         if self._diarizer and self._diarizer_loaded:
             diarize_task = asyncio.create_task(
-                self._diarizer.diarize(
-                    utterance.audio,
-                    utterance.sample_rate,
-                )
+                self._timed_diarize(utterance)
             )
 
         # Wait for results
@@ -820,9 +841,10 @@ class VoiceSession:
         # the per-speaker identity block in the TranscriptReady event.
         # Also maps raw pyannote labels (SPEAKER_00) to stable display
         # labels (Speaker A) or known names (Jacob) for the transcript.
-        label_map, identity_block = await self._resolve_speaker_identities(
-            diarization_result
-        )
+        with latency.span(self._conversation_id, "resolve"):
+            label_map, identity_block = await self._resolve_speaker_identities(
+                diarization_result
+            )
         # Merge anything derived here with the session-scoped mapping used
         # by the transcript builder. Agent ``identify_person`` calls update
         # ``_speaker_identities`` via SpeakerIdentified events; voice-ReID
@@ -851,7 +873,10 @@ class VoiceSession:
                     seg_data["embedding"] = seg.embedding
                 speaker_segments.append(seg_data)
 
-        # Publish TranscriptReady event
+        # Publish TranscriptReady event — the pre-agent stages are done;
+        # stamp the boundary so the breakdown shows STT+diarize+resolve
+        # cost against the agent + TTS cost that follows.
+        latency.mark(self._conversation_id, "transcript_ready")
         bus = get_event_bus()
         await bus.publish(
             TranscriptReady(

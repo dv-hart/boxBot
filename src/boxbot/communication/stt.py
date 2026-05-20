@@ -22,9 +22,12 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 import wave
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+
+from boxbot.core import latency
 
 logger = logging.getLogger(__name__)
 
@@ -152,10 +155,21 @@ class ElevenLabsSTT:
             self._model,
         )
 
+        _t = time.monotonic()
         result = await self._client.speech_to_text.convert(
             file=wav_bytes,
             model_id=self._model,
             language_code=language,
+        )
+        _stt_elapsed = time.monotonic() - _t
+        # Batch STT: the whole utterance is uploaded after speech ends,
+        # then we block on the full transcript. This is the inherent
+        # serial cost streaming STT would attack.
+        latency.add(conversation_id, "stt", _stt_elapsed)
+        logger.debug(
+            "ElevenLabs Scribe request took %.0fms (model=%s)",
+            _stt_elapsed * 1000,
+            self._model,
         )
 
         # Parse word-level timing if available

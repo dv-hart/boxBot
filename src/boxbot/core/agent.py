@@ -69,6 +69,7 @@ import anthropic
 if TYPE_CHECKING:
     from boxbot.conversations.store import ConversationStore
 
+from boxbot.core import latency
 from boxbot.core.config import get_config
 from boxbot.cost import from_anthropic_usage, record as record_cost
 from boxbot.core.conversation import (
@@ -2189,23 +2190,30 @@ class BoxBotAgent:
             # IMPORTANT: the exact named kwargs below are the only ones
             # we pass. No temperature / top_p / top_k / thinking — those
             # will 400 on Opus 4.7. See spec §3.
+            # Latency: stamp the agent-generation boundary once (voice
+            # round-trip breakdown) and accumulate API wall time across
+            # turns. No-op for non-voice conversations.
+            if turn_count == 1:
+                latency.mark(conversation_id, "gen_start")
+
             response = None
             for attempt in range(2):
                 try:
-                    response = await self._client.messages.create(
-                        model=model,
-                        max_tokens=_MAX_TOKENS,
-                        system=system_prompt_blocks,
-                        messages=messages,
-                        tools=turn_tools,
-                        output_config={
-                            "format": {
-                                "type": "json_schema",
-                                "schema": INTERNAL_NOTES_SCHEMA,
-                            }
-                        },
-                        cache_control={"type": "ephemeral"},
-                    )
+                    with latency.span(conversation_id, "api"):
+                        response = await self._client.messages.create(
+                            model=model,
+                            max_tokens=_MAX_TOKENS,
+                            system=system_prompt_blocks,
+                            messages=messages,
+                            tools=turn_tools,
+                            output_config={
+                                "format": {
+                                    "type": "json_schema",
+                                    "schema": INTERNAL_NOTES_SCHEMA,
+                                }
+                            },
+                            cache_control={"type": "ephemeral"},
+                        )
                     break
                 except anthropic.APIError as e:
                     logger.error(
@@ -2299,9 +2307,10 @@ class BoxBotAgent:
             # --- tool_use: outputs have already been dispatched (if any);
             # now run the tools and feed results back.
             if stop_reason == "tool_use":
-                tool_results = await self._process_tool_calls(
-                    response, tools, conversation_id=conversation_id,
-                )
+                with latency.span(conversation_id, "tools"):
+                    tool_results = await self._process_tool_calls(
+                        response, tools, conversation_id=conversation_id,
+                    )
                 # Inject-don't-interrupt: drain any utterances that
                 # arrived during this iteration's API call + tool
                 # dispatch and fold them into the same role:"user" turn

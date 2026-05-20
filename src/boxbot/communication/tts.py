@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, AsyncIterator, Protocol, runtime_checkable
+
+from boxbot.core import latency
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +252,20 @@ class ElevenLabsTTS:
             optimize_streaming_latency=self._optimize_streaming_latency,
         ) as response:
             headers = dict(response.headers or {})
+            _req_start = time.monotonic()
+            _first = True
             async for chunk in response.data:
+                if _first:
+                    _first = False
+                    _ttfb = time.monotonic() - _req_start
+                    # TTS time-to-first-byte: how long ElevenLabs takes
+                    # to start streaming audio. Distinct from the
+                    # round-trip headline, which first_audio() closes.
+                    latency.add(conversation_id, "tts_ttfb", _ttfb)
+                    latency.first_audio(conversation_id)
+                    logger.debug(
+                        "ElevenLabs TTS first audio after %.0fms", _ttfb * 1000
+                    )
                 yield chunk
 
         # Only reached when the stream is consumed to completion (no

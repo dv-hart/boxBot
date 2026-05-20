@@ -1341,6 +1341,7 @@ class BoxBotAgent:
                 self._client,
                 audit_only=config.memory.dream_audit_only,
                 max_dedup_pairs=config.memory.dream_max_dedup_pairs,
+                near_dup_threshold=config.memory.dream_near_dup_threshold,
             )
             logger.info(
                 "Dream cycle complete: %s candidates, %s pairs, batch=%s",

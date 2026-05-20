@@ -464,6 +464,17 @@ class MemoryConfig(BaseModel):
     # Hard ceiling on dedup pairs sent to the model in a single cycle.
     # Above this, lowest-confidence pairs are dropped before submission.
     dream_max_dedup_pairs: int = 30
+    # Cosine threshold for flagging a near-duplicate pair. The embedding
+    # model (all-MiniLM-L6-v2) produces a compressed cosine range:
+    # genuine paraphrastic duplicates land ~0.65-0.80, and only
+    # near-verbatim text reaches 0.85. The original 0.85 default was
+    # effectively unreachable — on the live corpus exactly 1 of ~4,200
+    # active pairs cleared it, so dedup never fired. This is a *recall*
+    # filter; the model + ``DEDUP_CONFIDENCE_THRESHOLD`` (0.8) are the
+    # precision guarantee, so we can afford to surface more candidates.
+    # Lower toward 0.70 for more recall, raise toward 0.80 for fewer
+    # but higher-confidence pairs.
+    dream_near_dup_threshold: float = 0.75
 
 
 class SlideshowConfig(BaseModel):

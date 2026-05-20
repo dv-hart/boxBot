@@ -60,11 +60,18 @@ logger = logging.getLogger(__name__)
 
 # Cosine thresholds. These are deliberately conservative — dedup is the
 # highest-leverage, lowest-risk dream operation, but we still want the
-# model to be the final arbiter on close calls. Pairing at 0.85 catches
-# near-duplicates; clustering at 0.7 catches the wider "related-fact"
-# neighbourhood that PR2 will turn into schemas.
+# model to be the final arbiter on close calls. Clustering at 0.7 catches
+# the wider "related-fact" neighbourhood that PR2 will turn into schemas.
+#
+# NEAR_DUP_THRESHOLD is the *default* recall filter for pairing; the live
+# value is sourced from ``config.memory.dream_near_dup_threshold`` and
+# threaded through ``run_dream_cycle``. The original 0.85 was calibrated
+# by intuition and proved unreachable for all-MiniLM-L6-v2's compressed
+# cosine range (real duplicates sit ~0.65-0.80; only near-verbatim text
+# hits 0.85), so dedup never fired in production. 0.75 is the corrected
+# default — the model + DEDUP_CONFIDENCE_THRESHOLD are the precision gate.
 CLUSTER_THRESHOLD = 0.70
-NEAR_DUP_THRESHOLD = 0.85
+NEAR_DUP_THRESHOLD = 0.75
 
 # Revisit pool sizes per the roadmap §3 "Cadence + scope per night".
 REVISIT_USED_TODAY = 3
@@ -404,8 +411,10 @@ async def cluster_candidates(
 async def find_near_duplicates(
     store: MemoryStore,
     candidates: CandidateSet,
+    *,
+    near_dup_threshold: float = NEAR_DUP_THRESHOLD,
 ) -> list[NearDupPair]:
-    """Pair memories at cosine ≥ NEAR_DUP_THRESHOLD that were NOT co-injected.
+    """Pair memories at cosine ≥ ``near_dup_threshold`` that were NOT co-injected.
 
     Two-pass:
 
@@ -451,7 +460,7 @@ async def find_near_duplicates(
         """Record a near-dup pair if it's novel + above threshold +
         not already-co-injected. Order the IDs so each pair is unique
         regardless of which side surfaced it first."""
-        if sim < NEAR_DUP_THRESHOLD:
+        if sim < near_dup_threshold:
             return
         if a.id == b.id:
             return
@@ -491,7 +500,7 @@ async def find_near_duplicates(
             if other.id == new_mem.id:
                 continue
             sim = cosine_similarity(new_mem.embedding, other.embedding)
-            if sim >= NEAR_DUP_THRESHOLD:
+            if sim >= near_dup_threshold:
                 scored.append((sim, other))
         # Top-K above threshold. K=10 is generous; in practice
         # most memories have 0-2 above-threshold neighbours.
@@ -1072,6 +1081,7 @@ async def run_dream_cycle(
     *,
     audit_only: bool = True,
     max_dedup_pairs: int = MAX_DEDUP_PAIRS_DEFAULT,
+    near_dup_threshold: float = NEAR_DUP_THRESHOLD,
     rng: random.Random | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -1092,7 +1102,9 @@ async def run_dream_cycle(
     # Phase 1 — gather and cluster (no model calls).
     candidates = await gather_candidates(store, now=now, rng=rng)
     clusters = await cluster_candidates(candidates)
-    pairs = await find_near_duplicates(store, candidates)
+    pairs = await find_near_duplicates(
+        store, candidates, near_dup_threshold=near_dup_threshold,
+    )
     pairs = pairs[:max_dedup_pairs]
 
     batch_id: str | None = None

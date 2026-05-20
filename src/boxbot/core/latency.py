@@ -76,6 +76,26 @@ class TurnLatency:
 # tracker per conversation.
 _trackers: dict[str, TurnLatency] = {}
 
+# Alias map: agent-side conversation id -> tracker key. A voice turn is
+# split across two identities — the voice *session* id (``voice_<uuid>``,
+# which STT / diarize / TTS see and which keys the tracker) and the
+# *Conversation* id (``voice:room``, which the agent loop runs under).
+# The transcript handler knows both and registers the bridge so the
+# agent loop's marks land on the live voice tracker. Non-voice
+# conversations never register an alias, so this is a no-op for them.
+_aliases: dict[str, str] = {}
+
+
+def alias(agent_key: str | None, tracker_key: str | None) -> None:
+    """Bridge an agent-side conversation id to a tracker key.
+
+    Idempotent; re-registered every transcript so it tracks the current
+    voice session. Stale entries for ended conversations are harmless
+    (bounded by the number of distinct conversation ids).
+    """
+    if agent_key and tracker_key and agent_key != tracker_key:
+        _aliases[agent_key] = tracker_key
+
 
 def begin(conversation_id: str | None, t0: float | None = None) -> None:
     """Open a fresh round-trip tracker for ``conversation_id``.
@@ -102,10 +122,16 @@ def begin(conversation_id: str | None, t0: float | None = None) -> None:
 
 
 def get(conversation_id: str | None) -> TurnLatency | None:
-    """Return the live tracker for ``conversation_id``, or ``None``."""
+    """Return the live tracker for ``conversation_id``, or ``None``.
+
+    Resolves through the alias map first, so a mark made under the
+    agent-side Conversation id finds the tracker opened under the voice
+    session id.
+    """
     if not conversation_id:
         return None
-    return _trackers.get(conversation_id)
+    key = _aliases.get(conversation_id, conversation_id)
+    return _trackers.get(key)
 
 
 def mark(conversation_id: str | None, label: str) -> None:

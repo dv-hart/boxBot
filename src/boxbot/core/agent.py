@@ -1426,6 +1426,11 @@ class BoxBotAgent:
             channel_key="voice:room",
             participants=participants,
         )
+        # Bridge the latency tracker: voice stages (STT/diarize/TTS) keyed
+        # it on the voice session id; the agent loop runs under the
+        # Conversation id. Register the alias so gen_start/api/tools marks
+        # land on the live tracker.
+        latency.alias(conv.conversation_id, voice_session_id)
         await conv.handle_input(
             transcript,
             speaker_name=person_name,

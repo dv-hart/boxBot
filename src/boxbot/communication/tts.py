@@ -240,6 +240,14 @@ class ElevenLabsTTS:
         # Use the raw client to expose response headers. ``stream`` is
         # an async context manager yielding an
         # ``AsyncHttpResponse[AsyncIterator[bytes]]``.
+        #
+        # Time-to-first-byte spans BOTH opening the stream context (which
+        # sends the request and reads response headers) AND the first body
+        # chunk, so the clock must start before the ``async with`` — not
+        # inside it, or we'd miss the connection + generation setup that
+        # is the bulk of the latency.
+        _req_start = time.monotonic()
+        _first = True
         async with self._client.text_to_speech.with_raw_response.stream(
             voice_id=self._voice_id,
             text=text,
@@ -252,8 +260,6 @@ class ElevenLabsTTS:
             optimize_streaming_latency=self._optimize_streaming_latency,
         ) as response:
             headers = dict(response.headers or {})
-            _req_start = time.monotonic()
-            _first = True
             async for chunk in response.data:
                 if _first:
                     _first = False

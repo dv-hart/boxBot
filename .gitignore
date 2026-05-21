@@ -58,6 +58,9 @@ Thumbs.db
 data/scheduler/
 data/integrations/
 
+# Voice-ID diagnostic recordings (scripts/diag/) — private audio, Pi-local
+data/voice_diag/
+
 # Ad-hoc audio artifacts (test output)
 /*.wav
 /tts_samples/

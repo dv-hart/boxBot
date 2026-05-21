@@ -53,7 +53,7 @@ The recorder is hands-off; the only manual step is jotting down
    ```
    nohup python3 scripts/diag/capture_voice.py > logs/voice_capture.log 2>&1 &
    ```
-3. **Talk.** Walk up and say the wake word + a natural command a few
+3. **Talk.** Walk up and say the wake word + a command a few
    times under each condition. For each batch, note the clock time,
    speaker, and condition, e.g.:
    ```

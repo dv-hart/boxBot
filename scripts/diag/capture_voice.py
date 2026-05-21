@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Continuous 6-channel utterance recorder for voice-ID diagnosis.
 
-Runs as a hands-off daemon: opens the ReSpeaker, and every time you
-speak an utterance (gated by the production Silero VAD, with
-OpenWakeWord annotating whether the wake word fired), it saves all six
-channels plus a wall-clock-timestamped metadata sidecar. No prompts, no
-per-trial typing.
+Runs as a hands-off daemon using the same gating as the live voice
+adapter: OpenWakeWord arms capture, then the production Silero VAD
+finalizes the utterance — and that utterance is submitted (all six
+channels + a wall-clock-timestamped metadata sidecar). Speech without a
+preceding wake word is ignored. No prompts, no per-trial typing.
 
 Workflow:
     1. Stop boxbot (the capture device is exclusive).
@@ -58,6 +58,7 @@ CHUNK_MS = 64  # match the HAL's chunk size
 CHUNK_FRAMES = int(SAMPLE_RATE * CHUNK_MS / 1000)
 RING_SECONDS = 90  # how much 6ch audio to keep for slicing
 PAD_SECONDS = 0.2  # context kept either side of the VAD boundary
+ARM_WINDOW = 8.0  # seconds a wake word "arms" capture (covers "BB" ... pause ... command)
 
 
 def _find_device(name: str) -> int:
@@ -199,12 +200,23 @@ async def run(args: argparse.Namespace) -> int:
     count = {"n": 0}
 
     async def on_utterance(utt: Utterance) -> None:
+        # Wake-word gate — submit only utterances the wake word started,
+        # exactly like the live voice adapter. An utterance counts if a
+        # wake-word detection landed within it or in the arming window
+        # just before it; stray speech / background talk is ignored.
+        fired = wake.last_fire_ts
+        armed = fired > 0 and (utt.timestamp_start - ARM_WINDOW) <= fired <= (utt.timestamp_end + PAD_SECONDS)
+        clock = datetime.datetime.now().strftime("%H:%M:%S")
+        if not armed:
+            print(f"[{clock}]      (ignored {utt.duration:.2f}s — no wake word)", flush=True)
+            return
         audio_6ch = mic.slice(utt.timestamp_start, utt.timestamp_end)
         if audio_6ch.shape[0] == 0:
             return
         now = time.time()
         epoch_ms = int(now * 1000)
-        wake_fired = utt.timestamp_start <= wake.last_fire_ts <= utt.timestamp_end + PAD_SECONDS
+        wake_conf = wake.last_conf
+        wake.last_fire_ts = 0.0  # consume — a fresh wake is needed for the next clip
         wav_path = out_dir / f"utt_{epoch_ms}.wav"
         _write_wav(wav_path, audio_6ch)
         meta = {
@@ -214,18 +226,16 @@ async def run(args: argparse.Namespace) -> int:
             "sample_rate": SAMPLE_RATE,
             "channels": CAPTURE_CHANNELS,
             "n_frames": int(audio_6ch.shape[0]),
-            "wake_fired": bool(wake_fired),
-            "wake_confidence": round(wake.last_conf, 3) if wake_fired else 0.0,
+            "wake_fired": True,
+            "wake_confidence": round(wake_conf, 3),
             # speaker / condition filled in later by alignment from notes.
             "speaker": None,
             "condition": None,
         }
         wav_path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
         count["n"] += 1
-        wk = f"wake={wake.last_conf:.2f}" if wake_fired else "no-wake"
-        clock = datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S")
         print(f"[{clock}] #{count['n']:>3} saved {wav_path.name}  "
-              f"{utt.duration:.2f}s  {wk}", flush=True)
+              f"{utt.duration:.2f}s  wake={wake_conf:.2f}", flush=True)
 
     capture.set_utterance_callback(on_utterance)
     await capture.start(mic)

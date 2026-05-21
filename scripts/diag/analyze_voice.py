@@ -42,7 +42,9 @@ import numpy as np
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT / "src"))
 
-from boxbot.core.config import get_config  # noqa: E402
+from boxbot.core.config import get_config, load_config  # noqa: E402
+
+load_config()  # reads config/config.yaml (same as production startup)
 
 DURATION_BUCKETS = [1.0, 1.5, 2.0, 3.0]
 

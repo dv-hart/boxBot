@@ -49,7 +49,7 @@ import sounddevice as sd  # noqa: E402
 
 from boxbot.communication.audio_capture import AudioCapture, Utterance  # noqa: E402
 from boxbot.communication.vad import VoiceActivityDetector  # noqa: E402
-from boxbot.core.config import get_config  # noqa: E402
+from boxbot.core.config import get_config, load_config  # noqa: E402
 from boxbot.hardware.base import AudioChunk  # noqa: E402
 
 SAMPLE_RATE = 16000
@@ -179,6 +179,7 @@ def _write_wav(path: Path, audio_6ch: np.ndarray) -> None:
 
 
 async def run(args: argparse.Namespace) -> int:
+    load_config()  # reads config/config.yaml (same as production startup)
     cfg = get_config().voice
     loop = asyncio.get_running_loop()
 

@@ -339,8 +339,18 @@ class TurnDetectionConfig(BaseModel):
 
 
 class DiarizationConfig(BaseModel):
-    """Speaker diarization settings."""
+    """Speaker diarization settings.
 
+    When ``enabled`` is False the segmentation pipeline (the "who spoke
+    when" model) is not loaded or run. Each utterance is treated as a
+    single speaker: the whole utterance is embedded with
+    ``embedding_model`` and routed through voice ReID for person ID. This
+    is the default — multi-speaker diarization only helps when several
+    people address BB simultaneously (niche), and the pyannote pipeline
+    adds ~4 s/utterance latency plus heavy CPU-tensor churn.
+    """
+
+    enabled: bool = False
     engine: str = "pyannote"
     model: str = "pyannote/speaker-diarization-3.1"
     embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"

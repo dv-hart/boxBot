@@ -148,6 +148,13 @@ voice:
 
   # Speaker diarization (pyannote)
   diarization:
+    # When false (default), the segmentation pipeline is not loaded or
+    # run. Each utterance is treated as a single speaker: embedded with
+    # embedding_model and routed through voice ReID for person ID.
+    # Multi-speaker diarization only helps when several people address BB
+    # at once (niche) and adds ~4s/utterance latency + heavy CPU-tensor
+    # churn, so it is off by default.
+    enabled: false
     engine: "pyannote"
     model: "pyannote/speaker-diarization-3.1"
     embedding_model: "pyannote/wespeaker-voxceleb-resnet34-LM"

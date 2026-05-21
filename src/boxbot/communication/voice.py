@@ -755,6 +755,37 @@ class VoiceSession:
                 utterance.sample_rate,
             )
 
+    async def _timed_embed(self, utterance: Utterance) -> Any:
+        """Embed the whole utterance as a single speaker (diarization off).
+
+        Returns a ``DiarizationResult`` with one ``SPEAKER_00`` segment so
+        the downstream ReID / identity / transcript path is identical to
+        the diarized case — only the segmentation work is skipped.
+        Recorded under the ``embed`` latency span (overlaps ``stt``).
+        """
+        from boxbot.communication.diarization import (
+            DiarizationResult,
+            SpeakerSegment,
+        )
+
+        with latency.span(self._conversation_id, "embed"):
+            embedding = await self._diarizer.embed_utterance(
+                utterance.audio,
+                utterance.sample_rate,
+            )
+        duration = (
+            len(utterance.audio) / 2 / float(utterance.sample_rate)
+            if utterance.sample_rate
+            else 0.0
+        )
+        seg = SpeakerSegment(
+            speaker_label="SPEAKER_00",
+            start=0.0,
+            end=duration,
+            embedding=embedding,
+        )
+        return DiarizationResult(segments=[seg], num_speakers=1)
+
     async def _on_utterance(self, utterance: Utterance) -> None:
         """Process a finalized utterance: run STT + diarization, publish transcript."""
         if self._state is not VoiceSessionState.ACTIVE:
@@ -785,16 +816,21 @@ class VoiceSession:
             except Exception:
                 pass
 
-        # Ensure diarizer is loaded if available
+        # Ensure the voice embedding model (and the diarization pipeline,
+        # iff enabled) is loaded.
         if self._diarizer and not self._diarizer_loaded:
             await self._ensure_diarizer_loaded()
 
-        # Run STT and diarization in parallel. STT records its own span
-        # from inside transcribe(); diarization is wrapped here. They
-        # overlap, so the breakdown shows them separately rather than
-        # summed.
+        diarize_enabled = self._config.diarization.enabled
+
+        # Run STT and voice embedding in parallel. STT records its own
+        # span from inside transcribe(); the voice stage is wrapped here.
+        # They overlap, so the breakdown shows them separately. The voice
+        # stage is either full diarization (segmentation + per-segment
+        # embeddings) or, when diarization is disabled, a single
+        # whole-utterance embedding wrapped as a one-speaker result.
         stt_task = None
-        diarize_task = None
+        voice_task = None
 
         if self._stt:
             stt_task = asyncio.create_task(
@@ -807,9 +843,14 @@ class VoiceSession:
             )
 
         if self._diarizer and self._diarizer_loaded:
-            diarize_task = asyncio.create_task(
-                self._timed_diarize(utterance)
-            )
+            if diarize_enabled:
+                voice_task = asyncio.create_task(
+                    self._timed_diarize(utterance)
+                )
+            else:
+                voice_task = asyncio.create_task(
+                    self._timed_embed(utterance)
+                )
 
         # Wait for results
         stt_result: STTResult | None = None
@@ -821,11 +862,13 @@ class VoiceSession:
             except Exception:
                 logger.exception("STT failed for utterance")
 
-        if diarize_task:
+        if voice_task:
             try:
-                diarization_result = await diarize_task
+                diarization_result = await voice_task
             except Exception:
-                logger.exception("Diarization failed for utterance")
+                logger.exception(
+                    "Voice embedding/diarization failed for utterance"
+                )
 
         if not stt_result or not stt_result.text.strip():
             # No transcript — go back to listening

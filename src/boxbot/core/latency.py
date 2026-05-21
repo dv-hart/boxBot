@@ -217,11 +217,11 @@ def _breakdown(t: TurnLatency) -> str:
 
     tr = t.marks.get("transcript_ready")
     if tr is not None:
-        # The pre-agent stages. stt and diarize run concurrently, so they
-        # overlap inside the transcript window — shown individually, not
-        # summed, on purpose.
+        # The pre-agent stages. stt runs concurrently with the voice
+        # stage (diarize when enabled, else embed), so they overlap inside
+        # the transcript window — shown individually, not summed.
         sub = []
-        for label in ("stt", "diarize", "resolve"):
+        for label in ("stt", "diarize", "embed", "resolve"):
             v = t.spans.get(label)
             if v is not None:
                 sub.append(f"{label}={v * 1000:.0f}")

@@ -75,12 +75,18 @@ class SpeakerDiarizer:
         self._embedding_inference: Any = None
 
     async def start(self) -> None:
-        """Load pyannote pipeline and embedding model.
+        """Load the embedding model, and the segmentation pipeline iff enabled.
 
         Runs model loading in a thread executor since it is CPU-heavy
         and involves downloading model weights on first run.
+
+        When ``config.enabled`` is False the segmentation pipeline is
+        skipped entirely — only the whole-window embedding model loads,
+        which is all :meth:`embed_utterance` needs for single-speaker
+        voice ReID. That avoids the pipeline's RAM footprint and its
+        per-utterance CPU-tensor churn.
         """
-        if Pipeline is None:
+        if Model is None:
             raise ImportError(
                 "pyannote.audio is required for SpeakerDiarizer. "
                 "Install it with: pip install pyannote.audio"
@@ -97,13 +103,19 @@ class SpeakerDiarizer:
 
         loop = asyncio.get_event_loop()
 
-        logger.info("Loading diarization pipeline: %s", self._config.model)
-        self._pipeline = await loop.run_in_executor(
-            None,
-            lambda: Pipeline.from_pretrained(
-                self._config.model, token=hf_token
-            ),
-        )
+        if self._config.enabled:
+            if Pipeline is None:
+                raise ImportError(
+                    "pyannote.audio Pipeline is required for diarization. "
+                    "Install it with: pip install pyannote.audio"
+                )
+            logger.info("Loading diarization pipeline: %s", self._config.model)
+            self._pipeline = await loop.run_in_executor(
+                None,
+                lambda: Pipeline.from_pretrained(
+                    self._config.model, token=hf_token
+                ),
+            )
 
         logger.info("Loading embedding model: %s", self._config.embedding_model)
         self._embedding_model = await loop.run_in_executor(
@@ -116,7 +128,34 @@ class SpeakerDiarizer:
             self._embedding_model, window="whole"
         )
 
-        logger.info("Diarization models loaded successfully")
+        logger.info(
+            "Voice embedding model loaded%s",
+            " (+ diarization pipeline)" if self._config.enabled else
+            " (diarization disabled — single-speaker embed-only mode)",
+        )
+
+    async def embed_utterance(
+        self, audio: bytes, sample_rate: int
+    ) -> np.ndarray | None:
+        """Embed a whole utterance as a single speaker (no segmentation).
+
+        The single-speaker counterpart to :meth:`diarize` — runs only the
+        whole-window embedding model over the entire utterance and returns
+        one 192-dim embedding (or None on error / non-finite output).
+        Used when diarization is disabled.
+        """
+        if self._embedding_inference is None:
+            raise RuntimeError(
+                "Diarizer not started. Call start() before embed_utterance()."
+            )
+        audio_int16 = np.frombuffer(audio, dtype=np.int16)
+        if audio_int16.size == 0:
+            return None
+        audio_float = audio_int16.astype(np.float32) / 32768.0
+        duration = len(audio_float) / float(sample_rate)
+        return await self._extract_embedding(
+            audio_float, sample_rate, 0.0, duration
+        )
 
     async def stop(self) -> None:
         """Release models and free memory."""

@@ -59,6 +59,8 @@ def load_utterances(in_dir: Path) -> list[dict]:
             print(f"[warn] no metadata for {wav_path}, skipping", file=sys.stderr)
             continue
         meta = json.loads(meta_path.read_text())
+        if not meta.get("speaker") or not meta.get("condition"):
+            continue  # unlabeled capture — align it to notes first
         with wave.open(str(wav_path), "rb") as w:
             nch = w.getnchannels()
             sr = w.getframerate()

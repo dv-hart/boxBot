@@ -8,14 +8,15 @@ changing anything.
 
 Two scripts:
 
-- `capture_voice.py` — records the **full 6-channel** ReSpeaker stream
-  for each wake-word-gated utterance (production VAD + OpenWakeWord on
-  channel 0 drive the gating; all six channels are saved). Output:
-  `data/voice_diag/<speaker>/<condition>/trialNN_<cmd>.wav` + `.json`.
-- `analyze_voice.py` — offline analyses over those recordings.
+- `capture_voice.py` — a hands-off **continuous recorder**. Saves all
+  six ReSpeaker channels for every VAD-gated utterance, each with a
+  wall-clock timestamp (production VAD + OpenWakeWord run on channel 0,
+  exactly as live). No prompts, no typing. Output:
+  `data/voice_diag/_inbox/utt_<epoch_ms>.{wav,json}`.
+- `analyze_voice.py` — offline analyses over the (labelled) recordings.
 
-Recordings live under `data/` (gitignored, Pi-local) — voice audio is
-never committed.
+Recordings live under `data/voice_diag/` (gitignored, Pi-local) — voice
+audio is never committed.
 
 ## Why 6 channels
 
@@ -38,40 +39,41 @@ Also on the suspect list (documented in `wipe_voice_enrollment.py`):
 BB's own TTS leaking into the mic during cold-start AEC, enrolling its
 own voice as the user.
 
-## Protocol
+## Workflow
 
-Run on the Pi, **with boxbot stopped** (the capture device is
-exclusive). Asymmetry to keep in mind: enrollment can be picky (prefer
-long/clean/quiet), but matching must survive short + noisy.
+The recorder is hands-off; the only manual step is jotting down
+"time / who / condition" while you talk. Claude does the rest.
 
-1. Stop boxbot.
-2. For each condition below, run one capture pass per speaker. Speak
-   each prompted command naturally, starting with "hey jarvis".
-
+1. **Stop boxbot** (the capture device is exclusive; also avoids running
+   heavy diagnostics against the live process):
    ```
-   python3 scripts/diag/capture_voice.py --speaker jacob --condition quiet_close
-   python3 scripts/diag/capture_voice.py --speaker jacob --condition quiet_far
-   python3 scripts/diag/capture_voice.py --speaker jacob --condition dishwasher_close
-   python3 scripts/diag/capture_voice.py --speaker jacob --condition dishwasher_far
-   # repeat all four for --speaker sarah  (needed for analysis #5)
+   pkill -f '\.venv/bin/boxbot$'
    ```
-
-   - `*_close` ≈ 1 m, `*_far` ≈ 3 m.
-   - Run `dishwasher_*` with the dishwasher actually running.
-   - The default 6-command list repeats naturally; add more passes for
-     more samples per condition (more is better for #3/#5).
-
-3. Analyse:
-
+2. **Start the recorder** (background):
    ```
-   HF_TOKEN=$HF_TOKEN python3 scripts/diag/analyze_voice.py \
-       --in-dir data/voice_diag --channel 0 --noise-channels 0,1,5
+   nohup python3 scripts/diag/capture_voice.py > logs/voice_capture.log 2>&1 &
    ```
-
-   `--channel` is the primary channel for #2/#3/#5; `--noise-channels`
-   is the per-channel sweep in #4. After analysis #1 names the cleanest
-   channel, re-run with `--channel <best>` to see the ceiling.
-   `--skip-diarization` skips the heavy pyannote pipeline in #2.
+3. **Talk.** Walk up and say the wake word + a natural command a few
+   times under each condition. For each batch, note the clock time,
+   speaker, and condition, e.g.:
+   ```
+   14:05  jacob  quiet_close       (3 commands)
+   14:08  sarah  quiet_close
+   14:12  jacob  dishwasher_close  (dishwasher running)
+   ...
+   ```
+   Suggested matrix: `{quiet,dishwasher} × {close ~1 m, far ~3 m}` for
+   both speakers; ≥3 utterances each. Talk however you normally do —
+   `analyze_voice.py` is text-independent.
+4. **Stop the recorder** (`kill <pid>` / Ctrl-C). Hand the notes to
+   Claude. Each clip's timestamp is in its `.json`; Claude writes the
+   matching `speaker`/`condition` into every sidecar, then runs:
+   ```
+   python3 scripts/diag/analyze_voice.py --in-dir data/voice_diag --channel 0 --noise-channels 0,1,5
+   ```
+   (unlabeled clips are skipped automatically). After analysis #1 names
+   the cleanest channel, re-run with `--channel <best>`.
+5. **Restart boxbot:** `./scripts/restart-boxbot.sh`.
 
 ## Reading the results → the fix
 

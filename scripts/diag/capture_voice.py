@@ -1,46 +1,42 @@
 #!/usr/bin/env python3
-"""Capture 6-channel wake-word-gated utterances for voice-ID diagnosis.
+"""Continuous 6-channel utterance recorder for voice-ID diagnosis.
 
-Records the FULL 6-channel ReSpeaker stream for each spoken utterance so
-the speaker-embedding pipeline can be analysed offline (channel choice,
-diarization fragmentation, clip-length sensitivity, noise robustness,
-speaker separability) WITHOUT re-recording. See
-``scripts/diag/analyze_voice.py`` for the analyses.
+Runs as a hands-off daemon: opens the ReSpeaker, and every time you
+speak an utterance (gated by the production Silero VAD, with
+OpenWakeWord annotating whether the wake word fired), it saves all six
+channels plus a wall-clock-timestamped metadata sidecar. No prompts, no
+per-trial typing.
 
-Faithful to production where it matters: the same Silero VAD
-(``AudioCapture`` + ``VoiceActivityDetector``) drives utterance
-boundaries, and the same OpenWakeWord model + threshold gates each
-trial. The one deliberate divergence is that we keep all six channels
-instead of extracting ``output_channel`` — which is exactly the choice
-under test.
+Workflow:
+    1. Stop boxbot (the capture device is exclusive).
+    2. Start this recorder (typically in the background).
+    3. Just talk — say the wake word + a command, naturally, under each
+       acoustic condition. Jot down "time / who / condition" per batch.
+    4. Stop the recorder. Hand the notes to Claude, who aligns each
+       utterance's timestamp to a (speaker, condition) and runs
+       ``analyze_voice.py``.
 
-Run this with the main boxbot process STOPPED (the ReSpeaker capture
-device is exclusive). One condition (quiet / dishwasher / etc.) per
-invocation; the script walks a fixed command list and prompts before
-each trial.
+All six channels are kept (production extracts only ``output_channel=0``,
+which is itself under test). Output:
+    data/voice_diag/_inbox/utt_<epoch_ms>.wav   (6ch int16)
+    data/voice_diag/_inbox/utt_<epoch_ms>.json  (timestamp, duration, …)
 
-Usage (on the Pi, in the project venv):
-    ./scripts/restart-boxbot.sh stop      # or however you stop it
-    python3 scripts/diag/capture_voice.py \
-        --speaker jacob --condition dishwasher_close
-
-    # second speaker, same conditions:
-    python3 scripts/diag/capture_voice.py \
-        --speaker sarah  --condition quiet_close
-
-Output: ``data/voice_diag/<speaker>/<condition>/trialNN_<command>.wav``
-(6-channel int16) plus a ``.json`` sidecar of metadata per utterance.
+Usage (on the Pi, in the project venv, boxbot stopped):
+    python3 scripts/diag/capture_voice.py
+    # or in the background:
+    nohup python3 scripts/diag/capture_voice.py > logs/voice_capture.log 2>&1 &
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
 import json
+import signal
 import sys
 import time
 import wave
 from collections import deque
-from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -63,31 +59,6 @@ CHUNK_FRAMES = int(SAMPLE_RATE * CHUNK_MS / 1000)
 RING_SECONDS = 90  # how much 6ch audio to keep for slicing
 PAD_SECONDS = 0.2  # context kept either side of the VAD boundary
 
-# Default command list — short, natural, household-realistic utterances.
-# Three per pass (one per treatment per person, per the experiment plan);
-# re-run the same condition to stack more samples. Override with
-# --commands-file (one command per line).
-DEFAULT_COMMANDS = [
-    "hey jarvis what's on my calendar for today",
-    "hey jarvis pull up the picture of the kids at the pumpkin patch",
-    "hey jarvis what's the weather looking like this afternoon",
-]
-
-
-@dataclass
-class TrialMeta:
-    speaker: str
-    condition: str
-    command: str
-    trial_index: int
-    duration_s: float
-    sample_rate: int
-    channels: int
-    n_frames: int
-    wake_fired: bool
-    wake_confidence: float
-    captured_at: float
-
 
 def _find_device(name: str) -> int:
     """Return the sounddevice index for a >=6ch input matching ``name``."""
@@ -104,7 +75,7 @@ class SixChannelMic:
     """Minimal 6ch capture that mimics the HAL's mono fan-out.
 
     Dispatches channel-0 mono ``AudioChunk``s to registered consumers
-    (so the production VAD / wake-word run exactly as they would live),
+    (so the production VAD / wake-word run exactly as they would live)
     while retaining every 6-channel frame in a timestamped ring buffer
     for later slicing.
     """
@@ -173,9 +144,7 @@ class WakeGate:
     """Runs OpenWakeWord on ch0 mono, recording the latest detection.
 
     Reused faithfully (same model + threshold as production); we only
-    need to know *whether* the wake word fired during an utterance, so
-    this records the last-fire timestamp/confidence rather than driving
-    an event bus.
+    need to know *whether* the wake word fired during an utterance.
     """
 
     def __init__(self, word: str, threshold: float, model_path: str | None) -> None:
@@ -212,22 +181,14 @@ async def run(args: argparse.Namespace) -> int:
     cfg = get_config().voice
     loop = asyncio.get_running_loop()
 
-    if args.commands_file:
-        commands = [
-            line.strip()
-            for line in Path(args.commands_file).read_text().splitlines()
-            if line.strip()
-        ]
-    else:
-        commands = DEFAULT_COMMANDS
-
     device_index = _find_device(args.device)
+    out_dir = Path(args.out_dir) / "_inbox"
     print(f"[capture] device='{args.device}' index={device_index}")
+    print(f"[capture] writing utterances to {out_dir}")
 
     mic = SixChannelMic(device_index, loop)
     vad = VoiceActivityDetector(cfg.vad)
     capture = AudioCapture(vad, cfg.turn_detection)
-
     wake = WakeGate(
         word=cfg.wake_word.word,
         threshold=cfg.wake_word.confidence_threshold,
@@ -235,95 +196,58 @@ async def run(args: argparse.Namespace) -> int:
     )
     mic.add_consumer(wake, name="wake")
 
-    # One utterance per trial; an Event hands the finalized utterance back
-    # to the trial loop.
-    pending: dict = {"utt": None, "event": asyncio.Event()}
+    count = {"n": 0}
 
     async def on_utterance(utt: Utterance) -> None:
-        pending["utt"] = utt
-        pending["event"].set()
+        audio_6ch = mic.slice(utt.timestamp_start, utt.timestamp_end)
+        if audio_6ch.shape[0] == 0:
+            return
+        now = time.time()
+        epoch_ms = int(now * 1000)
+        wake_fired = utt.timestamp_start <= wake.last_fire_ts <= utt.timestamp_end + PAD_SECONDS
+        wav_path = out_dir / f"utt_{epoch_ms}.wav"
+        _write_wav(wav_path, audio_6ch)
+        meta = {
+            "epoch_ms": epoch_ms,
+            "local_time": datetime.datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+            "duration_s": round(utt.duration, 3),
+            "sample_rate": SAMPLE_RATE,
+            "channels": CAPTURE_CHANNELS,
+            "n_frames": int(audio_6ch.shape[0]),
+            "wake_fired": bool(wake_fired),
+            "wake_confidence": round(wake.last_conf, 3) if wake_fired else 0.0,
+            # speaker / condition filled in later by alignment from notes.
+            "speaker": None,
+            "condition": None,
+        }
+        wav_path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+        count["n"] += 1
+        wk = f"wake={wake.last_conf:.2f}" if wake_fired else "no-wake"
+        clock = datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S")
+        print(f"[{clock}] #{count['n']:>3} saved {wav_path.name}  "
+              f"{utt.duration:.2f}s  {wk}", flush=True)
 
     capture.set_utterance_callback(on_utterance)
     await capture.start(mic)
     mic.start()
 
-    out_root = Path(args.out_dir) / args.speaker / args.condition
-    run_id = time.strftime("%H%M%S")  # distinguishes repeated passes
-    print(
-        f"[capture] speaker={args.speaker} condition={args.condition} "
-        f"run={run_id} -> {out_root}\n"
-    )
+    stop_event = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_event.set)
 
-    saved = 0
-    try:
-        for i, command in enumerate(commands, start=1):
-            slug = command.replace("hey jarvis ", "").replace(" ", "_")[:40]
-            print(f"--- Trial {i}/{len(commands)} [{args.condition}] ---")
-            print(f'    Say: "{command}"')
-            await loop.run_in_executor(None, input, "    Press Enter when ready, then speak... ")
+    print("[capture] recording — speak naturally. Ctrl-C or SIGTERM to stop.\n", flush=True)
+    await stop_event.wait()
 
-            capture.reset()
-            pending["utt"] = None
-            pending["event"].clear()
-            try:
-                await asyncio.wait_for(pending["event"].wait(), timeout=args.timeout)
-            except asyncio.TimeoutError:
-                print("    [!] No utterance detected before timeout — skipping.\n")
-                continue
-
-            utt: Utterance = pending["utt"]
-            audio_6ch = mic.slice(utt.timestamp_start, utt.timestamp_end)
-            wake_fired = utt.timestamp_start <= wake.last_fire_ts <= utt.timestamp_end + PAD_SECONDS
-
-            stem = f"trial{i:02d}_{slug}_{run_id}"
-            wav_path = out_root / f"{stem}.wav"
-            _write_wav(wav_path, audio_6ch)
-
-            meta = TrialMeta(
-                speaker=args.speaker,
-                condition=args.condition,
-                command=command,
-                trial_index=i,
-                duration_s=round(utt.duration, 3),
-                sample_rate=SAMPLE_RATE,
-                channels=CAPTURE_CHANNELS,
-                n_frames=int(audio_6ch.shape[0]),
-                wake_fired=bool(wake_fired),
-                wake_confidence=round(wake.last_conf, 3) if wake_fired else 0.0,
-                captured_at=time.time(),
-            )
-            wav_path.with_suffix(".json").write_text(json.dumps(asdict(meta), indent=2))
-            saved += 1
-            warn = "" if wake_fired else "  (wake word did NOT fire)"
-            print(
-                f"    saved {wav_path.name}  {utt.duration:.2f}s  "
-                f"{audio_6ch.shape[0]} frames{warn}\n"
-            )
-    finally:
-        await capture.stop()
-        mic.stop()
-
-    print(f"[capture] done — {saved}/{len(commands)} utterances saved under {out_root}")
+    print(f"\n[capture] stopping — {count['n']} utterances saved to {out_dir}")
+    await capture.stop()
+    mic.stop()
     return 0
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--speaker", required=True, help="Speaker label, e.g. jacob")
-    p.add_argument(
-        "--condition",
-        required=True,
-        help="Acoustic condition label, e.g. quiet_close, dishwasher_far",
-    )
     p.add_argument("--device", default="ReSpeaker", help="Input device name substring")
     p.add_argument("--out-dir", default="data/voice_diag", help="Output root")
-    p.add_argument("--commands-file", default=None, help="File of commands, one per line")
-    p.add_argument(
-        "--timeout",
-        type=float,
-        default=20.0,
-        help="Seconds to wait for an utterance per trial",
-    )
     args = p.parse_args()
     return asyncio.run(run(args))
 

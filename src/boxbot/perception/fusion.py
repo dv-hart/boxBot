@@ -102,9 +102,11 @@ class IdentityFusion:
         Returns:
             FusionResult with resolved identity and confirmation status.
         """
-        # Step 1: Voice matching
-        voice_centroids = await self._cloud_store.get_voice_centroids()
-        voice_match = self._voice_reid.match(speaker_embedding, voice_centroids)
+        # Step 1: Voice matching against per-person clouds (mean top-k
+        # cosine). Tiers map to high/medium/unknown so the agreement/
+        # conflict logic below is unchanged. See docs/voice-id-redesign.md.
+        voice_clouds = await self._cloud_store.get_voice_clouds()
+        voice_match = self._voice_reid.match_cloud(speaker_embedding, voice_clouds)
 
         # Step 2: DOA-based visual association
         visual_ref: str | None = None

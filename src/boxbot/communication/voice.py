@@ -1179,12 +1179,20 @@ class VoiceSession:
                 enrollment = getattr(pipeline, "enrollment", None)
                 if store is not None:
                     try:
-                        voice_centroids = await store.get_voice_centroids()
+                        # Cloud matching (mean top-k cosine) replaces the
+                        # single-centroid path. See docs/voice-id-redesign.md.
+                        voice_centroids = await store.get_voice_clouds()
                     except Exception:
                         logger.debug(
-                            "Could not load voice centroids", exc_info=True
+                            "Could not load voice clouds", exc_info=True
                         )
-                voice_reid = VoiceReID()
+                from boxbot.core.config import get_config
+                _p = get_config().perception
+                voice_reid = VoiceReID(
+                    confirmed_threshold=_p.voice_confirmed_threshold,
+                    maybe_threshold=_p.voice_maybe_threshold,
+                    topk=_p.voice_cloud_topk,
+                )
         except Exception:
             # Pipeline not running — we'll still assign display labels.
             logger.debug(
@@ -1216,10 +1224,10 @@ class VoiceSession:
                 continue
             seen_raw.add(raw)
 
-            # Run voice ReID if we have the machinery
+            # Run voice ReID (cloud match) if we have the machinery
             if voice_reid is not None and voice_centroids:
                 try:
-                    match = voice_reid.match(embedding, voice_centroids)
+                    match = voice_reid.match_cloud(embedding, voice_centroids)
                 except Exception:
                     logger.debug("Voice ReID match failed", exc_info=True)
                     match = None
@@ -1233,6 +1241,15 @@ class VoiceSession:
                 display = match.person_name
             else:
                 display = self._assign_display_label(raw)
+            # Key enrollment by the display label, not the raw pyannote
+            # label. With diarization off every utterance is SPEAKER_00, so
+            # keying by raw would pile a whole multi-speaker session onto
+            # one ref and commit it all to one person. Keying by display
+            # buffers each identity separately (a confirmed person, or a
+            # stable anonymous "Speaker X") and makes the agent's
+            # identify_person ref match the buffer key. See
+            # docs/voice-id-redesign.md.
+            enroll_ref = display
             label_map[raw] = display
 
             # Build the identity entry for this speaker
@@ -1247,7 +1264,7 @@ class VoiceSession:
             # If enrollment has an agent-established claim for this ref,
             # that trumps ReID — the agent has explicitly said who this is.
             if enrollment is not None:
-                claim = enrollment.get_claim(raw)
+                claim = enrollment.get_claim(enroll_ref)
                 if claim and claim.source == "agent_identify" and claim.name:
                     # Prefer the display_label to the person's actual name
                     # in the transcript so we don't confuse the model if it
@@ -1266,10 +1283,10 @@ class VoiceSession:
             # the stable ref key within the session (not the display label).
             if enrollment is not None:
                 try:
-                    enrollment.buffer_voice_embedding(raw, embedding)
+                    enrollment.buffer_voice_embedding(enroll_ref, embedding)
                     if match is not None:
                         enrollment.on_reid_match(
-                            raw,
+                            enroll_ref,
                             "voice",
                             person_id=match.person_id,
                             person_name=match.person_name,
@@ -1278,7 +1295,7 @@ class VoiceSession:
                         )
                 except Exception:
                     logger.debug(
-                        "Enrollment buffer/seed failed for ref=%s", raw,
+                        "Enrollment buffer/seed failed for ref=%s", enroll_ref,
                         exc_info=True,
                     )
 

@@ -387,6 +387,34 @@ class EnrollmentManager:
                 }
                 continue
 
+            # Growth requires an EXPLICIT identity. ReID seeds claims for
+            # attribution (who the agent is talking to), but committing on
+            # a reid-only claim is exactly the passive auto-enroll that
+            # polluted the clouds — and with diarization off it would
+            # blanket a multi-speaker session onto one person. Recognition
+            # runs off the seeded clouds; only an agent identify_person
+            # (later: voice+visual agreement) admits new embeddings.
+            # See docs/voice-id-redesign.md.
+            if claim.source != "agent_identify":
+                logger.debug(
+                    "commit_session: not committing ref=%s (claim source=%s) "
+                    "— %d voice / %d visual held back (no explicit identify)",
+                    ref, claim.source,
+                    len(person.voice_embeddings),
+                    len(person.visual_embeddings),
+                )
+                summary[ref] = {
+                    "person_id": claim.person_id,
+                    "name": claim.name,
+                    "voice_added": 0,
+                    "visual_added": 0,
+                    "dropped": (
+                        len(person.voice_embeddings)
+                        + len(person.visual_embeddings)
+                    ),
+                }
+                continue
+
             person_id = claim.person_id
             voice_added = 0
             visual_added = 0

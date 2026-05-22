@@ -53,6 +53,12 @@ class VoiceReID:
     HIGH_THRESHOLD = 0.85
     MEDIUM_THRESHOLD = 0.70
     LOW_THRESHOLD = 0.60
+    # Cloud-matching tiers (match_cloud). Defaults match the calibrated
+    # config values (docs/voice-id-redesign.md). confirmed → "high",
+    # maybe → "medium".
+    CONFIRMED_THRESHOLD = 0.55
+    MAYBE_THRESHOLD = 0.44
+    CLOUD_TOPK = 3
 
     def __init__(
         self,
@@ -60,6 +66,9 @@ class VoiceReID:
         high_threshold: float | None = None,
         medium_threshold: float | None = None,
         low_threshold: float | None = None,
+        confirmed_threshold: float | None = None,
+        maybe_threshold: float | None = None,
+        topk: int | None = None,
         # Legacy positional param — old callers passed a single threshold.
         threshold: float | None = None,
     ) -> None:
@@ -68,6 +77,15 @@ class VoiceReID:
         self._high = high_threshold if high_threshold is not None else self.HIGH_THRESHOLD
         self._medium = medium_threshold if medium_threshold is not None else self.MEDIUM_THRESHOLD
         self._low = low_threshold if low_threshold is not None else self.LOW_THRESHOLD
+        self._confirmed = (
+            confirmed_threshold if confirmed_threshold is not None
+            else self.CONFIRMED_THRESHOLD
+        )
+        self._maybe = (
+            maybe_threshold if maybe_threshold is not None
+            else self.MAYBE_THRESHOLD
+        )
+        self._topk = topk if topk is not None else self.CLOUD_TOPK
 
     def normalize_embedding(self, raw_output: np.ndarray) -> np.ndarray:
         """Normalize raw speaker embedding to unit L2 vector.
@@ -139,24 +157,30 @@ class VoiceReID:
         embedding: np.ndarray,
         clouds: dict[str, tuple[str, np.ndarray]],
         *,
-        confirmed_threshold: float,
-        maybe_threshold: float,
-        topk: int = 3,
+        confirmed_threshold: float | None = None,
+        maybe_threshold: float | None = None,
+        topk: int | None = None,
     ) -> MatchResult:
         """Match an embedding against per-person embedding *clouds*.
 
         Score for a person = mean of the top-k cosine similarities to that
         person's stored embeddings (proximity to real points, preserving
         per-condition modes a single centroid would average away). The
-        best-scoring person is returned with a tier:
+        best-scoring person is returned with a tier mapped onto the
+        existing vocabulary so downstream consumers are unchanged:
 
-        - ``confirmed`` ≥ ``confirmed_threshold`` (address by name)
-        - ``maybe``     ≥ ``maybe_threshold``     (tentative; verify)
-        - ``unknown``   below — id/name cleared
+        - ``high``    ≥ confirmed_threshold (address by name)
+        - ``medium``  ≥ maybe_threshold     (tentative; verify)
+        - ``unknown`` below — id/name cleared
 
-        See docs/voice-id-redesign.md. ``embedding`` and the cloud vectors
+        Thresholds default to the instance's configured values. See
+        docs/voice-id-redesign.md. ``embedding`` and the cloud vectors
         are expected L2-normalized; we normalize defensively anyway.
         """
+        confirmed = confirmed_threshold if confirmed_threshold is not None else self._confirmed
+        maybe = maybe_threshold if maybe_threshold is not None else self._maybe
+        k_top = topk if topk is not None else self._topk
+
         if not clouds:
             return MatchResult(
                 person_id=None, person_name=None, confidence=0.0, tier="unknown",
@@ -174,17 +198,17 @@ class VoiceReID:
             if vecs.size == 0:
                 continue
             sims = vecs @ q
-            k = min(topk, sims.shape[0])
+            k = min(k_top, sims.shape[0])
             score = float(np.sort(sims)[-k:].mean())
             if score > best_score:
                 best_score = score
                 best_id = person_id
                 best_name = name
 
-        if best_score >= confirmed_threshold:
-            tier = "confirmed"
-        elif best_score >= maybe_threshold:
-            tier = "maybe"
+        if best_score >= confirmed:
+            tier = "high"
+        elif best_score >= maybe:
+            tier = "medium"
         else:
             tier = "unknown"
             best_id = None

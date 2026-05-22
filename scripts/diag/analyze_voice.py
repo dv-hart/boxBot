@@ -202,7 +202,7 @@ def a2_whole_vs_fragments(utts: list[dict], emb: Embedder, channel: int) -> None
             whole_by_spk[spk].append(w)
         frags = emb.diarize_fragments(mono, u["sr"])
         n_spk = len({f[2] for f in frags})
-        split_counts.append((n_spk, len(frags), u["meta"]["command"]))
+        split_counts.append((n_spk, len(frags), u["meta"].get("local_time", "")))
         for _s, _e, _lbl, fe in frags:
             frag_by_spk[spk].append(fe)
     print("  same-speaker pairwise cosine:")

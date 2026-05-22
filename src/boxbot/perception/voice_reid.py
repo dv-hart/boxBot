@@ -133,3 +133,66 @@ class VoiceReID:
             confidence=best_score,
             tier=tier,
         )
+
+    def match_cloud(
+        self,
+        embedding: np.ndarray,
+        clouds: dict[str, tuple[str, np.ndarray]],
+        *,
+        confirmed_threshold: float,
+        maybe_threshold: float,
+        topk: int = 3,
+    ) -> MatchResult:
+        """Match an embedding against per-person embedding *clouds*.
+
+        Score for a person = mean of the top-k cosine similarities to that
+        person's stored embeddings (proximity to real points, preserving
+        per-condition modes a single centroid would average away). The
+        best-scoring person is returned with a tier:
+
+        - ``confirmed`` ≥ ``confirmed_threshold`` (address by name)
+        - ``maybe``     ≥ ``maybe_threshold``     (tentative; verify)
+        - ``unknown``   below — id/name cleared
+
+        See docs/voice-id-redesign.md. ``embedding`` and the cloud vectors
+        are expected L2-normalized; we normalize defensively anyway.
+        """
+        if not clouds:
+            return MatchResult(
+                person_id=None, person_name=None, confidence=0.0, tier="unknown",
+            )
+
+        q = embedding.astype(np.float32).flatten()
+        qn = np.linalg.norm(q)
+        if qn > 0:
+            q = q / qn
+
+        best_id: str | None = None
+        best_name: str | None = None
+        best_score = -1.0
+        for person_id, (name, vecs) in clouds.items():
+            if vecs.size == 0:
+                continue
+            sims = vecs @ q
+            k = min(topk, sims.shape[0])
+            score = float(np.sort(sims)[-k:].mean())
+            if score > best_score:
+                best_score = score
+                best_id = person_id
+                best_name = name
+
+        if best_score >= confirmed_threshold:
+            tier = "confirmed"
+        elif best_score >= maybe_threshold:
+            tier = "maybe"
+        else:
+            tier = "unknown"
+            best_id = None
+            best_name = None
+
+        return MatchResult(
+            person_id=best_id,
+            person_name=best_name,
+            confidence=best_score,
+            tier=tier,
+        )

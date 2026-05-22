@@ -357,6 +357,11 @@ class DiarizationConfig(BaseModel):
     min_speakers: int = 1
     max_speakers: int = 6
     match_threshold: float = 0.65
+    # When False, skip the diarization pipeline and embed each VAD
+    # utterance whole (single-speaker assumption). Avoids fragmenting a
+    # clean utterance into weak sub-second embeddings and the 3.6-4.5s
+    # pipeline latency. See docs/voice-id-redesign.md.
+    enabled: bool = False
 
 
 class STTConfig(BaseModel):
@@ -446,7 +451,16 @@ class PerceptionConfig(BaseModel):
     crop_retention_days_debug: int = 7
     doa_forward_angle: int = 0  # ReSpeaker angle that maps to camera center
     camera_hfov: int = 120  # Pi Camera Module 3 Wide horizontal FOV
-    voice_match_threshold: float = 0.60  # cosine similarity for voice ID
+    voice_match_threshold: float = 0.60  # legacy single-centroid threshold
+    # Cloud-based voice matching (docs/voice-id-redesign.md). Match score
+    # is the mean of the top-k cosine to a person's embedding cloud.
+    # Calibrated from measured genuine (~0.63) vs impostor (~0.20) cosine:
+    # confirmed ≈ 80th-pct genuine capture, maybe ≈ 98th-pct, both with
+    # ~0 false-accept given the wide margin. Re-calibrate clip-to-cloud
+    # via scripts/diag/seed_clusters.py after seeding.
+    voice_confirmed_threshold: float = 0.55
+    voice_maybe_threshold: float = 0.44
+    voice_cloud_topk: int = 3
 
 
 class MemoryConfig(BaseModel):

@@ -476,6 +476,39 @@ class CloudStore:
                 )
         return centroids
 
+    async def get_voice_clouds(self) -> dict[str, tuple[str, np.ndarray]]:
+        """Get every person's full voice embedding cloud.
+
+        Returns ``{person_id: (name, embeddings)}`` where ``embeddings``
+        is an ``(N, D)`` float32 array of that person's stored, L2-unit
+        voice embeddings. Only includes persons with at least one usable
+        (finite) embedding. This is the cloud-based counterpart to
+        :meth:`get_voice_centroids` — matching against the cloud (top-k
+        cosine) preserves per-condition modes that a single averaged
+        centroid collapses. See docs/voice-id-redesign.md.
+        """
+        db = self._ensure_db()
+        clouds: dict[str, tuple[str, np.ndarray]] = {}
+        async with db.execute(
+            """SELECT v.person_id, p.name, v.embedding
+               FROM voice_embeddings v
+               JOIN persons p ON v.person_id = p.id"""
+        ) as cursor:
+            acc: dict[str, tuple[str, list[np.ndarray]]] = {}
+            async for row in cursor:
+                emb = _blob_to_embedding(row["embedding"])
+                if not np.all(np.isfinite(emb)):
+                    continue
+                n = np.linalg.norm(emb)
+                if n > 0:
+                    emb = emb / n
+                name, vecs = acc.setdefault(row["person_id"], (row["name"], []))
+                vecs.append(emb.astype(np.float32))
+        for pid, (name, vecs) in acc.items():
+            if vecs:
+                clouds[pid] = (name, np.stack(vecs))
+        return clouds
+
     async def update_voice_centroid(
         self, person_id: str, centroid: np.ndarray
     ) -> None:
@@ -570,29 +603,52 @@ class CloudStore:
     async def _enforce_voice_cap(
         self, person_id: str, max_count: int = MAX_VOICE_EMBEDDINGS
     ) -> None:
-        """Delete oldest voice embeddings if over cap."""
+        """Evict voice embeddings by isolation + age when over cap.
+
+        Replaces oldest-first pruning with an outlier-aware policy
+        (docs/voice-id-redesign.md). When over cap, evict in a single
+        batch down to a low-water mark (~90% of cap), choosing the
+        highest ``isolation + λ·age`` first:
+
+        - ``isolation`` = 1 − mean(top-k cosine to nearest neighbours in
+          the cloud). Isolated points (contaminated / mis-enrolled clips)
+          score high; legit far/noisy clips have neighbours and survive.
+        - ``age`` (oldest = 1.0) breaks ties, so order is: outliers, then
+          old outliers, then just-old. λ is small so isolation dominates.
+
+        Distance is to *neighbours*, never the global mean, so genuine
+        per-condition modes are preserved.
+        """
         db = self._ensure_db()
-
-        async with db.execute(
-            "SELECT COUNT(*) as cnt FROM voice_embeddings WHERE person_id = ?",
-            (person_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            count = row["cnt"]
-
+        # Ordered oldest-first so index → age rank.
+        embeddings = await self.get_voice_embeddings(person_id)
+        count = len(embeddings)
         if count <= max_count:
             return
 
-        excess = count - max_count
-        async with db.execute(
-            """SELECT id FROM voice_embeddings
-               WHERE person_id = ?
-               ORDER BY timestamp ASC
-               LIMIT ?""",
-            (person_id, excess),
-        ) as cursor:
-            ids_to_delete = [row["id"] async for row in cursor]
+        low_water = max(1, int(max_count * 0.9))
+        n_evict = count - low_water
 
+        ids = [eid for eid, _ in embeddings]
+        vecs = np.stack([
+            (e / np.linalg.norm(e)) if np.linalg.norm(e) > 0 else e
+            for _, e in embeddings
+        ]).astype(np.float32)
+
+        sims = vecs @ vecs.T
+        np.fill_diagonal(sims, -1.0)  # exclude self
+        k = min(3, count - 1)
+        # mean of each row's top-k neighbour similarities
+        topk = np.sort(sims, axis=1)[:, -k:]
+        neighbour_sim = topk.mean(axis=1)
+        isolation = 1.0 - neighbour_sim
+
+        # oldest (index 0) → age 1.0, newest → 0.0
+        age = 1.0 - np.arange(count) / max(1, count - 1)
+        evict_score = isolation + 0.3 * age
+
+        evict_idx = np.argsort(evict_score)[-n_evict:]
+        ids_to_delete = [ids[i] for i in evict_idx]
         for emb_id in ids_to_delete:
             await db.execute(
                 "DELETE FROM voice_embeddings WHERE id = ?", (emb_id,)
@@ -600,7 +656,8 @@ class CloudStore:
         await db.commit()
 
         logger.debug(
-            "Pruned %d voice embeddings for person %s", excess, person_id
+            "Evicted %d voice embeddings for person %s (isolation+age)",
+            n_evict, person_id,
         )
 
 

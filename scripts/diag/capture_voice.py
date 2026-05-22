@@ -86,6 +86,7 @@ class SixChannelMic:
         self._loop = loop
         self._consumers: list = []
         self._stream = None
+        self.recent_peak = 0.0  # max ch0 RMS since last heartbeat read
         # ring of (monotonic_ts, ndarray[(frames, 6)] int16)
         self._ring: deque = deque(maxlen=int(RING_SECONDS * 1000 / CHUNK_MS))
 
@@ -130,6 +131,9 @@ class SixChannelMic:
         if not self._consumers:
             return
         mono = indata[:, 0].copy()
+        r = float(np.sqrt(np.mean((mono.astype(np.float32) / 32768.0) ** 2)))
+        if r > self.recent_peak:
+            self.recent_peak = r
         chunk = AudioChunk(
             data=mono.tobytes(),
             timestamp=now,
@@ -239,16 +243,28 @@ async def run(args: argparse.Namespace) -> int:
               f"{utt.duration:.2f}s  wake={wake_conf:.2f}", flush=True)
 
     capture.set_utterance_callback(on_utterance)
+    await vad.start()  # load Silero VAD — without this process_chunk returns 0.0
     await capture.start(mic)
     mic.start()
 
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(15)
+            peak = mic.recent_peak
+            mic.recent_peak = 0.0
+            clk = datetime.datetime.now().strftime("%H:%M:%S")
+            print(f"[{clk}] listening… {count['n']} saved | mic peak {peak:.3f} "
+                  f"(should rise when you speak)", flush=True)
+
+    hb = loop.create_task(heartbeat())
     stop_event = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
-    print("[capture] recording — speak naturally. Ctrl-C or SIGTERM to stop.\n", flush=True)
+    print("[capture] recording — say 'Hey Jarvis …'. Ctrl-C or SIGTERM to stop.\n", flush=True)
     await stop_event.wait()
 
+    hb.cancel()
     print(f"\n[capture] stopping — {count['n']} utterances saved to {out_dir}")
     await capture.stop()
     mic.stop()

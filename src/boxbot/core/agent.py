@@ -71,7 +71,11 @@ if TYPE_CHECKING:
 
 from boxbot.core import latency
 from boxbot.core.config import get_config
-from boxbot.cost import from_anthropic_usage, record as record_cost
+from boxbot.cost import (
+    from_agent_sdk_result,
+    from_anthropic_usage,
+    record as record_cost,
+)
 from boxbot.core.conversation import (
     Conversation,
     ConversationState,
@@ -914,11 +918,28 @@ class BoxBotAgent:
 
         config = get_config()
 
-        # Validate that an Anthropic API key is available
+        # ANTHROPIC_API_KEY is always required: peripherals (memory
+        # rerank Haiku, batch + dream pollers, web_search firewall,
+        # photo tagging) bill via the API regardless of which backend
+        # runs the main conversation loop. The OAuth-token Agent SDK
+        # credit only covers the conversation turn itself.
         if not config.api_keys.anthropic:
             raise RuntimeError(
                 "ANTHROPIC_API_KEY is not set. The agent cannot start "
-                "without an API key."
+                "without an API key — peripheral Haiku calls (memory "
+                "rerank, batch pollers, web_search firewall, photo "
+                "tagging) require it regardless of agent.backend."
+            )
+        if (
+            config.agent.backend == "claude_agent_sdk"
+            and not config.api_keys.claude_code_oauth_token
+        ):
+            raise RuntimeError(
+                "agent.backend = 'claude_agent_sdk' but "
+                "CLAUDE_CODE_OAUTH_TOKEN is not set. Run `claude "
+                "setup-token` on a machine with a browser and set the "
+                "result in .env, or switch backend back to "
+                "'raw_anthropic'."
             )
 
         self._client = anthropic.AsyncAnthropic(
@@ -1740,6 +1761,26 @@ class BoxBotAgent:
             )
             conv.sandbox_runner = None
 
+        # Tear down the per-conversation Claude Agent SDK client if
+        # one was attached. disconnect() reaps the underlying ``claude``
+        # CLI subprocess so we don't leak it between conversations.
+        sdk_client = getattr(conv, "_sdk_client", None)
+        if sdk_client is not None:
+            async def _stop_sdk_client(client: Any) -> None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    logger.exception(
+                        "SDK client disconnect failed (conv=%s)",
+                        conv_id,
+                    )
+
+            asyncio.create_task(
+                _stop_sdk_client(sdk_client),
+                name=f"sdk-disconnect-{conv_id}",
+            )
+            conv._sdk_client = None
+
         # Fire-and-forget memory extraction on the ended thread.
         # Persistent conversations have extraction routed through the
         # sweep loop (see _run_extraction_sweep) so they don't need
@@ -1804,16 +1845,30 @@ class BoxBotAgent:
         # The agent loop returns the full message history — from
         # prior_history + initial user + assistant/tool turns produced
         # this cycle. We'll extract the additions beyond our thread.
+        # Dispatch to the configured backend; both paths share the
+        # same signature and return shape so callers don't branch.
         conv.set_state(ConversationState.THINKING)
-        messages, turn_count = await self._agent_loop(
-            conversation_id=conv.conversation_id,
-            channel=conv.channel,
-            system_prompt_blocks=system_prompt_blocks,
-            initial_message=initial_message,
-            person_name=person_name,
-            max_turns=get_config().agent.max_turns,
-            prior_history=prior_history,
-        )
+        backend = get_config().agent.backend
+        if backend == "claude_agent_sdk":
+            messages, turn_count = await self._agent_loop_sdk(
+                conv=conv,
+                channel=conv.channel,
+                system_prompt_blocks=system_prompt_blocks,
+                initial_message=initial_message,
+                person_name=person_name,
+                max_turns=get_config().agent.max_turns,
+                prior_history=prior_history,
+            )
+        else:
+            messages, turn_count = await self._agent_loop(
+                conversation_id=conv.conversation_id,
+                channel=conv.channel,
+                system_prompt_blocks=system_prompt_blocks,
+                initial_message=initial_message,
+                person_name=person_name,
+                max_turns=get_config().agent.max_turns,
+                prior_history=prior_history,
+            )
 
         additions = messages[len(conv.thread):]
         summary = self._extract_summary(messages)
@@ -2411,6 +2466,231 @@ class BoxBotAgent:
                     person_name=person_name,
                     max_turns=max_turns,
                 )
+
+        return messages, turn_count
+
+    async def _agent_loop_sdk(
+        self,
+        conv: Any,
+        channel: str,
+        system_prompt_blocks: list[dict[str, Any]],
+        initial_message: str,
+        person_name: str | None,
+        max_turns: int = _DEFAULT_MAX_TURNS,
+        prior_history: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Run the conversation through the Claude Agent SDK backend.
+
+        Mirrors :meth:`_agent_loop` in signature and return shape so
+        callers don't branch on the backend. The SDK takes ownership of
+        the multi-turn tool loop; we observe the stream for logging,
+        memory hooks, output dispatch tracking, and cost telemetry, then
+        translate the SDK's view of the conversation back into the
+        ``messages`` history shape ``_run_conversation`` expects.
+
+        Lifecycle: one :class:`ClaudeSDKClient` per Conversation, cached
+        on ``conv._sdk_client``. The first turn of a Conversation
+        constructs the client and connects; subsequent turns reuse it,
+        so the SDK's internal session state carries multi-turn voice
+        continuity without us re-seeding ``prior_history``.
+
+        Auth: relies on ``CLAUDE_CODE_OAUTH_TOKEN`` in the process
+        environment (validated by :meth:`start`). The SDK reads the
+        token from env via its own precedence rules.
+
+        Cost: a single :class:`ResultMessage` arrives at the end of the
+        loop; we run it through :func:`from_agent_sdk_result` and
+        append one cost event (or one per model, in the multi-model
+        case). ``num_turns`` from the ResultMessage becomes our
+        ``turn_count`` return value.
+
+        Cancellation / interruption: external callers invoke
+        ``conv._sdk_client.interrupt()`` when new user input arrives
+        mid-stream. The SDK halts generation cleanly; this method's
+        ``receive_response()`` exits its loop on the resulting
+        ResultMessage with ``stop_reason == "interrupted"``.
+
+        Turn cap behavior: ``max_turns`` is passed straight through to
+        ``ClaudeAgentOptions``. The SDK enforces the cap. If the agent
+        finishes without invoking the ``message`` tool, the
+        post-loop :meth:`_dispatch_max_turns_fallback` (shared with the
+        raw backend) sends a hardcoded closing line.
+        """
+        from boxbot.core.agent_sdk_adapter import (
+            build_options,
+            flatten_system_prompt,
+            mcp_tool_name,
+        )
+        from boxbot.tools.registry import get_tools
+
+        config = get_config()
+        model = config.models.large
+
+        tools = get_tools()
+        system_prompt = flatten_system_prompt(system_prompt_blocks)
+        message_tool_full_name = mcp_tool_name("message")
+
+        # Build the messages history the SDK path will return. The SDK
+        # owns the actual session state; we track messages here only so
+        # the surrounding code (memory extraction, summary) sees the
+        # same return shape as the raw path produces.
+        messages: list[dict[str, Any]] = list(prior_history or [])
+        messages.append({"role": "user", "content": initial_message})
+
+        # Bookkeeping for the post-loop fallback dispatch.
+        message_dispatched = False
+        turn_count = 0
+
+        # Construct / reuse the SDK client. One per Conversation;
+        # multi-turn voice continuity comes for free.
+        sdk_client = getattr(conv, "_sdk_client", None)
+        if sdk_client is None:
+            options = build_options(
+                model=model,
+                max_turns=max_turns,
+                system_prompt=system_prompt,
+                tools=tools,
+                output_format={
+                    "type": "json_schema",
+                    "schema": INTERNAL_NOTES_SCHEMA,
+                },
+                conv=conv,
+            )
+            from claude_agent_sdk import ClaudeSDKClient
+            sdk_client = ClaudeSDKClient(options=options)
+            await sdk_client.connect()
+            conv._sdk_client = sdk_client
+
+        latency.mark(conv.conversation_id, "gen_start")
+
+        try:
+            with latency.span(conv.conversation_id, "api"):
+                await sdk_client.query(initial_message)
+
+                from claude_agent_sdk import (
+                    AssistantMessage,
+                    ResultMessage,
+                    TextBlock,
+                    ToolUseBlock,
+                )
+
+                async for sdk_msg in sdk_client.receive_response():
+                    if isinstance(sdk_msg, AssistantMessage):
+                        assistant_content: list[dict[str, Any]] = []
+                        for block in sdk_msg.content:
+                            if isinstance(block, TextBlock):
+                                assistant_content.append({
+                                    "type": "text",
+                                    "text": block.text,
+                                })
+                                parsed = parse_internal_notes(block.text)
+                                if parsed is None:
+                                    if block.text.strip():
+                                        logger.error(
+                                            "Could not parse internal "
+                                            "notes JSON (conv=%s). "
+                                            "First 200 chars: %r",
+                                            conv.conversation_id,
+                                            block.text[:200],
+                                        )
+                                    continue
+                                if parsed.thought:
+                                    logger.info(
+                                        "agent thought (conv=%s): %s",
+                                        conv.conversation_id,
+                                        parsed.thought,
+                                    )
+                                if parsed.observations:
+                                    logger.info(
+                                        "agent observations (conv=%s): %s",
+                                        conv.conversation_id,
+                                        " | ".join(parsed.observations),
+                                    )
+                            elif isinstance(block, ToolUseBlock):
+                                # Track whether the model dispatched a
+                                # message tool at any point. The SDK
+                                # runs the tool itself via our MCP
+                                # server, so the actual delivery has
+                                # already happened by the time we see
+                                # this block.
+                                assistant_content.append({
+                                    "type": "tool_use",
+                                    "id": block.id,
+                                    "name": block.name,
+                                    "input": block.input,
+                                })
+                                if block.name == message_tool_full_name:
+                                    message_dispatched = True
+                        if assistant_content:
+                            messages.append({
+                                "role": "assistant",
+                                "content": assistant_content,
+                            })
+                    elif isinstance(sdk_msg, ResultMessage):
+                        turn_count = sdk_msg.num_turns or 0
+                        try:
+                            events = from_agent_sdk_result(
+                                purpose="conversation",
+                                result_message=sdk_msg,
+                                correlation_id=conv.conversation_id,
+                                metadata={
+                                    "channel": channel,
+                                    "turn": turn_count,
+                                    "backend": "claude_agent_sdk",
+                                },
+                            )
+                            for event in events:
+                                await record_cost(self._memory_store, event)
+                        except Exception:
+                            logger.exception(
+                                "Failed to record SDK-loop cost "
+                                "(conv=%s turns=%d)",
+                                conv.conversation_id,
+                                turn_count,
+                            )
+                        if sdk_msg.is_error:
+                            logger.error(
+                                "SDK loop ended with error "
+                                "(conv=%s stop_reason=%s)",
+                                conv.conversation_id,
+                                sdk_msg.stop_reason,
+                            )
+                        break
+        except asyncio.CancelledError:
+            # New user input (wake word, barge-in) cancelled this
+            # generation. Tell the SDK to halt cleanly so the next
+            # query() starts from a settled state, then re-raise so the
+            # caller's cancel-and-fold flow proceeds normally.
+            try:
+                await asyncio.shield(sdk_client.interrupt())
+            except Exception:
+                logger.exception(
+                    "SDK client interrupt() failed during cancellation "
+                    "(conv=%s)",
+                    conv.conversation_id,
+                )
+            raise
+        except Exception:
+            logger.exception(
+                "SDK-backed agent loop raised (conv=%s)",
+                conv.conversation_id,
+            )
+
+        # Post-loop fallback: if the SDK hit the turn cap without
+        # the agent ever dispatching a message tool, send the
+        # hardcoded closing line so the user isn't left hanging.
+        if turn_count >= max_turns and not message_dispatched:
+            logger.warning(
+                "SDK conversation reached max turns (%d) without "
+                "dispatching a message — falling back",
+                max_turns,
+            )
+            await self._dispatch_max_turns_fallback(
+                conversation_id=conv.conversation_id,
+                channel=channel,
+                person_name=person_name,
+                max_turns=max_turns,
+            )
 
         return messages, turn_count
 

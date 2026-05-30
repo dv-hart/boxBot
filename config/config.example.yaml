@@ -20,6 +20,15 @@ agent:
   #              wake-word transcript filtering, routine pre-processing
   # Maximum conversation turns before auto-compaction
   max_turns: 20
+  # Which client runs the main conversation turn.
+  #   raw_anthropic    — direct Messages API, billed via Console.
+  #   claude_agent_sdk — Claude Agent SDK over OAuth, billed against the
+  #                      monthly Agent SDK credit (Pro/Max plans).
+  # Peripheral Haiku calls (memory rerank, batches, web-search firewall,
+  # photo tagging) stay on raw_anthropic regardless of this setting.
+  # Switching to claude_agent_sdk requires CLAUDE_CODE_OAUTH_TOKEN in .env
+  # and the `claude` CLI (npm @anthropic-ai/claude-code) installed on PATH.
+  backend: "raw_anthropic"
 
 # ── Schedule ──────────────────────────────────────────────────────────
 # The agent's internal planning system (triggers + to-do list).

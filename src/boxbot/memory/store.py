@@ -275,6 +275,14 @@ CREATE TABLE IF NOT EXISTS cost_log (
     metadata                 TEXT                           -- JSON: conversation_id, batch_id, etc.
 );
 
+-- Small key/value scratch for cross-run dream-phase state (e.g. the
+-- watermark of the last processed memory window). Avoids a misaligned
+-- "since midnight" window that left a daily blind spot.
+CREATE TABLE IF NOT EXISTS dream_state (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 CREATE INDEX IF NOT EXISTS idx_memories_person ON memories(person);
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
@@ -710,6 +718,23 @@ class MemoryStore:
     async def delete_memory(self, memory_id: str) -> None:
         """Permanently delete a memory (used by storage cap eviction)."""
         await self.db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        await self.db.commit()
+
+    async def get_dream_state(self, key: str) -> str | None:
+        """Read a dream-phase scratch value (e.g. the run watermark)."""
+        cursor = await self.db.execute(
+            "SELECT value FROM dream_state WHERE key = ?", (key,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row is not None else None
+
+    async def set_dream_state(self, key: str, value: str) -> None:
+        """Write a dream-phase scratch value (upsert)."""
+        await self.db.execute(
+            "INSERT INTO dream_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
         await self.db.commit()
 
     async def set_dream_audit_fields(

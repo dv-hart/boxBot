@@ -65,17 +65,43 @@ correct "Preschool Graduation…". (Owner: Jacob, handled calendar-side.)
   `skills/bb/modules/memory.md`.
 
 ### Fix B — dream cycle resolves clear contradictions
-- Add a **contradiction** judgment alongside dedup: same subject/predicate,
-  incompatible value → choose survivor (recency + presence of an explicit
-  correction memory) and invalidate the other with `superseded_by`.
-- **Authority (decided):** the cycle MAY autonomously invalidate when a
-  memory is *clearly* invalidated (e.g. "it's Erik's, not Zara's"). The
-  prompt gives instructions and leaves flag-vs-invalidate to the agent's
-  discretion — invalidate when unambiguous, flag when uncertain.
-- Fix the candidate window: select new memories via a **persisted
-  watermark** (created since last dream run) so every new memory gets the
-  Pass-2 scan exactly once, regardless of creation time.
-- Validate in audit mode, then set `dream_audit_only: false`.
+
+The dream cycle was a *deduplicator* only (`merge_into_a/merge_into_b/
+distinct/unsure`) — for "Zara's graduation" vs "Erik's graduation" the
+right dedup answer is `distinct`, so both survived forever. And its
+candidate window (`created since midnight UTC`, run at 10:00 UTC) never
+scanned memories created in the other ~14h, so the contradicting pair was
+never even compared ("6 candidates, 0 pairs" every night).
+
+Implemented:
+- **Contradiction decisions** added to the `dedup_decision` tool:
+  - `supersede` — incompatible claims about the same subject. The model
+    sets `stale_id` (the wrong/outdated memory); apply invalidates it with
+    `superseded_by=survivor`, no content merge. Resolution rule in the
+    prompt: explicit correction wins, else more recent `created_at` wins.
+  - `flag` — conflict suspected but not certain which is right. Recorded
+    for review (surfaced in the dream-log), never mutates.
+- **Authority (decided):** autonomous invalidate only when *clear* —
+  `supersede` is gated by confidence ≥ 0.8 and evidence citing both ids
+  (and `stale_id` must be one of the pair); the prompt tells the model to
+  prefer `flag` whenever uncertain. So it invalidates the unambiguous,
+  flags the rest.
+- **Robust across reboots:** apply resolves `supersede` from `stale_id` +
+  `evidence` (order-independent), since `pairs_by_custom_id` isn't retained
+  across boots.
+- **Candidate-window watermark:** new `dream_state` kv table holds
+  `last_run_iso`; `gather_candidates(since_iso=…)` scans memories created
+  since the last run (first run looks back 24h), advanced only after the
+  cycle's work is queued + logged. Eliminates the 14h blind spot — every
+  new memory gets the Pass-2 nearest-neighbour scan exactly once.
+- Soft-delete only (same as merge): `invalidated` + `superseded_by` +
+  `consolidated_by=batch_id`, so `scripts/undo_last_dream.py` can reverse it.
+
+**Enabling:** the code default is already `dream_audit_only: false`
+(config.py); the Pi's `config/config.yaml` overrides it to `true`. To turn
+B on, set `dream_audit_only: false` on the Pi (validate against a dry-run
+dream-log first). Until then, contradictions are detected and written to
+the dream-log but not applied.
 
 ### Fix C — proactive/trigger output threads into the user's conversation
 

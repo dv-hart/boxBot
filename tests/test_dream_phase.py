@@ -1027,3 +1027,210 @@ class TestUndoScript:
                 assert row["status"] == "failed"
             finally:
                 await store.close()
+
+
+# ---------------------------------------------------------------------------
+# Fix B — contradiction resolution (supersede / flag)
+# ---------------------------------------------------------------------------
+
+
+def _decision_entry(custom_id, payload):
+    """Build one succeeded batch entry carrying a dedup_decision payload."""
+    msg = _StubMessage(content=[_StubBlock(
+        type="tool_use", name="dedup_decision", input=payload,
+    )])
+    return _StubResultEntry(custom_id, _StubResult("succeeded", message=msg))
+
+
+class TestContradictionResolution:
+    @pytest.mark.asyncio
+    async def test_supersede_invalidates_stale_keeps_survivor(self, fresh_store):
+        from boxbot.memory.dream import NearDupPair, apply_dream_result
+
+        stale = await _seed(
+            fresh_store, content="Zara's preschool graduation Mon Jun 8",
+            summary="Zara graduation", person="Zara",
+        )
+        survivor = await _seed(
+            fresh_store, content="Erik's preschool graduation Mon Jun 8",
+            summary="Erik graduation", person="Erik",
+        )
+        pair = NearDupPair(memory_id_a=stale, memory_id_b=survivor, cosine=0.9)
+        payload = {
+            "decision": "supersede",
+            "stale_id": stale,
+            "evidence": [stale, survivor],
+            "confidence": 0.95,
+            "notes": "graduation is Erik's; Zara attribution corrected",
+        }
+        result = await apply_dream_result(
+            fresh_store, [_decision_entry("c1", payload)],
+            batch_id="batch_super",
+            pairs_by_custom_id={"c1": pair},
+            audit_only=False,
+        )
+        assert result.applied_supersessions == 1
+        assert result.applied_merges == 0
+        m_stale = await fresh_store.get_memory_no_touch(stale)
+        m_surv = await fresh_store.get_memory_no_touch(survivor)
+        assert m_stale.status == "invalidated"
+        assert m_stale.superseded_by == survivor
+        assert m_stale.consolidated_by == "batch_super"
+        # Survivor untouched (content not merged — stale was wrong).
+        assert m_surv.status == "active"
+        assert m_surv.content == "Erik's preschool graduation Mon Jun 8"
+
+    @pytest.mark.asyncio
+    async def test_supersede_works_from_evidence_across_reboot(
+        self, fresh_store,
+    ):
+        """pairs_by_custom_id is empty across boots; supersede must still
+        resolve via stale_id + evidence."""
+        from boxbot.memory.dream import apply_dream_result
+
+        stale = await _seed(fresh_store, content="old", summary="old")
+        survivor = await _seed(fresh_store, content="new", summary="new")
+        payload = {
+            "decision": "supersede",
+            "stale_id": stale,
+            "evidence": [survivor, stale],  # order intentionally swapped
+            "confidence": 0.9,
+        }
+        result = await apply_dream_result(
+            fresh_store, [_decision_entry("c1", payload)],
+            batch_id="b", pairs_by_custom_id={}, audit_only=False,
+        )
+        assert result.applied_supersessions == 1
+        assert (await fresh_store.get_memory_no_touch(stale)).status == (
+            "invalidated"
+        )
+        assert (await fresh_store.get_memory_no_touch(survivor)).status == (
+            "active"
+        )
+
+    @pytest.mark.asyncio
+    async def test_supersede_audit_only_counts_no_mutation(self, fresh_store):
+        from boxbot.memory.dream import NearDupPair, apply_dream_result
+
+        a = await _seed(fresh_store, content="a", summary="a")
+        b = await _seed(fresh_store, content="b", summary="b")
+        pair = NearDupPair(memory_id_a=a, memory_id_b=b, cosine=0.9)
+        payload = {
+            "decision": "supersede", "stale_id": a,
+            "evidence": [a, b], "confidence": 0.95,
+        }
+        result = await apply_dream_result(
+            fresh_store, [_decision_entry("c1", payload)],
+            batch_id="b", pairs_by_custom_id={"c1": pair}, audit_only=True,
+        )
+        assert result.applied_supersessions == 1
+        assert (await fresh_store.get_memory_no_touch(a)).status == "active"
+
+    @pytest.mark.asyncio
+    async def test_flag_records_review_no_mutation(self, fresh_store):
+        from boxbot.memory.dream import NearDupPair, apply_dream_result
+
+        a = await _seed(fresh_store, content="a", summary="a")
+        b = await _seed(fresh_store, content="b", summary="b")
+        pair = NearDupPair(memory_id_a=a, memory_id_b=b, cosine=0.9)
+        payload = {
+            "decision": "flag", "evidence": [a, b], "confidence": 0.6,
+            "notes": "might conflict, unsure which is right",
+        }
+        result = await apply_dream_result(
+            fresh_store, [_decision_entry("c1", payload)],
+            batch_id="b", pairs_by_custom_id={"c1": pair}, audit_only=False,
+        )
+        assert result.flagged_contradictions == 1
+        assert result.applied_supersessions == 0
+        assert (await fresh_store.get_memory_no_touch(a)).status == "active"
+        assert (await fresh_store.get_memory_no_touch(b)).status == "active"
+
+    @pytest.mark.asyncio
+    async def test_supersede_stale_id_not_in_pair_skipped(self, fresh_store):
+        from boxbot.memory.dream import NearDupPair, apply_dream_result
+
+        a = await _seed(fresh_store, content="a", summary="a")
+        b = await _seed(fresh_store, content="b", summary="b")
+        pair = NearDupPair(memory_id_a=a, memory_id_b=b, cosine=0.9)
+        payload = {
+            "decision": "supersede", "stale_id": "not-in-pair",
+            "evidence": [a, b], "confidence": 0.95,
+        }
+        result = await apply_dream_result(
+            fresh_store, [_decision_entry("c1", payload)],
+            batch_id="b", pairs_by_custom_id={"c1": pair}, audit_only=False,
+        )
+        assert result.applied_supersessions == 0
+        assert (await fresh_store.get_memory_no_touch(a)).status == "active"
+        assert (await fresh_store.get_memory_no_touch(b)).status == "active"
+
+    @pytest.mark.asyncio
+    async def test_supersede_low_confidence_skipped(self, fresh_store):
+        from boxbot.memory.dream import NearDupPair, apply_dream_result
+
+        a = await _seed(fresh_store, content="a", summary="a")
+        b = await _seed(fresh_store, content="b", summary="b")
+        pair = NearDupPair(memory_id_a=a, memory_id_b=b, cosine=0.9)
+        payload = {
+            "decision": "supersede", "stale_id": a,
+            "evidence": [a, b], "confidence": 0.5,  # below gate
+        }
+        result = await apply_dream_result(
+            fresh_store, [_decision_entry("c1", payload)],
+            batch_id="b", pairs_by_custom_id={"c1": pair}, audit_only=False,
+        )
+        assert result.applied_supersessions == 0
+        assert result.skipped_low_confidence == 1
+        assert (await fresh_store.get_memory_no_touch(a)).status == "active"
+
+
+# ---------------------------------------------------------------------------
+# Fix B — candidate-window watermark
+# ---------------------------------------------------------------------------
+
+
+class TestDreamWatermark:
+    @pytest.mark.asyncio
+    async def test_since_iso_catches_blind_spot(self, fresh_store):
+        """A memory created yesterday evening (the old midnight-cutoff
+        blind spot) is missed by the midnight window but caught by a
+        watermark that reaches back past it."""
+        from boxbot.memory.dream import gather_candidates
+
+        midnight = datetime.utcnow().replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        blind = await _seed(
+            fresh_store, content="created in blind spot", summary="blind",
+            created_at=(midnight - timedelta(hours=6)).isoformat(),
+        )
+        # Default (midnight) window: excluded.
+        cand_default = await gather_candidates(
+            fresh_store, now=midnight + timedelta(hours=10),
+            rng=random.Random(0),
+        )
+        assert blind not in {m.id for m in cand_default.new_today}
+        # Watermark reaching back 24h: included.
+        cand_wm = await gather_candidates(
+            fresh_store, now=midnight + timedelta(hours=10),
+            rng=random.Random(0),
+            since_iso=(midnight - timedelta(hours=24)).isoformat(),
+        )
+        assert blind in {m.id for m in cand_wm.new_today}
+
+    @pytest.mark.asyncio
+    async def test_run_cycle_advances_watermark(
+        self, fresh_store, fake_client, tmp_path,
+    ):
+        from boxbot.memory.dream import DREAM_WATERMARK_KEY, run_dream_cycle
+
+        assert await fresh_store.get_dream_state(DREAM_WATERMARK_KEY) is None
+        now = datetime.utcnow()
+        with patch("boxbot.memory.dream.WORKSPACE_DIR", tmp_path / "ws"):
+            await run_dream_cycle(
+                fresh_store, fake_client, audit_only=True, now=now,
+            )
+        assert await fresh_store.get_dream_state(DREAM_WATERMARK_KEY) == (
+            now.isoformat()
+        )

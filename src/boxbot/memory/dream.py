@@ -91,6 +91,10 @@ DEDUP_CONFIDENCE_THRESHOLD = 0.8
 # night" change budget at the pair level.
 MAX_DEDUP_PAIRS_DEFAULT = 30
 
+# dream_state key holding the ISO timestamp of the last completed cycle.
+# Drives the "new since last run" candidate window (see gather_candidates).
+DREAM_WATERMARK_KEY = "last_run_iso"
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -143,12 +147,13 @@ class DedupDecision:
 
     custom_id: str
     pair: NearDupPair | None
-    decision: str  # merge_into_a | merge_into_b | distinct | unsure
+    decision: str  # merge_into_a|merge_into_b|supersede|flag|distinct|unsure
     merged_content: str | None
     merged_summary: str | None
     evidence: list[str]
     confidence: float
     notes: str
+    stale_id: str | None = None  # supersede: the memory to invalidate
 
 
 @dataclass
@@ -158,6 +163,8 @@ class DreamApplyResult:
     audit_only: bool
     decisions: list[DedupDecision] = field(default_factory=list)
     applied_merges: int = 0
+    applied_supersessions: int = 0
+    flagged_contradictions: int = 0
     skipped_low_confidence: int = 0
     skipped_unsure_or_distinct: int = 0
 
@@ -173,10 +180,12 @@ class DreamApplyResult:
 DEDUP_TOOL: dict[str, Any] = {
     "name": "dedup_decision",
     "description": (
-        "Decide whether two memories represent the same fact. Be "
-        "conservative — only merge when they are clearly the same fact "
-        "in different words. If there is any meaningful difference, "
-        "return 'distinct'. If you cannot tell, return 'unsure'."
+        "Judge two memories. They may be the same fact in different "
+        "words (merge), genuinely different (distinct), or making "
+        "INCOMPATIBLE claims about the same subject (supersede / flag). "
+        "Be conservative — when unsure whether they're the same, return "
+        "'distinct'; when unsure which of two conflicting facts is "
+        "correct, return 'flag', never 'supersede'."
     ),
     "input_schema": {
         "type": "object",
@@ -187,18 +196,29 @@ DEDUP_TOOL: dict[str, Any] = {
                 "enum": [
                     "merge_into_a",
                     "merge_into_b",
+                    "supersede",
+                    "flag",
                     "distinct",
                     "unsure",
                 ],
             },
             "merged_content": {"type": "string"},
             "merged_summary": {"type": "string"},
+            "stale_id": {
+                "type": "string",
+                "description": (
+                    "For 'supersede' only: the id of the memory that is "
+                    "now wrong or outdated and should be invalidated. "
+                    "Must be one of the two memory ids in the pair; the "
+                    "other is kept as the survivor."
+                ),
+            },
             "evidence": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Memory IDs you cited. Required for any merge — "
-                    "must include both IDs from the pair."
+                    "Memory IDs you cited. Required for any merge or "
+                    "supersede — must include both IDs from the pair."
                 ),
             },
             "confidence": {
@@ -215,23 +235,25 @@ DEDUP_TOOL: dict[str, Any] = {
 DEDUP_SYSTEM_PROMPT = """\
 You are the dream-phase memory consolidator for boxBot.
 
-Each request shows you exactly two memories from a household assistant's long-term store. Your single job: decide whether they record the same underlying fact in different words, or whether they are distinct.
+Each request shows you exactly two memories from a household assistant's long-term store. Your job: decide whether they record the same fact (merge), are unrelated/different (distinct), or make INCOMPATIBLE claims about the same subject (supersede / flag).
 
 Output rules (strictly via the `dedup_decision` tool):
 
 - `merge_into_a`: keep memory A's id, fold in any extra information from B. Use this when both clearly state the same fact and A's wording is at least as good as B's.
 - `merge_into_b`: keep memory B's id, fold in extra info from A.
-- `distinct`: any meaningful difference — different person, different time period, different scope, different attribute. **When in doubt, prefer this.**
-- `unsure`: you genuinely cannot tell. Returns are logged but no merge happens.
+- `supersede`: the two memories make INCOMPATIBLE claims about the SAME subject — the same event attributed to different people, or a value that has been updated/corrected (e.g. "Zara's preschool graduation is Mon Jun 8" vs "Erik's preschool graduation is Mon Jun 8"; or "lives in Portland" vs "moved to Seattle"). Set `stale_id` to the memory that is now WRONG or OUTDATED; the other is kept. Decide which is stale by: (a) an explicit correction wins over the thing corrected, (b) otherwise the more recent `created_at` wins. Use this ONLY when the contradiction is clear AND you are confident which one is current.
+- `flag`: the memories seem to conflict, but you are NOT sure they truly conflict, or NOT sure which one is correct. Nothing is changed — the conflict is recorded for human/agent review. **Prefer `flag` over `supersede` whenever you are uncertain.** Invalidating a memory is destructive; only `supersede` when it's unambiguous.
+- `distinct`: any meaningful difference that is NOT a contradiction — different person, different time period, different scope, different attribute. **When in doubt between merge and distinct, prefer this.**
+- `unsure`: you genuinely cannot tell anything. Logged; nothing happens.
 
 Hard rules:
 
-1. Be conservative. Spurious merges destroy information; a missed merge is fixable on a future night. False merges are not.
-2. If two memories are about different people, different times, or different aspects, they are `distinct` — even if the words overlap.
-3. `confidence` must be ≥ 0.8 only if you are sure; below that, the apply step will skip the merge regardless of decision.
-4. `evidence` MUST include both memory IDs from the pair when merging.
-5. When merging, `merged_content` should be 1–3 sentences containing every fact present in either input. `merged_summary` should be ≤80 chars.
-6. Operational memories (activity-log entries) are never merged — return `distinct`. They are append-only.
+1. Be conservative. Spurious merges and false supersessions destroy information; a missed one is fixable on a future night. When torn between `supersede` and `flag`, choose `flag`.
+2. Two memories about different people, times, or aspects that do NOT contradict are `distinct` — even if the words overlap. A contradiction means they cannot both be true of the same subject.
+3. `confidence` must be ≥ 0.8 only if you are sure; below that, the apply step will skip the merge/supersede regardless of decision.
+4. `evidence` MUST include both memory IDs from the pair when merging or superseding. For `supersede`, `stale_id` MUST be one of those two ids.
+5. When merging, `merged_content` should be 1–3 sentences containing every fact present in either input. `merged_summary` should be ≤80 chars. Do NOT merge content on a `supersede` — the stale memory is wrong, not additive.
+6. Operational memories (activity-log entries) are never merged or superseded — return `distinct`. They are append-only.
 
 If the inputs are too thin to judge (e.g. single-word summaries), return `unsure` with confidence ≤ 0.4.
 """
@@ -282,8 +304,9 @@ async def gather_candidates(
     *,
     now: datetime | None = None,
     rng: random.Random | None = None,
+    since_iso: str | None = None,
 ) -> CandidateSet:
-    """Collect today's new memories plus 6 revisits across three pools.
+    """Collect newly-created memories plus 6 revisits across three pools.
 
     Pools (per roadmap §3):
       A — "used today" (last_relevant_at >= midnight): pick 3
@@ -291,17 +314,26 @@ async def gather_candidates(
           by exp(-age_days / AGE_DECAY_DAYS)
       C — uniform random across active memories: pick 1
 
-    Memories already in the new-today set are excluded from the revisit
-    pools so the same record isn't sampled twice.
+    ``since_iso`` bounds the "new" set: memories created at or after it.
+    ``run_dream_cycle`` passes the watermark of the last run, so every
+    new memory is scanned exactly once regardless of when in the day it
+    was created. Falls back to today's UTC midnight when unset (the old
+    behaviour) — but note that on its own midnight leaves a daily blind
+    spot for memories created between the run time and the next midnight,
+    which is why the watermark exists.
+
+    Memories already in the new set are excluded from the revisit pools
+    so the same record isn't sampled twice.
     """
     rng = rng or random.Random()
     now = now or datetime.utcnow()
     midnight = _midnight_utc(now)
     midnight_iso = midnight.isoformat()
 
-    # New memories created since midnight (active only — we don't dedup
-    # archived/invalidated rows).
-    new_today = await store.list_memories_created_since(midnight_iso)
+    # New memories created since the watermark (active only — we don't
+    # dedup archived/invalidated rows).
+    new_window_iso = since_iso or midnight_iso
+    new_today = await store.list_memories_created_since(new_window_iso)
     new_today_ids = {m.id for m in new_today}
 
     # Pool A: used today
@@ -727,6 +759,10 @@ def _decision_from_payload(
         evidence=list(payload.get("evidence") or []),
         confidence=float(payload.get("confidence") or 0.0),
         notes=str(payload.get("notes") or ""),
+        stale_id=(
+            str(payload["stale_id"])
+            if payload.get("stale_id") else None
+        ),
     )
 
 
@@ -793,6 +829,12 @@ async def apply_dream_result(
     result = DreamApplyResult(audit_only=audit_only, decisions=decisions)
 
     for d in decisions:
+        # A flag is "these conflict but I'm not sure" — recorded for
+        # review, never mutates. No confidence gate: it's already the
+        # uncertain path.
+        if d.decision == "flag":
+            result.flagged_contradictions += 1
+            continue
         if d.decision in {"distinct", "unsure"}:
             result.skipped_unsure_or_distinct += 1
             continue
@@ -814,8 +856,10 @@ async def apply_dream_result(
                 d.custom_id,
             )
             continue
-        if d.decision not in {"merge_into_a", "merge_into_b"}:
+        if d.decision not in {"merge_into_a", "merge_into_b", "supersede"}:
             continue
+        # Defence against confabulation: evidence must cite both members
+        # of the pair for any destructive op (merge or supersede).
         if not d.evidence or pair.memory_id_a not in d.evidence \
                 or pair.memory_id_b not in d.evidence:
             logger.warning(
@@ -825,6 +869,33 @@ async def apply_dream_result(
             )
             continue
 
+        # --- Contradiction: invalidate the stale memory, keep the other.
+        if d.decision == "supersede":
+            stale = d.stale_id
+            if stale not in {pair.memory_id_a, pair.memory_id_b}:
+                logger.warning(
+                    "Dream supersede %s: stale_id %r is not one of the "
+                    "pair; skipping",
+                    d.custom_id, stale,
+                )
+                continue
+            survivor = (
+                pair.memory_id_b if stale == pair.memory_id_a
+                else pair.memory_id_a
+            )
+            if audit_only:
+                result.applied_supersessions += 1
+                continue
+            await _apply_supersede(
+                store,
+                stale_id=stale,
+                survivor_id=survivor,
+                batch_id=batch_id,
+            )
+            result.applied_supersessions += 1
+            continue
+
+        # --- Merge: same fact, different words.
         if audit_only:
             # Audit-only: count the decision as if it would have
             # applied, but leave the store untouched.
@@ -847,10 +918,12 @@ async def apply_dream_result(
         result.applied_merges += 1
 
     logger.info(
-        "Dream apply (audit_only=%s, batch=%s): merges=%d, "
-        "skipped_low_conf=%d, skipped_distinct_or_unsure=%d",
+        "Dream apply (audit_only=%s, batch=%s): merges=%d, supersessions=%d, "
+        "flagged=%d, skipped_low_conf=%d, skipped_distinct_or_unsure=%d",
         audit_only, batch_id,
         result.applied_merges,
+        result.applied_supersessions,
+        result.flagged_contradictions,
         result.skipped_low_confidence,
         result.skipped_unsure_or_distinct,
     )
@@ -920,6 +993,45 @@ async def _apply_merge(
     )
     await store.set_dream_audit_fields(
         loser_id, consolidated_by=batch_id,
+    )
+
+
+async def _apply_supersede(
+    store: MemoryStore,
+    *,
+    stale_id: str,
+    survivor_id: str,
+    batch_id: str,
+) -> None:
+    """Resolve a contradiction: invalidate the stale memory, keep the other.
+
+    Unlike a merge, no content is folded — the stale memory is *wrong*,
+    not an additive restatement. Soft-delete only: the stale row is
+    marked ``invalidated`` with ``superseded_by=survivor`` and both rows
+    are stamped ``consolidated_by=batch_id`` for auditability/undo.
+    """
+    stale = await store.get_memory_no_touch(stale_id)
+    survivor = await store.get_memory_no_touch(survivor_id)
+    if stale is None or survivor is None:
+        logger.warning(
+            "Supersede skipped: stale=%s survivor=%s — at least one missing",
+            stale_id, survivor_id,
+        )
+        return
+    if stale.status != "active":
+        # Already retired (e.g. invalidated earlier the same night) —
+        # nothing to do; avoid clobbering an existing superseded_by chain.
+        return
+    await store.invalidate_memory(
+        stale_id,
+        invalidated_by=batch_id,
+        superseded_by=survivor_id,
+    )
+    await store.set_dream_audit_fields(stale_id, consolidated_by=batch_id)
+    await store.set_dream_audit_fields(survivor_id, consolidated_by=batch_id)
+    logger.info(
+        "Dream supersede (batch=%s): invalidated %s, kept %s",
+        batch_id, stale_id, survivor_id,
     )
 
 
@@ -1034,9 +1146,11 @@ def write_dream_log(
     lines.append("")
 
     lines.append("## Applied")
-    if audit_only:
-        lines.append("- (in audit-only mode, nothing applied)")
-    elif decisions is None:
+    flagged = (
+        sum(1 for d in decisions if d.decision == "flag")
+        if decisions else 0
+    )
+    if decisions is None:
         lines.append("- (pending poll)")
     else:
         merges = sum(
@@ -1044,7 +1158,18 @@ def write_dream_log(
             if d.decision in {"merge_into_a", "merge_into_b"}
             and d.confidence >= DEDUP_CONFIDENCE_THRESHOLD
         )
-        lines.append(f"- {merges} merges applied")
+        supersedes = sum(
+            1 for d in decisions
+            if d.decision == "supersede"
+            and d.confidence >= DEDUP_CONFIDENCE_THRESHOLD
+        )
+        verb = "would apply" if audit_only else "applied"
+        lines.append(f"- {merges} merges {verb}")
+        lines.append(f"- {supersedes} contradiction supersessions {verb}")
+        # Flags always surface — they are review items, not mutations.
+        lines.append(f"- {flagged} contradictions flagged for review")
+        if audit_only:
+            lines.append("  (audit-only mode: store left untouched)")
     lines.append("")
 
     lines.append("## Maintenance")
@@ -1099,8 +1224,19 @@ async def run_dream_cycle(
     now = now or datetime.utcnow()
     rng = rng or random.Random()
 
+    # Watermark: scan memories created since the last run, not since
+    # midnight. The old "since midnight" window — combined with a run at
+    # 10:00 UTC — never scanned memories created between the run and the
+    # next midnight, so cross-conversation dupes/contradictions in that
+    # ~14h band accumulated forever. On the first run (no watermark) look
+    # back 24h to avoid scanning the entire history in one batch.
+    watermark = await store.get_dream_state(DREAM_WATERMARK_KEY)
+    since_iso = watermark or (now - timedelta(hours=24)).isoformat()
+
     # Phase 1 — gather and cluster (no model calls).
-    candidates = await gather_candidates(store, now=now, rng=rng)
+    candidates = await gather_candidates(
+        store, now=now, rng=rng, since_iso=since_iso,
+    )
     clusters = await cluster_candidates(candidates)
     pairs = await find_near_duplicates(
         store, candidates, near_dup_threshold=near_dup_threshold,
@@ -1143,6 +1279,11 @@ async def run_dream_cycle(
         maintenance_stats=maintenance_stats,
         now=now,
     )
+
+    # Advance the watermark only after the cycle's work is durably
+    # queued (batch submitted) and logged. If anything above threw, we
+    # keep the old watermark so the next run re-covers this window.
+    await store.set_dream_state(DREAM_WATERMARK_KEY, now.isoformat())
 
     return {
         "now": now.isoformat(),

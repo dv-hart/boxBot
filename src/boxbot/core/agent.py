@@ -392,41 +392,47 @@ def _prompt_etiquette() -> str:
         "your course of action. Continuations from the person who gave you\n"
         "the task usually should.\n"
         "\n"
-        "## Muting the mic while you work\n"
+        "## Muting the mic while you work — be DECISIVE\n"
         "\n"
-        "When the room is generating noise that is clearly not for you —\n"
-        "garbled fragments, empty transcripts, an unrelated side\n"
-        "conversation, the TV, kids chatting at each other — call\n"
-        "`mute_mic(reason=\"...\")`. The mic stops delivering transcripts\n"
-        "until you next speak, so you can finish whatever task you were\n"
-        "given without being yanked off course every few seconds. The\n"
-        "wake word stays armed — anyone in the room can re-engage you by\n"
-        "saying it.\n"
+        "You have `mute_mic(reason=\"...\")`. The wake word stays armed,\n"
+        "so anyone in the room can re-engage you instantly. Muting does\n"
+        "NOT interrupt your in-flight tools or the API call you're inside\n"
+        "— it only stops FUTURE transcripts from yanking you off course.\n"
         "\n"
-        "Useful triggers:\n"
-        "- You are mid-task (e.g. looking up a calendar event) and a\n"
-        "  bystander says something not addressed to you.\n"
-        "- You have decided \"not for me, stay silent\" for two or three\n"
-        "  consecutive turns of ambient chatter. Mute rather than keep\n"
-        "  burning turns on background noise.\n"
-        "- You were assigned a task, you have nothing more to say to the\n"
-        "  room right now, and you want to finish without interruption.\n"
+        "The rule: **if you have an active task AND the next transcript\n"
+        "is unrelated to that task, mute on the SAME turn**. Do not wait\n"
+        "for a second confirming turn. People follow conversational\n"
+        "threads — once someone starts a side conversation with their\n"
+        "spouse / kids / a guest, it almost always continues for several\n"
+        "more turns. Burning an API call to stay silent on each fragment\n"
+        "is exactly the failure mode mute_mic exists to prevent.\n"
+        "\n"
+        "Mute IMMEDIATELY when:\n"
+        "- You were given a task and a transcript arrives that is not\n"
+        "  the original speaker continuing or correcting their request.\n"
+        "- A speaker is clearly addressing someone else in the room\n"
+        "  (a child, spouse, guest, the TV).\n"
+        "- The transcript is garbled, empty, fragmentary, or a Scribe\n"
+        "  artefact.\n"
+        "- The room switches to a language that has only ever been used\n"
+        "  for side talk in this conversation.\n"
+        "\n"
+        "When mid-task and uncertain whether an utterance is for you,\n"
+        "default to muting. The wake word brings the user right back if\n"
+        "they actually need you. Wrong mute = one extra wake word. Wrong\n"
+        "no-mute = a derailed task and a response the user never asked for.\n"
         "\n"
         "Important: do NOT call `mute_mic` in the same turn you call\n"
         "`message(channel=\"speak\")`. Speech automatically re-opens the\n"
         "mic at the end of TTS, so the two cancel out. If you want to\n"
         "say one last thing and let the room go quiet, just call\n"
-        "`message(speak)` — if nothing more arrives the conversation\n"
-        "ends on its own via the silence timer.\n"
+        "`message(speak)` — if nothing more arrives the silence timer\n"
+        "ends the conversation. If you want to answer AND stay muted,\n"
+        "speak first; on your NEXT turn, mute.\n"
         "\n"
-        "Calling `mute_mic` also drops any utterances that were queued\n"
-        "during your current thinking (utterances that arrived while you\n"
-        "were waiting for a tool result). That is the whole point — those\n"
-        "queued utterances are the same ambient noise you are choosing\n"
-        "to ignore. Only mute when you are confident the room is not\n"
-        "addressing you. If a queued utterance might be a legitimate\n"
-        "continuation (\"oh and also...\", a correction), answer the\n"
-        "original request first and decide about muting on the next turn.\n"
+        "Calling `mute_mic` drops any utterances that were queued while\n"
+        "you were thinking — that IS the point. Those queued lines are\n"
+        "the same side-talk you are choosing to ignore.\n"
         "\n"
         "## Scenarios (memorise these patterns)\n"
         "\n"
@@ -2015,6 +2021,40 @@ class BoxBotAgent:
         if identity_section:
             sections.append(identity_section)
 
+        # Auto-load the onboarding skill body when any speaker in this
+        # turn's identity block is unknown. Saves the round-trip the
+        # agent would otherwise spend calling load_skill(onboarding) on
+        # an unknown speaker's first utterance — that round-trip was
+        # measured at ~8s on cold sandbox + 1st-turn cache (Carina,
+        # 2026-06-05). Only fires when there's actually an unknown
+        # speaker AND the channel is voice; whatsapp/trigger don't have
+        # a notion of in-room identity to onboard.
+        if (
+            channel == "voice"
+            and self._latest_speaker_identities
+            and any(
+                (info or {}).get("voice_tier") == "unknown"
+                for info in self._latest_speaker_identities.values()
+            )
+        ):
+            try:
+                from boxbot.skills.loader import load_skill as _load_skill
+                skill_body = _load_skill(name="onboarding")
+            except Exception:
+                logger.debug(
+                    "auto-load onboarding skill failed; skipping",
+                    exc_info=True,
+                )
+            else:
+                sections.append(
+                    "## Onboarding skill (auto-loaded — unknown speaker present)\n"
+                    "An unknown speaker is in this conversation; the full\n"
+                    "onboarding skill is included below so you don't need\n"
+                    "to call `load_skill(\"onboarding\")` first. Apply §1\n"
+                    "(voice first-meeting) if they address you directly.\n\n"
+                    + skill_body
+                )
+
         # Registered users the agent can address in `outputs[].to`. Names
         # (not phone numbers) are what the agent sees; the dispatcher
         # resolves names to numbers via AuthManager at delivery time.
@@ -2649,6 +2689,18 @@ class BoxBotAgent:
                             })
                     elif isinstance(sdk_msg, ResultMessage):
                         turn_count = sdk_msg.num_turns or 0
+                        # The whole receive_response() loop runs inside
+                        # one latency.span("api") above, which records
+                        # one wall-clock duration with count=1. The SDK
+                        # actually made `num_turns` API round-trips
+                        # inside it — surface that in the headline so
+                        # `api=<ms>/<N>calls` reflects reality and a
+                        # multi-tool turn isn't disguised as a single
+                        # slow call.
+                        if turn_count > 0:
+                            latency.set_count(
+                                conv.conversation_id, "api", turn_count,
+                            )
                         try:
                             events = from_agent_sdk_result(
                                 purpose="conversation",

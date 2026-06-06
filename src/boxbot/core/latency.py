@@ -148,6 +148,23 @@ def add(conversation_id: str | None, label: str, seconds: float) -> None:
         t._add(label, seconds)
 
 
+def set_count(conversation_id: str | None, label: str, count: int) -> None:
+    """Override the call count for ``label`` (no-op without a live tracker).
+
+    Used when the wall-clock duration of a span was already accumulated
+    via :func:`span` / :func:`add`, but the underlying work was actually
+    N separate sub-operations rather than 1. The SDK backend's agent
+    loop is the motivating case: ``sdk_client.receive_response()`` is
+    one ``await`` from our point of view but the SDK runs multiple API
+    round-trips inside it. Setting the count to ``num_turns`` after the
+    loop completes makes the headline report ``api=<ms>/<N>calls``
+    instead of the misleading ``/1calls``.
+    """
+    t = get(conversation_id)
+    if t is not None and count > 0:
+        t.counts[label] = count
+
+
 @contextmanager
 def span(conversation_id: str | None, label: str) -> Iterator[None]:
     """Time the enclosed block and accumulate it under ``label``.

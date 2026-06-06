@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import time
 import wave
 from dataclasses import dataclass, field
@@ -30,6 +31,29 @@ from typing import Any, Protocol, runtime_checkable
 from boxbot.core import latency
 
 logger = logging.getLogger(__name__)
+
+# Scribe emits bracketed annotations for non-speech audio:
+# "[background noise]", "[silence]", "[music]", "[laughter]", etc.
+# If the transcript is ONLY annotations after stripping, it carries no
+# speech and must not reach the agent — a wasted turn on noise costs ~5s
+# of latency and can spawn a conversation from silence (see voice
+# pipeline logs 2026-06-05 08:39:56 for the symptom).
+_SCRIBE_ANNOTATION_RE = re.compile(r"\[[^\]]+\]")
+
+
+def _is_annotation_only(text: str) -> bool:
+    """True when ``text`` is empty or contains only Scribe annotations.
+
+    Examples that return True: "", "[background noise]",
+    "[silence] [music]", " [no speech] ".
+    Examples that return False: "[Speaker A]: Hello", "Good morning",
+    "[background noise] Help" (any real content alongside annotations
+    is preserved — we only filter the all-noise case).
+    """
+    if not text or not text.strip():
+        return True
+    stripped = _SCRIBE_ANNOTATION_RE.sub("", text).strip()
+    return not stripped
 
 # Default channel and sample-width assumptions for the PCM payload.
 # boxBot's voice path is mono int16 throughout (mic capture, VAD,
@@ -191,6 +215,20 @@ class ElevenLabsSTT:
             if hasattr(result, "language_code")
             else language
         )
+
+        # Drop pure non-speech annotations (e.g. "[background noise]")
+        # before they reach the voice pipeline. The downstream guard in
+        # ``VoiceSession._on_utterance`` treats empty text as "no
+        # transcript — return to listening", so this both prevents a
+        # stray turn AND avoids creating/interrupting a conversation
+        # from silence.
+        if _is_annotation_only(text):
+            logger.info(
+                "STT dropped non-speech annotation transcript: %r",
+                text,
+            )
+            text = ""
+            words = []
 
         logger.debug("Transcription result: %d chars, %d words", len(text), len(words))
 

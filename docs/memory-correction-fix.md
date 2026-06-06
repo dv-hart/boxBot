@@ -78,13 +78,42 @@ correct "Preschool Graduation…". (Owner: Jacob, handled calendar-side.)
 - Validate in audit mode, then set `dream_audit_only: false`.
 
 ### Fix C — proactive/trigger output threads into the user's conversation
-- When a trigger's output is user-facing text on a threaded channel
-  (WhatsApp), deliver through and record on that user's persistent
-  `whatsapp:{phone}` conversation instead of the throwaway `trigger:` one.
-- **Content (decided):** thread the **full trigger reasoning** into the
-  persistent conversation (KISS — no separate "context note" path).
-- Effect: the reply rehydrates with the briefing + calendar pull + injected
-  memory, so Fix A and the extraction safety net both have their handles.
+
+A **dispatch-as-bridge** mechanism already existed (commit `6cd42a1`,
+2026-05-14): after a trigger conversation ends, each delivered text is
+folded into the recipient's persistent `whatsapp:{phone}` thread, and the
+inbound path rehydrates it (`_get_or_create_conversation` →
+`store.get_active`). It **silently broke** when the conversation loop moved
+to the `claude_agent_sdk` backend (commit `53fa2a8`, deployed 2026-05-29):
+the backend records tool calls as `mcp__boxbot_tools__message`, but the
+post-hoc thread scanners (`_delivered_text_messages_from_thread`,
+`_summarize_trigger_thread`, `_build_transcript`, `_extract_summary`)
+matched the bare name `"message"`. So the bridge saw "nothing delivered"
+and bridged nothing — the reply landed in a fresh, context-free thread.
+
+**C1 — restore the bridge (the load-bearing fix):** add
+`base_tool_name()` (inverse of `mcp_tool_name()`) and normalize tool names
+at every post-hoc scanner. This alone makes the bridge fire again and also
+repairs memory-extraction transcripts, which had the same blindness.
+
+**C2 — thread the full trigger reasoning (decided: full reasoning, KISS):**
+the old bridge folded only the delivered text. C1 alone would let BB
+understand the correction and fix *memory*, but the briefing's "Zara" came
+from the **calendar**, and `delete_event`/`update_event` need the
+`event_id` — which lives only in the `list_upcoming_events` result inside
+the run's reasoning, not in the delivered text. So fold the **full rendered
+run transcript** (`_build_transcript`) into each addressed recipient's
+thread via `Conversation.build_trigger_context_turns`. Now a reply sees the
+calendar event + its id and can fix the upstream source — not just a memory
+copy that the calendar would regenerate the next morning.
+
+- Effect: the reply rehydrates with the briefing, the calendar pull (event
+  id + provenance), and the reasoning; BB can fix the source, and the
+  whatsapp reply's own memory injection feeds the extraction safety net.
+- Multi-recipient: each addressed recipient gets the full transcript
+  (includes the other's delivered text) — accepted per KISS.
+- Transcript is rendered text (not raw tool blocks): avoids tool-pair /
+  MCP-replay integrity hazards; capped at 16 KB.
 
 ## Sequencing
 1. Fix A — smallest; stops corrections silently failing.

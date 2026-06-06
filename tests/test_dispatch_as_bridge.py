@@ -10,13 +10,19 @@ Covers:
   * Conversation.ingest_trigger_delivery — IDLE/LISTENING immediate
     fold-in, THINKING deferred fold-in (the mid-generation race),
     ENDED rejection
-  * build_trigger_delivery_turns — the shared turn shape
+  * build_trigger_context_turns — the shared turn shape (full reasoning)
+  * tool-name normalization (base_tool_name) so the SDK backend's
+    mcp__boxbot_tools__message deliveries are seen by the scanner/receipt
 """
 from __future__ import annotations
 
 import pytest
 
-from boxbot.core.agent import _delivered_text_messages_from_thread
+from boxbot.core.agent import (
+    _delivered_text_messages_from_thread,
+    _summarize_trigger_thread,
+)
+from boxbot.core.agent_sdk_adapter import base_tool_name, mcp_tool_name
 from boxbot.core.conversation import Conversation, ConversationState
 
 
@@ -25,18 +31,33 @@ from boxbot.core.conversation import Conversation, ConversationState
 # ---------------------------------------------------------------------------
 
 
-def _assistant_message(to: str, channel: str, content: str) -> dict:
+def _assistant_message(
+    to: str, channel: str, content: str, *, name: str = "message",
+) -> dict:
     return {
         "role": "assistant",
         "content": [
             {
                 "type": "tool_use",
                 "id": "toolu_x",
-                "name": "message",
+                "name": name,
                 "input": {"to": to, "channel": channel, "content": content},
             }
         ],
     }
+
+
+def _ctx_turns(
+    recipient: str = "Jacob",
+    delivered: str = "Morning briefing — Thu.",
+    transcript: str = "[boxBot → Jacob via text]: Morning briefing — Thu.",
+) -> list[dict]:
+    return Conversation.build_trigger_context_turns(
+        description="Morning briefing",
+        transcript=transcript,
+        recipient=recipient,
+        delivered_texts=[delivered],
+    )
 
 
 class TestDeliveredTextParser:
@@ -82,15 +103,63 @@ class TestDeliveredTextParser:
         ]
         assert _delivered_text_messages_from_thread(msgs) == []
 
+    def test_extracts_mcp_namespaced_deliveries(self):
+        """Regression: the SDK backend records the delivery as
+        mcp__boxbot_tools__message. The scanner missed it before, so the
+        bridge bridged nothing and replies lost the briefing."""
+        msgs = [
+            {"role": "user", "content": "[Trigger fired: Morning briefing]"},
+            _assistant_message(
+                "Jacob", "text", "Morning briefing — Fri.",
+                name=mcp_tool_name("message"),
+            ),
+        ]
+        out = _delivered_text_messages_from_thread(msgs)
+        assert ("Jacob", "Morning briefing — Fri.") in out
+
+
+class TestTriggerReceipt:
+    def test_receipt_recognizes_mcp_namespaced_delivery(self):
+        """The receipt summarizer must also see SDK-namespaced messages,
+        or it reports 'nothing delivered' for a briefing that went out."""
+        msgs = [
+            {"role": "user", "content": "[Trigger fired: Morning briefing]"},
+            _assistant_message(
+                "Jacob", "text", "hi",
+                name=mcp_tool_name("message"),
+            ),
+            _assistant_message(
+                "Carina", "text", "hi",
+                name=mcp_tool_name("message"),
+            ),
+        ]
+        receipt = _summarize_trigger_thread(msgs, "2026-06-05T14:00:00")
+        assert "Delivered" in receipt
+        assert "Jacob" in receipt and "Carina" in receipt
+        assert "nothing delivered" not in receipt
+
+
+def test_base_tool_name_strips_prefix_and_passes_bare_through():
+    assert base_tool_name(mcp_tool_name("message")) == "message"
+    assert base_tool_name("message") == "message"
+    assert base_tool_name("mcp__boxbot_tools__execute_script") == (
+        "execute_script"
+    )
+
 
 # ---------------------------------------------------------------------------
-# build_trigger_delivery_turns
+# build_trigger_context_turns
 # ---------------------------------------------------------------------------
 
 
-def test_build_turns_shape():
-    turns = Conversation.build_trigger_delivery_turns(
-        "Jacob", "Morning briefing — Thu.",
+def test_build_context_turns_shape():
+    turns = Conversation.build_trigger_context_turns(
+        description="Morning briefing",
+        transcript="[boxBot used tool: execute_script]\n"
+        "[Tool Result]: {'id': '193ptomq', 'title': 'Zara Preschool "
+        "Graduation'}\n[boxBot → Jacob via text]: Morning briefing — Thu.",
+        recipient="Jacob",
+        delivered_texts=["Morning briefing — Thu."],
     )
     assert len(turns) == 2
     # Framing turn: user role, [trigger] prefix (so it's not mistaken
@@ -98,9 +167,25 @@ def test_build_turns_shape():
     assert turns[0]["role"] == "user"
     assert turns[0]["content"].startswith("[trigger]")
     assert "Jacob" in turns[0]["content"]
-    # The delivered text is an assistant turn — BB said it.
+    # Full reasoning is threaded — the calendar event id is present, so a
+    # reply can fix the upstream source, not just a memory.
+    assert "193ptomq" in turns[0]["content"]
+    # The delivered text is an assistant turn — BB said it. Ends on
+    # assistant so the next inbound user reply alternates cleanly.
     assert turns[1]["role"] == "assistant"
     assert turns[1]["content"] == "Morning briefing — Thu."
+
+
+def test_build_context_turns_truncates_huge_transcript():
+    turns = Conversation.build_trigger_context_turns(
+        description="x",
+        transcript="A" * 50_000,
+        recipient="Jacob",
+        delivered_texts=["done"],
+        max_transcript_chars=1_000,
+    )
+    assert "transcript truncated" in turns[0]["content"]
+    assert len(turns[0]["content"]) < 2_000
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +215,7 @@ def _make_conversation(state: ConversationState) -> Conversation:
 async def test_ingest_when_listening_folds_in_immediately():
     conv = _make_conversation(ConversationState.LISTENING)
     ok = await conv.ingest_trigger_delivery(
-        recipient="Jacob", content="Morning briefing — Thu.",
+        recipient="Jacob", turns=_ctx_turns(),
     )
     assert ok is True
     # Turns are in the live thread right away.
@@ -149,7 +234,7 @@ async def test_ingest_when_thinking_defers_fold_in():
     conv = _make_conversation(ConversationState.THINKING)
     thread_len_before = len(conv._thread)
     ok = await conv.ingest_trigger_delivery(
-        recipient="Jacob", content="Morning briefing — Thu.",
+        recipient="Jacob", turns=_ctx_turns(),
     )
     assert ok is True
     # The live thread is untouched mid-generation...
@@ -165,7 +250,7 @@ async def test_ingest_when_ended_returns_false():
     a fresh store-backed thread."""
     conv = _make_conversation(ConversationState.ENDED)
     ok = await conv.ingest_trigger_delivery(
-        recipient="Jacob", content="Morning briefing — Thu.",
+        recipient="Jacob", turns=_ctx_turns(),
     )
     assert ok is False
     assert conv._pending_external_turns == []
@@ -175,8 +260,12 @@ async def test_ingest_when_ended_returns_false():
 async def test_deferred_turns_fold_in_preserve_order():
     """Two deliveries during THINKING both land, in order, when folded."""
     conv = _make_conversation(ConversationState.THINKING)
-    await conv.ingest_trigger_delivery(recipient="Jacob", content="first")
-    await conv.ingest_trigger_delivery(recipient="Jacob", content="second")
+    await conv.ingest_trigger_delivery(
+        recipient="Jacob", turns=_ctx_turns(delivered="first"),
+    )
+    await conv.ingest_trigger_delivery(
+        recipient="Jacob", turns=_ctx_turns(delivered="second"),
+    )
     # 2 turns per delivery
     assert len(conv._pending_external_turns) == 4
     assert conv._pending_external_turns[1]["content"] == "first"
@@ -222,7 +311,7 @@ async def test_bridge_routes_into_live_conversation(monkeypatch, mock_config):
         "boxbot.communication.auth.get_auth_manager", lambda: fake_auth,
     )
 
-    await agent._bridge_trigger_delivery("Jacob", "Morning briefing — Thu.")
+    await agent._bridge_trigger_delivery("Jacob", _ctx_turns())
 
     # Folded into the live conversation...
     assert live._thread[-1]["content"] == "Morning briefing — Thu."
@@ -262,7 +351,14 @@ async def test_bridge_routes_to_store_when_no_live_conversation(
         "boxbot.communication.auth.get_auth_manager", lambda: fake_auth,
     )
 
-    await agent._bridge_trigger_delivery("Carina", "Morning briefing — Thu.")
+    await agent._bridge_trigger_delivery(
+        "Carina",
+        _ctx_turns(
+            recipient="Carina",
+            transcript="[boxBot used tool: execute_script]\n[Tool Result]: "
+            "{'id': '193ptomq', 'title': 'Zara Preschool Graduation'}",
+        ),
+    )
 
     store.get_or_create_active.assert_awaited_once()
     assert (
@@ -273,6 +369,8 @@ async def test_bridge_routes_to_store_when_no_live_conversation(
     cid, turns = store.append_turns.call_args.args
     assert cid == "conv_carina_stored"
     assert turns[-1]["content"] == "Morning briefing — Thu."
+    # Full reasoning (the calendar event id) rode along into the thread.
+    assert "193ptomq" in turns[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -299,7 +397,9 @@ async def test_bridge_drops_unregistered_recipient(monkeypatch, mock_config):
     )
 
     # "Stranger" isn't a registered user.
-    await agent._bridge_trigger_delivery("Stranger", "secret briefing")
+    await agent._bridge_trigger_delivery(
+        "Stranger", _ctx_turns(recipient="Stranger"),
+    )
 
     store.get_or_create_active.assert_not_awaited()
     store.append_turns.assert_not_awaited()

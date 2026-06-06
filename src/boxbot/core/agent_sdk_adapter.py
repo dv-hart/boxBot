@@ -72,6 +72,20 @@ def mcp_tool_name(tool_name: str) -> str:
     return f"mcp__{MCP_SERVER_NAME}__{tool_name}"
 
 
+def base_tool_name(name: str) -> str:
+    """Inverse of :func:`mcp_tool_name`: strip the ``mcp__<server>__``
+    prefix so post-hoc thread scanners match a tool by its bare name
+    regardless of which backend recorded it.
+
+    The SDK backend records tool calls as ``mcp__boxbot_tools__message``;
+    the legacy direct-API loop recorded the bare ``message``. Helpers that
+    scan a persisted thread (delivery bridge, trigger receipt, transcript
+    rendering) must accept both. Bare names pass through unchanged.
+    """
+    prefix = f"mcp__{MCP_SERVER_NAME}__"
+    return name[len(prefix):] if name.startswith(prefix) else name
+
+
 def _content_blocks(result: Any) -> list[dict[str, Any]]:
     """Coerce a ``Tool.execute`` return value into MCP content blocks.
 
@@ -215,6 +229,7 @@ def build_options(
 
 __all__ = [
     "MCP_SERVER_NAME",
+    "base_tool_name",
     "build_mcp_server",
     "build_options",
     "flatten_system_prompt",

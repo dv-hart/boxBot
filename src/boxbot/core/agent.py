@@ -668,6 +668,20 @@ def _workspace_artifacts_from_thread(
     return paths
 
 
+def _trigger_description_from_thread(messages: list[dict[str, Any]]) -> str:
+    """Pull the trigger's description from its opening ``[Trigger fired: …]``
+    turn, for framing the bridged context. Falls back to a generic label."""
+    if messages:
+        first = messages[0]
+        if first.get("role") == "user":
+            content = first.get("content")
+            if isinstance(content, str):
+                m = _TRIGGER_DESC_RE.search(content)
+                if m:
+                    return m.group(1).strip()
+    return "scheduled trigger"
+
+
 def _delivered_text_messages_from_thread(
     messages: list[dict[str, Any]],
 ) -> list[tuple[str, str]]:
@@ -682,6 +696,8 @@ def _delivered_text_messages_from_thread(
     a wake-cycle trigger has no current_speaker, so a real delivery
     always names a registered user explicitly.
     """
+    from boxbot.core.agent_sdk_adapter import base_tool_name
+
     out: list[tuple[str, str]] = []
     for msg in messages:
         if msg.get("role") != "assistant":
@@ -692,7 +708,10 @@ def _delivered_text_messages_from_thread(
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") != "tool_use" or block.get("name") != "message":
+            if block.get("type") != "tool_use":
+                continue
+            # The SDK backend records this as mcp__boxbot_tools__message.
+            if base_tool_name(str(block.get("name") or "")) != "message":
                 continue
             inp = block.get("input") or {}
             if inp.get("channel") != "text":
@@ -725,6 +744,8 @@ def _summarize_trigger_thread(
     excludes trigger conversations — so it can't earworm; but
     `search_memory` can still surface it on a deliberate lookup.
     """
+    from boxbot.core.agent_sdk_adapter import base_tool_name
+
     description = "trigger"
     recipients: list[str] = []
     if messages:
@@ -746,7 +767,7 @@ def _summarize_trigger_thread(
                 continue
             if block.get("type") != "tool_use":
                 continue
-            if block.get("name") != "message":
+            if base_tool_name(str(block.get("name") or "")) != "message":
                 continue
             to = (block.get("input") or {}).get("to")
             if to and to not in recipients:
@@ -3030,35 +3051,53 @@ class BoxBotAgent:
                 "Failed to write trigger summary for %s", conversation_id,
             )
 
-        # Dispatch-as-bridge: record each text the trigger delivered
-        # into the recipient's real conversation, so a reply continues
-        # a thread that contains the briefing. Runs after the receipt
-        # write and is independently fault-isolated — a bridge failure
-        # must not lose the receipt.
-        for recipient, content in _delivered_text_messages_from_thread(
-            messages
-        ):
-            try:
-                await self._bridge_trigger_delivery(recipient, content)
-            except Exception:
-                logger.exception(
-                    "Failed to bridge trigger delivery to %s (conv=%s)",
-                    recipient, conversation_id,
+        # Dispatch-as-bridge: fold the trigger run's FULL reasoning into
+        # each addressed recipient's real conversation, so a reply
+        # continues a thread that contains not just the briefing text but
+        # the run that produced it (calendar pulls with event ids, tool
+        # results) — enough to fix the upstream source, not just a memory.
+        # Runs after the receipt write and is independently fault-isolated
+        # — a bridge failure must not lose the receipt.
+        delivered = _delivered_text_messages_from_thread(messages)
+        if delivered:
+            description = _trigger_description_from_thread(messages)
+            transcript = self._build_transcript(messages, person_name)
+            # Distinct recipients, in first-delivered order.
+            recipients = list(dict.fromkeys(r for r, _ in delivered))
+            for recipient in recipients:
+                recipient_texts = [
+                    c for r, c in delivered if r == recipient
+                ]
+                turns = Conversation.build_trigger_context_turns(
+                    description=description,
+                    transcript=transcript,
+                    recipient=recipient,
+                    delivered_texts=recipient_texts,
                 )
+                try:
+                    await self._bridge_trigger_delivery(recipient, turns)
+                except Exception:
+                    logger.exception(
+                        "Failed to bridge trigger delivery to %s (conv=%s)",
+                        recipient, conversation_id,
+                    )
 
     async def _bridge_trigger_delivery(
-        self, recipient: str, content: str,
+        self, recipient: str, turns: list[dict[str, Any]],
     ) -> None:
-        """Record one trigger-delivered text into the recipient's own
+        """Record a trigger run's context turns into the recipient's own
         conversation thread (dispatch-as-bridge).
 
-        If the recipient has a live in-memory conversation, the
-        delivery folds into it via ``Conversation.ingest_trigger_delivery``
-        (which handles the mid-generation race). Otherwise it goes
-        straight to the store via ``get_or_create_active`` —
-        resurrecting their thread if it's still inside the rolling
-        window, or starting a fresh persistent one — so the next
-        inbound rehydrates a thread that already contains the briefing.
+        ``turns`` is the prebuilt block from
+        ``Conversation.build_trigger_context_turns`` — the full run
+        transcript plus the delivered message(s). If the recipient has a
+        live in-memory conversation, it folds into that via
+        ``Conversation.ingest_trigger_delivery`` (which handles the
+        mid-generation race). Otherwise it goes straight to the store via
+        ``get_or_create_active`` — resurrecting their thread if it's
+        still inside the rolling window, or starting a fresh persistent
+        one — so the next inbound rehydrates a thread that already
+        contains the briefing and its reasoning.
         """
         store = self._conversation_store
         if store is None:
@@ -3106,7 +3145,7 @@ class BoxBotAgent:
             )
             if conv is not None and not conv.is_ended:
                 recorded = await conv.ingest_trigger_delivery(
-                    recipient=recipient, content=content,
+                    recipient=recipient, turns=turns,
                 )
                 if recorded:
                     logger.info(
@@ -3119,15 +3158,12 @@ class BoxBotAgent:
 
             # Store-only path: no live conversation. Resurrect the
             # recipient's thread within the window, or start a fresh
-            # persistent one, and append the delivery turns.
+            # persistent one, and append the run's context turns.
             record, created = await store.get_or_create_active(
                 channel="whatsapp",
                 channel_key=channel_key,
                 max_inactive_seconds=window,
                 participants={recipient, agent_name},
-            )
-            turns = Conversation.build_trigger_delivery_turns(
-                recipient, content,
             )
             await store.append_turns(record.conversation_id, turns)
             logger.info(
@@ -3214,7 +3250,10 @@ class BoxBotAgent:
                             else:
                                 lines.append(f"[boxBot thought]: {text}")
                         elif block_type == "tool_use":
-                            name = block.get("name", "")
+                            from boxbot.core.agent_sdk_adapter import (
+                                base_tool_name,
+                            )
+                            name = base_tool_name(str(block.get("name") or ""))
                             tool_input = block.get("input") or {}
                             if name == "message":
                                 to = str(tool_input.get("to", "")).strip() or "?"
@@ -3256,12 +3295,14 @@ class BoxBotAgent:
 
             if isinstance(content, list):
                 # Prefer the latest message tool content as the summary.
+                from boxbot.core.agent_sdk_adapter import base_tool_name
                 for block in reversed(content):
                     if not isinstance(block, dict):
                         continue
                     if (
                         block.get("type") == "tool_use"
-                        and block.get("name") == "message"
+                        and base_tool_name(str(block.get("name") or ""))
+                        == "message"
                     ):
                         tool_input = block.get("input") or {}
                         spoken = str(tool_input.get("content") or "").strip()

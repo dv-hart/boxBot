@@ -497,45 +497,61 @@ class Conversation:
         return drained
 
     @staticmethod
-    def build_trigger_delivery_turns(
-        recipient: str, content: str,
+    def build_trigger_context_turns(
+        *,
+        description: str,
+        transcript: str,
+        recipient: str,
+        delivered_texts: list[str],
+        max_transcript_chars: int = 16_000,
     ) -> list[dict[str, Any]]:
-        """The turn pair recording a trigger-delivered message.
+        """Turns recording a proactive trigger run into a recipient's thread.
 
-        A ``[trigger]`` framing turn (so it's marked as a proactive
-        delivery, not a human reply, and role-alternation holds) plus
-        an assistant turn carrying the delivered text. Shared by both
-        dispatch-as-bridge paths — the live-conversation path
-        (``ingest_trigger_delivery``) and the store-only path in the
-        agent — so the recorded shape is identical either way.
+        Threads the FULL trigger reasoning (the rendered run transcript)
+        so a reply has the run's real context — calendar pulls with
+        event ids, tool results, the agent's reasoning, and the
+        delivered message(s) — not just the final text. Without the
+        reasoning, a reply correcting a briefing item can't see the
+        upstream source (e.g. the calendar event that produced it).
+
+        Shape: a ``[trigger]`` framing user turn carrying the transcript
+        (so it reads as proactive context, not a human reply), plus an
+        assistant turn carrying what was actually delivered to this
+        recipient — so the block ends on an assistant turn and the next
+        inbound user reply preserves role-alternation. Shared by both
+        dispatch-as-bridge paths (live-conversation and store-only) so
+        the recorded shape is identical either way.
         """
+        body = transcript.strip()
+        if len(body) > max_transcript_chars:
+            body = body[:max_transcript_chars] + "\n…[transcript truncated]"
+        delivered = "\n\n".join(t.strip() for t in delivered_texts if t.strip())
+        if not delivered:
+            delivered = "(no message text)"
+        framing = (
+            f"[trigger] Scheduled run — '{description}'. You did the "
+            f"following autonomously and delivered the message(s) below "
+            f"to {recipient}. This is context for any reply, not a new "
+            f"request.\n\n--- run transcript ---\n{body}"
+        )
         return [
-            {
-                "role": "user",
-                "content": (
-                    f"[trigger] Scheduled delivery — the assistant sent "
-                    f"the message below to {recipient}."
-                ),
-            },
-            {"role": "assistant", "content": content},
+            {"role": "user", "content": framing},
+            {"role": "assistant", "content": delivered},
         ]
 
     async def ingest_trigger_delivery(
-        self, *, recipient: str, content: str,
+        self, *, recipient: str, turns: list[dict[str, Any]],
     ) -> bool:
-        """Record a trigger-delivered message into this conversation's
-        thread (dispatch-as-bridge).
+        """Record a trigger run's context into this conversation's thread
+        (dispatch-as-bridge).
 
-        When a trigger conversation sends ``recipient`` a text, that
-        delivery is also recorded here — in the recipient's own real
-        conversation — so a later reply continues a thread that
-        actually contains the briefing, rather than landing in a fresh
-        conversation with no context.
-
-        The delivery is recorded as a ``[trigger]`` framing turn plus
-        an assistant turn carrying the delivered text — preserving
-        role-alternation and marking it as a proactive delivery, not a
-        reply. It is history only: it never starts a generation.
+        When a trigger conversation delivers to ``recipient``, the run's
+        context (built by :meth:`build_trigger_context_turns`) is also
+        recorded here — in the recipient's own real conversation — so a
+        later reply continues a thread that actually contains the
+        briefing and its reasoning, rather than landing in a fresh
+        conversation with no context. It is history only: it never
+        starts a generation.
 
         Concurrency: if the conversation is mid-generation
         (THINKING / SPEAKING) the turns are persisted to the store
@@ -546,7 +562,6 @@ class Conversation:
         Returns True if recorded, False if the conversation has ENDED
         (the caller should fall back to a fresh store-backed thread).
         """
-        turns = self.build_trigger_delivery_turns(recipient, content)
         async with self._lock:
             if self._state is ConversationState.ENDED:
                 return False

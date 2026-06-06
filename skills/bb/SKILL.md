@@ -40,6 +40,7 @@ This file is a map. For each module, there is a deeper doc under
 `modules/`:
 
 - `modules/workspace.md` — full API and patterns for the notebook
+- `modules/memory.md` — `bb.memory` API: save/search/invalidate, id-prefix handling, the correction pattern
 - `modules/audio.md` — `bb.audio` API for playing workspace audio files
 - `modules/skill.md` — `bb.skill` API for creating new skills at runtime
 - `modules/integrations.md` — `bb.integrations` API for calling and authoring data-pipe integrations

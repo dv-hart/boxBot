@@ -168,15 +168,39 @@ def search(query: str, *,
     return [MemoryRecord(r) for r in results]
 
 
-def delete(memory_id: str) -> None:
-    """Delete (soft-delete) a memory.
+def delete(memory_id: str, *, reason: str | None = None) -> dict[str, Any]:
+    """Delete (soft-delete / invalidate) a memory.
+
+    The ``memory_id`` may be the **8-char prefix** shown in injected
+    context (``#fe98abdb``) or a full UUID — the main process resolves it.
 
     Args:
-        memory_id: The ID of the memory to delete.
+        memory_id: The id (or shown prefix) of the memory to delete.
+        reason: Optional human-readable reason, logged for provenance.
+
+    Returns:
+        The invalidated record, e.g.
+        ``{"id": "...", "person": "Zara", "summary": "...",
+        "status": "invalidated"}`` — so you can confirm *what* was removed
+        without a follow-up search.
 
     Raises:
-        MemoryError: if the main process rejects the call.
+        MemoryError: if no memory matches the id/prefix, the prefix is
+            ambiguous, or the main process otherwise rejects the call.
     """
     v.require_str(memory_id, "memory_id")
-    response = _transport.request("memory.delete", {"id": memory_id}, timeout=30)
+    payload: dict[str, Any] = {"id": memory_id}
+    if reason is not None:
+        payload["reason"] = v.require_str(reason, "reason")
+    response = _transport.request("memory.delete", payload, timeout=30)
     _raise_on_error(response, "memory.delete")
+    return response.get("invalidated", {})
+
+
+def invalidate(memory_id: str, *, reason: str | None = None) -> dict[str, Any]:
+    """Invalidate a memory — the explicit entry point for corrections.
+
+    Alias for :func:`delete` (memory deletion is a soft invalidate). Use
+    this when a user corrects a stored fact. Accepts the shown id prefix.
+    """
+    return delete(memory_id, reason=reason)

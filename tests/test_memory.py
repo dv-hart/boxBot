@@ -170,12 +170,56 @@ class TestMemoryStoreCRUD:
             summary="Old",
             person="Jacob",
         )
-        await memory_store.invalidate_memory(
+        affected = await memory_store.invalidate_memory(
             mid, invalidated_by="conv-1", superseded_by=None
         )
+        assert affected == 1
         m = await memory_store.get_memory_no_touch(mid)
         assert m.status == "invalidated"
         assert m.invalidated_by == "conv-1"
+
+    @pytest.mark.asyncio
+    async def test_invalidate_unknown_id_affects_zero_rows(self, memory_store):
+        """A full-id miss must report 0, not look like a success.
+
+        Regression for the misattribution bug: a 0-row UPDATE is not a
+        SQLite error, so callers must check the count.
+        """
+        affected = await memory_store.invalidate_memory(
+            "no-such-id", invalidated_by="conv-1"
+        )
+        assert affected == 0
+
+    @pytest.mark.asyncio
+    async def test_resolve_memory_id_exact_and_prefix(self, memory_store):
+        mid = await memory_store.create_memory(
+            type="person",
+            content="Resolve me",
+            summary="Resolve",
+            person="Jacob",
+        )
+        # Exact id.
+        assert await memory_store.resolve_memory_id(mid) == [mid]
+        # 8-char prefix (the form the agent actually sees).
+        assert await memory_store.resolve_memory_id(mid[:8]) == [mid]
+
+    @pytest.mark.asyncio
+    async def test_resolve_memory_id_no_match(self, memory_store):
+        assert await memory_store.resolve_memory_id("ffffffff") == []
+
+    @pytest.mark.asyncio
+    async def test_resolve_memory_id_skips_invalidated_on_prefix(
+        self, memory_store
+    ):
+        """Prefix matching ignores already-invalidated rows so a correction
+        doesn't resolve to a dead duplicate."""
+        mid = await memory_store.create_memory(
+            type="person", content="Dead", summary="Dead", person="Jacob"
+        )
+        await memory_store.invalidate_memory(mid, invalidated_by="c")
+        # Exact id still resolves (idempotent); prefix does not.
+        assert await memory_store.resolve_memory_id(mid) == [mid]
+        assert await memory_store.resolve_memory_id(mid[:8]) == []
 
     @pytest.mark.asyncio
     async def test_delete_memory_removes_permanently(self, memory_store):
@@ -559,3 +603,66 @@ class TestSearchMemoriesEntryPoint:
     async def test_get_mode_without_id_raises(self, memory_store):
         with pytest.raises(ValueError, match="memory_id is required"):
             await search_memories(memory_store, mode="get")
+
+
+class TestMemoryDeleteHandler:
+    """The memory.delete sandbox action: prefix resolution, honest errors,
+    and an informative response. Regression suite for the misattribution
+    bug where a prefix delete silently no-op'd but returned ok."""
+
+    @pytest.mark.asyncio
+    async def test_delete_resolves_prefix_and_returns_record(
+        self, memory_store, monkeypatch
+    ):
+        from boxbot.tools import _sandbox_actions as sa
+
+        monkeypatch.setattr(sa, "_memory_store", memory_store)
+        mid = await memory_store.create_memory(
+            type="person",
+            content="Zara's preschool graduation: Mon Jun 8 2026, 8:45 AM.",
+            summary="Zara's preschool graduation",
+            person="Zara",
+        )
+        ctx = sa.ActionContext()
+        # The agent only ever sees the 8-char prefix.
+        resp = await sa.process_action(
+            {"_sdk": "memory.delete", "id": mid[:8]}, ctx
+        )
+        assert resp["status"] == "ok"
+        assert resp["invalidated"]["id"] == mid
+        assert resp["invalidated"]["person"] == "Zara"
+        assert resp["invalidated"]["status"] == "invalidated"
+        m = await memory_store.get_memory_no_touch(mid)
+        assert m.status == "invalidated"
+
+    @pytest.mark.asyncio
+    async def test_delete_no_match_errors(self, memory_store, monkeypatch):
+        from boxbot.tools import _sandbox_actions as sa
+
+        monkeypatch.setattr(sa, "_memory_store", memory_store)
+        ctx = sa.ActionContext()
+        resp = await sa.process_action(
+            {"_sdk": "memory.delete", "id": "deadbeef"}, ctx
+        )
+        assert resp["status"] == "error"
+        assert "no active memory" in resp["message"]
+
+    @pytest.mark.asyncio
+    async def test_delete_ambiguous_prefix_errors(
+        self, memory_store, monkeypatch
+    ):
+        from boxbot.tools import _sandbox_actions as sa
+
+        monkeypatch.setattr(sa, "_memory_store", memory_store)
+
+        async def _two(_prefix):
+            return ["id-aaaa-1", "id-aaaa-2"]
+
+        monkeypatch.setattr(memory_store, "resolve_memory_id", _two)
+        ctx = sa.ActionContext()
+        resp = await sa.process_action(
+            {"_sdk": "memory.delete", "id": "id-aaaa"}, ctx
+        )
+        assert resp["status"] == "error"
+        assert "ambiguous" in resp["message"]
+        assert resp["matches"] == ["id-aaaa-1", "id-aaaa-2"]

@@ -16,7 +16,7 @@ Modules:
     integrations — Call, list, create, update, delete data-pipe
                    integrations (weather, calendar, custom services)
     packages     — Package installation with user approval
-    memory       — Memory store operations (save, search, delete)
+    memory       — Memory store operations (save, search, delete/invalidate)
     photos       — Photo library management
     tasks        — Trigger and to-do management
     secrets      — Write-only secret storage

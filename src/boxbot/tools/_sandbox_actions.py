@@ -1182,19 +1182,56 @@ async def _handle_memory_action(
             return {"status": "ok", "results": facts}
 
         if sub == "delete":
-            memory_id = payload.get("id")
-            if not isinstance(memory_id, str) or not memory_id:
+            raw_id = payload.get("id")
+            if not isinstance(raw_id, str) or not raw_id:
                 return {"status": "error", "message": "'id' is required"}
+
+            # The agent only ever sees the 8-char id prefix (memories are
+            # injected as #{id[:8]}), so resolve prefix -> full id and fail
+            # loudly on no-match / ambiguity instead of silently no-op'ing.
+            matches = await store.resolve_memory_id(raw_id)
+            if not matches:
+                return {
+                    "status": "error",
+                    "message": f"no active memory matches id '{raw_id}'",
+                }
+            if len(matches) > 1:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"id '{raw_id}' is ambiguous — matches "
+                        f"{len(matches)} memories; use a longer prefix"
+                    ),
+                    "matches": matches,
+                }
+
+            mem_id = matches[0]
+            record = await store.get_memory_no_touch(mem_id)
             from boxbot.tools._tool_context import get_current_conversation
 
             conv = get_current_conversation()
             invalidated_by = (
                 conv.conversation_id if conv is not None else "agent"
             )
-            await store.invalidate_memory(
-                memory_id, invalidated_by=invalidated_by
+            affected = await store.invalidate_memory(
+                mem_id, invalidated_by=invalidated_by
             )
-            return {"status": "ok", "id": memory_id}
+            if not affected:
+                return {
+                    "status": "error",
+                    "message": f"memory '{mem_id}' could not be invalidated",
+                }
+            # Echo the record back so the agent can confirm *what* it
+            # invalidated without a follow-up search.
+            return {
+                "status": "ok",
+                "invalidated": {
+                    "id": mem_id,
+                    "person": getattr(record, "person", None),
+                    "summary": getattr(record, "summary", None),
+                    "status": "invalidated",
+                },
+            }
 
         return {
             "status": "error",

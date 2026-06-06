@@ -649,27 +649,63 @@ class MemoryStore:
         )
         await self.db.commit()
 
+    async def resolve_memory_id(self, id_or_prefix: str) -> list[str]:
+        """Resolve a full id or an id *prefix* to matching memory ids.
+
+        Memories are injected into context with an 8-char id prefix
+        (``retrieval.py`` → ``#{id[:8]}``), so the agent only ever sees the
+        prefix. Callers (delete/invalidate) need to turn that back into a
+        real id without silently no-op'ing.
+
+        An exact id match short-circuits to a single id regardless of
+        status (idempotent re-invalidation is fine). Otherwise we
+        prefix-match against **active** memories only, so a prefix never
+        resolves to an already-invalidated duplicate.
+
+        Returns:
+            ``[]`` for no match, ``[id]`` for a unique match, or several
+            ids when the prefix is ambiguous.
+        """
+        cursor = await self.db.execute(
+            "SELECT id FROM memories WHERE id = ?", (id_or_prefix,)
+        )
+        row = await cursor.fetchone()
+        if row is not None:
+            return [row[0]]
+
+        cursor = await self.db.execute(
+            "SELECT id FROM memories WHERE id LIKE ? AND status = 'active'",
+            (id_or_prefix + "%",),
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
     async def invalidate_memory(
         self,
         memory_id: str,
         *,
         invalidated_by: str,
         superseded_by: str | None = None,
-    ) -> None:
+    ) -> int:
         """Mark a memory as invalidated (soft delete).
 
         Args:
-            memory_id: The memory to invalidate.
+            memory_id: The memory to invalidate. Must be a full id —
+                callers pass prefixes through ``resolve_memory_id`` first.
             invalidated_by: Conversation ID that caused the invalidation.
             superseded_by: ID of the replacement memory, if any.
+
+        Returns:
+            Number of rows affected (0 if no memory had that id).
         """
-        await self.db.execute(
+        cursor = await self.db.execute(
             """UPDATE memories
                SET status = 'invalidated', invalidated_by = ?, superseded_by = ?
                WHERE id = ?""",
             (invalidated_by, superseded_by, memory_id),
         )
         await self.db.commit()
+        return cursor.rowcount
 
     async def delete_memory(self, memory_id: str) -> None:
         """Permanently delete a memory (used by storage cap eviction)."""

@@ -402,8 +402,11 @@ class TestFindNearDuplicates:
         assert pairs[0].cosine >= NEAR_DUP_THRESHOLD
 
     @pytest.mark.asyncio
-    async def test_co_injected_pairs_skipped(self, fresh_store):
-        """Pairs that were both injected in the same conversation are NOT flagged."""
+    async def test_co_injected_pairs_still_surfaced(self, fresh_store):
+        """Co-injection no longer excludes a pair. Two memories injected
+        together are a *reason* to adjudicate (the contradiction kept
+        reappearing), not a reason to skip — daytime extraction only
+        resolves explicit in-conversation corrections."""
         from boxbot.memory.dream import (
             CandidateSet, find_near_duplicates,
         )
@@ -416,7 +419,8 @@ class TestFindNearDuplicates:
         id_b = await _seed(
             fresh_store, content="b", summary="b", embedding_vec=v_b,
         )
-        # Create a conversation that lists BOTH as accessed memories.
+        # A conversation that lists BOTH as accessed memories no longer
+        # exempts the pair from dedup.
         await fresh_store.create_conversation(
             channel="voice",
             participants=["Jacob"],
@@ -431,7 +435,8 @@ class TestFindNearDuplicates:
         pairs = await find_near_duplicates(
             fresh_store, CandidateSet(new_today=mems, revisits=[]),
         )
-        assert pairs == []
+        assert len(pairs) == 1
+        assert {pairs[0].memory_id_a, pairs[0].memory_id_b} == {id_a, id_b}
 
     # Lifecycle step 7 retired the ``operational`` type and removed
     # the dream-phase exemption that excluded it from dedup. The old
@@ -439,6 +444,159 @@ class TestFindNearDuplicates:
     # opposite behaviour, has been deleted. The step-7 test suite
     # (``tests/test_drop_operational_type.py``) covers the new
     # contract: no skip, no enum entry.
+
+
+# ---------------------------------------------------------------------------
+# Enriched judge: reasoning + provenance + related context
+# ---------------------------------------------------------------------------
+
+
+class TestReasoningField:
+    def test_reasoning_required_in_tool_schema(self):
+        from boxbot.memory.dream import DEDUP_TOOL
+
+        schema = DEDUP_TOOL["input_schema"]
+        assert "reasoning" in schema["required"]
+        assert "reasoning" in schema["properties"]
+
+    def test_reasoning_parsed_onto_decision(self):
+        from boxbot.memory.dream import _decision_from_payload
+
+        d = _decision_from_payload(
+            "cid", None,
+            {
+                "reasoning": "A is an automated re-derivation; B is Jacob's "
+                             "explicit correction, so A is stale.",
+                "decision": "supersede",
+                "evidence": ["x", "y"],
+                "confidence": 0.9,
+                "stale_id": "x",
+            },
+        )
+        assert d.reasoning.startswith("A is an automated")
+        assert d.decision == "supersede"
+
+    def test_reasoning_defaults_empty_when_absent(self):
+        from boxbot.memory.dream import _decision_from_payload
+
+        d = _decision_from_payload(
+            "cid", None,
+            {"decision": "distinct", "evidence": [], "confidence": 0.5},
+        )
+        assert d.reasoning == ""
+
+
+class TestProvenanceClassification:
+    @pytest.mark.parametrize(
+        "channel,is_human",
+        [
+            ("voice", True),
+            ("whatsapp", True),
+            ("signal", True),
+            ("whatsapp:+15035550100", True),  # keyed channel, base matches
+            ("", False),
+            ("trigger:abc123", False),
+            ("evening-review", False),
+            (None, False),
+        ],
+    )
+    def test_classify_channel(self, channel, is_human):
+        from boxbot.memory.dream import _classify_channel
+
+        result = _classify_channel(channel)
+        assert ("stated by a person" in result) is is_human
+
+
+class TestEnrichedRequestShape:
+    def test_build_request_includes_provenance_and_context(self):
+        from boxbot.memory.dream import _build_dedup_request
+        from boxbot.memory.store import Memory
+
+        def _mem(mid, person, summary):
+            return Memory(
+                id=mid, type="person",
+                content=f"{summary} (content)", summary=summary,
+                person=person, people=[person], tags=[],
+                source_conversation=None,
+                created_at="2026-06-05T00:00:00",
+                last_relevant_at="2026-06-05T00:00:00",
+                status="active", invalidated_by=None, superseded_by=None,
+                embedding=None,
+            )
+
+        req = _build_dedup_request(
+            custom_id="cid",
+            memory_a=_mem("a" * 36, "Erik", "Erik's preschool graduation"),
+            memory_b=_mem("b" * 36, "Zara", "Zara's preschool graduation"),
+            cosine=0.78,
+            source_a="signal; stated by a person — \"Jacob corrected it\"",
+            source_b="automated review; recorded by an automated process",
+            related_context="- [Zara] Zara is 2, not in preschool (id deadbeef)",
+        )
+        msg = req["params"]["messages"][0]["content"]
+        assert "source: signal; stated by a person" in msg
+        assert "recorded by an automated process" in msg
+        assert "[What else is known]" in msg
+        assert "Zara is 2, not in preschool" in msg
+
+
+class TestSubmitBatchEnrichment:
+    @pytest.mark.asyncio
+    async def test_request_carries_provenance_and_related_context(
+        self, fresh_store, fake_client,
+    ):
+        """End-to-end: the enriched request distinguishes a human-stated
+        memory from a machine-derived one and surfaces the decisive
+        related fact — the exact signal that resolves Erik-vs-Zara."""
+        from boxbot.memory.dream import NearDupPair, submit_dream_batch
+
+        erik = await _seed(
+            fresh_store, person="Erik",
+            content="Erik is graduating preschool (not Zara).",
+            summary="Erik's preschool graduation",
+            embedding_vec=_unit([1.0, 0.0, 0.0]),
+        )
+        zara = await _seed(
+            fresh_store, person="Zara",
+            content="Zara's preschool graduation Mon Jun 8.",
+            summary="Zara's preschool graduation",
+            embedding_vec=_unit([0.98, 0.2, 0.0]),
+        )
+        # The decisive related fact — different person, so it never embeds
+        # next to the pair, but it settles the contradiction.
+        await _seed(
+            fresh_store, person="Zara",
+            content="Zara is 2 and not in preschool yet; Erik is the older sibling.",
+            summary="Zara is 2, not in preschool yet",
+            embedding_vec=_unit([0.0, 1.0, 0.0]),
+        )
+
+        conv_human = await fresh_store.create_conversation(
+            channel="signal", participants=["Jacob"],
+            summary="Jacob corrected: Erik's graduation, not Zara's.",
+        )
+        conv_auto = await fresh_store.create_conversation(
+            channel="", participants=[],
+            summary="Automated evening review covering Zara's preschool graduation.",
+        )
+        await fresh_store.db.execute(
+            "UPDATE memories SET source_conversation=? WHERE id=?",
+            (conv_human, erik),
+        )
+        await fresh_store.db.execute(
+            "UPDATE memories SET source_conversation=? WHERE id=?",
+            (conv_auto, zara),
+        )
+        await fresh_store.db.commit()
+
+        pair = NearDupPair(memory_id_a=erik, memory_id_b=zara, cosine=0.78)
+        await submit_dream_batch(fake_client, fresh_store, [pair])
+
+        msg = fake_client.create_calls[0]["requests"][0][
+            "params"]["messages"][0]["content"]
+        assert "stated by a person" in msg          # Erik via Signal
+        assert "recorded by an automated process" in msg  # Zara via review
+        assert "Zara is 2, not in preschool yet" in msg   # decisive context
 
 
 # ---------------------------------------------------------------------------

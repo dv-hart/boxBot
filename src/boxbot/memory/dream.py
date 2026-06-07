@@ -6,11 +6,16 @@ across multiple PRs; **this module covers PR1 only**:
 
 1. Deterministic clustering of candidate memories at cosine ≥ 0.7
    (clusters of size ≥3 are *logged* — schema formation lands in PR2).
-2. Pair near-duplicate memories at cosine ≥ 0.85 where the two were not
-   co-injected during the day (cross-conversation only — daytime
-   extraction handles co-injected dedup via invalidations).
+2. Pair near-duplicate memories at cosine ≥ NEAR_DUP_THRESHOLD and hand
+   each pair to the model judge. Co-injected pairs are NOT excluded — a
+   contradiction that keeps being injected together is exactly what
+   needs adjudicating, and daytime extraction only resolves explicit
+   in-conversation corrections.
 3. Submit one Anthropic batch with one ``dedup_decision`` request per
-   pair, structured-output via the ``DEDUP_TOOL`` schema.
+   pair, structured-output via the ``DEDUP_TOOL`` schema. Each request
+   carries provenance (who/what asserted each memory) and a
+   "what else is known" block of related memories, and the model must
+   reason before deciding.
 4. Apply with confidence ≥ 0.8 — but **default audit_only=True**, so
    PR1 ships in a "log decisions, mutate nothing" safety mode.
 5. Integrate ``boxbot.memory.maintenance.run_maintenance`` into the
@@ -134,7 +139,7 @@ class Cluster:
 
 @dataclass
 class NearDupPair:
-    """Two memories at cosine ≥ NEAR_DUP_THRESHOLD that were NOT co-injected."""
+    """Two memories at cosine ≥ NEAR_DUP_THRESHOLD, surfaced for adjudication."""
 
     memory_id_a: str
     memory_id_b: str
@@ -154,6 +159,7 @@ class DedupDecision:
     confidence: float
     notes: str
     stale_id: str | None = None  # supersede: the memory to invalidate
+    reasoning: str = ""  # the model's think-it-through, captured for audit
 
 
 @dataclass
@@ -180,17 +186,29 @@ class DreamApplyResult:
 DEDUP_TOOL: dict[str, Any] = {
     "name": "dedup_decision",
     "description": (
-        "Judge two memories. They may be the same fact in different "
-        "words (merge), genuinely different (distinct), or making "
-        "INCOMPATIBLE claims about the same subject (supersede / flag). "
-        "Be conservative — when unsure whether they're the same, return "
-        "'distinct'; when unsure which of two conflicting facts is "
-        "correct, return 'flag', never 'supersede'."
+        "Resolve two memories against each other, using the provenance "
+        "and related context provided. Reason first, then decide: the "
+        "same fact in different words (merge), genuinely different "
+        "(distinct), or INCOMPATIBLE claims about the same subject "
+        "(supersede / flag). When unsure whether they're the same, "
+        "return 'distinct'; when they conflict but you can't tell which "
+        "is current, return 'flag', never 'supersede'."
     ),
     "input_schema": {
         "type": "object",
-        "required": ["decision", "evidence", "confidence"],
+        "required": ["reasoning", "decision", "evidence", "confidence"],
         "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": (
+                    "Think it through BEFORE deciding. What does each "
+                    "memory actually claim? Where did each come from — a "
+                    "person stating or correcting it, or an automated "
+                    "process reading an external source? What does the "
+                    "related context say, and which memory does it "
+                    "support? Which is more trustworthy, and why?"
+                ),
+            },
             "decision": {
                 "type": "string",
                 "enum": [
@@ -233,27 +251,34 @@ DEDUP_TOOL: dict[str, Any] = {
 
 
 DEDUP_SYSTEM_PROMPT = """\
-You are the dream-phase memory consolidator for boxBot.
+You are the dream-phase memory consolidator for boxBot. Your real job is to keep what the household's assistant believes both true and tidy — not to mechanically match strings.
 
-Each request shows you exactly two memories from a household assistant's long-term store. Your job: decide whether they record the same fact (merge), are unrelated/different (distinct), or make INCOMPATIBLE claims about the same subject (supersede / flag).
+Each request gives you TWO memories, plus, for each, its **source** (who or what asserted it) and a **[What else is known]** block of related memories. Use all of it. Fill in `reasoning` first — actually think it through — then decide.
 
-Output rules (strictly via the `dedup_decision` tool):
+How to think it through:
 
-- `merge_into_a`: keep memory A's id, fold in any extra information from B. Use this when both clearly state the same fact and A's wording is at least as good as B's.
-- `merge_into_b`: keep memory B's id, fold in extra info from A.
-- `supersede`: the two memories make INCOMPATIBLE claims about the SAME subject — the same event attributed to different people, or a value that has been updated/corrected (e.g. "Zara's preschool graduation is Mon Jun 8" vs "Erik's preschool graduation is Mon Jun 8"; or "lives in Portland" vs "moved to Seattle"). Set `stale_id` to the memory that is now WRONG or OUTDATED; the other is kept. Decide which is stale by: (a) an explicit correction wins over the thing corrected, (b) otherwise the more recent `created_at` wins. Use this ONLY when the contradiction is clear AND you are confident which one is current.
-- `flag`: the memories seem to conflict, but you are NOT sure they truly conflict, or NOT sure which one is correct. Nothing is changed — the conflict is recorded for human/agent review. **Prefer `flag` over `supersede` whenever you are uncertain.** Invalidating a memory is destructive; only `supersede` when it's unambiguous.
-- `distinct`: any meaningful difference that is NOT a contradiction — different person, different time period, different scope, different attribute. **When in doubt between merge and distinct, prefer this.**
+1. **What does each memory claim?** State the underlying fact, not just the wording.
+2. **Where did each come from?** A fact a person stated directly, or explicitly corrected, is strong evidence. A fact an automated process inferred from an ambiguous external source (a calendar event that names no one, an auto-generated review) is weak — it may be a re-derived guess. Weigh provenance accordingly: a human's correction outranks a machine's inference about the same thing, even if the machine's memory is newer.
+3. **What else is known?** The related context often settles it outright (e.g. "Zara is 2 and not in preschool yet" decides who is graduating). A memory contradicted by well-established related facts is the stale one.
+4. **Recency is the WEAKEST signal.** An automated process can re-derive the same error nightly, so the wrong fact often looks "newest." Only fall back to recency when provenance and context don't break the tie.
+
+Decisions (strictly via the `dedup_decision` tool):
+
+- `merge_into_a`: same fact; keep A's id and fold in any extra detail from B. Use when both clearly state the same fact and A's wording is at least as good.
+- `merge_into_b`: same fact; keep B's id instead.
+- `supersede`: the two make INCOMPATIBLE claims about the SAME subject — the same event attributed to different people, or a value that changed/was corrected ("lives in Portland" vs "moved to Seattle"). Set `stale_id` to the memory that is now WRONG or OUTDATED; the other survives. Choose the stale one by provenance and related context first, recency last. Use ONLY when the contradiction is clear AND you are confident which is current.
+- `flag`: they seem to conflict but you are not sure they truly do, or not sure which is correct. Nothing changes; the conflict is recorded for review. **Prefer `flag` over `supersede` whenever you are genuinely uncertain** — invalidating a memory is destructive.
+- `distinct`: any meaningful difference that is NOT a contradiction — different person, time, scope, or attribute that can both be true. **When in doubt between merge and distinct, prefer distinct.**
 - `unsure`: you genuinely cannot tell anything. Logged; nothing happens.
 
 Hard rules:
 
-1. Be conservative. Spurious merges and false supersessions destroy information; a missed one is fixable on a future night. When torn between `supersede` and `flag`, choose `flag`.
-2. Two memories about different people, times, or aspects that do NOT contradict are `distinct` — even if the words overlap. A contradiction means they cannot both be true of the same subject.
-3. `confidence` must be ≥ 0.8 only if you are sure; below that, the apply step will skip the merge/supersede regardless of decision.
-4. `evidence` MUST include both memory IDs from the pair when merging or superseding. For `supersede`, `stale_id` MUST be one of those two ids.
-5. When merging, `merged_content` should be 1–3 sentences containing every fact present in either input. `merged_summary` should be ≤80 chars. Do NOT merge content on a `supersede` — the stale memory is wrong, not additive.
-6. Operational memories (activity-log entries) are never merged or superseded — return `distinct`. They are append-only.
+1. Be conservative about destruction. A spurious merge or false supersede loses information; a missed one is fixable on a future night. Torn between `supersede` and `flag` → choose `flag`.
+2. Different people, times, or aspects that do NOT contradict are `distinct`, even if the words overlap. A contradiction means they cannot both be true of the same subject.
+3. `confidence` ≥ 0.8 only when you are sure; below that the apply step skips any merge/supersede regardless of decision.
+4. `evidence` MUST include both memory IDs from the pair for any merge or supersede. For `supersede`, `stale_id` MUST be one of the two.
+5. When merging, `merged_content` is 1–3 sentences containing every fact from either input; `merged_summary` ≤80 chars. Do NOT fold content on a `supersede` — the stale memory is wrong, not additive.
+6. Operational memories (activity-log entries) are append-only — never merge or supersede them; return `distinct`.
 
 If the inputs are too thin to judge (e.g. single-word summaries), return `unsure` with confidence ≤ 0.4.
 """
@@ -446,7 +471,7 @@ async def find_near_duplicates(
     *,
     near_dup_threshold: float = NEAR_DUP_THRESHOLD,
 ) -> list[NearDupPair]:
-    """Pair memories at cosine ≥ ``near_dup_threshold`` that were NOT co-injected.
+    """Pair memories at cosine ≥ ``near_dup_threshold`` for adjudication.
 
     Two-pass:
 
@@ -461,11 +486,15 @@ async def find_near_duplicates(
        lands in the same narrow revisit window (probability ~7% per
        night on a 90-memory corpus), so they accumulate forever.
 
-    "Co-injected" is determined by the conversation each memory cites
-    as its source. If conversation X already recorded both memories
-    as accessed, the daytime extraction had a chance to invalidate
-    one in favour of the other — we don't want the dream phase to
-    second-guess that.
+    Co-injected pairs are deliberately NOT excluded. The old design
+    skipped any pair that had appeared together in a conversation, on
+    the theory that daytime extraction already resolved it — but
+    extraction only invalidates on an *explicit* in-conversation
+    correction, so two contradictory memories that keep getting injected
+    together and merely produce a wrong answer fell through both nets
+    forever. Repeated co-injection is a reason to adjudicate, not skip.
+    The enriched judge (provenance + related context) is the precision
+    gate; the ``MAX_DEDUP_PAIRS`` cap bounds batch size.
     """
     cand_memories = [
         m for m in candidates.all_memories if m.embedding is not None
@@ -473,34 +502,21 @@ async def find_near_duplicates(
     if len(cand_memories) == 0:
         return []
 
-    # Build a co-injection map over a superset of memories we might
-    # touch — today's candidates AND any active memory we'll compare
-    # in the nearest-neighbour expansion. Cheaper to build once.
+    # The active pool backs the nearest-neighbour expansion below.
     active_pool = await store.list_memories(status="active", limit=10_000)
     active_with_embed = [
         m for m in active_pool if m.embedding is not None
     ]
-    co_inject_index = await _build_co_injection_index(
-        store, active_with_embed,
-    )
-
-    new_today_ids = {m.id for m in candidates.new_today}
 
     pairs_by_key: dict[tuple[str, str], NearDupPair] = {}
 
     def _record(a: Memory, b: Memory, sim: float) -> None:
-        """Record a near-dup pair if it's novel + above threshold +
-        not already-co-injected. Order the IDs so each pair is unique
-        regardless of which side surfaced it first."""
+        """Record a near-dup pair if it's novel + above threshold. Order
+        the IDs so each pair is unique regardless of which side surfaced
+        it first."""
         if sim < near_dup_threshold:
             return
         if a.id == b.id:
-            return
-        shared = (
-            co_inject_index.get(a.id, set())
-            & co_inject_index.get(b.id, set())
-        )
-        if shared:
             return
         key = (a.id, b.id) if a.id < b.id else (b.id, a.id)
         if key not in pairs_by_key:
@@ -592,13 +608,22 @@ def _build_dedup_request(
     memory_a: Memory,
     memory_b: Memory,
     cosine: float,
+    source_a: str = "(source unknown)",
+    source_b: str = "(source unknown)",
+    related_context: str = "(no related memories on file)",
     model: str = DEFAULT_EXTRACTION_MODEL,
-    max_tokens: int = 800,
+    max_tokens: int = 1200,
 ) -> dict[str, Any]:
-    """Build one Anthropic batch request for a single dedup pair."""
+    """Build one Anthropic batch request for a single dedup pair.
+
+    ``source_a`` / ``source_b`` describe each memory's provenance (who or
+    what asserted it). ``related_context`` is a rendered block of other
+    active memories about the same people — "what else is known" — so the
+    judge can resolve contradictions the two memories alone don't settle.
+    """
     user_msg = (
-        f"You are comparing TWO memories. Return a single `dedup_decision` "
-        f"tool call.\n\n"
+        f"Resolve these TWO memories against each other. Reason it through "
+        f"first, then return a single `dedup_decision` tool call.\n\n"
         f"Embedding cosine: {cosine:.3f}\n\n"
         f"[Memory A]\n"
         f"id: {memory_a.id}\n"
@@ -606,7 +631,8 @@ def _build_dedup_request(
         f"person: {memory_a.person or '(none)'}\n"
         f"content: {memory_a.content}\n"
         f"summary: {memory_a.summary}\n"
-        f"created_at: {memory_a.created_at}\n\n"
+        f"created_at: {memory_a.created_at}\n"
+        f"source: {source_a}\n\n"
         f"[Memory B]\n"
         f"id: {memory_b.id}\n"
         f"type: {memory_b.type}\n"
@@ -614,6 +640,9 @@ def _build_dedup_request(
         f"content: {memory_b.content}\n"
         f"summary: {memory_b.summary}\n"
         f"created_at: {memory_b.created_at}\n"
+        f"source: {source_b}\n\n"
+        f"[What else is known]\n"
+        f"{related_context}\n"
     )
     return {
         "custom_id": custom_id,
@@ -636,6 +665,88 @@ def _build_dedup_request(
 
 def _custom_id_for_pair(batch_uuid: str, index: int) -> str:
     return f"dream-{batch_uuid}-{index:04d}"
+
+
+# Channels where a human is the one talking. Anything else (a scheduled
+# wake/review, a trigger firing, an empty channel on an automated job)
+# is treated as machine-derived provenance.
+_HUMAN_CHANNELS = {"voice", "whatsapp", "signal"}
+
+
+def _classify_channel(channel: str | None) -> str:
+    """Describe whether a memory's source conversation was human or automated."""
+    base = (channel or "").split(":", 1)[0].strip().lower()
+    if base in _HUMAN_CHANNELS:
+        return "stated by a person"
+    return (
+        "recorded by an automated process (e.g. a scheduled review "
+        "reading an external source) — treat as a possibly re-derived guess"
+    )
+
+
+async def _source_provenance(store: MemoryStore, memory: Memory) -> str:
+    """Render a one-line provenance string for a memory's source conversation."""
+    conv_id = memory.source_conversation
+    if not conv_id:
+        return "(source unknown)"
+    conv = await store.get_conversation(conv_id)
+    if conv is None:
+        return "(source conversation no longer on file)"
+    origin = _classify_channel(conv.channel)
+    chan = conv.channel or "automated review"
+    summ = (conv.summary or "").strip().replace("\n", " ")
+    if len(summ) > 200:
+        summ = summ[:200] + "…"
+    tail = f' — "{summ}"' if summ else ""
+    return f"{chan}; {origin}{tail}"
+
+
+async def _related_context(
+    store: MemoryStore,
+    memory_a: Memory,
+    memory_b: Memory,
+    *,
+    limit: int = 5,
+) -> str:
+    """Render other active memories about the same people — "what else is known".
+
+    Pulls active memories whose primary ``person`` matches anyone named in
+    either memory, excluding the pair itself. This is the block that lets
+    the judge resolve a contradiction the two memories alone can't (e.g.
+    a separate "Zara is 2, not in preschool yet" memory deciding who is
+    actually graduating).
+    """
+    persons: set[str] = set()
+    for m in (memory_a, memory_b):
+        if m.person:
+            persons.add(m.person)
+        for p in m.people or []:
+            if p:
+                persons.add(p)
+
+    seen = {memory_a.id, memory_b.id}
+    related: list[Memory] = []
+    for person in sorted(persons):
+        for m in await store.list_memories(
+            status="active", person=person, limit=20,
+        ):
+            if m.id in seen:
+                continue
+            seen.add(m.id)
+            related.append(m)
+
+    related.sort(key=lambda m: m.last_relevant_at, reverse=True)
+    related = related[:limit]
+    if not related:
+        return "(no related memories on file)"
+
+    lines: list[str] = []
+    for m in related:
+        who = m.person or (", ".join(m.people) if m.people else "—")
+        lines.append(
+            f"- [{who}] {m.summary} (id {m.id[:8]}, created {m.created_at[:10]})"
+        )
+    return "\n".join(lines)
 
 
 async def submit_dream_batch(
@@ -686,12 +797,22 @@ async def submit_dream_batch(
 
     requests: list[dict[str, Any]] = []
     for custom_id, p in valid:
+        mem_a = by_id[p.memory_id_a]
+        mem_b = by_id[p.memory_id_b]
+        # Enrich each request: where each fact came from, and what else
+        # the store knows about the same people. The judge weighs these.
+        source_a = await _source_provenance(store, mem_a)
+        source_b = await _source_provenance(store, mem_b)
+        related_context = await _related_context(store, mem_a, mem_b)
         requests.append(
             _build_dedup_request(
                 custom_id=custom_id,
-                memory_a=by_id[p.memory_id_a],
-                memory_b=by_id[p.memory_id_b],
+                memory_a=mem_a,
+                memory_b=mem_b,
                 cosine=p.cosine,
+                source_a=source_a,
+                source_b=source_b,
+                related_context=related_context,
                 model=model,
             )
         )
@@ -763,6 +884,7 @@ def _decision_from_payload(
             str(payload["stale_id"])
             if payload.get("stale_id") else None
         ),
+        reasoning=str(payload.get("reasoning") or ""),
     )
 
 
@@ -1136,6 +1258,11 @@ def write_dream_log(
                 f"- pair {pair_repr}: {tag}, "
                 f"confidence {d.confidence:.2f}{note}"
             )
+            if d.reasoning:
+                reasoning = d.reasoning.strip().replace("\n", " ")
+                if len(reasoning) > 240:
+                    reasoning = reasoning[:240] + "…"
+                lines.append(f"  - reasoning: {reasoning}")
     lines.append("")
 
     lines.append("## Cost")

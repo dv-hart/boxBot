@@ -109,10 +109,13 @@ async def test_neighbour_expansion_respects_threshold(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_co_injected_pairs_still_skipped(tmp_path, monkeypatch):
-    """Even if the neighbour expansion finds them, pairs that were
-    already co-injected in a conversation are skipped — daytime
-    extraction owned that case."""
+async def test_co_injected_pairs_surfaced_by_neighbour_expansion(
+    tmp_path, monkeypatch,
+):
+    """Neighbour expansion surfaces a co-injected pair rather than skipping
+    it. The old exclusion let two contradictory memories that kept being
+    injected together evade dedup forever; co-injection is now a reason to
+    adjudicate, with the enriched judge as the precision gate."""
     from pathlib import Path as _Path
     from boxbot.memory.store import MemoryStore
     from boxbot.memory.dream import (
@@ -134,7 +137,8 @@ async def test_co_injected_pairs_still_skipped(tmp_path, monkeypatch):
             content="b", summary="b", embedding_vec=v_b,
         )
 
-        # Both memories were accessed in one conversation
+        # Both memories were accessed in one conversation — no longer
+        # exempts the pair.
         await store.create_conversation_stub(
             conversation_id="conv_shared",
             channel="voice",
@@ -150,8 +154,8 @@ async def test_co_injected_pairs_still_skipped(tmp_path, monkeypatch):
         new_mem = await store.get_memory_no_touch(new_id)
         cands = CandidateSet(new_today=[new_mem], revisits=[])
         pairs = await find_near_duplicates(store, cands)
-        # Skipped because co-injected
-        assert pairs == []
+        assert len(pairs) == 1
+        assert {pairs[0].memory_id_a, pairs[0].memory_id_b} == {old_id, new_id}
     finally:
         await store.close()
 

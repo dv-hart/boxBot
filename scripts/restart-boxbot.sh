@@ -4,14 +4,17 @@
 # also be run manually for a quick bounce.
 #
 # What it does:
-#   1. SIGTERM the current boxbot process and wait up to 15s for clean exit.
-#   2. SIGKILL if it's still alive after that.
-#   3. Spawn a fresh boxbot via ``nohup setsid`` with a fresh dated log file.
-#   4. Sleep briefly, then tail the new log so the operator can see startup.
+#   - If boxbot is installed as a systemd unit (boxbot.service), restart
+#     it via ``systemctl restart`` so the unit's PID tracking, memory
+#     caps, and restart counter stay coherent. This is the normal case
+#     on a provisioned Pi (scripts/systemd/install.sh).
+#   - Otherwise, fall back to the legacy bounce: SIGTERM the running
+#     process (SIGKILL after 15s), then spawn a fresh one via
+#     ``nohup setsid`` with a dated log file.
 #
 # Idempotent: if no boxbot is running, just starts one.
 #
-# Exits non-zero if the new process didn't survive startup.
+# Exits non-zero if boxbot didn't survive startup.
 
 set -euo pipefail
 
@@ -27,7 +30,34 @@ fi
 cd "$PROJECT_DIR"
 
 # -------------------------------------------------------------------
-# Stop existing boxbot (if any)
+# Preferred path: systemd-managed restart.
+# -------------------------------------------------------------------
+# When boxbot.service is installed, a pgrep SIGTERM + nohup respawn would
+# orphan the process from systemd — the unit would show inactive while a
+# rogue copy ran, Restart=on-failure won't relaunch after a clean
+# SIGTERM, and the memory caps in the unit wouldn't apply. So defer to
+# systemctl whenever the unit exists.
+if command -v systemctl >/dev/null 2>&1 \
+        && systemctl cat boxbot.service >/dev/null 2>&1; then
+    echo "boxbot.service is installed — restarting via systemd"
+    sudo systemctl restart boxbot.service
+    # Give it a few seconds to either come up or fail loudly.
+    sleep 5
+    if ! systemctl is-active --quiet boxbot.service; then
+        echo "ERROR: boxbot.service did not come up. Recent state + logs:" >&2
+        sudo systemctl status boxbot.service --no-pager -l 2>&1 | tail -20 >&2
+        journalctl -u boxbot.service -n 30 --no-pager >&2 2>/dev/null || true
+        exit 1
+    fi
+    echo "boxbot.service active (pid $(systemctl show -p MainPID --value boxbot.service))"
+    echo ""
+    echo "=== recent app log ==="
+    tail -25 logs/boxbot.log 2>/dev/null || echo "(no logs/boxbot.log yet)"
+    exit 0
+fi
+
+# -------------------------------------------------------------------
+# Fallback (no systemd unit): stop existing boxbot (if any)
 # -------------------------------------------------------------------
 
 CUR_PID="$(pgrep -f '\.venv/bin/boxbot$' | head -1 || true)"

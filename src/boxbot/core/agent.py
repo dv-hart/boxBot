@@ -132,9 +132,10 @@ def _generate_conversation_id() -> str:
     return f"conv_{uuid.uuid4().hex[:12]}"
 
 
-# Mime type → file extension for inbound WhatsApp images. Restricted to
-# the formats the multimodal attach pipeline accepts (build_image_block).
-_WHATSAPP_IMAGE_EXTS: dict[str, str] = {
+# Mime type → file extension for inbound images (WhatsApp + Signal).
+# Restricted to the formats the multimodal attach pipeline accepts
+# (build_image_block).
+_INBOUND_IMAGE_EXTS: dict[str, str] = {
     "image/jpeg": "jpg",
     "image/jpg": "jpg",
     "image/png": "png",
@@ -167,7 +168,7 @@ async def _stage_whatsapp_image(media_id: str, message_id: str) -> Path | None:
         return None
     data, mime_type = result
 
-    ext = _WHATSAPP_IMAGE_EXTS.get(mime_type.lower())
+    ext = _INBOUND_IMAGE_EXTS.get(mime_type.lower())
     if ext is None:
         logger.warning(
             "WhatsApp image %s: unsupported mime %s", media_id, mime_type
@@ -227,7 +228,7 @@ async def _stage_signal_image(
         return None
     data, mime_type = result
 
-    ext = _WHATSAPP_IMAGE_EXTS.get(mime_type.lower())
+    ext = _INBOUND_IMAGE_EXTS.get(mime_type.lower())
     if ext is None:
         logger.warning(
             "Signal image %s: unsupported mime %s", attachment_id, mime_type
@@ -2218,13 +2219,14 @@ class BoxBotAgent:
         except Exception:
             logger.debug("Could not fetch scheduler status line")
 
-        # WhatsApp inbound image hint: when the inbound handler stages a
-        # photo, the user message starts with "[image attached at <path>]".
-        # Tell the agent how to act on it. Only injected when this turn's
+        # Inbound image hint: when the inbound handler stages a photo, the
+        # user message starts with "[image attached at <path>]". Tell the
+        # agent how to act on it. Fires for any messaging channel that
+        # stages images (WhatsApp + Signal), and only when this turn's
         # context actually carries a staged path so we don't waste prompt
         # bytes on plain text turns.
         if (
-            channel == "whatsapp"
+            channel in ("whatsapp", "signal")
             and context
             and context.get("attachment_path")
         ):
@@ -2236,7 +2238,7 @@ class BoxBotAgent:
                 "pixels attach to the tool result. If the photo is worth "
                 "keeping (family moment, something the user asked you to "
                 "remember, anything you'd want to surface later), save it "
-                "with `bb.photos.ingest(path, source=\"whatsapp\", "
+                f"with `bb.photos.ingest(path, source=\"{channel}\", "
                 "sender=<name>, caption=<their text>)`. Do NOT ingest "
                 "memes, throwaway shares, or anything ephemeral — view, "
                 "respond, and let the janitor reap it."

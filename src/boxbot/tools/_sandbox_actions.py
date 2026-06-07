@@ -367,7 +367,12 @@ async def _handle_photos_action(
     payload: dict[str, Any],
     ctx: ActionContext,
 ) -> dict[str, Any]:
-    from boxbot.photos.search import resolve_photo_path, search_photos
+    from boxbot.photos.search import (
+        _record_to_dict,
+        get_store,
+        resolve_photo_path,
+        search_photos,
+    )
 
     try:
         if action_type == "photos.search":
@@ -542,11 +547,179 @@ async def _handle_photos_action(
                 "photo_ids": ids,
             }
 
-        # Fire-and-forget ops (tags, slideshow, delete, …) — acknowledge
-        # without actually mutating, to match current backend completeness.
+        # --- Metadata / lifecycle mutations (backed by PhotoStore) ---
+
+        if action_type == "photos.update":
+            pid = payload.get("id")
+            description = payload.get("description")
+            if not pid:
+                return {"status": "error", "error": "photo id is required"}
+            if description is None:
+                return {"status": "error", "error": "description is required"}
+            store = await get_store()
+            # Recompute the description embedding so hybrid search stays
+            # consistent with the new text (skip for an empty description).
+            emb = None
+            if description:
+                from boxbot.memory.embeddings import embed
+
+                emb = embed(description)
+            ok = await store.update_photo(
+                pid, description=description, embedding=emb
+            )
+            if not ok:
+                return {"status": "error", "error": f"photo {pid} not found"}
+            return {"status": "ok", "id": pid, "updated": True}
+
+        if action_type == "photos.set_tags":
+            pid = payload.get("id")
+            tags = payload.get("tags")
+            if not pid:
+                return {"status": "error", "error": "photo id is required"}
+            if not isinstance(tags, list):
+                return {"status": "error", "error": "tags must be a list"}
+            store = await get_store()
+            ok = await store.update_tags(pid, [str(t) for t in tags])
+            if not ok:
+                return {"status": "error", "error": f"photo {pid} not found"}
+            return {"status": "ok", "id": pid, "tags": tags}
+
+        if action_type == "photos.set_person":
+            pid = payload.get("id")
+            idx = payload.get("person_index")
+            name = payload.get("name")
+            if not pid:
+                return {"status": "error", "error": "photo id is required"}
+            if not isinstance(idx, int) or idx < 0:
+                return {
+                    "status": "error",
+                    "error": "person_index must be a non-negative integer",
+                }
+            if not name:
+                return {"status": "error", "error": "name is required"}
+            store = await get_store()
+            record = await store.get_photo(pid)
+            if record is None:
+                return {"status": "error", "error": f"photo {pid} not found"}
+            people = [dict(p) for p in record.people]
+            if idx >= len(people):
+                return {
+                    "status": "error",
+                    "error": (
+                        f"person_index {idx} out of range "
+                        f"({len(people)} people in photo)"
+                    ),
+                }
+            people[idx]["label"] = str(name)
+            await store.update_people(pid, people)
+            return {"status": "ok", "id": pid, "person": people[idx]}
+
+        if action_type == "photos.add_to_slideshow":
+            pid = payload.get("id")
+            if not pid:
+                return {"status": "error", "error": "photo id is required"}
+            store = await get_store()
+            ok = await store.add_to_slideshow(pid)
+            if not ok:
+                return {
+                    "status": "error",
+                    "error": f"photo {pid} not found or deleted",
+                }
+            return {"status": "ok", "id": pid, "in_slideshow": True}
+
+        if action_type == "photos.remove_from_slideshow":
+            pid = payload.get("id")
+            if not pid:
+                return {"status": "error", "error": "photo id is required"}
+            store = await get_store()
+            ok = await store.remove_from_slideshow(pid)
+            if not ok:
+                return {"status": "error", "error": f"photo {pid} not found"}
+            return {"status": "ok", "id": pid, "in_slideshow": False}
+
+        if action_type == "photos.merge_tags":
+            source = payload.get("source")
+            into = payload.get("into")
+            if not source or not into:
+                return {
+                    "status": "error",
+                    "error": "source and into are required",
+                }
+            store = await get_store()
+            count = await store.merge_tags(str(source), str(into))
+            return {"status": "ok", "merged_count": count}
+
+        if action_type == "photos.rename_tag":
+            old = payload.get("old")
+            new = payload.get("new")
+            if not old or not new:
+                return {"status": "error", "error": "old and new are required"}
+            store = await get_store()
+            ok = await store.rename_tag(str(old), str(new))
+            if not ok:
+                return {"status": "error", "error": f"tag {old!r} not found"}
+            return {"status": "ok", "renamed": True}
+
+        if action_type == "photos.delete_tag":
+            tag = payload.get("tag")
+            if not tag:
+                return {"status": "error", "error": "tag is required"}
+            store = await get_store()
+            count = await store.delete_tag(str(tag))
+            return {"status": "ok", "removed_count": count}
+
+        if action_type == "photos.delete":
+            pid = payload.get("id")
+            if not pid:
+                return {"status": "error", "error": "photo id is required"}
+            store = await get_store()
+            ok = await store.soft_delete_photo(pid)
+            if not ok:
+                return {
+                    "status": "error",
+                    "error": f"photo {pid} not found or already deleted",
+                }
+            return {"status": "ok", "id": pid, "deleted": True}
+
+        if action_type == "photos.restore":
+            pid = payload.get("id")
+            if not pid:
+                return {"status": "error", "error": "photo id is required"}
+            store = await get_store()
+            ok = await store.restore_photo(pid)
+            if not ok:
+                return {
+                    "status": "error",
+                    "error": f"photo {pid} not found or not deleted",
+                }
+            return {"status": "ok", "id": pid, "restored": True}
+
+        if action_type == "photos.list_deleted":
+            store = await get_store()
+            records = await store.list_deleted()
+            return {
+                "status": "ok",
+                "results": [_record_to_dict(r) for r in records],
+            }
+
+        if action_type == "photos.storage_info":
+            store = await get_store()
+            info = await store.get_storage_info()
+            count = await store.count_photos()
+            return {
+                "status": "ok",
+                "used_bytes": info.used_bytes,
+                "quota_bytes": info.quota_bytes,
+                "used_percent": info.used_percent,
+                "used_gb": round(info.used_bytes / (1024**3), 2),
+                "quota_gb": round(info.quota_bytes / (1024**3), 2),
+                "photo_count": count,
+            }
+
+        # Unknown action — acknowledge without mutating.
         return {
             "status": "stub",
-            "message": f"{action_type} acknowledged but not yet wired.",
+            "message": f"{action_type} acknowledged but not handled.",
         }
 
     except KeyError as e:

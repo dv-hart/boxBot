@@ -812,6 +812,16 @@ class PhotoStore:
             used_percent=round(used_percent, 1),
         )
 
+    async def count_photos(self, *, include_deleted: bool = False) -> int:
+        """Count photos in the library (active by default)."""
+        db = self._ensure_db()
+        sql = "SELECT COUNT(*) AS cnt FROM photos"
+        if not include_deleted:
+            sql += " WHERE deleted_at IS NULL"
+        async with db.execute(sql) as cursor:
+            row = await cursor.fetchone()
+            return int(row["cnt"]) if row else 0
+
     # ------------------------------------------------------------------
     # FTS rebuild
     # ------------------------------------------------------------------

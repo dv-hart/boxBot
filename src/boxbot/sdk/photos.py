@@ -158,7 +158,7 @@ def view_path(path: str) -> dict[str, Any]:
     """Attach a local image file's pixels to the tool result.
 
     Use this for files that haven't been ingested into the photo
-    library yet — most often an inbound WhatsApp image staged at
+    library yet — most often an inbound Signal/WhatsApp image staged at
     ``[image attached at <path>]`` in the user's message. Path must
     live under one of the allowlisted roots (sandbox tmp, workspace,
     photos, perception crops); anything else is refused.
@@ -187,8 +187,9 @@ def ingest(
 
     Args:
         path: Local file path (must be under an allowlisted root).
-        source: Where the image came from — ``"whatsapp"``, ``"camera"``,
-            or ``"upload"``. Stored on the photo for filtering later.
+        source: Where the image came from — ``"signal"``, ``"whatsapp"``,
+            ``"camera"``, or ``"upload"``. Stored on the photo for
+            filtering later.
         sender: Person who sent it, if known.
         caption: Optional human-supplied description; used as the
             initial photo description until the small-model tagger
@@ -236,10 +237,10 @@ def update(photo_id: str, *, description: str) -> None:
     """
     v.require_str(photo_id, "photo_id")
     v.require_str(description, "description")
-    _transport.emit_action("photos.update", {
+    _check(_transport.request("photos.update", {
         "id": photo_id,
         "description": description,
-    })
+    }, timeout=30))
 
 
 def set_tags(photo_id: str, *, tags: list[str]) -> None:
@@ -251,10 +252,10 @@ def set_tags(photo_id: str, *, tags: list[str]) -> None:
     """
     v.require_str(photo_id, "photo_id")
     v.require_list(tags, "tags")
-    _transport.emit_action("photos.set_tags", {
+    _check(_transport.request("photos.set_tags", {
         "id": photo_id,
         "tags": tags,
-    })
+    }, timeout=30))
 
 
 def set_person(photo_id: str, *, person_index: int, name: str) -> None:
@@ -268,11 +269,11 @@ def set_person(photo_id: str, *, person_index: int, name: str) -> None:
     v.require_str(photo_id, "photo_id")
     v.require_int(person_index, "person_index", min_val=0)
     v.require_str(name, "name")
-    _transport.emit_action("photos.set_person", {
+    _check(_transport.request("photos.set_person", {
         "id": photo_id,
         "person_index": person_index,
         "name": name,
-    })
+    }, timeout=30))
 
 
 # --- Slideshow management ---
@@ -284,7 +285,8 @@ def add_to_slideshow(photo_id: str) -> None:
         photo_id: Photo ID.
     """
     v.require_str(photo_id, "photo_id")
-    _transport.emit_action("photos.add_to_slideshow", {"id": photo_id})
+    _check(_transport.request(
+        "photos.add_to_slideshow", {"id": photo_id}, timeout=30))
 
 
 def remove_from_slideshow(photo_id: str) -> None:
@@ -294,7 +296,8 @@ def remove_from_slideshow(photo_id: str) -> None:
         photo_id: Photo ID.
     """
     v.require_str(photo_id, "photo_id")
-    _transport.emit_action("photos.remove_from_slideshow", {"id": photo_id})
+    _check(_transport.request(
+        "photos.remove_from_slideshow", {"id": photo_id}, timeout=30))
 
 
 # --- Tag library management ---
@@ -308,10 +311,10 @@ def merge_tags(source: str, *, into: str) -> None:
     """
     v.require_str(source, "source tag")
     v.require_str(into, "target tag")
-    _transport.emit_action("photos.merge_tags", {
+    _check(_transport.request("photos.merge_tags", {
         "source": source,
         "into": into,
-    })
+    }, timeout=30))
 
 
 def rename_tag(old: str, *, to: str) -> None:
@@ -323,10 +326,10 @@ def rename_tag(old: str, *, to: str) -> None:
     """
     v.require_str(old, "old tag name")
     v.require_str(to, "new tag name")
-    _transport.emit_action("photos.rename_tag", {
+    _check(_transport.request("photos.rename_tag", {
         "old": old,
         "new": to,
-    })
+    }, timeout=30))
 
 
 def delete_tag(tag: str) -> None:
@@ -336,7 +339,7 @@ def delete_tag(tag: str) -> None:
         tag: Tag name to delete.
     """
     v.require_str(tag, "tag")
-    _transport.emit_action("photos.delete_tag", {"tag": tag})
+    _check(_transport.request("photos.delete_tag", {"tag": tag}, timeout=30))
 
 
 # --- Soft delete / restore ---
@@ -348,7 +351,7 @@ def delete(photo_id: str) -> None:
         photo_id: Photo ID.
     """
     v.require_str(photo_id, "photo_id")
-    _transport.emit_action("photos.delete", {"id": photo_id})
+    _check(_transport.request("photos.delete", {"id": photo_id}, timeout=30))
 
 
 def restore(photo_id: str) -> None:
@@ -358,7 +361,7 @@ def restore(photo_id: str) -> None:
         photo_id: Photo ID.
     """
     v.require_str(photo_id, "photo_id")
-    _transport.emit_action("photos.restore", {"id": photo_id})
+    _check(_transport.request("photos.restore", {"id": photo_id}, timeout=30))
 
 
 def list_deleted() -> list[PhotoRecord]:
@@ -367,7 +370,7 @@ def list_deleted() -> list[PhotoRecord]:
     Returns:
         List of PhotoRecord objects that are soft-deleted.
     """
-    response = _transport.request("photos.list_deleted", {}, timeout=30)
+    response = _check(_transport.request("photos.list_deleted", {}, timeout=30))
     results = response.get("results", [])
     return [PhotoRecord(r) for r in results]
 
@@ -380,5 +383,5 @@ def storage_info() -> StorageInfo:
     Returns:
         StorageInfo with usage and quota details.
     """
-    response = _transport.request("photos.storage_info", {}, timeout=30)
+    response = _check(_transport.request("photos.storage_info", {}, timeout=30))
     return StorageInfo(response)

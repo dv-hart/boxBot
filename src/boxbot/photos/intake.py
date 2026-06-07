@@ -70,11 +70,12 @@ class IntakeItem:
     """An item in the intake queue awaiting processing."""
 
     file_path: Path
-    source: str  # "whatsapp", "camera", "upload"
+    source: str  # "whatsapp", "signal", "camera", "upload"
     sender: str | None
     future: asyncio.Future[str]
     caption: str | None = None
     delete_source: bool = False
+    stop: bool = False  # sentinel: tells the worker loop to exit
 
 
 @dataclass
@@ -125,8 +126,10 @@ class IntakePipeline:
             self._janitor_task.cancel()
             try:
                 await self._janitor_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                logger.exception("Janitor task errored during shutdown")
             self._janitor_task = None
         if self._task:
             # Put a sentinel to unblock the queue.get()
@@ -135,9 +138,10 @@ class IntakePipeline:
             self._queue.put_nowait(
                 IntakeItem(
                     file_path=Path("/dev/null"),
-                    source="__stop__",
+                    source="",
                     sender=None,
                     future=sentinel_future,
+                    stop=True,
                 )
             )
             try:
@@ -253,44 +257,6 @@ class IntakePipeline:
 
         return await future
 
-    async def process_photo(
-        self,
-        file_path: str | Path,
-        *,
-        source: str = "upload",
-        sender: str | None = None,
-        caption: str | None = None,
-    ) -> str:
-        """Process a photo synchronously (bypasses the queue).
-
-        Useful for direct processing without the background loop.
-
-        Args:
-            file_path: Path to the image file to process.
-            source: Origin — "whatsapp", "camera", or "upload".
-            sender: Person name if from messaging.
-            caption: Optional human-supplied description.
-
-        Returns:
-            The photo ID.
-        """
-        file_path = Path(file_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"Photo file not found: {file_path}")
-
-        # Check storage quota
-        storage_info = await self._store.get_storage_info()
-        if storage_info.used_percent >= 98.0:
-            raise ValueError(
-                f"Photo storage is at {storage_info.used_percent}% of quota "
-                f"({storage_info.used_bytes / (1024**3):.1f} GB / "
-                f"{storage_info.quota_bytes / (1024**3):.1f} GB). "
-                f"Cannot save new photos. Ask the user what to remove."
-            )
-
-        result = await self._run_pipeline(file_path, source, sender, caption=caption)
-        return result.photo_id
-
     # ------------------------------------------------------------------
     # Background processing
     # ------------------------------------------------------------------
@@ -302,7 +268,7 @@ class IntakePipeline:
                 item = await self._queue.get()
 
                 # Check for stop sentinel
-                if item.source == "__stop__":
+                if item.stop:
                     break
 
                 try:

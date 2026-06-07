@@ -247,7 +247,9 @@ class TestImageBlockGuards:
 
         (tmp_path / "workspace").mkdir(parents=True)
         img = tmp_path / "workspace" / "x.png"
-        img.write_bytes(b"\x89PNG" + b"\x00" * 100)
+        # Full 8-byte PNG signature — build_image_block now sniffs the
+        # actual bytes (not the .png extension), so the magic must be real.
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
         block = sa.build_image_block(img)
         assert block is not None
         assert block["type"] == "image"

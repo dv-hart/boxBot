@@ -462,43 +462,43 @@ async def _init_voice(hal_modules: dict[str, Any], config: Any) -> Any | None:
 
 
 async def _init_communication() -> Any | None:
-    """Initialise the communication layer (WhatsApp + message router).
+    """Initialise the communication layer (auth + per-channel clients +
+    message router).
 
-    Returns the MessageRouter if WhatsApp credentials are configured,
-    otherwise None.
+    Returns the MessageRouter if at least one outbound channel was
+    configured; otherwise None. WhatsApp and Signal are independent —
+    either, neither, or both can be enabled.
     """
-    from boxbot.communication.auth import AuthManager
+    from boxbot.communication.auth import AuthManager, set_auth_manager
     from boxbot.communication.router import MessageRouter
-    from boxbot.communication.whatsapp import WhatsAppClient
     from boxbot.core.config import get_config
 
     config = get_config()
 
-    # WhatsApp requires an access token and phone number ID
-    if not config.api_keys.whatsapp_access_token or not config.api_keys.whatsapp_phone_number_id:
+    auth = AuthManager()
+    await auth.init_db()
+    set_auth_manager(auth)
+
+    whatsapp_ok = await _init_whatsapp_client(config)
+    signal_ok = await _init_signal_client(config)
+
+    if not (whatsapp_ok or signal_ok):
         logger.warning(
-            "WhatsApp credentials not configured. "
+            "No remote channel configured (WhatsApp or Signal). "
             "Communication layer will be limited to voice."
         )
         return None
 
-    whatsapp = WhatsAppClient(
-        access_token=config.api_keys.whatsapp_access_token,
-        phone_number_id=config.api_keys.whatsapp_phone_number_id,
+    # The router's legacy ``whatsapp=`` parameter is only used by the
+    # dead ``route_outgoing`` / ``send_to_admins`` paths. Modern
+    # outbound goes through the OutboundChannel registry. Pass the
+    # WhatsApp client when present for legacy callers, None otherwise.
+    from boxbot.communication.whatsapp import get_whatsapp_client
+    router = MessageRouter(auth=auth, whatsapp=get_whatsapp_client())
+    logger.info(
+        "Communication layer initialised (whatsapp=%s, signal=%s)",
+        whatsapp_ok, signal_ok,
     )
-
-    auth = AuthManager()
-    await auth.init_db()
-
-    # Register singletons so the agent's output dispatcher can reach them
-    # without being passed a direct reference.
-    from boxbot.communication.auth import set_auth_manager
-    from boxbot.communication.whatsapp import set_whatsapp_client
-    set_whatsapp_client(whatsapp)
-    set_auth_manager(auth)
-
-    router = MessageRouter(auth=auth, whatsapp=whatsapp)
-    logger.info("Communication layer initialised (WhatsApp + router)")
 
     # First-run setup: if no admins are registered yet AND we haven't
     # already seeded setup todos, drop a small ordered backlog. The
@@ -508,6 +508,64 @@ async def _init_communication() -> Any | None:
     await _maybe_seed_setup_todos(auth)
 
     return router
+
+
+async def _init_whatsapp_client(config: Any) -> bool:
+    """Register the WhatsApp outbound client if enabled + credentials present."""
+    from boxbot.communication.whatsapp import WhatsAppClient, set_whatsapp_client
+
+    if not config.whatsapp.enabled:
+        logger.info("WhatsApp channel disabled in config")
+        return False
+    if not (
+        config.api_keys.whatsapp_access_token
+        and config.api_keys.whatsapp_phone_number_id
+    ):
+        logger.warning(
+            "WhatsApp enabled but credentials missing; skipping WhatsApp client"
+        )
+        return False
+
+    whatsapp = WhatsAppClient(
+        access_token=config.api_keys.whatsapp_access_token,
+        phone_number_id=config.api_keys.whatsapp_phone_number_id,
+    )
+    set_whatsapp_client(whatsapp)
+    return True
+
+
+async def _init_signal_client(config: Any) -> bool:
+    """Register the Signal outbound client if enabled and reachable.
+
+    Connects to the signal-cli daemon socket. If the daemon isn't running
+    we log and return False — the agent stays up; Signal users get the
+    "no outbound client registered" path in the dispatcher.
+    """
+    from boxbot.communication.signal_client import (
+        SignalClient, set_signal_client,
+    )
+
+    if not config.signal.enabled:
+        logger.info("Signal channel disabled in config")
+        return False
+    if not config.api_keys.signal_account:
+        logger.warning(
+            "Signal enabled but SIGNAL_ACCOUNT env var not set; skipping"
+        )
+        return False
+
+    client = SignalClient(
+        socket_path=config.signal.socket_path,
+        account=config.api_keys.signal_account,
+        attachments_dir=config.signal.attachments_dir,
+    )
+    try:
+        await client.connect()
+    except ConnectionError as e:
+        logger.warning("Signal daemon unreachable: %s; skipping Signal client", e)
+        return False
+    set_signal_client(client)
+    return True
 
 
 async def _maybe_seed_setup_todos(auth: Any) -> None:
@@ -588,7 +646,7 @@ async def _maybe_seed_setup_todos(auth: Any) -> None:
 
 
 async def _init_whatsapp_inbound(router: Any) -> Any | None:
-    """Start the SQS-backed WhatsApp webhook poller, if configured.
+    """Start the SQS-backed WhatsApp webhook poller, if enabled + configured.
 
     Returns the poller if started, otherwise None. Required env:
     BOXBOT_SQS_QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
@@ -597,6 +655,8 @@ async def _init_whatsapp_inbound(router: Any) -> Any | None:
     from boxbot.core.config import get_config
 
     config = get_config()
+    if not config.whatsapp.enabled:
+        return None
     queue_url = config.api_keys.whatsapp_sqs_queue_url
     key = config.api_keys.aws_access_key_id
     secret = config.api_keys.aws_secret_access_key
@@ -616,6 +676,33 @@ async def _init_whatsapp_inbound(router: Any) -> Any | None:
     )
     await poller.start()
     return poller
+
+
+async def _init_signal_inbound(router: Any) -> Any | None:
+    """Subscribe to the signal-cli daemon's notification stream, if enabled.
+
+    Returns the SignalInbound instance if started, otherwise None.
+    Depends on _init_communication having already connected the
+    SignalClient singleton — this just attaches the subscriber.
+    """
+    from boxbot.communication.signal_client import get_signal_client
+    from boxbot.communication.signal_inbound import SignalInbound
+    from boxbot.core.config import get_config
+
+    if not get_config().signal.enabled:
+        return None
+    client = get_signal_client()
+    if client is None:
+        logger.info("Signal inbound: client not registered; skipping")
+        return None
+
+    inbound = SignalInbound(router=router, client=client)
+    try:
+        await inbound.start()
+    except Exception:
+        logger.exception("Signal inbound failed to start; daemon may be down")
+        return None
+    return inbound
 
 
 async def _init_agent(
@@ -661,6 +748,7 @@ async def _shutdown(
         "agent",
         "voice",
         "whatsapp_inbound",
+        "signal_inbound",
         "communication",
         "photo_intake",
         "perception",
@@ -686,6 +774,18 @@ async def _shutdown(
                 await instance.stop()
             elif name == "whatsapp_inbound":
                 await instance.stop()
+            elif name == "signal_inbound":
+                await instance.stop()
+                # Inbound holds a reference to the SignalClient; close
+                # the daemon socket here so the agent shutdown chain
+                # doesn't leak a connection.
+                from boxbot.communication.signal_client import (
+                    get_signal_client, set_signal_client,
+                )
+                sig_client = get_signal_client()
+                if sig_client is not None:
+                    await sig_client.disconnect()
+                    set_signal_client(None)
             elif name == "communication":
                 # MessageRouter does not have a stop method currently
                 pass
@@ -847,13 +947,16 @@ async def _async_main() -> None:
         if voice_session is not None:
             subsystems["voice"] = voice_session
 
-        # Communication — WhatsApp client and message routing
+        # Communication — auth + per-channel clients + message routing
         comm_router = await _init_communication()
         if comm_router is not None:
             subsystems["communication"] = comm_router
             inbound = await _init_whatsapp_inbound(comm_router)
             if inbound is not None:
                 subsystems["whatsapp_inbound"] = inbound
+            signal_inbound = await _init_signal_inbound(comm_router)
+            if signal_inbound is not None:
+                subsystems["signal_inbound"] = signal_inbound
 
         # Agent — the brain, subscribes to events from all other subsystems
         agent = await _init_agent(memory_store, conversation_store)

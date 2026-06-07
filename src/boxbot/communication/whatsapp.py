@@ -47,9 +47,16 @@ def get_whatsapp_client() -> "WhatsAppClient | None":
 
 
 def set_whatsapp_client(client: "WhatsAppClient | None") -> None:
-    """Register the process-wide WhatsAppClient instance."""
+    """Register the process-wide WhatsAppClient instance.
+
+    Also (un)registers the client in the channel-agnostic OutboundChannel
+    registry so the dispatcher can resolve it via ``Channel.WHATSAPP``.
+    """
     global _whatsapp_client
     _whatsapp_client = client
+    # Import locally to avoid a circular import at module load time.
+    from boxbot.communication.channels import Channel, register_outbound_channel
+    register_outbound_channel(Channel.WHATSAPP, client)
 
 
 @dataclass(frozen=True)
@@ -76,6 +83,9 @@ class WhatsAppClient:
         phone_number_id: The WhatsApp Business phone number ID.
         timeout: HTTP request timeout in seconds.
     """
+
+    # Channel identifier — satisfies the OutboundChannel Protocol.
+    name: str = "whatsapp"
 
     def __init__(
         self,
@@ -259,6 +269,19 @@ class WhatsAppClient:
         except (httpx.HTTPError, OSError) as e:
             logger.error("Error uploading/sending image to %s: %s", phone, e)
             return False
+
+    async def send_attachment(
+        self,
+        phone: str,
+        file_path: str,
+        caption: str | None = None,
+    ) -> bool:
+        """Channel-agnostic attachment send. Satisfies ``OutboundChannel``.
+
+        WhatsApp only supports image attachments through this path today;
+        delegates to :meth:`upload_and_send_image`.
+        """
+        return await self.upload_and_send_image(phone, file_path, caption=caption)
 
     async def download_media(
         self,

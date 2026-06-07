@@ -118,6 +118,7 @@ def _overlay_env(data: dict[str, Any]) -> None:
         "AWS_S3_BUCKET": "aws_s3_bucket",
         "AWS_REGION": "aws_region",
         "BOXBOT_SQS_QUEUE_URL": "whatsapp_sqs_queue_url",
+        "SIGNAL_ACCOUNT": "signal_account",
     }
     for env_var, key_name in env_key_map.items():
         if val := os.environ.get(env_var):
@@ -418,7 +419,16 @@ class WhatsAppConfig(BaseModel):
     Async-by-default text needs a different shape than voice. Voice
     silence-times out in seconds; WhatsApp threads stay alive for
     hours (default 4) and only close once the user has truly stopped.
+
+    These settings apply to both WhatsApp and Signal in practice — both
+    are async-text channels with the same human-pacing semantics — but
+    the keys live here for back-compat with existing config files.
     """
+
+    # ``enabled`` gates the inbound poller and outbound client. WhatsApp
+    # is enabled by default for back-compat. Phase 5 of the Signal
+    # migration flips this to false in config.example.yaml.
+    enabled: bool = True
 
     # Rolling window of inactivity before a WhatsApp thread is
     # considered closed. Reset on every inbound or outbound message —
@@ -432,6 +442,28 @@ class WhatsAppConfig(BaseModel):
     # threads to extract. 5 minutes is well under the window so
     # extraction fires within a few minutes of the cutoff being met.
     extraction_sweep_seconds: int = 300
+
+
+class SignalConfig(BaseModel):
+    """Signal channel — runs against the signal-cli daemon over a
+    unix-socket JSON-RPC interface.
+
+    The phone number (``account``) comes from the SIGNAL_ACCOUNT env
+    var, not config.yaml — it's per-Pi and shouldn't be committed.
+    """
+
+    # Off by default until Phase 5 of the migration flips the default
+    # on. Operators with the daemon running can override locally.
+    enabled: bool = False
+
+    # signal-cli daemon JSON-RPC unix socket. Matches the
+    # ``--socket`` flag in scripts/systemd/signal-cli.service.
+    socket_path: str = "/run/signal-cli/socket"
+
+    # Local cache where the daemon stores downloaded inbound attachments.
+    # Default matches signal-cli's standard data dir; override to point
+    # at a different daemon's storage.
+    attachments_dir: str = "/home/jhart/.local/share/signal-cli/attachments"
 
 
 class PerceptionConfig(BaseModel):
@@ -655,6 +687,10 @@ class ApiKeysConfig(BaseModel):
     aws_s3_bucket: str | None = None
     aws_region: str = "us-west-2"
     whatsapp_sqs_queue_url: str | None = None
+    # Signal channel — the registered phone number signal-cli daemon
+    # answers on. Sourced from SIGNAL_ACCOUNT env (set in .env, mirrored
+    # in /etc/default/boxbot-signal for the daemon's own use).
+    signal_account: str | None = None
 
     def __repr__(self) -> str:
         """Redact secrets in repr output."""
@@ -738,6 +774,7 @@ class BoxBotConfig(BaseModel):
     camera: CameraConfig = Field(default_factory=CameraConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
+    signal: SignalConfig = Field(default_factory=SignalConfig)
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     photos: PhotosConfig = Field(default_factory=PhotosConfig)

@@ -88,6 +88,7 @@ from boxbot.core.events import (
     ConversationEnded,
     ConversationInterruptRequested,
     PersonIdentified,
+    SignalMessage,
     SpeakerIdentified,
     TranscriptReady,
     TriggerFired,
@@ -198,6 +199,66 @@ async def _stage_whatsapp_image(media_id: str, message_id: str) -> Path | None:
         return None
 
     logger.info("Staged WhatsApp image %s → %s (%d bytes)", media_id, dest, len(data))
+    return dest
+
+
+async def _stage_signal_image(
+    attachment_id: str, message_id: str
+) -> Path | None:
+    """Read an inbound Signal image from the signal-cli cache and stage it.
+
+    signal-cli auto-downloads attachments to its local data dir; we just
+    copy into the sandbox-readable inbound staging path so the agent's
+    multimodal attach pipeline can use it. Lands at
+    ``{sandbox.tmp_dir}/inbound/signal/{message_id}.{ext}``.
+
+    Returns the staged path on success, or None if the client is not
+    configured, the file isn't on disk, or the mime type isn't accepted.
+    """
+    from boxbot.communication.signal_client import get_signal_client
+
+    client = get_signal_client()
+    if client is None:
+        logger.warning("Signal image %s: client not configured", attachment_id)
+        return None
+
+    result = await client.download_media(attachment_id)
+    if result is None:
+        return None
+    data, mime_type = result
+
+    ext = _WHATSAPP_IMAGE_EXTS.get(mime_type.lower())
+    if ext is None:
+        logger.warning(
+            "Signal image %s: unsupported mime %s", attachment_id, mime_type
+        )
+        return None
+
+    try:
+        from boxbot.core.config import get_config
+
+        tmp_dir = Path(get_config().sandbox.tmp_dir)
+    except Exception:
+        tmp_dir = Path("/var/lib/boxbot-sandbox/tmp")
+
+    inbound_dir = tmp_dir / "inbound" / "signal"
+    try:
+        inbound_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("Signal inbound dir create failed: %s", e)
+        return None
+
+    safe_id = message_id.replace("/", "_").replace("\\", "_") or uuid.uuid4().hex
+    dest = inbound_dir / f"{safe_id}.{ext}"
+    try:
+        dest.write_bytes(data)
+    except OSError as e:
+        logger.warning("Signal image write failed for %s: %s", dest, e)
+        return None
+
+    logger.info(
+        "Staged Signal image %s → %s (%d bytes)", attachment_id, dest, len(data)
+    )
     return dest
 
 
@@ -999,6 +1060,7 @@ class BoxBotAgent:
         # raced with the first real utterance.
         bus = get_event_bus()
         bus.subscribe(WhatsAppMessage, self._on_whatsapp_message)
+        bus.subscribe(SignalMessage, self._on_signal_message)
         bus.subscribe(TriggerFired, self._on_trigger_fired)
         bus.subscribe(PersonIdentified, self._on_person_identified)
         bus.subscribe(SpeakerIdentified, self._on_speaker_identified)
@@ -1020,9 +1082,9 @@ class BoxBotAgent:
         # rehydrate via _get_or_create_conversation.
         if self._conversation_store is not None:
             try:
-                await self._warm_load_whatsapp_conversations()
+                await self._warm_load_persistent_conversations()
             except Exception:
-                logger.exception("WhatsApp warm-load failed")
+                logger.exception("Persistent-conversation warm-load failed")
 
             # Start the extraction sweep. It runs for the agent's
             # lifetime and fires extraction on threads whose window
@@ -1045,6 +1107,7 @@ class BoxBotAgent:
         # Unsubscribe from events
         bus = get_event_bus()
         bus.unsubscribe(WhatsAppMessage, self._on_whatsapp_message)
+        bus.unsubscribe(SignalMessage, self._on_signal_message)
         bus.unsubscribe(TriggerFired, self._on_trigger_fired)
         bus.unsubscribe(PersonIdentified, self._on_person_identified)
         bus.unsubscribe(SpeakerIdentified, self._on_speaker_identified)
@@ -1089,8 +1152,9 @@ class BoxBotAgent:
         self._client = None
         logger.info("BoxBotAgent stopped")
 
-    async def _warm_load_whatsapp_conversations(self) -> None:
-        """Rehydrate persistent WhatsApp threads still inside their window.
+    async def _warm_load_persistent_conversations(self) -> None:
+        """Rehydrate persistent text threads (WhatsApp + Signal) still
+        inside their window.
 
         Restores each as a live Conversation in LISTENING state — no
         ConversationStarted event is fired (the conversation already
@@ -1102,9 +1166,9 @@ class BoxBotAgent:
             return
         config = get_config()
         window = float(config.whatsapp.thread_window_seconds)
-        records = await store.list_active(
-            channel="whatsapp", max_inactive_seconds=window,
-        )
+        # No channel filter: pick up any persistent-mode row regardless
+        # of whether the user was on WhatsApp or Signal at the time.
+        records = await store.list_active(max_inactive_seconds=window)
         if not records:
             return
         for rec in records:
@@ -1126,9 +1190,9 @@ class BoxBotAgent:
                 )
                 self._attach_sandbox_runner(conv)
                 logger.info(
-                    "Warm-loaded WhatsApp conversation %s "
+                    "Warm-loaded %s conversation %s "
                     "(key=%s, turns=%d, last_activity=%s)",
-                    rec.conversation_id, rec.channel_key,
+                    rec.channel, rec.conversation_id, rec.channel_key,
                     len(thread), rec.last_activity_at_iso,
                 )
             except Exception:
@@ -1167,10 +1231,13 @@ class BoxBotAgent:
     async def _run_extraction_sweep(
         self, store: "ConversationStore", window: float,
     ) -> None:
-        """One pass of the sweep — separated for testability."""
-        expired = await store.list_extractable(
-            max_inactive_seconds=window, channel="whatsapp",
-        )
+        """One pass of the sweep — separated for testability.
+
+        Scans every persistent-text channel (WhatsApp + Signal). Voice
+        and trigger conversations are transient; they extract
+        synchronously on ConversationEnded and never appear here.
+        """
+        expired = await store.list_extractable(max_inactive_seconds=window)
         for rec in expired:
             flipped = await store.mark_extracted(rec.conversation_id)
             if not flipped:
@@ -1293,6 +1360,62 @@ class BoxBotAgent:
             thread_window = None
         conv = await self._get_or_create_conversation(
             channel="whatsapp",
+            channel_key=channel_key,
+            participants={event.sender_name} if event.sender_name else None,
+            lifecycle_mode=lifecycle_mode,
+            thread_window_seconds=thread_window,
+        )
+        await conv.handle_input(
+            text,
+            speaker_name=event.sender_name or None,
+            source="user",
+            context={
+                "sender_phone": event.sender_phone,
+                "media_url": event.media_url,
+                "media_type": event.media_type,
+                "attachment_path": str(attachment_path) if attachment_path else None,
+            },
+        )
+
+    async def _on_signal_message(self, event: SignalMessage) -> None:
+        """Route an inbound Signal message to its per-sender conversation.
+
+        Mirrors :meth:`_on_whatsapp_message` — same persistent thread
+        model, same window, just keyed on ``signal:`` and using the
+        signal-cli attachment cache for inbound images.
+        """
+        logger.info(
+            "Signal message from %s", event.sender_name or event.sender_phone,
+        )
+        text = event.text or ""
+
+        attachment_path: Path | None = None
+        if event.media_type == "image" and event.media_url:
+            attachment_path = await _stage_signal_image(
+                attachment_id=event.media_url,
+                message_id=event.message_id,
+            )
+
+        if attachment_path is not None:
+            text = f"[image attached at {attachment_path}] {text}".strip()
+        elif event.media_type == "image":
+            text = f"[image attached, download failed] {text}".strip()
+        elif event.media_type:
+            text = f"[{event.media_type} attached] {text}".strip()
+
+        channel_key = f"signal:{event.sender_phone or 'unknown'}"
+        if self._conversation_store is not None:
+            lifecycle_mode = "persistent"
+            # Signal text shares the same human-pacing window as
+            # WhatsApp — both are async-by-default text channels.
+            thread_window: float | None = float(
+                get_config().whatsapp.thread_window_seconds
+            )
+        else:
+            lifecycle_mode = "transient"
+            thread_window = None
+        conv = await self._get_or_create_conversation(
+            channel="signal",
             channel_key=channel_key,
             participants={event.sender_name} if event.sender_name else None,
             lifecycle_mode=lifecycle_mode,

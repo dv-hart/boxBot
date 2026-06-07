@@ -72,6 +72,7 @@ class User:
     role: str  # "admin" or "user"
     registered_at: str
     last_seen: str | None = None
+    channel: str = "whatsapp"  # outbound transport — "whatsapp" | "signal"
 
 
 @dataclass(frozen=True)
@@ -118,18 +119,23 @@ class AuthManager:
         self._temp_block_duration = temp_block_duration
         self._max_temp_blocks = max_temp_blocks
 
+    # Bump when a new additive migration is added in _migrate_schema.
+    SCHEMA_VERSION = 1
+
     async def init_db(self) -> None:
-        """Create database tables if they don't exist."""
+        """Create database tables if they don't exist; migrate older schemas."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
 
         async with aiosqlite.connect(self._db_path) as db:
+            # Fresh-install schema — already at SCHEMA_VERSION.
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     phone TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     role TEXT NOT NULL DEFAULT 'user',
                     registered_at TEXT NOT NULL,
-                    last_seen TEXT
+                    last_seen TEXT,
+                    channel TEXT NOT NULL DEFAULT 'whatsapp'
                 )
             """)
             await db.execute("""
@@ -157,8 +163,32 @@ class AuthManager:
                     expires_at TEXT
                 )
             """)
+
+            await self._migrate_schema(db)
             await db.commit()
             logger.info("Auth database initialized at %s", self._db_path)
+
+    async def _migrate_schema(self, db: aiosqlite.Connection) -> None:
+        """Bring an older auth DB up to ``SCHEMA_VERSION``.
+
+        Additive only — no destructive operations. Idempotent: running
+        twice is a no-op. Caller commits.
+        """
+        cursor = await db.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        version = row[0] if row else 0
+
+        if version < 1:
+            # v0 → v1: add users.channel (defaults 'whatsapp' for legacy rows).
+            cursor = await db.execute("PRAGMA table_info(users)")
+            cols = {r[1] for r in await cursor.fetchall()}
+            if "channel" not in cols:
+                await db.execute(
+                    "ALTER TABLE users "
+                    "ADD COLUMN channel TEXT NOT NULL DEFAULT 'whatsapp'"
+                )
+                logger.info("Auth DB migrated v0 → v1: added users.channel")
+            await db.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
 
     def _get_db(self) -> aiosqlite.Connection:
         """Open a database connection.
@@ -187,7 +217,7 @@ class AuthManager:
         async with self._get_db() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT phone, name, role, registered_at, last_seen "
+                "SELECT phone, name, role, registered_at, last_seen, channel "
                 "FROM users WHERE phone = ?",
                 (phone,),
             )
@@ -200,6 +230,7 @@ class AuthManager:
                 role=row["role"],
                 registered_at=row["registered_at"],
                 last_seen=row["last_seen"],
+                channel=row["channel"],
             )
 
     async def list_users(self) -> list[User]:
@@ -207,7 +238,7 @@ class AuthManager:
         async with self._get_db() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT phone, name, role, registered_at, last_seen "
+                "SELECT phone, name, role, registered_at, last_seen, channel "
                 "FROM users ORDER BY registered_at"
             )
             rows = await cursor.fetchall()
@@ -218,6 +249,7 @@ class AuthManager:
                     role=row["role"],
                     registered_at=row["registered_at"],
                     last_seen=row["last_seen"],
+                    channel=row["channel"],
                 )
                 for row in rows
             ]
@@ -247,6 +279,20 @@ class AuthManager:
         async with self._get_db() as db:
             cursor = await db.execute(
                 "UPDATE users SET role = ? WHERE phone = ?", (role, phone)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def update_channel(self, phone: str, channel: str) -> bool:
+        """Update a user's outbound channel. Returns True if updated.
+
+        Used by the Signal migration to flip individual users from
+        ``'whatsapp'`` to ``'signal'`` after they confirm reception on
+        the new transport.
+        """
+        async with self._get_db() as db:
+            cursor = await db.execute(
+                "UPDATE users SET channel = ? WHERE phone = ?", (channel, phone)
             )
             await db.commit()
             return cursor.rowcount > 0
@@ -388,6 +434,8 @@ class AuthManager:
         phone: str,
         name: str,
         code: str,
+        *,
+        channel: str = "whatsapp",
     ) -> RegisterResult:
         """Register a new user with a valid registration code.
 
@@ -395,6 +443,10 @@ class AuthManager:
             phone: Phone number in E.164 format.
             name: Display name.
             code: The registration code to consume.
+            channel: The transport this user reached us on. Stored on the
+                row so the dispatcher knows where to send outbound
+                messages. Defaults to ``"whatsapp"``; the Signal router
+                passes ``"signal"`` in Phase 3+.
 
         Returns:
             RegisterResult with success status.
@@ -430,15 +482,17 @@ class AuthManager:
 
             # Create user
             await db.execute(
-                "INSERT INTO users (phone, name, role, registered_at) "
-                "VALUES (?, ?, ?, ?)",
-                (phone, name, role, now),
+                "INSERT INTO users (phone, name, role, registered_at, channel) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (phone, name, role, now, channel),
             )
             await db.commit()
 
-        user = User(phone=phone, name=name, role=role, registered_at=now)
+        user = User(
+            phone=phone, name=name, role=role, registered_at=now, channel=channel
+        )
         logger.info(
-            "User registered: %s (%s) as %s", name, phone, role
+            "User registered: %s (%s) as %s on %s", name, phone, role, channel
         )
         return RegisterResult(success=True, user=user)
 

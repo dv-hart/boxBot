@@ -133,11 +133,18 @@ git push origin main
 #     heavy to run every deploy; we do just the SDK install here.
 PI_HEAD="$(ssh "$TARGET" "cd $PI_PROJECT_DIR && git rev-parse HEAD" 2>/dev/null || echo unknown)"
 SETUP_CHANGED=0
+SIGNAL_SETUP_CHANGED=0
 SDK_CHANGED=0
 if [[ "$PI_HEAD" != "unknown" && "$PI_HEAD" != "$LOCAL_HEAD" ]]; then
     CHANGED_FILES="$(git diff --name-only "$PI_HEAD" "$LOCAL_HEAD" 2>/dev/null || true)"
     if echo "$CHANGED_FILES" | grep -q '^scripts/setup-sandbox\.sh$'; then
         SETUP_CHANGED=1
+    fi
+    # signal-cli unit / installer changes need sudo to apply, so we just
+    # warn the operator the same way setup-sandbox.sh does.
+    if echo "$CHANGED_FILES" \
+           | grep -qE '^scripts/setup-signal\.sh$|^scripts/systemd/signal-cli\.service$'; then
+        SIGNAL_SETUP_CHANGED=1
     fi
     # README.md is doc-only and never affects imports. Everything else
     # under src/boxbot/sdk/ — .py files AND pyproject.toml (version
@@ -172,6 +179,14 @@ if [[ "$SETUP_CHANGED" -eq 1 ]]; then
     echo "WARNING: scripts/setup-sandbox.sh changed in this deploy."
     echo "After restart, run on the Pi:"
     echo "    ssh $TARGET 'cd $PI_PROJECT_DIR && sudo bash scripts/setup-sandbox.sh'"
+    echo ""
+fi
+
+if [[ "$SIGNAL_SETUP_CHANGED" -eq 1 ]]; then
+    echo ""
+    echo "WARNING: signal-cli systemd unit or installer changed in this deploy."
+    echo "After restart, run on the Pi:"
+    echo "    ssh $TARGET 'cd $PI_PROJECT_DIR && bash scripts/setup-signal.sh'"
     echo ""
 fi
 

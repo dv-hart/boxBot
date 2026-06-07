@@ -721,7 +721,7 @@ async def _handle_auth_action(
     script can't mint codes "from" any admin.
     """
     from boxbot.communication.auth import get_auth_manager
-    from boxbot.communication.whatsapp import get_whatsapp_client
+    from boxbot.communication.channels import Channel, get_outbound_channel
     from boxbot.tools._tool_context import get_current_conversation
 
     auth = get_auth_manager()
@@ -780,13 +780,21 @@ async def _handle_auth_action(
             text = str(payload.get("text") or "")
             if not text.strip():
                 return {"status": "error", "error": "text is required"}
-            wa = get_whatsapp_client()
-            if wa is None:
-                return {"status": "error", "error": "WhatsApp client not configured"}
             admins = [u for u in await auth.list_users() if u.role == "admin"]
             sent = 0
             for admin in admins:
-                if await wa.send_text(admin.phone, text):
+                try:
+                    admin_channel = Channel(admin.channel)
+                except ValueError:
+                    logger.warning(
+                        "Admin %s has unknown channel '%s'; skipping notify",
+                        admin.phone, admin.channel,
+                    )
+                    continue
+                out = get_outbound_channel(admin_channel)
+                if out is None:
+                    continue
+                if await out.send_text(admin.phone, text):
                     sent += 1
             return {"status": "ok", "delivered": sent, "admins": len(admins)}
 

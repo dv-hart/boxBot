@@ -1,0 +1,40 @@
+[Unit]
+Description=signal-cli daemon — Signal Messenger JSON-RPC for boxBot
+Documentation=https://github.com/AsamK/signal-cli
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jhart
+Group=jhart
+
+# SIGNAL_ACCOUNT comes from /etc/default/boxbot-signal, written by
+# scripts/setup-signal.sh. The leading dash makes the file optional —
+# if missing, ExecStart will fail with an empty -a argument and the
+# operator can re-run setup-signal.sh to fix it.
+EnvironmentFile=-/etc/default/boxbot-signal
+
+# Socket lives under /run/signal-cli/ — systemd manages this directory
+# (created on start at User:Group with mode 0750; removed on stop).
+RuntimeDirectory=signal-cli
+RuntimeDirectoryMode=0750
+
+# --receive-mode on-start: daemon receives from Signal continuously,
+# regardless of whether the agent is connected to the JSON-RPC socket.
+# Keeps Signal protocol acks flowing even across agent restarts.
+ExecStart=/usr/local/bin/signal-cli -a ${SIGNAL_ACCOUNT} daemon \
+    --socket /run/signal-cli/socket \
+    --receive-mode on-start \
+    --no-receive-stdout
+
+Restart=on-failure
+RestartSec=5s
+
+# JVM steady-state is ~150-300 MB resident. Leave headroom; the agent's
+# boxbot.service already caps at 7G separately.
+MemoryHigh=600M
+MemoryMax=900M
+
+[Install]
+WantedBy=multi-user.target

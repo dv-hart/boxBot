@@ -278,9 +278,10 @@ async def test_deferred_turns_fold_in_preserve_order():
 
 
 class _FakeUser:
-    def __init__(self, name: str, phone: str) -> None:
+    def __init__(self, name: str, phone: str, channel: str = "whatsapp") -> None:
         self.name = name
         self.phone = phone
+        self.channel = channel
 
 
 @pytest.mark.asyncio

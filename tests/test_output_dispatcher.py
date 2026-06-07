@@ -112,10 +112,17 @@ class _FakeVoiceSession:
 
 
 class _FakeUser:
-    def __init__(self, name: str, phone: str, role: str = "user"):
+    def __init__(
+        self,
+        name: str,
+        phone: str,
+        role: str = "user",
+        channel: str = "whatsapp",
+    ):
         self.name = name
         self.phone = phone
         self.role = role
+        self.channel = channel
 
 
 class _FakeAuth:
@@ -127,6 +134,8 @@ class _FakeAuth:
 
 
 class _FakeWhatsApp:
+    name = "whatsapp"
+
     def __init__(self):
         self.sent = []
 
@@ -155,11 +164,16 @@ def fake_auth(monkeypatch):
 
 
 @pytest.fixture
-def fake_whatsapp(monkeypatch):
+def fake_whatsapp():
     wa = _FakeWhatsApp()
+    # Channel-agnostic dispatcher reaches the client through the registry,
+    # so register via the canonical setter (it also handles teardown).
     import boxbot.communication.whatsapp as wa_mod
-    monkeypatch.setattr(wa_mod, "_whatsapp_client", wa, raising=False)
-    return wa
+    wa_mod.set_whatsapp_client(wa)
+    try:
+        yield wa
+    finally:
+        wa_mod.set_whatsapp_client(None)
 
 
 class TestDispatchOutputs:

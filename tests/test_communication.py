@@ -421,6 +421,77 @@ class TestMessageRouter:
         assert result is False
 
     @pytest.mark.asyncio
+    async def test_signal_authorized_user_routed(self, auth_manager, event_bus):
+        """A user registered on WhatsApp can still send via Signal during the
+        migration window — auth lookup is channel-agnostic."""
+        code = await auth_manager.generate_bootstrap_code()
+        await auth_manager.register_user("+15551234567", "Jacob", code)
+
+        received = []
+
+        async def on_msg(event):
+            received.append(event)
+
+        from boxbot.core.events import SignalMessage
+        event_bus.subscribe(SignalMessage, on_msg)
+
+        router = MessageRouter(auth=auth_manager)
+        result = await router.route_incoming(
+            Channel.SIGNAL, "+15551234567", "Hello via Signal",
+        )
+        assert result is True
+        assert len(received) == 1
+        assert received[0].sender_name == "Jacob"
+        assert received[0].text == "Hello via Signal"
+
+    @pytest.mark.asyncio
+    async def test_signal_unknown_number_silently_dropped(
+        self, auth_manager, event_bus
+    ):
+        received = []
+
+        async def on_msg(event):
+            received.append(event)
+
+        from boxbot.core.events import SignalMessage
+        event_bus.subscribe(SignalMessage, on_msg)
+
+        router = MessageRouter(auth=auth_manager)
+        result = await router.route_incoming(
+            Channel.SIGNAL, "+19999999999", "Hello",
+        )
+        assert result is False
+        assert len(received) == 0
+
+    @pytest.mark.asyncio
+    async def test_signal_valid_code_registers_user_with_signal_channel(
+        self, auth_manager, event_bus
+    ):
+        """A user who registers via Signal lands with channel='signal'."""
+        code = await auth_manager.generate_bootstrap_code()
+
+        from boxbot.core.events import SignalMessage
+        received = []
+        async def on_msg(event):
+            received.append(event)
+        event_bus.subscribe(SignalMessage, on_msg)
+
+        router = MessageRouter(auth=auth_manager)
+        result = await router.route_incoming(
+            Channel.SIGNAL,
+            "+15559999999",
+            code,
+            sender_name="NewUserOnSignal",
+        )
+        assert result is True
+        assert await auth_manager.is_authorized("+15559999999") is True
+        user = await auth_manager.get_user("+15559999999")
+        assert user is not None
+        assert user.channel == "signal"  # ← the key new invariant
+        assert len(received) == 1
+        assert "[REGISTRATION]" in received[0].text
+
+    @pytest.mark.asyncio
     async def test_auth_maintenance_purges_expired(self, auth_manager):
         """run_maintenance cleans up expired codes, old attempts, and expired blocks."""
         # Create an expired code by backdating it

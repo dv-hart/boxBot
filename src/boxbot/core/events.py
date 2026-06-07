@@ -140,6 +140,25 @@ class WhatsAppMessage(Event):
 
 
 @dataclass(frozen=True)
+class SignalMessage(Event):
+    """Incoming Signal message from an authorized user.
+
+    Source: Communication (signal-cli daemon JSON-RPC stream)
+    Consumers: Agent
+
+    ``media_url`` carries the signal-cli attachment id when there's a
+    file attached; the agent fetches via ``SignalClient.download_media``.
+    """
+
+    sender_name: str = ""
+    sender_phone: str = ""
+    text: str = ""
+    media_url: str | None = None
+    media_type: str | None = None  # "image", "audio", "document", "video"
+    message_id: str = ""  # signal-cli envelope timestamp (millis since epoch)
+
+
+@dataclass(frozen=True)
 class UserRegistered(Event):
     """A new user just completed WhatsApp registration.
 

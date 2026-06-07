@@ -21,20 +21,20 @@ Usage:
 from __future__ import annotations
 
 import logging
-from enum import Enum
 
 from boxbot.communication.auth import AuthManager
+from boxbot.communication.channels import Channel
 from boxbot.communication.whatsapp import WhatsAppClient
-from boxbot.core.events import UserRegistered, WhatsAppMessage, get_event_bus
+from boxbot.core.events import (
+    SignalMessage,
+    UserRegistered,
+    WhatsAppMessage,
+    get_event_bus,
+)
 
 logger = logging.getLogger(__name__)
 
-
-class Channel(Enum):
-    """Communication channel types."""
-
-    VOICE = "voice"
-    WHATSAPP = "whatsapp"
+__all__ = ["Channel", "MessageRouter"]
 
 
 class MessageRouter:
@@ -97,6 +97,16 @@ class MessageRouter:
 
         if channel == Channel.WHATSAPP:
             return await self._route_whatsapp(
+                sender_phone,
+                message,
+                media_url=media_url,
+                media_type=media_type,
+                sender_name=sender_name,
+                message_id=message_id,
+            )
+
+        if channel == Channel.SIGNAL:
+            return await self._route_signal(
                 sender_phone,
                 message,
                 media_url=media_url,
@@ -207,6 +217,95 @@ class MessageRouter:
 
         # SILENT DROP — no response, no error, no information leakage
         logger.debug("Unknown number, silent drop: %s", sender_phone)
+        return False
+
+    async def _route_signal(
+        self,
+        sender_phone: str,
+        message: str | None,
+        *,
+        media_url: str | None = None,
+        media_type: str | None = None,
+        sender_name: str | None = None,
+        message_id: str = "",
+    ) -> bool:
+        """Route a Signal message through auth to the agent.
+
+        Mirrors ``_route_whatsapp``: silent drop for unknown senders,
+        registration-code exception, ``UserRegistered`` event on success.
+        Auth lookup ignores channel — a whatsapp-registered user texting
+        from Signal during the migration is still authorised.
+
+        Returns True if routed, False if silently dropped.
+        """
+        if await self._auth.is_blocked(sender_phone):
+            logger.debug("Blocked number, silent drop: %s", sender_phone)
+            return False
+
+        user = await self._auth.get_user(sender_phone)
+        if user is not None:
+            await self._auth.update_last_seen(sender_phone)
+
+            event = SignalMessage(
+                sender_name=user.name,
+                sender_phone=sender_phone,
+                text=message or "",
+                media_url=media_url,
+                media_type=media_type,
+                message_id=message_id,
+            )
+            await self._event_bus.publish(event)
+            logger.info(
+                "Signal message from %s (%s) routed to agent",
+                user.name,
+                sender_phone,
+            )
+            return True
+
+        # Unknown number — check if message is a valid registration code.
+        if message and message.strip():
+            code = message.strip()
+            if await self._auth.validate_code(code):
+                inviter = await self._auth.get_code_creator(code)
+                name = sender_name or "New User"
+                result = await self._auth.register_user(
+                    phone=sender_phone,
+                    name=name,
+                    code=code,
+                    channel="signal",
+                )
+                if result.success and result.user:
+                    invited_by = (
+                        "" if not inviter or inviter == "bootstrap" else inviter
+                    )
+                    await self._event_bus.publish(
+                        UserRegistered(
+                            phone=sender_phone,
+                            name=result.user.name,
+                            role=result.user.role,
+                            invited_by_phone=invited_by,
+                        )
+                    )
+                    event = SignalMessage(
+                        sender_name=result.user.name,
+                        sender_phone=sender_phone,
+                        text=f"[REGISTRATION] {code}",
+                        media_url=None,
+                        media_type=None,
+                    )
+                    await self._event_bus.publish(event)
+                    logger.info(
+                        "New Signal user registered: %s (%s) as %s",
+                        result.user.name,
+                        sender_phone,
+                        result.user.role,
+                    )
+                    return True
+
+            await self._auth.record_failed_attempt(sender_phone)
+
+        # SILENT DROP — no response, no error.
+        logger.debug("Unknown number on Signal, silent drop: %s", sender_phone)
         return False
 
     async def route_outgoing(

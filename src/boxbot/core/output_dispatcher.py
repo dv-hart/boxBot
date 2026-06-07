@@ -39,7 +39,8 @@ fails to resolve.
 
 The dispatcher is stateless; all dependencies come from module
 singletons that ``main.py`` sets up at boot (``get_voice_session``,
-``get_whatsapp_client``, ``get_auth_manager``).
+``get_auth_manager``) plus the outbound-channel registry from
+``boxbot.communication.channels``.
 """
 
 from __future__ import annotations
@@ -354,25 +355,28 @@ async def _dispatch_text(
     conversation_id: str,
     channel_context: str,
 ) -> DispatchResult:
-    """Resolve ``to`` to a registered user's phone and send via WhatsApp."""
+    """Resolve ``to`` to a registered user and send via their outbound channel.
+
+    The user's ``channel`` column picks which outbound client receives
+    the send — WhatsApp for legacy users, Signal once migrated.
+    """
     from boxbot.communication.auth import get_auth_manager
-    from boxbot.communication.whatsapp import get_whatsapp_client
+    from boxbot.communication.channels import Channel, get_outbound_channel
 
     auth = get_auth_manager()
-    wa = get_whatsapp_client()
 
-    if auth is None or wa is None:
+    if auth is None:
         logger.warning(
-            "Text dispatch unavailable (auth=%s wa=%s); dropping output "
+            "Text dispatch unavailable (auth not configured); dropping output "
             "to=%s (conv=%s)",
-            auth is not None, wa is not None, to, conversation_id,
+            to, conversation_id,
         )
         return DispatchResult(
             to=to, channel="text", status="dropped",
-            reason="text delivery is unavailable (WhatsApp not configured)",
+            reason="text delivery is unavailable (auth not configured)",
         )
 
-    # Resolve name → phone. Exact case-insensitive name match on the user list.
+    # Resolve name → user. Exact case-insensitive name match on the user list.
     try:
         users = await auth.list_users()
     except Exception:
@@ -382,16 +386,16 @@ async def _dispatch_text(
             reason="could not look up registered users",
         )
 
-    phone: str | None = None
+    matched = None
     for user in users:
         if user.name.strip().lower() == to.strip().lower():
-            phone = user.phone
+            matched = user
             break
         if user.phone == to:  # allow direct phone if the agent provided one
-            phone = user.phone
+            matched = user
             break
 
-    if phone is None:
+    if matched is None:
         names = [u.name for u in users]
         known = ", ".join(names) or "(no registered users)"
         logger.warning(
@@ -408,19 +412,48 @@ async def _dispatch_text(
             valid_recipients=names,
         )
 
-    logger.info(
-        "output: text → %s (%s) (conv=%s chan=%s): %s",
-        to, phone, conversation_id, channel_context, content[:120],
-    )
+    # Pick the outbound channel from the user record.
     try:
-        await wa.send_text(phone, content)
-    except Exception:
-        logger.exception(
-            "Text dispatch failed (conv=%s to=%s phone=%s)",
-            conversation_id, to, phone,
+        target_channel = Channel(matched.channel)
+    except ValueError:
+        logger.warning(
+            "User %s has unknown channel '%s'; cannot dispatch (conv=%s)",
+            matched.phone, matched.channel, conversation_id,
         )
         return DispatchResult(
             to=to, channel="text", status="dropped",
-            reason="WhatsApp send failed",
+            reason=f"user channel '{matched.channel}' is not recognised",
+        )
+
+    out = get_outbound_channel(target_channel)
+    if out is None:
+        logger.warning(
+            "No outbound client registered for channel %s; dropping text to %s "
+            "(conv=%s)",
+            target_channel.value, matched.phone, conversation_id,
+        )
+        return DispatchResult(
+            to=to, channel="text", status="dropped",
+            reason=(
+                f"no outbound client registered for channel "
+                f"'{target_channel.value}'"
+            ),
+        )
+
+    logger.info(
+        "output: text → %s (%s via %s) (conv=%s chan=%s): %s",
+        to, matched.phone, out.name, conversation_id, channel_context,
+        content[:120],
+    )
+    try:
+        await out.send_text(matched.phone, content)
+    except Exception:
+        logger.exception(
+            "Text dispatch failed (conv=%s to=%s phone=%s)",
+            conversation_id, to, matched.phone,
+        )
+        return DispatchResult(
+            to=to, channel="text", status="dropped",
+            reason=f"{out.name} send failed",
         )
     return DispatchResult(to=to, channel="text", status="delivered")

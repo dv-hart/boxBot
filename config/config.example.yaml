@@ -300,6 +300,11 @@ sdk:
 # (see config/whatsapp.example.yaml). The lifecycle settings below
 # apply to the boxbot-side conversation handling, not the API client.
 whatsapp:
+  # Flip false to disable WhatsApp entirely (outbound client + SQS
+  # poller both skip startup). Phase 5 of the Signal migration flips
+  # this default off; for now WhatsApp stays on for back-compat.
+  enabled: true
+
   # Rolling window of inactivity before a WhatsApp thread is
   # considered closed. Reset on every inbound or outbound message,
   # so an actively-engaged exchange stays alive as long as messages
@@ -314,6 +319,26 @@ whatsapp:
   # window; tune lower if you want extraction to land sooner after
   # the cutoff.
   extraction_sweep_seconds: 300  # 5 minutes
+
+# ── Signal ────────────────────────────────────────────────────────────
+# Signal runs as a parallel/replacement channel for WhatsApp. The
+# account number (a Google Voice number works) comes from the
+# SIGNAL_ACCOUNT env var in .env. The signal-cli daemon is a separate
+# systemd service — see scripts/setup-signal.sh and
+# scripts/systemd/signal-cli.service.
+signal:
+  # Off by default. Enable once setup-signal.sh has been run on the
+  # Pi and the daemon socket is reachable.
+  enabled: false
+
+  # signal-cli daemon JSON-RPC unix socket. Matches --socket in the
+  # systemd unit file. Override if the daemon runs elsewhere.
+  socket_path: "/run/signal-cli/socket"
+
+  # Where signal-cli writes downloaded inbound attachments. Default
+  # matches signal-cli's standard data dir under the daemon user's
+  # home; override if you moved the daemon's account-data directory.
+  attachments_dir: "/home/jhart/.local/share/signal-cli/attachments"
 
 # ── Logging ───────────────────────────────────────────────────────────
 logging:

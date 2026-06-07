@@ -114,12 +114,17 @@ class SignalInbound:
             # Receipt / typing / sync — not a user-authored message.
             return
 
-        sender_phone = envelope.get("sourceNumber") or envelope.get("source") or ""
-        if not sender_phone or not sender_phone.startswith("+"):
+        raw_sender = envelope.get("sourceNumber") or envelope.get("source") or ""
+        if not raw_sender or not raw_sender.startswith("+"):
             # No usable phone — could be a UUID-only sender during
             # contact discovery transitions. Skip rather than spoof.
             logger.debug("Signal: notification without phone source; skipping")
             return
+        # boxBot's user database stores phones WITHOUT the leading +
+        # (the WhatsApp Cloud API webhook delivers raw digits, and the
+        # users table was first populated from there). Strip the +
+        # before handing to the router so auth lookups match.
+        sender_phone = raw_sender.lstrip("+")
 
         timestamp = int(envelope.get("timestamp") or data.get("timestamp") or 0)
         dedup_key = (sender_phone, timestamp)

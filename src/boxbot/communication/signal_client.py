@@ -318,10 +318,16 @@ class SignalClient:
     # -----------------------------------------------------------------
 
     async def send_text(self, phone: str, message: str) -> bool:
-        """Send a text message to a single recipient. Returns True on success."""
+        """Send a text message to a single recipient. Returns True on success.
+
+        signal-cli requires E.164 recipients (``+15035086292``) but
+        boxBot's user records store phones without the leading ``+``
+        (WhatsApp webhook convention). Normalise here so callers can
+        pass either format.
+        """
         params = {
             "account": self._account,
-            "recipient": [phone],
+            "recipient": [_to_e164(phone)],
             "message": message,
         }
         try:
@@ -344,7 +350,7 @@ class SignalClient:
         """Send a local file as an attachment, optionally with a caption."""
         params: dict[str, Any] = {
             "account": self._account,
-            "recipient": [phone],
+            "recipient": [_to_e164(phone)],
             "attachment": [file_path],
         }
         if caption:
@@ -446,3 +452,9 @@ _EXT_MIME = {
 def _mime_from_extension(path: Path) -> str:
     ext = path.suffix.lower()
     return _EXT_MIME.get(ext, "application/octet-stream")
+
+
+def _to_e164(phone: str) -> str:
+    """signal-cli wants ``+15551234567``; boxBot stores ``15551234567``."""
+    phone = phone.strip()
+    return phone if phone.startswith("+") else f"+{phone}"

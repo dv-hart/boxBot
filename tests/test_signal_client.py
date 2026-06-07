@@ -151,3 +151,11 @@ async def test_attachment_download_returns_none_for_missing_file():
         attachments_dir="/tmp/nonexistent-signal-attachments-dir-xyz",
     )
     assert await client.download_media("any-id") is None
+
+
+def test_phone_normalisation_adds_leading_plus_for_e164():
+    """Stored phones (digits only) get the leading + for signal-cli."""
+    from boxbot.communication.signal_client import _to_e164
+    assert _to_e164("15035086292") == "+15035086292"
+    assert _to_e164("+15035086292") == "+15035086292"
+    assert _to_e164("  15035086292  ") == "+15035086292"

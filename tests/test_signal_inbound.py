@@ -60,7 +60,10 @@ async def test_text_message_routes_through_router():
     router.route_incoming.assert_awaited_once()
     args, kwargs = router.route_incoming.call_args
     assert args[0] == Channel.SIGNAL
-    assert args[1] == "+15035086292"
+    # signal-cli delivers "+15035086292"; the router gets the
+    # leading-+-stripped form so it matches the existing users.db
+    # convention shared with WhatsApp.
+    assert args[1] == "15035086292"
     assert args[2] == "hello"
     assert kwargs["sender_name"] == "Jacob"
     assert kwargs["media_url"] is None

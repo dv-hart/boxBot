@@ -168,12 +168,18 @@ async def _stage_whatsapp_image(media_id: str, message_id: str) -> Path | None:
         return None
     data, mime_type = result
 
-    ext = _INBOUND_IMAGE_EXTS.get(mime_type.lower())
-    if ext is None:
+    # Trust the bytes, not the server-claimed MIME: sniff the real format
+    # from magic bytes and reject anything that isn't a supported image.
+    from boxbot.photos.imageutil import sniff_image_mime
+
+    sniffed = sniff_image_mime(data)
+    if sniffed is None:
         logger.warning(
-            "WhatsApp image %s: unsupported mime %s", media_id, mime_type
+            "WhatsApp image %s: not a recognised image (claimed %s)",
+            media_id, mime_type,
         )
         return None
+    ext = _INBOUND_IMAGE_EXTS[sniffed]
 
     try:
         from boxbot.core.config import get_config
@@ -228,12 +234,18 @@ async def _stage_signal_image(
         return None
     data, mime_type = result
 
-    ext = _INBOUND_IMAGE_EXTS.get(mime_type.lower())
-    if ext is None:
+    # Trust the bytes, not the claimed/extension MIME: sniff the real
+    # format from magic bytes and reject anything that isn't an image.
+    from boxbot.photos.imageutil import sniff_image_mime
+
+    sniffed = sniff_image_mime(data)
+    if sniffed is None:
         logger.warning(
-            "Signal image %s: unsupported mime %s", attachment_id, mime_type
+            "Signal image %s: not a recognised image (claimed %s)",
+            attachment_id, mime_type,
         )
         return None
+    ext = _INBOUND_IMAGE_EXTS[sniffed]
 
     try:
         from boxbot.core.config import get_config

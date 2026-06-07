@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 GRAPH_API_VERSION = "v21.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
+# Hard cap on inbound media we'll buffer from the Graph API. Defense in
+# depth: Meta already bounds media sizes, but we don't want a malicious
+# or misbehaving response ballooning RAM on the Pi.
+MAX_MEDIA_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
 
 # Singleton accessor — set by main during startup, read by the output dispatcher
 # so the agent loop can reach the WhatsApp client without being passed a
@@ -329,17 +334,29 @@ class WhatsAppClient:
                     logger.error("No URL in media response for %s", media_id)
                     return None
 
-                # Step 2: Download the media
-                media_response = await client.get(media_url, headers=headers)
-                if media_response.status_code != 200:
-                    logger.error(
-                        "Failed to download media from %s: %d",
-                        media_url,
-                        media_response.status_code,
-                    )
-                    return None
+                # Step 2: Download the media — streamed and size-capped so
+                # an oversized response can't balloon RAM on the Pi.
+                buf = bytearray()
+                async with client.stream(
+                    "GET", media_url, headers=headers
+                ) as media_response:
+                    if media_response.status_code != 200:
+                        logger.error(
+                            "Failed to download media from %s: %d",
+                            media_url,
+                            media_response.status_code,
+                        )
+                        return None
+                    async for chunk in media_response.aiter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > MAX_MEDIA_DOWNLOAD_BYTES:
+                            logger.warning(
+                                "Media %s exceeds %d-byte cap; aborting",
+                                media_id, MAX_MEDIA_DOWNLOAD_BYTES,
+                            )
+                            return None
 
-                return media_response.content, mime_type
+                return bytes(buf), mime_type
         except httpx.HTTPError as e:
             logger.error("HTTP error downloading media %s: %s", media_id, e)
             return None

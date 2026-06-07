@@ -225,21 +225,35 @@ class IntakePipeline:
         Raises:
             RuntimeError: If the pipeline is not running.
             FileNotFoundError: If the file does not exist.
-            ValueError: If storage quota would be exceeded.
+            ValueError: If the file is too large, the queue is saturated,
+                or storage quota would be exceeded.
         """
         file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"Photo file not found: {file_path}")
 
-        # Check storage quota before queueing
-        storage_info = await self._store.get_storage_info()
-        if storage_info.used_percent >= 98.0:
+        config = get_config()
+
+        # Reject oversize sources before we ever hand them to PIL — a
+        # huge image would otherwise be fully buffered in RAM on decode.
+        max_bytes = config.photos.max_ingest_bytes
+        size = file_path.stat().st_size
+        if size > max_bytes:
             raise ValueError(
-                f"Photo storage is at {storage_info.used_percent}% of quota "
-                f"({storage_info.used_bytes / (1024**3):.1f} GB / "
-                f"{storage_info.quota_bytes / (1024**3):.1f} GB). "
-                f"Cannot save new photos. Ask the user what to remove."
+                f"Image is {size / (1024**2):.1f} MB, over the "
+                f"{max_bytes / (1024**2):.0f} MB ingest limit."
             )
+
+        # Backpressure: don't let a burst pile up unbounded and overshoot
+        # quota / memory before the worker drains.
+        if self._queue.qsize() >= config.photos.max_intake_queue_depth:
+            raise ValueError(
+                "Photo intake queue is saturated "
+                f"({self._queue.qsize()} pending). Try again shortly."
+            )
+
+        # Check storage quota before queueing.
+        await self._check_quota()
 
         loop = asyncio.get_event_loop()
         future: asyncio.Future[str] = loop.create_future()
@@ -256,6 +270,23 @@ class IntakePipeline:
         logger.debug("Enqueued photo for intake: %s", file_path)
 
         return await future
+
+    async def _check_quota(self) -> None:
+        """Raise ValueError if the photo store is over its quota threshold.
+
+        Called at enqueue (fail fast) and again right before the worker
+        writes bytes (a long-running backlog can cross the line between
+        the two).
+        """
+        threshold = get_config().photos.quota_block_percent
+        storage_info = await self._store.get_storage_info()
+        if storage_info.used_percent >= threshold:
+            raise ValueError(
+                f"Photo storage is at {storage_info.used_percent}% of quota "
+                f"({storage_info.used_bytes / (1024**3):.1f} GB / "
+                f"{storage_info.quota_bytes / (1024**3):.1f} GB). "
+                f"Cannot save new photos. Ask the user what to remove."
+            )
 
     # ------------------------------------------------------------------
     # Background processing
@@ -343,7 +374,10 @@ class IntakePipeline:
         if description:
             description_embedding = embed(description)
 
-        # Step 5: Store the image file
+        # Step 5: Store the image file. Re-check quota at write time —
+        # a queued backlog may have crossed the threshold since enqueue.
+        await self._check_quota()
+
         storage_path = Path(config.photos.storage_path)
         now = datetime.now(timezone.utc)
         relative_dir = f"{now.year}/{now.month:02d}"
@@ -411,8 +445,16 @@ class IntakePipeline:
         """
         from PIL import Image
 
+        # Cap total decoded pixels so a crafted "decompression bomb"
+        # (tiny file, enormous canvas) can't exhaust RAM on the Pi. PIL
+        # raises DecompressionBombError past the limit; we let it
+        # propagate so the photo's future fails cleanly.
+        Image.MAX_IMAGE_PIXELS = 50_000_000  # ~50 MP
+
         def _do_resize() -> tuple[Any, int, int, str]:
             img = Image.open(file_path)
+            img.load()  # force decode now, inside the guard, so a bomb
+            #              is caught here rather than at first pixel access
 
             # Auto-rotate based on EXIF orientation
             try:

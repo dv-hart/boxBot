@@ -567,6 +567,17 @@ class PhotosConfig(BaseModel):
     max_image_resolution: list[int] = Field(
         default_factory=lambda: [1920, 1080]
     )
+    # Hard cap on the source file the intake pipeline will decode. Guards
+    # against a registered user (or a buggy camera capture) handing us a
+    # multi-hundred-MB image that PIL would fully buffer in RAM on the Pi.
+    max_ingest_bytes: int = 25 * 1024 * 1024
+    # Reject new ingests once the photo store reaches this percent of its
+    # quota. The agent's delete tools free space below it again.
+    quota_block_percent: float = 98.0
+    # Backpressure: refuse to enqueue when this many photos are already
+    # waiting, so a burst can't overshoot quota or exhaust memory before
+    # the worker drains them.
+    max_intake_queue_depth: int = 100
     soft_delete_retention_days: int = 30
     slideshow: SlideshowConfig = Field(default_factory=SlideshowConfig)
     backup: PhotoBackupConfig = Field(default_factory=PhotoBackupConfig)

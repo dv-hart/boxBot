@@ -248,6 +248,15 @@ photos:
   # (preserving aspect ratio). Saves disk space significantly
   # for camera captures while remaining well above display resolution.
   max_image_resolution: [1920, 1080]
+  # Hard cap on the source file the intake pipeline will decode (bytes).
+  # Guards the Pi's RAM against an oversized image on decode.
+  max_ingest_bytes: 26214400   # 25 MB
+  # Reject new ingests once the store reaches this percent of its quota.
+  # The agent's delete tools free space below it again.
+  quota_block_percent: 98.0
+  # Backpressure: refuse to enqueue when this many photos are pending,
+  # so a burst can't overshoot quota or memory before the worker drains.
+  max_intake_queue_depth: 100
   # Days to retain soft-deleted photos before permanent purge.
   soft_delete_retention_days: 30
   slideshow:

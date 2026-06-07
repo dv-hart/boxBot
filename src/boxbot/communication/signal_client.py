@@ -31,6 +31,10 @@ from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on inbound attachment bytes we'll read off disk. Defense in
+# depth: signal-cli already bounds attachment sizes.
+MAX_MEDIA_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
 
 # Default signal-cli attachment cache. The daemon downloads inbound
 # attachments here automatically (we run without --ignore-attachments).
@@ -398,6 +402,15 @@ class SignalClient:
 
         for path in candidates:
             try:
+                # Size-cap before reading so a huge attachment can't
+                # balloon RAM on the Pi (defense in depth — signal-cli
+                # already bounds these).
+                if path.stat().st_size > MAX_MEDIA_DOWNLOAD_BYTES:
+                    logger.warning(
+                        "Signal attachment %s over %d-byte cap; skipping",
+                        media_id, MAX_MEDIA_DOWNLOAD_BYTES,
+                    )
+                    return None
                 data = path.read_bytes()
             except OSError:
                 continue

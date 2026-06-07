@@ -35,12 +35,13 @@ import base64
 import inspect
 import io
 import logging
-import mimetypes
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from boxbot.photos.imageutil import sniff_image_file, sniff_image_mime
 
 logger = logging.getLogger(__name__)
 
@@ -171,14 +172,19 @@ def build_image_block(abs_path: Path) -> dict[str, Any] | None:
             "image attach refused (too large, %d bytes): %s", size, abs_path
         )
         return None
-    mt, _ = mimetypes.guess_type(str(abs_path))
-    if mt not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
-        logger.warning("image attach refused (unsupported type %s): %s", mt, abs_path)
-        return None
     try:
         data = abs_path.read_bytes()
     except OSError as e:
         logger.warning("image attach failed (read): %s: %s", abs_path, e)
+        return None
+    # Determine the media type from the actual bytes, not the filename
+    # extension — a mislabeled file must not be sent to the API with the
+    # wrong type (or sneak past as a non-image).
+    mt = sniff_image_mime(data)
+    if mt is None:
+        logger.warning(
+            "image attach refused (not a recognised image): %s", abs_path
+        )
         return None
 
     # Fast path: small files pass through verbatim (preserves animated
@@ -449,6 +455,11 @@ async def _handle_photos_action(
                         "(sandbox tmp, workspace, photos, perception crops)"
                     ),
                 }
+            if sniff_image_file(abs_path) is None:
+                return {
+                    "status": "error",
+                    "error": "file is not a recognised image (jpeg/png/gif/webp)",
+                }
             if len(ctx.image_attachments) < MAX_IMAGES_PER_CALL:
                 ctx.image_attachments.append(abs_path)
                 attached = True
@@ -489,6 +500,11 @@ async def _handle_photos_action(
                         "path is outside the allowed roots "
                         "(sandbox tmp, workspace, photos, perception crops)"
                     ),
+                }
+            if sniff_image_file(abs_path) is None:
+                return {
+                    "status": "error",
+                    "error": "file is not a recognised image (jpeg/png/gif/webp)",
                 }
             from boxbot.photos.intake import get_intake_pipeline
 

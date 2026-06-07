@@ -2,8 +2,9 @@
 
 Processes incoming photos when the system is idle:
   1. Resize to configurable max resolution (default 1920x1080)
-  2. Person detection via YOLO + ReID (stub — Hailo integration)
-  3. Small model tagging (stub — description + tags)
+  2. Person detection via an injected Hailo YOLO + ReID detector
+     (optional — no-op when none is wired)
+  3. Small model tagging — description + tags via the small Claude model
   4. Embed description with MiniLM
   5. Store image + metadata in SQLite
 
@@ -23,12 +24,13 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
-import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import numpy as np
@@ -38,6 +40,68 @@ from boxbot.memory.embeddings import embed
 from boxbot.photos.store import PhotoStore
 
 logger = logging.getLogger(__name__)
+
+# A people detector takes the resized PIL image and returns a list of
+# person annotation dicts (keys: label, optional person_id + bbox_*).
+# Injected at construction; defaults to None (no detection) so the
+# pipeline runs anywhere. The on-device implementation wraps the
+# perception pipeline's Hailo YOLO + OSNet ReID — see _detect_people.
+PeopleDetector = Callable[[Any], Awaitable[list[dict[str, Any]]]]
+
+# Small-model tagging knobs.
+_TAG_MODEL_MAX_TOKENS = 1024
+_TAG_LONG_EDGE_PX = 1024  # downscale before sending to the small model
+
+_TAGGER_SYSTEM = (
+    "You tag photos for a household's private photo library. Return a "
+    "short, factual 1-2 sentence description and a handful of lowercase "
+    "tags. Reuse tags from the provided library wherever they fit; only "
+    "invent a new tag when nothing existing applies. Keep tags general "
+    "and reusable (people, place, event, objects, mood). Do not guess "
+    "the identities of people beyond what the annotations tell you."
+)
+
+_TAGGER_TOOL = {
+    "name": "describe_photo",
+    "description": "Describe and tag a photo for a household photo library.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "description": {
+                "type": "string",
+                "description": "1-2 sentence factual description.",
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "3-8 lowercase tags. Prefer reusing tags from the "
+                    "provided library; invent new ones only when needed."
+                ),
+            },
+        },
+        "required": ["description", "tags"],
+    },
+}
+
+
+def _extract_tool_use_input(message: Any, tool_name: str) -> dict | None:
+    """Pull the input dict of the named tool_use block from a message."""
+    for block in getattr(message, "content", None) or []:
+        btype = getattr(block, "type", None) or (
+            block.get("type") if isinstance(block, dict) else None
+        )
+        if btype != "tool_use":
+            continue
+        bname = getattr(block, "name", None) or (
+            block.get("name") if isinstance(block, dict) else None
+        )
+        if bname == tool_name:
+            payload = getattr(block, "input", None)
+            if payload is None and isinstance(block, dict):
+                payload = block.get("input")
+            return payload if isinstance(payload, dict) else None
+    return None
 
 
 # Module-level accessor so sandbox action handlers (bb.photos.ingest)
@@ -100,12 +164,24 @@ class IntakePipeline:
     The pipeline respects system idle state and Hailo NPU contention.
     """
 
-    def __init__(self, store: PhotoStore) -> None:
+    def __init__(
+        self,
+        store: PhotoStore,
+        *,
+        anthropic_client: Any = None,
+        people_detector: PeopleDetector | None = None,
+    ) -> None:
         self._store = store
         self._queue: asyncio.Queue[IntakeItem] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
         self._janitor_task: asyncio.Task[None] | None = None
         self._running = False
+        # Small model for description + tags; lazily built from config on
+        # first use if not injected.
+        self._client = anthropic_client
+        # Optional Hailo/ReID people detector (see PeopleDetector). When
+        # None, photos are stored without person annotations.
+        self._people_detector = people_detector
 
     async def start(self) -> None:
         """Start the background processing loop."""
@@ -354,18 +430,17 @@ class IntakePipeline:
             file_path, max_width=max_res[0], max_height=max_res[1]
         )
 
-        # Step 2: Person detection (stub — will integrate with Hailo)
+        # Step 2: Person detection (optional injected Hailo/ReID detector)
         people = await self._detect_people(resized_image)
 
-        # Step 3: Small model tagging (stub — will call Claude small model)
+        # Step 3: Small model tagging — description + tags
         description, tags, new_tags = await self._generate_tags(
             resized_image, people
         )
 
-        # Caption fallback: if the small-model tagger gave us nothing
-        # (current behaviour — it's a stub), use the human-supplied
-        # caption so search at least has something to match against.
-        # Once the tagger lands, the caption can be passed in as a hint.
+        # Caption fallback: if the tagger gave us nothing (no API key, or
+        # the call failed), use the human-supplied caption so search at
+        # least has something to match against.
         if not description and caption:
             description = caption
 
@@ -494,47 +569,138 @@ class IntakePipeline:
     ) -> list[dict[str, Any]]:
         """Detect and identify people in the image.
 
-        STUB: Will integrate with Hailo NPU for YOLO detection + OSNet ReID.
-        Currently returns an empty list.
+        Delegates to the injected :data:`PeopleDetector` (the on-device
+        adapter wraps the perception pipeline's Hailo YOLO + OSNet ReID,
+        yielding to live perception via the shared NPU lock). When no
+        detector is wired, returns an empty list so the rest of the
+        pipeline still runs. Detector failures are swallowed — a photo is
+        worth storing even if person detection hiccups.
 
-        When implemented:
-          1. Run YOLOv8n on Hailo to detect person bounding boxes
-          2. For each detection, extract OSNet embedding
-          3. Match against known person clouds from perception system
-          4. Return list of {label, person_id, bbox_x, bbox_y, bbox_w, bbox_h}
-
-        Hailo contention: This step yields to live perception via a shared
-        priority semaphore. If a person is detected by the live pipeline
-        during photo processing, intake pauses until the NPU is available.
+        Returns a list of ``{label, person_id, bbox_x, bbox_y, bbox_w,
+        bbox_h}`` dicts.
         """
-        # TODO: Integrate with boxbot.hardware.hailo for person detection
-        # TODO: Integrate with perception system for ReID matching
-        return []
+        if self._people_detector is None:
+            return []
+        try:
+            people = await self._people_detector(image)
+            return people or []
+        except Exception:
+            logger.exception(
+                "Photo people-detector failed; storing without people"
+            )
+            return []
+
+    def _get_client(self) -> Any:
+        """Return the small-model client, lazily built from config."""
+        if self._client is not None:
+            return self._client
+        try:
+            import anthropic
+
+            api_key = get_config().api_keys.anthropic
+            if not api_key:
+                return None
+            self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("Photo tagger: no Anthropic client (%s)", e)
+            return None
+        return self._client
 
     async def _generate_tags(
         self, image: Any, people: list[dict[str, Any]]
     ) -> tuple[str, list[str], list[str]]:
-        """Generate description and tags using the small model.
+        """Generate a description + tags via the small model.
 
-        STUB: Will call the small Claude model with the image, person
-        annotations, and existing tag library.
+        The model sees the (downscaled) image, any person annotations,
+        and the existing tag library so it can prefer reusing tags. Any
+        failure degrades gracefully to ``("", [], [])`` — the caller then
+        falls back to the human caption, and the photo is still stored.
 
-        Returns:
-            Tuple of (description, all_tags, new_tags_created).
-
-        When implemented, the small model receives:
-          - The image
-          - Person annotations: ["Jacob (left)", "unknown person (center)"]
-          - The existing tag library
-        And returns structured output:
-          {"description": "...", "tags": [...], "new_tags": [...]}
+        Returns ``(description, all_tags, new_tags_created)``.
         """
-        # TODO: Call small model for description + tagging
-        # For now, return empty description and no tags
-        description = ""
+        client = self._get_client()
+        if client is None:
+            return "", [], []
+
+        try:
+            existing = [t.name for t in await self._store.list_tags()]
+        except Exception:
+            existing = []
+
+        try:
+            img_b64 = await asyncio.to_thread(self._encode_for_model, image)
+        except Exception:
+            logger.warning("Photo tagger: could not encode image")
+            return "", [], []
+
+        prompt = "Describe and tag this photo."
+        if people:
+            labels = ", ".join(p.get("label", "person") for p in people)
+            prompt += f"\nPeople detected: {labels}."
+        if existing:
+            prompt += "\nExisting tag library (prefer these): " + ", ".join(
+                sorted(existing)
+            )
+
+        try:
+            response = await client.messages.create(
+                model=get_config().models.small,
+                max_tokens=_TAG_MODEL_MAX_TOKENS,
+                system=_TAGGER_SYSTEM,
+                tools=[_TAGGER_TOOL],
+                tool_choice={"type": "tool", "name": "describe_photo"},
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": img_b64,
+                                },
+                            },
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+            )
+        except Exception as e:
+            logger.warning("Photo tagger call failed: %s", e)
+            return "", [], []
+
+        payload = _extract_tool_use_input(response, "describe_photo")
+        if not payload:
+            return "", [], []
+
+        description = str(payload.get("description") or "").strip()
         tags: list[str] = []
-        new_tags: list[str] = []
+        for raw in payload.get("tags") or []:
+            tag = str(raw).strip().lower()
+            if tag and tag not in tags:
+                tags.append(tag)
+
+        existing_lower = {e.lower() for e in existing}
+        new_tags = [t for t in tags if t not in existing_lower]
         return description, tags, new_tags
+
+    @staticmethod
+    def _encode_for_model(image: Any) -> str:
+        """Downscale + JPEG-encode a PIL image to base64 for the model."""
+        from PIL import Image
+
+        img = image
+        w, h = img.size
+        long_edge = max(w, h)
+        if long_edge > _TAG_LONG_EDGE_PX:
+            ratio = _TAG_LONG_EDGE_PX / long_edge
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
 
     # ------------------------------------------------------------------
     # Helpers

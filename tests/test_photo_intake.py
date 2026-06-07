@@ -123,6 +123,134 @@ class TestIntakePipeline:
             await pipeline._run_pipeline(src, "signal", None)
 
 
+class _FakeBlock:
+    def __init__(self, name, payload):
+        self.type = "tool_use"
+        self.name = name
+        self.input = payload
+
+
+class _FakeResp:
+    def __init__(self, name, payload):
+        self.content = [_FakeBlock(name, payload)]
+
+
+class _FakeMessages:
+    def __init__(self, payload):
+        self._payload = payload
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeResp("describe_photo", self._payload)
+
+
+class _FakeClient:
+    def __init__(self, payload):
+        self.messages = _FakeMessages(payload)
+
+
+@pytest.mark.asyncio
+class TestTagging:
+    async def test_generate_tags_parses_and_dedups(self, photo_store, mock_config):
+        client = _FakeClient(
+            {"description": "  A dog on a beach.  ",
+             "tags": ["Dog", "beach", "BEACH", "  "]}
+        )
+        pipe = IntakePipeline(photo_store, anthropic_client=client)
+        img = Image.new("RGB", (32, 24), (1, 2, 3))
+        desc, tags, new_tags = await pipe._generate_tags(img, [])
+        assert desc == "A dog on a beach."
+        assert tags == ["dog", "beach"]  # lowercased + deduped + blanks dropped
+        assert set(new_tags) == {"dog", "beach"}  # no prior library
+        # the model actually got an image block
+        sent = client.messages.calls[0]["messages"][0]["content"]
+        assert any(b["type"] == "image" for b in sent)
+
+    async def test_new_tags_excludes_existing_library(self, photo_store, mock_config):
+        await photo_store.create_photo(
+            filename="seed.jpg", source="signal", tags=["beach"]
+        )
+        client = _FakeClient({"description": "x", "tags": ["beach", "dog"]})
+        pipe = IntakePipeline(photo_store, anthropic_client=client)
+        img = Image.new("RGB", (10, 10), (0, 0, 0))
+        _, tags, new_tags = await pipe._generate_tags(img, [])
+        assert set(tags) == {"beach", "dog"}
+        assert new_tags == ["dog"]  # beach already in library
+
+    async def test_run_pipeline_uses_tagger(
+        self, photo_store, tmp_path, mock_config
+    ):
+        client = _FakeClient(
+            {"description": "a sunset over water", "tags": ["sunset", "ocean"]}
+        )
+        pipe = IntakePipeline(photo_store, anthropic_client=client)
+        src = tmp_path / "p.jpg"
+        src.write_bytes(_jpeg_bytes())
+        result = await pipe._run_pipeline(src, "signal", None)
+        rec = await photo_store.get_photo(result.photo_id)
+        assert rec.description == "a sunset over water"
+        assert set(rec.tags) == {"sunset", "ocean"}
+
+    async def test_tagger_failure_falls_back_to_caption(
+        self, photo_store, tmp_path, mock_config
+    ):
+        class _BoomMessages:
+            async def create(self, **kwargs):
+                raise RuntimeError("api down")
+
+        class _BoomClient:
+            messages = _BoomMessages()
+
+        pipe = IntakePipeline(photo_store, anthropic_client=_BoomClient())
+        src = tmp_path / "q.jpg"
+        src.write_bytes(_jpeg_bytes())
+        result = await pipe._run_pipeline(
+            src, "signal", None, caption="grandma's birthday"
+        )
+        rec = await photo_store.get_photo(result.photo_id)
+        assert rec.description == "grandma's birthday"
+
+
+@pytest.mark.asyncio
+class TestPeopleDetectorSeam:
+    async def test_injected_detector_annotations_stored(
+        self, photo_store, tmp_path, mock_config
+    ):
+        async def detector(image):
+            return [{"label": "Jacob", "bbox_x": 0.1, "bbox_y": 0.2}]
+
+        pipe = IntakePipeline(photo_store, people_detector=detector)
+        src = tmp_path / "d.jpg"
+        src.write_bytes(_jpeg_bytes())
+        result = await pipe._run_pipeline(src, "signal", None)
+        rec = await photo_store.get_photo(result.photo_id)
+        assert rec.people and rec.people[0]["label"] == "Jacob"
+
+    async def test_detector_failure_is_swallowed(
+        self, photo_store, tmp_path, mock_config
+    ):
+        async def detector(image):
+            raise RuntimeError("hailo busy")
+
+        pipe = IntakePipeline(photo_store, people_detector=detector)
+        src = tmp_path / "e.jpg"
+        src.write_bytes(_jpeg_bytes())
+        result = await pipe._run_pipeline(src, "signal", None)  # must not raise
+        rec = await photo_store.get_photo(result.photo_id)
+        assert rec.people == []
+
+    async def test_no_detector_means_no_people(
+        self, photo_store, tmp_path, mock_config
+    ):
+        pipe = IntakePipeline(photo_store)
+        src = tmp_path / "f.jpg"
+        src.write_bytes(_jpeg_bytes())
+        result = await pipe._run_pipeline(src, "signal", None)
+        rec = await photo_store.get_photo(result.photo_id)
+        assert rec.people == []
+
+
 class TestAttachContentSniff:
     """build_image_block must key on content, not the filename extension."""
 

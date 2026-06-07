@@ -49,27 +49,41 @@ Async intake pipeline — processes incoming photos when the system is idle:
 
 1. **Resize** — scale to configurable max resolution (default 1920x1080),
    preserving aspect ratio. Determines orientation (landscape, portrait,
-   square) and stores dimensions
-2. **Person detection** — run YOLOv8n on Hailo to detect people in the
-   image. For each detected person bounding box, extract OSNet embedding
-   and match against known person clouds from the perception system
-3. **Tagging** — send the image to the small model with person
-   annotations and the existing tag library. Model returns a 1-2 sentence
-   description and selected/created tags
+   square) and stores dimensions. The decoder is bounded by
+   `Image.MAX_IMAGE_PIXELS` (decompression-bomb guard) and by
+   `photos.max_ingest_bytes` (source-size cap), both enforced before the
+   bytes reach PIL
+2. **Person detection** — delegated to an injected detector
+   (`PeopleDetector`) that wraps the perception pipeline's Hailo YOLOv8n +
+   OSNet ReID and matches detected boxes against known person clouds. The
+   seam is **optional**: when no detector is wired (e.g. dev, or before
+   the on-device adapter is enabled) the pipeline stores photos without
+   person annotations. Detector errors are swallowed — a photo is worth
+   keeping even if detection hiccups
+3. **Tagging** — send the (downscaled) image to the small model with any
+   person annotations and the existing tag library. The model returns a
+   1-2 sentence description and lowercase tags, preferring existing tags.
+   Any failure (no API key, API error) degrades to the human-supplied
+   caption so search still has something to match
 4. **Embedding** — embed the description text with MiniLM (384-dim) for
    hybrid search
-5. **Storage** — save resized image to disk, write metadata to SQLite,
-   add to slideshow by default
+5. **Storage** — re-check quota, save resized image to disk, write
+   metadata to SQLite, add to slideshow by default
 
-**Idle scheduling:** The intake pipeline is async and waits for the system
-to be idle (no active conversation, no pending perception tasks). This
-ensures the Hailo NPU is available for person detection without contending
-with live perception.
+**Status:** resize, tagging, embedding, and storage are live. Person
+detection runs only when an on-device `PeopleDetector` is injected at
+construction — wiring the perception-backed adapter (and validating Hailo
+contention against the live pipeline) is on-device follow-up work.
 
-**Hailo priority:** Live perception always preempts photo intake. If a
-person is detected during photo processing, intake yields the Hailo and
-resumes when it becomes available. Implemented via a shared semaphore
-with priority levels.
+**Backpressure & quota:** `enqueue` rejects oversize sources, refuses to
+queue beyond `photos.max_intake_queue_depth`, and checks quota up front;
+the worker re-checks quota at write time (a backlog can cross the line
+between enqueue and write). Quota blocks at `photos.quota_block_percent`.
+
+**Hailo priority (planned):** Live perception should always preempt photo
+intake. The on-device detector adapter must acquire the shared Hailo lock
+so intake yields the NPU to live perception. (The shared-semaphore /
+priority-preemption layer is still v1 — lock fairness only.)
 
 **Queue processing:** Multiple incoming photos are processed sequentially
 from the intake queue. The pipeline is fault-tolerant — a failure on one

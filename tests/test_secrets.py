@@ -3,8 +3,9 @@
 Covers:
 - :class:`boxbot.secrets.SecretStore` round-trip and validation.
 - The ``secrets.*`` sandbox action handler (store / delete / list / use).
-- Integration runner injects ``BOXBOT_SECRET_<NAME>`` env vars and adds
-  them to sudo's ``--preserve-env=`` list.
+- Integration runner resolves ``BOXBOT_SECRET_<NAME>`` values and stages
+  them in a file (never in sudo's ``--preserve-env=`` list, which sudo
+  records verbatim in its audit log).
 - ``execute_script`` resolves named secrets server-side.
 
 Sandbox enforcement is bypassed throughout — these tests run as the
@@ -298,17 +299,19 @@ def test_runner_build_env_injects_declared_secrets(tmp_path, isolated_secret_sto
     metas = discover_integrations(root=tmp_path)
     meta = next(m for m in metas if m.name == "echo")
 
-    env, names = _build_env(
+    env, secrets = _build_env(
         inputs_path=tmp_path / "in.json",
         output_path=tmp_path / "out.json",
         meta=meta,
     )
-    assert env.get("BOXBOT_SECRET_FOO_KEY") == "foo-value"
+    # Secrets are returned separately and kept OUT of the process env, so
+    # they can't reach sudo's --preserve-env (and thus its audit log).
+    assert secrets == {"BOXBOT_SECRET_FOO_KEY": "foo-value"}
+    assert "BOXBOT_SECRET_FOO_KEY" not in env
     assert "BOXBOT_SECRET_BAR_KEY" not in env
-    assert names == ["BOXBOT_SECRET_FOO_KEY"]
 
 
-def test_runner_build_command_extends_preserve_env(tmp_path):
+def test_runner_build_command_preserves_secrets_path_not_values(tmp_path):
     from boxbot.integrations.manifest import IntegrationMeta
     from boxbot.integrations.runner import _build_command
 
@@ -329,12 +332,56 @@ def test_runner_build_command_extends_preserve_env(tmp_path):
         bootstrap_path=Path("/tmp/bootstrap.py"),
         sandbox_user="boxbot-sandbox",
         enforce_sandbox=True,
-        secret_env_names=["BOXBOT_SECRET_FOO_KEY"],
+        include_secrets_path=True,
     )
     preserve_arg = next(a for a in cmd if a.startswith("--preserve-env="))
-    assert "BOXBOT_SECRET_FOO_KEY" in preserve_arg
+    # Only the path crosses sudo — never a BOXBOT_SECRET_* var.
+    assert "BOXBOT_SECRETS_PATH" in preserve_arg
+    assert "BOXBOT_SECRET_FOO_KEY" not in preserve_arg
     # Doesn't drop the default keys.
     assert "BOXBOT_SECCOMP_MODE" in preserve_arg
+
+
+def test_runner_build_command_omits_secrets_path_when_none(tmp_path):
+    """No declared secrets → BOXBOT_SECRETS_PATH isn't preserved at all."""
+    from boxbot.integrations.manifest import IntegrationMeta
+    from boxbot.integrations.runner import _build_command
+
+    meta = IntegrationMeta(
+        name="echo",
+        description="t",
+        inputs={},
+        outputs={},
+        secrets=(),
+        timeout=5,
+        root_path=tmp_path,
+        manifest_path=tmp_path / "manifest.yaml",
+        script_path=tmp_path / "script.py",
+    )
+    cmd = _build_command(
+        meta,
+        venv_python=Path("/usr/bin/python3"),
+        bootstrap_path=Path("/tmp/bootstrap.py"),
+        sandbox_user="boxbot-sandbox",
+        enforce_sandbox=True,
+        include_secrets_path=False,
+    )
+    preserve_arg = next(a for a in cmd if a.startswith("--preserve-env="))
+    assert "BOXBOT_SECRETS_PATH" not in preserve_arg
+
+
+def test_write_secrets_file_perms_and_content(tmp_path):
+    from boxbot.tools.builtins.execute_script import _write_secrets_file
+
+    secrets = {"BOXBOT_SECRET_FOO": "foo-value", "BOXBOT_SECRET_BAR": "bar"}
+    path = _write_secrets_file(secrets, tmp_path)
+    assert path is not None
+    assert json.loads(path.read_text()) == secrets
+    # owner rw, group read, world none — group read is how the sandbox
+    # user (same 'boxbot' group) reads it; world has no access.
+    assert (path.stat().st_mode & 0o777) == 0o640
+    # No secrets → no file, returns None (caller omits BOXBOT_SECRETS_PATH).
+    assert _write_secrets_file({}, tmp_path) is None
 
 
 # ---------------------------------------------------------------------------

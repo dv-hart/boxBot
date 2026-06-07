@@ -154,7 +154,7 @@ def _build_command(
     bootstrap_path: Path,
     sandbox_user: str | None,
     enforce_sandbox: bool,
-    secret_env_names: list[str] | None = None,
+    include_secrets_path: bool = False,
     script_path: Path | None = None,
 ) -> list[str]:
     target_script = script_path if script_path is not None else meta.script_path
@@ -164,11 +164,11 @@ def _build_command(
             "BOXBOT_SKILLS_ROOT",
             "BOXBOT_INTEGRATION_INPUTS_PATH", "BOXBOT_INTEGRATION_OUTPUT_PATH",
         ]
-        if secret_env_names:
-            # sudo strips env vars not in --preserve-env=, so any
-            # BOXBOT_SECRET_* we set in the env dict has to be named here
-            # too, or it never reaches the script.
-            preserve.extend(secret_env_names)
+        if include_secrets_path:
+            # Secret *values* never cross sudo (it logs every preserved
+            # var); only the path to the staged secrets file does. The
+            # bootstrap reads it into the env after the privilege drop.
+            preserve.append("BOXBOT_SECRETS_PATH")
         return [
             "sudo", "-n",
             "--preserve-env=" + ",".join(preserve),
@@ -184,16 +184,17 @@ def _build_env(
     inputs_path: Path,
     output_path: Path,
     meta: IntegrationMeta | None = None,
-) -> tuple[dict[str, str], list[str]]:
-    """Subset of os.environ + integration-specific vars + declared secrets.
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Subset of os.environ + integration-specific vars, plus secrets.
 
-    Returns ``(env, secret_env_names)``. ``secret_env_names`` is the
-    list of ``BOXBOT_SECRET_*`` keys that were resolved successfully —
-    the caller passes them to :func:`_build_command` so sudo's
-    ``--preserve-env`` lets them through privilege drop. Missing
-    secrets are logged but don't block the run; the script can detect
-    ``os.environ.get(...)`` returning ``None`` and surface a helpful
-    error in its output.
+    Returns ``(env, secrets)``. ``env`` is the subprocess environment and
+    deliberately contains **no** secret values. ``secrets`` maps
+    ``BOXBOT_SECRET_*`` → value for each declared secret that resolved;
+    the caller stages it in a file (see :func:`_write_secrets_file`) and
+    passes only the file path through sudo, so secret values never reach
+    sudo's audit log. Missing secrets are logged but don't block the run;
+    the script can detect ``os.environ.get(...)`` returning ``None`` and
+    surface a helpful error in its output.
     """
     SAFE_ENV_KEYS = {
         "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
@@ -205,7 +206,7 @@ def _build_env(
     env["BOXBOT_INTEGRATION_INPUTS_PATH"] = str(inputs_path)
     env["BOXBOT_INTEGRATION_OUTPUT_PATH"] = str(output_path)
 
-    secret_env_names: list[str] = []
+    secrets: dict[str, str] = {}
     if meta is not None and meta.secrets:
         from boxbot.secrets import get_secret_store
 
@@ -219,9 +220,7 @@ def _build_env(
                     meta.name, name,
                 )
                 continue
-            env_key = f"BOXBOT_SECRET_{name}"
-            env[env_key] = value
-            secret_env_names.append(env_key)
+            secrets[f"BOXBOT_SECRET_{name}"] = value
 
     # Reuse the same seccomp policy as agent scripts.
     try:
@@ -241,7 +240,7 @@ def _build_env(
     except Exception:  # noqa: BLE001
         pass
 
-    return env, secret_env_names
+    return env, secrets
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +321,7 @@ async def run(
 
     inputs_path: Path | None = None
     output_path: Path | None = None
+    secrets_path: Path | None = None
     status = "error"
     output: Any = None
     error: str | None = None
@@ -329,7 +329,10 @@ async def run(
     try:
         # Lazy imports to keep this module light at module-load time.
         from boxbot.core.config import get_config
-        from boxbot.tools.builtins.execute_script import _resolve_bootstrap_path
+        from boxbot.tools.builtins.execute_script import (
+            _resolve_bootstrap_path,
+            _write_secrets_file,
+        )
 
         try:
             cfg = get_config()
@@ -362,9 +365,14 @@ async def run(
         except OSError as exc:
             logger.warning("could not chmod integration tmp files: %s", exc)
 
-        env, secret_env_names = _build_env(
+        env, secrets = _build_env(
             inputs_path=inputs_path, output_path=output_path, meta=meta,
         )
+        # Stage secrets in a file the bootstrap reads + unlinks, so their
+        # values never cross sudo (which logs every --preserve-env var).
+        secrets_path = _write_secrets_file(secrets, tmp_root)
+        if secrets_path is not None:
+            env["BOXBOT_SECRETS_PATH"] = str(secrets_path)
         script_path = _resolve_script_path(meta, runtime_dir)
         cmd = _build_command(
             meta,
@@ -372,7 +380,7 @@ async def run(
             bootstrap_path=bootstrap_path,
             sandbox_user=sandbox_user,
             enforce_sandbox=enforce_sandbox,
-            secret_env_names=secret_env_names,
+            include_secrets_path=secrets_path is not None,
             script_path=script_path,
         )
 
@@ -446,8 +454,10 @@ async def run(
             output=output if status == "ok" else None,
             error=error,
         )
-        # Best-effort cleanup of temp files.
-        for p in (inputs_path, output_path):
+        # Best-effort cleanup of temp files. The bootstrap normally
+        # unlinks the secrets file itself; this is a backstop for the
+        # case where the sandbox never started.
+        for p in (inputs_path, output_path, secrets_path):
             if p is not None:
                 try:
                     p.unlink()

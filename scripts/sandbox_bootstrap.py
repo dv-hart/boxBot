@@ -47,6 +47,7 @@ operator can set this and restart the agent without redeploying code.
 
 from __future__ import annotations
 
+import json
 import os
 import runpy
 import sys
@@ -231,6 +232,45 @@ def _add_skills_to_path() -> None:
         sys.path.insert(0, parent)
 
 
+def _load_secrets_file() -> None:
+    """Load secrets passed via a file into the environment, then delete it.
+
+    The host writes resolved ``BOXBOT_SECRET_*`` values to a JSON file in
+    the sandbox tmp dir and passes its path in ``BOXBOT_SECRETS_PATH``,
+    rather than handing the values to ``sudo --preserve-env``. sudo
+    records the value of every preserved env var verbatim in its audit
+    log (the journal), so naming a secret there leaks it in cleartext;
+    naming only a *path* does not. We read the file into ``os.environ``
+    so scripts and ``bb.secrets`` see ``BOXBOT_SECRET_*`` exactly as
+    before, then unlink it immediately — before the user script runs —
+    to keep the on-disk window as small as possible.
+
+    Best-effort throughout: a missing or malformed file leaves the
+    secrets absent (the script can detect ``None`` and surface its own
+    error), exactly as an unresolved secret name did before.
+    """
+    path = os.environ.pop("BOXBOT_SECRETS_PATH", None)
+    if not path:
+        return
+    data = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        sys.stderr.write(
+            f"[sandbox-bootstrap] could not read secrets file: {e}\n"
+        )
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(key, str) and isinstance(value, str):
+                os.environ[key] = value
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         sys.stderr.write(
@@ -238,6 +278,10 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
+    # Load + unlink the secrets file first, so it is removed from disk
+    # even if filter setup below aborts the process (e.g. enforce mode
+    # with no libseccomp). Reads/unlink use only allowed syscalls.
+    _load_secrets_file()
     _maybe_apply_filter()
     _add_skills_to_path()
 

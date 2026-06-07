@@ -83,6 +83,40 @@ def _resolve_bootstrap_path(runtime_dir: Path | None) -> Path:
     return _PROJECT_BOOTSTRAP_PATH
 
 
+def _write_secrets_file(
+    secrets: dict[str, str], tmp_dir: Path
+) -> Path | None:
+    """Stage resolved secrets in a file for the sandbox to read.
+
+    Secrets reach the sandbox through a file (read and unlinked by
+    ``sandbox_bootstrap.py``) rather than ``sudo --preserve-env`` env
+    vars, because sudo records the value of every preserved variable in
+    its audit log — naming a ``BOXBOT_SECRET_*`` there leaks it to the
+    journal in cleartext. The host passes only the file *path* via
+    ``BOXBOT_SECRETS_PATH``, which is safe to log.
+
+    The file lands in the setgid sandbox tmp dir (owner
+    ``boxbot-sandbox``, group ``boxbot``, mode 2770), so it inherits
+    group ``boxbot`` and the sandbox user can both read and unlink it.
+    Mode 0640 keeps it owner-rw / group-read / world-none. Returns the
+    path, or ``None`` when there are no secrets (caller then omits
+    ``BOXBOT_SECRETS_PATH`` entirely).
+    """
+    if not secrets:
+        return None
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    path = tmp_dir / f"secrets-{uuid4().hex[:12]}.json"
+    path.write_text(json.dumps(secrets), encoding="utf-8")
+    try:
+        os.chmod(path, 0o640)
+    except OSError as exc:
+        logger.warning("could not chmod sandbox secrets file: %s", exc)
+    return path
+
+
 class ExecuteScriptTool(Tool):
     """Run a Python script in the sandbox environment."""
 
@@ -219,6 +253,13 @@ class ExecuteScriptTool(Tool):
         script_path = scripts_dir / f"{script_id}.py"
         script_path.write_text(script, encoding="utf-8")
 
+        # Pull resolved secrets out of env_vars: they travel via a file
+        # (BOXBOT_SECRETS_PATH), not the process env, so they never reach
+        # sudo's --preserve-env and thus never land in the audit log.
+        # (env_vars still carried them for the long-lived-runner path
+        # above, which passes env over stdin and has already returned.)
+        secrets_map = {k: env_vars.pop(k) for k in secret_env_keys}
+
         SAFE_ENV_KEYS = {
             "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
             "PYTHONPATH", "VIRTUAL_ENV", "PYTHONDONTWRITEBYTECODE",
@@ -228,6 +269,14 @@ class ExecuteScriptTool(Tool):
         env.update(env_vars)
         # Force unbuffered stdout so we can stream action lines in real time.
         env["PYTHONUNBUFFERED"] = "1"
+
+        # Stage secrets in a file the bootstrap reads + unlinks. We write
+        # into scripts_dir (already created above; same 2770 sandbox dir
+        # as the script itself), so the sandbox user can read and remove
+        # it. Only BOXBOT_SECRETS_PATH (a path) crosses the sudo boundary.
+        secrets_path = _write_secrets_file(secrets_map, scripts_dir)
+        if secrets_path is not None:
+            env["BOXBOT_SECRETS_PATH"] = str(secrets_path)
 
         # Seccomp mode is read by sandbox_bootstrap.py at the start of
         # every sandboxed run. Honours the kill-switch env var so an
@@ -253,10 +302,11 @@ class ExecuteScriptTool(Tool):
                 "BOXBOT_SECCOMP_DISABLE",
                 "BOXBOT_SKILLS_ROOT",
             ]
-            # sudo strips env not listed here, so any BOXBOT_SECRET_* we
-            # resolved above must be named explicitly to cross the
-            # privilege drop.
-            preserve.extend(secret_env_keys)
+            # sudo strips env not listed here. Secrets are NOT named —
+            # they ride in the file at BOXBOT_SECRETS_PATH so their values
+            # stay out of sudo's audit log. Only the path is preserved.
+            if secrets_path is not None:
+                preserve.append("BOXBOT_SECRETS_PATH")
             cmd = [
                 "sudo", "-n",
                 "--preserve-env=" + ",".join(preserve),
@@ -284,6 +334,10 @@ class ExecuteScriptTool(Tool):
                 cwd=str(Path.cwd()),
             )
         except FileNotFoundError:
+            # The bootstrap never ran, so nothing unlinked the secrets
+            # file — remove it here so the credential doesn't linger.
+            if secrets_path is not None:
+                secrets_path.unlink(missing_ok=True)
             return json.dumps({
                 "status": "error",
                 "error": (

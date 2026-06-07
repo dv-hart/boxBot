@@ -137,7 +137,12 @@ SIGNAL_SETUP_CHANGED=0
 SDK_CHANGED=0
 if [[ "$PI_HEAD" != "unknown" && "$PI_HEAD" != "$LOCAL_HEAD" ]]; then
     CHANGED_FILES="$(git diff --name-only "$PI_HEAD" "$LOCAL_HEAD" 2>/dev/null || true)"
-    if echo "$CHANGED_FILES" | grep -q '^scripts/setup-sandbox\.sh$'; then
+    # setup-sandbox.sh OR sandbox_bootstrap.py: both are staged into the
+    # runtime dir by setup-sandbox.sh, and the sandbox runs the *staged*
+    # copy. A code change here doesn't reach the sandbox until the script
+    # is re-run, so warn the operator either way.
+    if echo "$CHANGED_FILES" \
+           | grep -qE '^scripts/setup-sandbox\.sh$|^scripts/sandbox_bootstrap\.py$'; then
         SETUP_CHANGED=1
     fi
     # signal-cli unit / installer changes need sudo to apply, so we just

@@ -37,6 +37,7 @@ def _run_bootstrap(
     mode: str | None = None,
     disable: bool = False,
     extra_args: list[str] | None = None,
+    env_extra: dict[str, str] | None = None,
     timeout: float = 10.0,
 ) -> subprocess.CompletedProcess:
     """Invoke ``sandbox_bootstrap.py`` with a temp user script."""
@@ -49,6 +50,8 @@ def _run_bootstrap(
         env["BOXBOT_SECCOMP_DISABLE"] = "1"
     else:
         env.pop("BOXBOT_SECCOMP_DISABLE", None)
+    if env_extra:
+        env.update(env_extra)
 
     script_dir = PROJECT_ROOT / ".pytest-tmp"
     script_dir.mkdir(exist_ok=True)
@@ -131,6 +134,41 @@ class TestBootstrapMechanics:
         assert result.returncode == 0, result.stderr
         assert "is main" in result.stdout
         assert "NOT main" not in result.stdout
+
+    def test_secrets_file_loaded_into_env_then_unlinked(self, tmp_path):
+        """BOXBOT_SECRETS_PATH → values land in os.environ; file is removed."""
+        import json
+
+        secrets_file = tmp_path / "secrets.json"
+        secrets_file.write_text(
+            json.dumps({"BOXBOT_SECRET_FOO": "sekret-value"}),
+            encoding="utf-8",
+        )
+        result = _run_bootstrap(
+            "import os\n"
+            "print('GOT:' + os.environ.get('BOXBOT_SECRET_FOO', 'MISSING'))\n"
+            "print('PATHVAR:' + os.environ.get('BOXBOT_SECRETS_PATH', 'GONE'))\n",
+            mode="disabled",
+            env_extra={"BOXBOT_SECRETS_PATH": str(secrets_file)},
+        )
+        assert result.returncode == 0, result.stderr
+        # Script saw the secret as a normal BOXBOT_SECRET_* env var.
+        assert "GOT:sekret-value" in result.stdout
+        # The path var is popped before the script runs (not inherited).
+        assert "PATHVAR:GONE" in result.stdout
+        # The file is unlinked before the user script runs.
+        assert not secrets_file.exists()
+
+    def test_missing_secrets_file_is_noop(self, tmp_path):
+        """A dangling BOXBOT_SECRETS_PATH doesn't crash the bootstrap."""
+        result = _run_bootstrap(
+            "import os\n"
+            "print('GOT:' + os.environ.get('BOXBOT_SECRET_FOO', 'MISSING'))\n",
+            mode="disabled",
+            env_extra={"BOXBOT_SECRETS_PATH": str(tmp_path / "nope.json")},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "GOT:MISSING" in result.stdout
 
     def test_missing_script_path_returns_2(self):
         """No argv → usage error, exit 2."""

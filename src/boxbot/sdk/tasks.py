@@ -159,7 +159,9 @@ def create_trigger(description: str, instructions: str, *,
         fire_at: ISO datetime for point-in-time trigger.
         fire_after: Duration string for timer trigger (max 24h), e.g. "2h", "30m".
         cron: Cron expression for recurring trigger.
-        person: Person name for presence trigger.
+        person: Person-presence condition. A name (e.g. "Jacob") fires when
+            that person is visually identified; "*" fires on ANY person seen,
+            no identification required.
         for_person: Person this trigger is about (for context).
         todo_id: Link to a to-do item.
 

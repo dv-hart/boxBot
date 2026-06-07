@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -186,6 +187,11 @@ class PerceptionPipeline:
 
         self._loop_task: asyncio.Task[None] | None = None
         self._running = False
+
+        # Throttle for the per-frame ReID failure WARNING so a persistent
+        # inference error surfaces at INFO+ without flooding the log.
+        self._last_reid_error_log: datetime | None = None
+        self._reid_error_log_interval = timedelta(seconds=60)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -402,6 +408,26 @@ class PerceptionPipeline:
             outputs, params, frame.shape[:2], frame
         )
 
+    def _log_reid_error(self, ref: str) -> None:
+        """Log a ReID inference failure at WARNING, throttled to once a minute.
+
+        Always keeps the full traceback at DEBUG; the throttled WARNING just
+        ensures a persistent failure is visible at the default INFO log level.
+        """
+        now = datetime.now(timezone.utc)
+        if (
+            self._last_reid_error_log is None
+            or (now - self._last_reid_error_log) >= self._reid_error_log_interval
+        ):
+            self._last_reid_error_log = now
+            logger.warning(
+                "ReID inference failed for %s (visual identification is "
+                "down — named person triggers will not fire). Throttled; "
+                "see DEBUG for traceback.",
+                ref,
+            )
+        logger.debug("ReID inference failed for %s", ref, exc_info=True)
+
     async def _run_reid(
         self, frame: np.ndarray, detections: list, bus: Any
     ) -> None:
@@ -443,12 +469,27 @@ class PerceptionPipeline:
                 raw_embedding = next(iter(reid_output.values()))
                 embedding = self._reid.normalize_embedding(raw_embedding)
             except Exception:
-                logger.debug("ReID inference failed for %s", ref, exc_info=True)
+                # A persistent ReID failure silently kills all visual
+                # identification (and therefore named person triggers), so
+                # surface it at WARNING — throttled so it can't flood.
+                self._log_reid_error(ref)
                 continue
 
             # Match against centroids
             match = self._reid.match(embedding, centroids)
             self._state_machine.on_identification(ref, match, det.bbox)
+
+            # Identification is the crux of person-trigger firing and is
+            # otherwise invisible (it produces no event below the "high" tier).
+            # Log every match outcome at INFO so we can see *why* a face did or
+            # didn't resolve to a name. ReID only runs on ~5s heartbeats while
+            # someone is present, so this does not flood.
+            logger.info(
+                "ReID match: ref=%s tier=%s confidence=%.3f name=%s "
+                "(%d enrolled centroid(s))",
+                ref, match.tier, match.confidence,
+                match.person_name or "—", len(centroids),
+            )
 
             # Buffer embedding for enrollment
             if self._enrollment:
@@ -456,6 +497,10 @@ class PerceptionPipeline:
 
             # Publish PersonIdentified for high-confidence matches
             if match.tier == "high" and match.person_id and match.person_name:
+                logger.info(
+                    "Publishing PersonIdentified: %s (confidence=%.3f)",
+                    match.person_name, match.confidence,
+                )
                 await bus.publish(
                     PersonIdentified(
                         person_id=match.person_id,

@@ -137,7 +137,7 @@ class PerceptionStateMachine:
 
         if self._state == PerceptionState.CHECKING:
             self._state = PerceptionState.DETECTED
-            logger.debug(
+            logger.info(
                 "CHECKING -> DETECTED (%d person(s))", len(detections)
             )
 

@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from boxbot.core.events import PersonDetected, PersonIdentified
 from boxbot.core.scheduler import (
+    ANY_PERSON,
     CronExpr,
     Scheduler,
     cancel_todo,
@@ -338,6 +340,17 @@ class TestConditionEvaluation:
         trigger = {"person": "Jacob"}
         assert evaluate_person_condition(trigger, {"Alice"}) is False
 
+    def test_evaluate_person_condition_wildcard_with_anyone_present_is_true(self):
+        # "*" means any person — met as long as someone is present, regardless
+        # of who, including the unidentified-presence sentinel.
+        trigger = {"person": "*"}
+        assert evaluate_person_condition(trigger, {"Alice"}) is True
+        assert evaluate_person_condition(trigger, {"*"}) is True
+
+    def test_evaluate_person_condition_wildcard_with_nobody_present_is_false(self):
+        trigger = {"person": "*"}
+        assert evaluate_person_condition(trigger, set()) is False
+
     def test_evaluate_trigger_inactive_is_false(self):
         trigger = {"status": "cancelled", "fire_at": None, "person": None}
         assert evaluate_trigger(trigger) is False
@@ -430,3 +443,86 @@ class TestSeedFromConfig:
         assert len(dream_rows) == 1
         assert dream_rows[0]["cron"] == "0 4 * * *"
         assert dream_rows[0]["source"] == "agent"
+
+
+# ---------------------------------------------------------------------------
+# Person-trigger firing (named + wildcard)
+# ---------------------------------------------------------------------------
+
+
+class TestPersonTriggerFiring:
+    """Test the scheduler's person-presence trigger firing paths."""
+
+    @pytest.mark.asyncio
+    async def test_wildcard_trigger_fires_on_person_detected(self):
+        # "Greet the next person, no ID required" — fires on a raw detection,
+        # without waiting for visual identification.
+        tid = await create_trigger(
+            description="Greet next person",
+            instructions="Say hi",
+            person=ANY_PERSON,
+        )
+        sched = Scheduler()
+        await sched._on_person_detected(
+            PersonDetected(person_ref="A", confidence=0.9)
+        )
+        trigger = await get_trigger(tid)
+        assert trigger["status"] == "fired"
+        assert trigger["fire_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_named_trigger_not_fired_by_unidentified_detection(self):
+        # A named trigger must wait for identification — a raw detection
+        # (no name) must not fire it.
+        tid = await create_trigger(
+            description="Greet Jacob",
+            instructions="Say hi Jacob",
+            person="Jacob",
+        )
+        sched = Scheduler()
+        await sched._on_person_detected(
+            PersonDetected(person_ref="A", confidence=0.9)
+        )
+        trigger = await get_trigger(tid)
+        assert trigger["status"] == "active"
+        assert trigger["fire_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_named_trigger_fires_on_person_identified(self):
+        tid = await create_trigger(
+            description="Greet Jacob",
+            instructions="Say hi Jacob",
+            person="Jacob",
+        )
+        sched = Scheduler()
+        await sched._on_person_identified(
+            PersonIdentified(person_id="p1", person_name="Jacob", confidence=0.9)
+        )
+        trigger = await get_trigger(tid)
+        assert trigger["status"] == "fired"
+
+    @pytest.mark.asyncio
+    async def test_wildcard_trigger_also_fires_for_identified_person(self):
+        # An identified person is also "any person" — a wildcard trigger
+        # should fire on identification too.
+        tid = await create_trigger(
+            description="Greet next person",
+            instructions="Say hi",
+            person=ANY_PERSON,
+        )
+        sched = Scheduler()
+        await sched._on_person_identified(
+            PersonIdentified(person_id="p1", person_name="Jacob", confidence=0.9)
+        )
+        trigger = await get_trigger(tid)
+        assert trigger["status"] == "fired"
+
+    @pytest.mark.asyncio
+    async def test_person_detected_is_throttled_after_rising_edge(self):
+        # First detection (rising edge) scans; a second within the throttle
+        # window is suppressed so per-frame detections don't hammer the DB.
+        sched = Scheduler()
+        sched._check_person_triggers = AsyncMock()
+        await sched._on_person_detected(PersonDetected(person_ref="A"))
+        await sched._on_person_detected(PersonDetected(person_ref="A"))
+        assert sched._check_person_triggers.await_count == 1

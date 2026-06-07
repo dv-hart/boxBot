@@ -74,7 +74,10 @@ class ManageTasksTool(Tool):
             "person": {
                 "type": "string",
                 "description": (
-                    "Person name — fires when detected. "
+                    "Person-presence condition. A name (e.g. 'Jacob') fires "
+                    "when that person is visually identified. Use '*' for ANY "
+                    "person, no identification required — fires on the first "
+                    "person seen (the 'greet whoever walks up next' case). "
                     "Combine with time fields for compound triggers (AND)."
                 ),
             },

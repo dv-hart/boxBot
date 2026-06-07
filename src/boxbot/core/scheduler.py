@@ -36,7 +36,12 @@ from uuid import uuid4
 import aiosqlite
 
 from boxbot.core.config import BoxBotConfig, get_config
-from boxbot.core.events import PersonIdentified, TriggerFired, get_event_bus
+from boxbot.core.events import (
+    PersonDetected,
+    PersonIdentified,
+    TriggerFired,
+    get_event_bus,
+)
 from boxbot.core.paths import SCHEDULER_DIR
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DB_PATH = SCHEDULER_DIR / "scheduler.db"
+
+# Sentinel value for a trigger's ``person`` field meaning "any person, no
+# identification required". A trigger with ``person="*"`` fires on the first
+# ``PersonDetected`` event (raw YOLO detection) — it does NOT wait for visual
+# ReID to put a name to the face. Named person triggers (``person="Jacob"``)
+# still require a ``PersonIdentified`` event.
+ANY_PERSON = "*"
 
 _TRIGGERS_DDL = """\
 CREATE TABLE IF NOT EXISTS triggers (
@@ -749,12 +761,16 @@ def evaluate_person_condition(
     Person conditions are transient — the person must be present at
     evaluation time.
 
-    Returns True if there is no person condition (vacuously true) or if
-    the person is in ``present_people``.
+    Returns True if there is no person condition (vacuously true), if the
+    condition is the ``ANY_PERSON`` wildcard and *anyone* is present, or if
+    the named person is in ``present_people``.
     """
     person = trigger.get("person")
     if not person:
         return True
+    if person == ANY_PERSON:
+        # "Any person" — met as long as someone (named or not) is present.
+        return bool(present_people)
     return person in present_people
 
 
@@ -807,7 +823,8 @@ class Scheduler:
 
     Responsibilities:
     - Check time-based triggers every 60 seconds
-    - Subscribe to ``PersonIdentified`` events for person conditions
+    - Subscribe to ``PersonIdentified`` events (named person conditions) and
+      ``PersonDetected`` events (the ``ANY_PERSON`` wildcard condition)
     - Emit ``TriggerFired`` events when all conditions are met
     - Handle recurring trigger reset and expiry sweeps
     """
@@ -819,6 +836,12 @@ class Scheduler:
         self._person_last_seen: dict[str, datetime] = {}
         # How long a person remains "present" after last detection
         self._person_presence_window = timedelta(minutes=5)
+        # PersonDetected fires per-frame (several times/sec while someone is in
+        # view). Throttle the wildcard trigger scan so we don't hammer the DB —
+        # but always scan immediately on the rising edge (someone just
+        # appeared) so "greet the next person" feels instant.
+        self._last_any_person_check: datetime | None = None
+        self._any_person_check_interval = timedelta(seconds=2)
 
     async def start(self) -> None:
         """Start the background scheduler loop and event subscriptions."""
@@ -834,6 +857,7 @@ class Scheduler:
 
         bus = get_event_bus()
         bus.subscribe(PersonIdentified, self._on_person_identified)
+        bus.subscribe(PersonDetected, self._on_person_detected)
 
         self._running = True
         self._task = asyncio.create_task(self._run_loop(), name="scheduler")
@@ -847,6 +871,7 @@ class Scheduler:
         self._running = False
         bus = get_event_bus()
         bus.unsubscribe(PersonIdentified, self._on_person_identified)
+        bus.unsubscribe(PersonDetected, self._on_person_detected)
 
         if self._task is not None:
             self._task.cancel()
@@ -876,17 +901,50 @@ class Scheduler:
 
             await asyncio.sleep(60)
 
+    def _mark_present(self, key: str) -> bool:
+        """Record that ``key`` is currently present. Returns True on rising edge.
+
+        ``key`` is either a person's name or the ``ANY_PERSON`` sentinel. The
+        rising edge (the key was previously absent) lets callers react
+        immediately instead of waiting for the next throttle window.
+        """
+        was_absent = key not in self._present_people
+        self._present_people.add(key)
+        self._person_last_seen[key] = _now_utc()
+        return was_absent
+
     async def _on_person_identified(self, event: PersonIdentified) -> None:
         """Handle a person identification event from the perception pipeline."""
         name = event.person_name
         if not name:
             return
 
-        self._person_last_seen[name] = _now_utc()
-        self._present_people.add(name)
+        # An identified person is also "any person" — mark both so wildcard
+        # triggers fire on identified people too.
+        self._mark_present(name)
+        self._mark_present(ANY_PERSON)
 
-        # Check if any active triggers are waiting on this person
-        await self._check_person_triggers(name)
+        # Check triggers waiting on this specific person or on any person.
+        await self._check_person_triggers(name, ANY_PERSON)
+
+    async def _on_person_detected(self, event: PersonDetected) -> None:
+        """Handle a raw (unidentified) person detection.
+
+        Drives ``ANY_PERSON`` wildcard triggers — the "greet the next person,
+        no ID required" case. Fires immediately when someone newly appears,
+        then throttles repeat scans while they remain in view.
+        """
+        rising = self._mark_present(ANY_PERSON)
+        now = _now_utc()
+        if (
+            not rising
+            and self._last_any_person_check is not None
+            and (now - self._last_any_person_check)
+            < self._any_person_check_interval
+        ):
+            return
+        self._last_any_person_check = now
+        await self._check_person_triggers(ANY_PERSON)
 
     def _refresh_present_people(self) -> None:
         """Remove people who haven't been seen within the presence window."""
@@ -916,11 +974,18 @@ class Scheduler:
             if evaluate_trigger(trigger, self._present_people):
                 await self._fire_trigger(trigger)
 
-    async def _check_person_triggers(self, person_name: str) -> None:
-        """Check active triggers waiting on a specific person."""
+    async def _check_person_triggers(self, *person_keys: str) -> None:
+        """Check active triggers whose person condition matches any of the keys.
+
+        ``person_keys`` may include real names and/or the ``ANY_PERSON``
+        sentinel. Matching is exact against the trigger's ``person`` field, so
+        a wildcard (``person="*"``) trigger is only matched when ``ANY_PERSON``
+        is among the keys.
+        """
+        keys = set(person_keys)
         triggers = await list_triggers(status="active")
         for trigger in triggers:
-            if trigger.get("person") != person_name:
+            if trigger.get("person") not in keys:
                 continue
             if _is_expired(trigger):
                 await update_trigger(trigger["id"], status="expired")

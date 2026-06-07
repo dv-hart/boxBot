@@ -337,3 +337,53 @@ async def test_delete_cascades_turns(store):
     assert await store.get(rec.conversation_id) is None
     turns = await store.get_turns(rec.conversation_id)
     assert turns == []
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_and_signal_threads_for_same_user_are_independent(store):
+    """A single user can have parallel threads on WhatsApp and Signal —
+    the channel: prefix in channel_key keeps them separate, list_active
+    with no channel filter returns both, and turns don't cross-contaminate.
+    """
+    wa = await store.create(
+        channel="whatsapp",
+        channel_key="whatsapp:+15551111111",
+        participants={"Jacob"},
+    )
+    sg = await store.create(
+        channel="signal",
+        channel_key="signal:+15551111111",
+        participants={"Jacob"},
+    )
+    assert wa.conversation_id != sg.conversation_id
+
+    await store.append_turn(
+        wa.conversation_id, role="user",
+        content={"role": "user", "content": "via whatsapp"},
+    )
+    await store.append_turn(
+        sg.conversation_id, role="user",
+        content={"role": "user", "content": "via signal"},
+    )
+
+    # No channel filter — both rows come back.
+    active = await store.list_active(max_inactive_seconds=3600)
+    ids = {r.conversation_id for r in active}
+    assert wa.conversation_id in ids
+    assert sg.conversation_id in ids
+
+    # Channel-filtered queries scope correctly.
+    wa_only = await store.list_active(
+        channel="whatsapp", max_inactive_seconds=3600,
+    )
+    assert {r.conversation_id for r in wa_only} == {wa.conversation_id}
+    sg_only = await store.list_active(
+        channel="signal", max_inactive_seconds=3600,
+    )
+    assert {r.conversation_id for r in sg_only} == {sg.conversation_id}
+
+    # Turns stay on their own thread.
+    wa_turns = await store.get_turns(wa.conversation_id)
+    sg_turns = await store.get_turns(sg.conversation_id)
+    assert [t.content["content"] for t in wa_turns] == ["via whatsapp"]
+    assert [t.content["content"] for t in sg_turns] == ["via signal"]

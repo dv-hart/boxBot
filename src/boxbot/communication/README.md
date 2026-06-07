@@ -82,6 +82,16 @@ transcripts) and the perception pipeline (speaker identification
 and voice cloud management). During conversation, both systems
 consume the same diarization output.
 
+### `channels.py`
+Channel identity + `OutboundChannel` Protocol + a small registry.
+
+The dispatcher (`output_dispatcher._dispatch_text`) looks each user's
+`channel` column up and resolves through `get_outbound_channel(Channel.X)`
+to find the right client — no transport-specific imports in the agent
+path. WhatsApp and Signal both implement the same `OutboundChannel`
+shape: `send_text`, `send_attachment`, `download_media`, plus a `name`
+identifier.
+
 ### `whatsapp.py`
 WhatsApp Business API integration:
 - Receives messages via webhook
@@ -92,6 +102,27 @@ WhatsApp Business API integration:
 - Routes incoming messages to the agent as conversation events
 - Handles message queuing for when the agent is sleeping (process on wake)
 - Validates webhook request signatures (prevents forged webhooks)
+
+### `signal_client.py` / `signal_inbound.py`
+Signal channel via the `signal-cli` daemon on the Pi.
+
+`SignalClient` opens a long-lived JSON-RPC connection over a unix
+socket (`/run/signal-cli/socket` by default, managed by
+`scripts/systemd/signal-cli.service`) and exposes the same outbound
+surface WhatsApp does. `SignalInbound` registers a notification
+handler, calls `subscribeReceive`, and routes every Signal-side
+`receive` envelope through `MessageRouter` — same auth gate as
+WhatsApp, same silent-drop semantics for unknown senders.
+
+Both channels run in parallel when both are enabled — the user's
+`channel` column picks which outbound transport carries BB's replies,
+while inbound is accepted on either (auth lookups ignore channel).
+This is what makes the staged migration work: a user can still text
+BB via Signal while their `channel` column still reads `whatsapp`.
+
+Operator setup (one-time per Pi): run `scripts/setup-signal.sh`, which
+installs the systemd unit and verifies the daemon. To flip a registered
+user from WhatsApp → Signal, use `scripts/migrate_users_to_signal.py`.
 
 ### `channels.py`
 Abstract `Channel` interface for fork-friendly extensibility:

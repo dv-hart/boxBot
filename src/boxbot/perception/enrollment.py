@@ -87,9 +87,27 @@ Tier = Literal["high", "medium", "low", "unknown"]
 ClaimSource = Literal[
     "voice_reid_match",
     "visual_reid_match",
+    "voice_doa",          # voice-confirmed + DOA-associated detection (bootstrap)
+    "voice_visual_agree",  # voice match and visual ReID agree on the person
     "agent_identify",
     "unknown",
 ]
+
+# Claim sources that admit embeddings to a cloud at commit (vs. held-back
+# passive reid-only claims). See docs/plans/person-id-overhaul.md.
+# Visual admits on the bootstrap path too (voice teaches vision); voice only
+# admits on agreement or explicit identify (decision 2026-06-07).
+_VISUAL_ADMIT_SOURCES = frozenset(
+    {"agent_identify", "voice_visual_agree", "voice_doa"}
+)
+_VOICE_ADMIT_SOURCES = frozenset({"agent_identify", "voice_visual_agree"})
+
+# Map claim source → embedding provenance label (clouds.PROVENANCE_*).
+_SOURCE_TO_PROVENANCE = {
+    "agent_identify": "agent_identify",
+    "voice_visual_agree": "voice_visual_agree",
+    "voice_doa": "voice_doa",
+}
 
 
 @dataclass
@@ -123,6 +141,9 @@ class SessionPerson:
 
     ref: str
     visual_embeddings: list[np.ndarray] = field(default_factory=list)
+    # Crop image path per visual embedding (parallel to visual_embeddings;
+    # None when no crop was saved). Lets commit persist crop_path alongside.
+    visual_crops: list[str | None] = field(default_factory=list)
     voice_embeddings: list[np.ndarray] = field(default_factory=list)
     first_seen: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_seen: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -177,9 +198,12 @@ class EnrollmentManager:
         self,
         ref: str,
         embedding: np.ndarray,
+        crop_path: str | None = None,
     ) -> None:
-        """Buffer a visual embedding under a session ref."""
-        self._touch(ref).visual_embeddings.append(embedding)
+        """Buffer a visual embedding (and optional saved crop) under a ref."""
+        person = self._touch(ref)
+        person.visual_embeddings.append(embedding)
+        person.visual_crops.append(crop_path)
 
     def buffer_voice_embedding(
         self,
@@ -249,6 +273,39 @@ class EnrollmentManager:
                 match_tier=tier,
                 match_score=score,
             )
+
+    def mark_admission(
+        self,
+        ref: str,
+        *,
+        person_id: str,
+        person_name: str | None,
+        source: ClaimSource,
+        score: float,
+    ) -> None:
+        """Record a fusion-driven *admitting* claim for a ref.
+
+        Called when fusion concludes an identity strong enough to grow a cloud:
+        ``voice_doa`` (voice-confirmed + DOA-associated detection → teach
+        vision) or ``voice_visual_agree`` (voice and visual agree). Never
+        overrides an ``agent_identify`` claim (the agent is canonical), and
+        never downgrades a stronger admitting source already set this session.
+        """
+        existing = self._claims.get(ref)
+        if existing is not None and existing.source == "agent_identify":
+            return
+        if (
+            existing is not None
+            and _admit_rank(source) < _admit_rank(existing.source)
+        ):
+            return
+        self._claims[ref] = SessionClaim(
+            person_id=person_id,
+            name=person_name,
+            source=source,
+            match_tier="high",
+            match_score=score,
+        )
 
     # --- agent-facing identification -----------------------------------
 
@@ -387,18 +444,21 @@ class EnrollmentManager:
                 }
                 continue
 
-            # Growth requires an EXPLICIT identity. ReID seeds claims for
-            # attribution (who the agent is talking to), but committing on
-            # a reid-only claim is exactly the passive auto-enroll that
-            # polluted the clouds — and with diarization off it would
-            # blanket a multi-speaker session onto one person. Recognition
-            # runs off the seeded clouds; only an agent identify_person
-            # (later: voice+visual agreement) admits new embeddings.
-            # See docs/voice-id-redesign.md.
-            if claim.source != "agent_identify":
+            # Admission is provenance-gated. Passive single-modality reid
+            # claims (voice_reid_match / visual_reid_match) are held back —
+            # they're for attribution, not growth, and auto-enrolling them
+            # pollutes the clouds. Admit only on:
+            #   visual: agent_identify | voice_visual_agree | voice_doa
+            #           (voice teaches vision — see person-id-overhaul.md)
+            #   voice:  agent_identify | voice_visual_agree
+            # The embedding's provenance is the claim source, so the matcher
+            # and the eviction janitor can weight/protect it appropriately.
+            admit_visual = claim.source in _VISUAL_ADMIT_SOURCES
+            admit_voice = claim.source in _VOICE_ADMIT_SOURCES
+            if not admit_visual and not admit_voice:
                 logger.debug(
                     "commit_session: not committing ref=%s (claim source=%s) "
-                    "— %d voice / %d visual held back (no explicit identify)",
+                    "— %d voice / %d visual held back",
                     ref, claim.source,
                     len(person.voice_embeddings),
                     len(person.visual_embeddings),
@@ -416,34 +476,48 @@ class EnrollmentManager:
                 continue
 
             person_id = claim.person_id
+            provenance = _SOURCE_TO_PROVENANCE.get(claim.source, "legacy")
             voice_added = 0
             visual_added = 0
 
-            for emb in person.voice_embeddings:
-                try:
-                    await self._store.add_voice_embedding(person_id, emb)
-                    voice_added += 1
-                except Exception:
-                    logger.exception(
-                        "Failed to commit voice embedding for ref=%s → %s",
-                        ref, claim.name,
-                    )
+            if admit_voice:
+                for emb in person.voice_embeddings:
+                    try:
+                        added = await self._store.add_voice_embedding(
+                            person_id, emb,
+                            provenance=provenance,
+                            confidence=claim.match_score,
+                            source_ref=ref,
+                        )
+                        if added:
+                            voice_added += 1
+                    except Exception:
+                        logger.exception(
+                            "Failed to commit voice embedding for ref=%s → %s",
+                            ref, claim.name,
+                        )
 
-            for emb in person.visual_embeddings:
-                try:
-                    # Visual embeddings committed via identify() or reid-match
-                    # are treated as voice-confirmed (agent-blessed).
-                    await self._store.add_visual_embedding(
-                        person_id,
-                        emb,
-                        voice_confirmed=(claim.source == "agent_identify"),
-                    )
-                    visual_added += 1
-                except Exception:
-                    logger.exception(
-                        "Failed to commit visual embedding for ref=%s → %s",
-                        ref, claim.name,
-                    )
+            if admit_visual:
+                crops = person.visual_crops
+                for idx, emb in enumerate(person.visual_embeddings):
+                    crop_path = crops[idx] if idx < len(crops) else None
+                    try:
+                        added = await self._store.add_visual_embedding(
+                            person_id,
+                            emb,
+                            voice_confirmed=True,
+                            crop_path=crop_path,
+                            provenance=provenance,
+                            confidence=claim.match_score,
+                            source_ref=ref,
+                        )
+                        if added:
+                            visual_added += 1
+                    except Exception:
+                        logger.exception(
+                            "Failed to commit visual embedding for ref=%s → %s",
+                            ref, claim.name,
+                        )
 
             # Recompute centroids now that new embeddings are in.
             try:
@@ -498,3 +572,17 @@ _TIER_ORDER: dict[Tier | None, int] = {
 
 def _tier_rank(tier: Tier | None) -> int:
     return _TIER_ORDER.get(tier, -1)
+
+
+# Strength order for admitting claim sources (higher wins, never downgraded).
+_ADMIT_ORDER: dict[str, int] = {
+    "voice_reid_match": 0,
+    "visual_reid_match": 0,
+    "voice_doa": 1,
+    "voice_visual_agree": 2,
+    "agent_identify": 3,
+}
+
+
+def _admit_rank(source: str | None) -> int:
+    return _ADMIT_ORDER.get(source or "", -1)

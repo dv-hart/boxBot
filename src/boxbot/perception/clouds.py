@@ -38,6 +38,43 @@ MAX_VISUAL_EMBEDDINGS = 200
 MAX_VOICE_EMBEDDINGS = 50
 
 # ---------------------------------------------------------------------------
+# Provenance — how we came to believe an embedding belongs to a person.
+# ---------------------------------------------------------------------------
+# Strongest → weakest. Drives weighted matching and eviction protection.
+# See docs/plans/person-id-overhaul.md.
+PROVENANCE_AGENT_IDENTIFY = "agent_identify"
+PROVENANCE_VOICE_VISUAL_AGREE = "voice_visual_agree"
+PROVENANCE_VOICE_DOA = "voice_doa"
+PROVENANCE_VISUAL_REID = "visual_reid"
+PROVENANCE_CONTEXT_INFERRED = "context_inferred"
+PROVENANCE_SEED = "seed"
+PROVENANCE_LEGACY = "legacy"
+
+# Relative trust weight per provenance, used when scoring a cloud match so a
+# single hand-confirmed anchor outranks many shaky auto-admitted points.
+PROVENANCE_WEIGHT: dict[str, float] = {
+    PROVENANCE_AGENT_IDENTIFY: 3.0,
+    PROVENANCE_VOICE_VISUAL_AGREE: 2.0,
+    PROVENANCE_VOICE_DOA: 1.5,
+    PROVENANCE_VISUAL_REID: 1.0,
+    PROVENANCE_CONTEXT_INFERRED: 0.7,
+    PROVENANCE_SEED: 1.0,
+    PROVENANCE_LEGACY: 1.0,
+}
+_DEFAULT_PROVENANCE_WEIGHT = 1.0
+
+# Provenance tiers that are anchors — never evicted by the cap janitor, and the
+# only ground truth the dream-cycle reconciliation self-labels against.
+ANCHOR_PROVENANCES = frozenset({PROVENANCE_AGENT_IDENTIFY})
+
+
+def provenance_weight(provenance: str | None) -> float:
+    """Return the trust weight for a provenance label (default if unknown)."""
+    if not provenance:
+        return _DEFAULT_PROVENANCE_WEIGHT
+    return PROVENANCE_WEIGHT.get(provenance, _DEFAULT_PROVENANCE_WEIGHT)
+
+# ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
 
@@ -57,6 +94,9 @@ CREATE TABLE IF NOT EXISTS visual_embeddings (
     timestamp TEXT NOT NULL,
     voice_confirmed INTEGER NOT NULL DEFAULT 0,
     crop_path TEXT,
+    provenance TEXT NOT NULL DEFAULT 'legacy',
+    confidence REAL,
+    source_ref TEXT,
     FOREIGN KEY (person_id) REFERENCES persons(id)
 );
 
@@ -65,6 +105,9 @@ CREATE TABLE IF NOT EXISTS voice_embeddings (
     person_id TEXT NOT NULL,
     embedding BLOB NOT NULL,
     timestamp TEXT NOT NULL,
+    provenance TEXT NOT NULL DEFAULT 'legacy',
+    confidence REAL,
+    source_ref TEXT,
     FOREIGN KEY (person_id) REFERENCES persons(id)
 );
 
@@ -74,6 +117,19 @@ CREATE TABLE IF NOT EXISTS centroids (
     voice_centroid BLOB,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (person_id) REFERENCES persons(id)
+);
+
+-- Audit log of identity corrections (agent_identify overrides, dream-cycle
+-- merges/relabels). Enables undo and feeds reconciliation. See
+-- docs/plans/person-id-overhaul.md.
+CREATE TABLE IF NOT EXISTS id_corrections (
+    id TEXT PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    source_ref TEXT,
+    from_person_id TEXT,
+    to_person_id TEXT,
+    source TEXT NOT NULL,
+    detail TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_visual_person
@@ -144,13 +200,52 @@ class CloudStore:
         """Run schema migrations for existing databases."""
         # Add crop_path column to visual_embeddings if missing
         async with db.execute("PRAGMA table_info(visual_embeddings)") as cur:
-            columns = {row[1] async for row in cur}
-        if "crop_path" not in columns:
+            visual_cols = {row[1] async for row in cur}
+        if "crop_path" not in visual_cols:
             await db.execute(
                 "ALTER TABLE visual_embeddings ADD COLUMN crop_path TEXT"
             )
             await db.commit()
             logger.info("Migrated visual_embeddings: added crop_path column")
+
+        # Provenance/confidence/source_ref columns (person-id-overhaul).
+        # SQLite ALTER ... ADD COLUMN can't add a NOT NULL column without a
+        # constant default, so we add with the 'legacy' default; pre-existing
+        # rows keep that label (treated as low-trust, never an anchor).
+        for table in ("visual_embeddings", "voice_embeddings"):
+            async with db.execute(f"PRAGMA table_info({table})") as cur:
+                cols = {row[1] async for row in cur}
+            if "provenance" not in cols:
+                await db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN "
+                    "provenance TEXT NOT NULL DEFAULT 'legacy'"
+                )
+                logger.info("Migrated %s: added provenance column", table)
+            if "confidence" not in cols:
+                await db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN confidence REAL"
+                )
+                logger.info("Migrated %s: added confidence column", table)
+            if "source_ref" not in cols:
+                await db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN source_ref TEXT"
+                )
+                logger.info("Migrated %s: added source_ref column", table)
+        await db.commit()
+
+        # id_corrections table for older DBs created before it existed.
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS id_corrections (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                source_ref TEXT,
+                from_person_id TEXT,
+                to_person_id TEXT,
+                source TEXT NOT NULL,
+                detail TEXT
+            )"""
+        )
+        await db.commit()
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -255,30 +350,46 @@ class CloudStore:
         embedding: np.ndarray,
         voice_confirmed: bool = False,
         crop_path: str | None = None,
+        provenance: str = PROVENANCE_LEGACY,
+        confidence: float | None = None,
+        source_ref: str | None = None,
     ) -> str:
         """Add a visual embedding to a person's cloud.
 
-        Enforces the per-person embedding cap (oldest pruned first).
+        Enforces the per-person embedding cap (isolation+age eviction).
 
         Args:
             person_id: Person to add embedding for.
             embedding: Float32 embedding vector (typically 512-dim).
             voice_confirmed: Whether this embedding was voice-confirmed.
             crop_path: Optional path to the saved crop image.
+            provenance: How we came to believe this belongs to the person
+                (see PROVENANCE_* constants). Drives matching weight + eviction.
+            confidence: Match/admission confidence at enrollment time.
+            source_ref: Session ref the embedding was captured under (audit).
 
         Returns:
-            The generated embedding ID.
+            The generated embedding ID, or ``""`` if rejected as non-finite.
         """
+        if embedding is None or not np.all(np.isfinite(embedding)):
+            logger.warning(
+                "Refusing to add non-finite visual embedding for person %s",
+                person_id,
+            )
+            return ""
+
         db = self._ensure_db()
         emb_id = _generate_id()
         now = _now_iso()
 
         await db.execute(
             """INSERT INTO visual_embeddings
-               (id, person_id, embedding, timestamp, voice_confirmed, crop_path)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               (id, person_id, embedding, timestamp, voice_confirmed,
+                crop_path, provenance, confidence, source_ref)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (emb_id, person_id, _embedding_to_blob(embedding), now,
-             1 if voice_confirmed else 0, crop_path),
+             1 if voice_confirmed else 0, crop_path,
+             provenance, confidence, source_ref),
         )
         await db.commit()
 
@@ -320,12 +431,61 @@ class CloudStore:
             row = await cursor.fetchone()
             return row["cnt"]
 
+    async def get_visual_clouds(
+        self,
+    ) -> dict[str, tuple[str, np.ndarray, np.ndarray]]:
+        """Get every person's full visual embedding cloud, with match weights.
+
+        Returns ``{person_id: (name, embeddings, weights)}`` where
+        ``embeddings`` is an ``(N, D)`` float32 array of that person's stored,
+        L2-unit visual embeddings and ``weights`` is an ``(N,)`` float32 array
+        of per-embedding provenance trust weights. This is the cloud-based
+        counterpart to the single visual centroid — matching against the cloud
+        (provenance-weighted top-k cosine) preserves per-appearance modes that
+        a single averaged centroid collapses, and lets a hand-confirmed anchor
+        outweigh shaky auto-admitted points. See
+        docs/plans/person-id-overhaul.md.
+        """
+        db = self._ensure_db()
+        acc: dict[str, tuple[str, list[np.ndarray], list[float]]] = {}
+        async with db.execute(
+            """SELECT v.person_id, p.name, v.embedding, v.provenance
+               FROM visual_embeddings v
+               JOIN persons p ON v.person_id = p.id"""
+        ) as cursor:
+            async for row in cursor:
+                emb = _blob_to_embedding(row["embedding"])
+                if not np.all(np.isfinite(emb)):
+                    continue
+                n = np.linalg.norm(emb)
+                if n > 0:
+                    emb = emb / n
+                name, vecs, wts = acc.setdefault(
+                    row["person_id"], (row["name"], [], [])
+                )
+                vecs.append(emb.astype(np.float32))
+                wts.append(provenance_weight(row["provenance"]))
+        clouds: dict[str, tuple[str, np.ndarray, np.ndarray]] = {}
+        for pid, (name, vecs, wts) in acc.items():
+            if vecs:
+                clouds[pid] = (
+                    name,
+                    np.stack(vecs),
+                    np.asarray(wts, dtype=np.float32),
+                )
+        return clouds
+
     # ------------------------------------------------------------------
     # Voice embeddings (schema ready, full implementation for future use)
     # ------------------------------------------------------------------
 
     async def add_voice_embedding(
-        self, person_id: str, embedding: np.ndarray
+        self,
+        person_id: str,
+        embedding: np.ndarray,
+        provenance: str = PROVENANCE_LEGACY,
+        confidence: float | None = None,
+        source_ref: str | None = None,
     ) -> str:
         """Add a voice embedding to a person's cloud.
 
@@ -360,9 +520,11 @@ class CloudStore:
 
         await db.execute(
             """INSERT INTO voice_embeddings
-               (id, person_id, embedding, timestamp)
-               VALUES (?, ?, ?, ?)""",
-            (emb_id, person_id, _embedding_to_blob(embedding), now),
+               (id, person_id, embedding, timestamp,
+                provenance, confidence, source_ref)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (emb_id, person_id, _embedding_to_blob(embedding), now,
+             provenance, confidence, source_ref),
         )
         await db.commit()
 
@@ -574,22 +736,65 @@ class CloudStore:
     async def _enforce_visual_cap(
         self, person_id: str, max_count: int = MAX_VISUAL_EMBEDDINGS
     ) -> None:
-        """Delete oldest visual embeddings if over cap."""
+        """Evict visual embeddings by isolation + age when over cap.
+
+        Mirrors :meth:`_enforce_voice_cap` (docs/voice-id-redesign.md), with one
+        addition: **anchor provenances are never evicted** — hand-confirmed
+        ground truth is precious, so the janitor only sheds non-anchor points.
+        When over cap, evict in one batch down to ~90% of cap, choosing the
+        highest ``isolation + λ·age`` first:
+
+        - ``isolation`` = 1 − mean(top-k cosine to nearest neighbours in the
+          cloud). Mis-attributed faces have no neighbours → evicted first.
+        - ``age`` (oldest = 1.0) breaks ties.
+
+        Distance is to *neighbours*, never the global mean, so genuine
+        per-appearance modes (different outfits/lighting) survive.
+        """
         db = self._ensure_db()
-        count = await self.count_visual_embeddings(person_id)
+        async with db.execute(
+            """SELECT id, embedding, provenance FROM visual_embeddings
+               WHERE person_id = ? ORDER BY timestamp ASC""",
+            (person_id,),
+        ) as cursor:
+            rows = [
+                (r["id"], _blob_to_embedding(r["embedding"]), r["provenance"])
+                async for r in cursor
+            ]
+        count = len(rows)
         if count <= max_count:
             return
 
-        excess = count - max_count
-        async with db.execute(
-            """SELECT id FROM visual_embeddings
-               WHERE person_id = ?
-               ORDER BY timestamp ASC
-               LIMIT ?""",
-            (person_id, excess),
-        ) as cursor:
-            ids_to_delete = [row["id"] async for row in cursor]
+        low_water = max(1, int(max_count * 0.9))
+        n_evict = count - low_water
 
+        # Evictable = non-anchor rows only. Anchors are kept even over cap.
+        evictable = [
+            (i, rid) for i, (rid, _, prov) in enumerate(rows)
+            if prov not in ANCHOR_PROVENANCES
+        ]
+        if not evictable:
+            return
+        n_evict = min(n_evict, len(evictable))
+
+        vecs = np.stack([
+            (e / np.linalg.norm(e)) if np.linalg.norm(e) > 0 else e
+            for _, e, _ in rows
+        ]).astype(np.float32)
+        sims = vecs @ vecs.T
+        np.fill_diagonal(sims, -1.0)
+        k = min(3, count - 1)
+        topk = np.sort(sims, axis=1)[:, -k:]
+        neighbour_sim = topk.mean(axis=1)
+        isolation = 1.0 - neighbour_sim
+        age = 1.0 - np.arange(count) / max(1, count - 1)
+        evict_score = isolation + 0.3 * age
+
+        # Rank only the evictable (non-anchor) rows; take the worst n_evict.
+        evictable_sorted = sorted(
+            evictable, key=lambda t: evict_score[t[0]], reverse=True
+        )
+        ids_to_delete = [rid for _, rid in evictable_sorted[:n_evict]]
         for emb_id in ids_to_delete:
             await db.execute(
                 "DELETE FROM visual_embeddings WHERE id = ?", (emb_id,)
@@ -597,7 +802,8 @@ class CloudStore:
         await db.commit()
 
         logger.debug(
-            "Pruned %d visual embeddings for person %s", excess, person_id
+            "Evicted %d visual embeddings for person %s (isolation+age)",
+            len(ids_to_delete), person_id,
         )
 
     async def _enforce_voice_cap(

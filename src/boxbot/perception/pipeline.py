@@ -136,6 +136,12 @@ class PerceptionPipeline:
         motion_threshold: float = 12.0,
         reid_high_threshold: float = 0.85,
         reid_low_threshold: float = 0.60,
+        visual_confirmed_threshold: float = 0.70,
+        visual_maybe_threshold: float = 0.55,
+        visual_cloud_topk: int = 3,
+        enable_voice_teaches_vision: bool = True,
+        enable_voice_visual_voice_admit: bool = True,
+        visual_admit_min_crop_area_px: int = 4096,
         presence_timeout: float = 30.0,
         heartbeat_interval: float = 5.0,
         scan_fps: int = 5,
@@ -162,7 +168,13 @@ class PerceptionPipeline:
         self._reid = VisualReID(
             high_threshold=reid_high_threshold,
             low_threshold=reid_low_threshold,
+            confirmed_threshold=visual_confirmed_threshold,
+            maybe_threshold=visual_maybe_threshold,
+            topk=visual_cloud_topk,
         )
+        self._enable_voice_teaches_vision = enable_voice_teaches_vision
+        self._enable_voice_visual_voice_admit = enable_voice_visual_voice_admit
+        self._visual_admit_min_crop_area_px = visual_admit_min_crop_area_px
         self._state_machine = PerceptionStateMachine(
             presence_timeout=presence_timeout,
             heartbeat_interval=heartbeat_interval,
@@ -428,6 +440,40 @@ class PerceptionPipeline:
             )
         logger.debug("ReID inference failed for %s", ref, exc_info=True)
 
+    def _detection_quality_ok(self, det: Any) -> bool:
+        """Quality floor for admitting a detection's embedding to a cloud.
+
+        Gates on the *source bbox* area (not the resized ReID crop, which is a
+        fixed size) so we don't enrol tiny / far / low-detail detections.
+        """
+        try:
+            x1, y1, x2, y2 = det.bbox
+        except (TypeError, ValueError):
+            return False
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+        return area >= self._visual_admit_min_crop_area_px
+
+    def _maybe_save_crop(self, crop: np.ndarray, ref: str, match: Any) -> str | None:
+        """Persist a detection crop to disk; return its path (or None).
+
+        Crops back the dream-cycle's retroactive labelling and let the agent
+        review faces. Cheap (tiny JPEGs, retention-pruned). Best-effort.
+        """
+        if self._crop_manager is None or crop is None:
+            return None
+        try:
+            return self._crop_manager.save_crop(
+                crop,
+                ref,
+                "",  # embedding_id assigned at commit; crop_path is the link
+                match.person_name or ref,
+                float(match.confidence),
+                voice_confirmed=False,
+            )
+        except Exception:
+            logger.debug("save_crop failed for %s", ref, exc_info=True)
+            return None
+
     async def _run_reid(
         self, frame: np.ndarray, detections: list, bus: Any
     ) -> None:
@@ -435,7 +481,7 @@ class PerceptionPipeline:
         if not self._cloud_store:
             return
 
-        centroids = await self._cloud_store.get_centroids()
+        clouds = await self._cloud_store.get_visual_clouds()
 
         for i, det in enumerate(detections):
             # Get or generate ref for this detection
@@ -475,8 +521,9 @@ class PerceptionPipeline:
                 self._log_reid_error(ref)
                 continue
 
-            # Match against centroids
-            match = self._reid.match(embedding, centroids)
+            # Match against each person's visual cloud (provenance-weighted
+            # top-k cosine), the counterpart to voice cloud matching.
+            match = self._reid.match_cloud(embedding, clouds)
             self._state_machine.on_identification(ref, match, det.bbox)
 
             # Identification is the crux of person-trigger firing and is
@@ -486,14 +533,31 @@ class PerceptionPipeline:
             # someone is present, so this does not flood.
             logger.info(
                 "ReID match: ref=%s tier=%s confidence=%.3f name=%s "
-                "(%d enrolled centroid(s))",
+                "(%d enrolled person cloud(s))",
                 ref, match.tier, match.confidence,
-                match.person_name or "—", len(centroids),
+                match.person_name or "—", len(clouds),
             )
 
-            # Buffer embedding for enrollment
-            if self._enrollment:
-                self._enrollment.buffer_embedding(ref, embedding)
+            # Seed/upgrade the session claim from this visual match so the
+            # end-of-session commit can route buffered embeddings correctly.
+            if self._enrollment and match.person_id:
+                self._enrollment.on_reid_match(
+                    ref, "visual",
+                    person_id=match.person_id,
+                    person_name=match.person_name,
+                    tier=match.tier,
+                    score=match.confidence,
+                )
+
+            # Buffer this visual embedding (+ saved crop) for enrollment, but
+            # only if the detection is big enough to be worth admitting later.
+            # Matching above still happens for any detection; this gate only
+            # controls what can grow a cloud (quality floor on admission).
+            if self._enrollment and self._detection_quality_ok(det):
+                crop_path = self._maybe_save_crop(crop, ref, match)
+                self._enrollment.buffer_visual_embedding(
+                    ref, embedding, crop_path=crop_path
+                )
 
             # Publish PersonIdentified for high-confidence matches
             if match.tier == "high" and match.person_id and match.person_name:
@@ -592,6 +656,45 @@ class PerceptionPipeline:
                 active_persons=self._state_machine.active_persons,
                 doa_angle=doa_angle,
             )
+
+            # Voice teaches vision: turn a voice-confirmed identity into
+            # admitting claims so the end-of-session commit grows the clouds.
+            # agent_identify is canonical and is never overridden inside
+            # mark_admission. See docs/plans/person-id-overhaul.md.
+            if (
+                self._enrollment is not None
+                and result.person_id
+                and result.voice_confirmed
+            ):
+                if result.source == "fused":
+                    # Voice + visual agree → reinforce visual, and (if enabled)
+                    # admit voice too.
+                    if result.visual_ref:
+                        self._enrollment.mark_admission(
+                            result.visual_ref,
+                            person_id=result.person_id,
+                            person_name=result.person_name,
+                            source="voice_visual_agree",
+                            score=result.confidence,
+                        )
+                    if self._enable_voice_visual_voice_admit:
+                        self._enrollment.mark_admission(
+                            speaker_label,
+                            person_id=result.person_id,
+                            person_name=result.person_name,
+                            source="voice_visual_agree",
+                            score=result.confidence,
+                        )
+                elif result.visual_ref and self._enable_voice_teaches_vision:
+                    # Voice-confirmed + DOA-associated detection, but visual
+                    # didn't recognize them → bootstrap vision from voice.
+                    self._enrollment.mark_admission(
+                        result.visual_ref,
+                        person_id=result.person_id,
+                        person_name=result.person_name,
+                        source="voice_doa",
+                        score=result.confidence,
+                    )
 
             # Publish SpeakerIdentified for confirmed matches
             if result.voice_confirmed and result.person_id and result.person_name:

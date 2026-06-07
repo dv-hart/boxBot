@@ -696,3 +696,238 @@ class TestPerceptionConfig:
         cfg = BoxBotConfig()
         assert hasattr(cfg, "hardware")
         assert cfg.hardware.camera.rotation == 180
+
+
+# ---------------------------------------------------------------------------
+# Visual cloud matching (person-id-overhaul: N1)
+# ---------------------------------------------------------------------------
+
+
+def _unit(dim: int = 512, seed: int | None = None) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    v = rng.standard_normal(dim).astype(np.float32)
+    return v / np.linalg.norm(v)
+
+
+class TestVisualCloudMatching:
+    """get_visual_clouds + VisualReID.match_cloud (provenance-weighted)."""
+
+    @pytest_asyncio.fixture
+    async def store(self, tmp_path):
+        from boxbot.perception.clouds import CloudStore
+
+        s = CloudStore(db_path=tmp_path / "vc.db")
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @pytest.mark.asyncio
+    async def test_get_visual_clouds_shape_and_weights(self, store):
+        from boxbot.perception.clouds import (
+            PROVENANCE_AGENT_IDENTIFY,
+            PROVENANCE_VISUAL_REID,
+            provenance_weight,
+        )
+
+        pid = await store.create_person("Jacob")
+        await store.add_visual_embedding(
+            pid, _unit(seed=1), provenance=PROVENANCE_AGENT_IDENTIFY
+        )
+        await store.add_visual_embedding(
+            pid, _unit(seed=2), provenance=PROVENANCE_VISUAL_REID
+        )
+
+        clouds = await store.get_visual_clouds()
+        assert pid in clouds
+        name, embs, weights = clouds[pid]
+        assert name == "Jacob"
+        assert embs.shape == (2, 512)
+        assert np.linalg.norm(embs[0]) == pytest.approx(1.0, abs=1e-5)
+        assert sorted(weights.tolist()) == sorted([
+            provenance_weight(PROVENANCE_AGENT_IDENTIFY),
+            provenance_weight(PROVENANCE_VISUAL_REID),
+        ])
+
+    def test_match_cloud_high_tier_on_self(self):
+        from boxbot.perception.visual_reid import VisualReID
+
+        reid = VisualReID(confirmed_threshold=0.7, maybe_threshold=0.55, topk=3)
+        v = _unit(seed=3)
+        clouds = {"p1": ("Jacob", np.stack([v, v]), np.array([1.0, 1.0], np.float32))}
+        r = reid.match_cloud(v, clouds)
+        assert r.tier == "high"
+        assert r.person_id == "p1"
+        assert r.confidence == pytest.approx(1.0, abs=1e-4)
+
+    def test_match_cloud_unknown_when_orthogonal(self):
+        from boxbot.perception.visual_reid import VisualReID
+
+        reid = VisualReID(confirmed_threshold=0.7, maybe_threshold=0.55, topk=3)
+        a = np.zeros(512, np.float32); a[0] = 1.0
+        b = np.zeros(512, np.float32); b[1] = 1.0
+        clouds = {"p1": ("Jacob", np.stack([b]), np.array([1.0], np.float32))}
+        r = reid.match_cloud(a, clouds)
+        assert r.tier == "unknown"
+        assert r.person_id is None
+
+    def test_match_cloud_empty_is_unknown(self):
+        from boxbot.perception.visual_reid import VisualReID
+
+        r = VisualReID().match_cloud(_unit(seed=4), {})
+        assert r.tier == "unknown"
+
+    def test_match_cloud_provenance_weighting_raises_score(self):
+        # A close point and a far point. Up-weighting the close point pulls the
+        # weighted top-k mean up (0.7 → 0.8), showing provenance influence.
+        from boxbot.perception.visual_reid import VisualReID
+
+        reid = VisualReID(confirmed_threshold=0.7, maybe_threshold=0.55, topk=2)
+        q = np.zeros(512, np.float32); q[0] = 1.0
+        close = np.zeros(512, np.float32)
+        close[0] = 0.9; close[1] = float(np.sqrt(1 - 0.81))   # cos 0.9
+        far = np.zeros(512, np.float32)
+        far[0] = 0.5; far[1] = float(np.sqrt(1 - 0.25))       # cos 0.5
+        embs = np.stack([close, far])
+
+        equal = reid.match_cloud(
+            q, {"p1": ("J", embs, np.array([1.0, 1.0], np.float32))}
+        )
+        weighted = reid.match_cloud(
+            q, {"p1": ("J", embs, np.array([3.0, 1.0], np.float32))}
+        )
+        assert equal.confidence == pytest.approx(0.7, abs=1e-3)
+        assert weighted.confidence == pytest.approx(0.8, abs=1e-3)
+
+
+class TestVisualEvictionProvenance:
+    """_enforce_visual_cap: isolation+age eviction protects anchors."""
+
+    @pytest_asyncio.fixture
+    async def store(self, tmp_path):
+        from boxbot.perception.clouds import CloudStore
+
+        s = CloudStore(db_path=tmp_path / "ev.db")
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @pytest.mark.asyncio
+    async def test_anchors_never_evicted(self, store):
+        from boxbot.perception.clouds import (
+            PROVENANCE_AGENT_IDENTIFY,
+            PROVENANCE_VOICE_DOA,
+        )
+
+        pid = await store.create_person("Jacob")
+        for _ in range(2):
+            await store.add_visual_embedding(
+                pid, _unit(), provenance=PROVENANCE_AGENT_IDENTIFY
+            )
+        for _ in range(8):
+            await store.add_visual_embedding(
+                pid, _unit(), provenance=PROVENANCE_VOICE_DOA
+            )
+
+        await store._enforce_visual_cap(pid, max_count=5)
+
+        db = store._ensure_db()
+        async with db.execute(
+            "SELECT provenance, COUNT(*) c FROM visual_embeddings "
+            "WHERE person_id = ? GROUP BY provenance",
+            (pid,),
+        ) as cur:
+            counts = {r["provenance"]: r["c"] async for r in cur}
+        # Both anchors survive; total trimmed toward the low-water mark.
+        assert counts.get(PROVENANCE_AGENT_IDENTIFY) == 2
+        assert sum(counts.values()) <= 5
+
+
+class TestEnrollmentAdmission:
+    """commit_session provenance gating + mark_admission precedence."""
+
+    @pytest_asyncio.fixture
+    async def cloud_store(self, tmp_path):
+        from boxbot.perception.clouds import CloudStore
+
+        s = CloudStore(db_path=tmp_path / "adm.db")
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @pytest_asyncio.fixture
+    async def manager(self, cloud_store):
+        from boxbot.perception.enrollment import EnrollmentManager
+
+        return EnrollmentManager(cloud_store)
+
+    @pytest.mark.asyncio
+    async def test_voice_doa_admits_visual_not_voice(self, manager, cloud_store):
+        pid = await cloud_store.create_person("Jacob")
+        manager.buffer_visual_embedding("Person A", _unit(), crop_path="/c.jpg")
+        manager.buffer_voice_embedding("Person A", _unit(192))
+        manager.mark_admission(
+            "Person A", person_id=pid, person_name="Jacob",
+            source="voice_doa", score=0.7,
+        )
+        await manager.commit_session()
+
+        assert await cloud_store.count_visual_embeddings(pid) == 1
+        assert len(await cloud_store.get_voice_embeddings(pid)) == 0
+
+    @pytest.mark.asyncio
+    async def test_voice_visual_agree_admits_both(self, manager, cloud_store):
+        pid = await cloud_store.create_person("Jacob")
+        manager.buffer_visual_embedding("Person A", _unit())
+        manager.buffer_voice_embedding("Person A", _unit(192))
+        manager.mark_admission(
+            "Person A", person_id=pid, person_name="Jacob",
+            source="voice_visual_agree", score=0.8,
+        )
+        await manager.commit_session()
+
+        assert await cloud_store.count_visual_embeddings(pid) == 1
+        assert len(await cloud_store.get_voice_embeddings(pid)) == 1
+
+    @pytest.mark.asyncio
+    async def test_reid_only_claim_held_back(self, manager, cloud_store):
+        pid = await cloud_store.create_person("Jacob")
+        manager.buffer_visual_embedding("Person A", _unit())
+        manager.on_reid_match(
+            "Person A", "visual", person_id=pid, person_name="Jacob",
+            tier="medium", score=0.6,
+        )
+        await manager.commit_session()
+        # Passive reid match must not grow the cloud.
+        assert await cloud_store.count_visual_embeddings(pid) == 0
+
+    @pytest.mark.asyncio
+    async def test_admitted_visual_tagged_with_provenance(self, manager, cloud_store):
+        pid = await cloud_store.create_person("Jacob")
+        manager.buffer_visual_embedding("Person A", _unit())
+        manager.mark_admission(
+            "Person A", person_id=pid, person_name="Jacob",
+            source="voice_doa", score=0.7,
+        )
+        await manager.commit_session()
+
+        db = cloud_store._ensure_db()
+        async with db.execute(
+            "SELECT provenance FROM visual_embeddings WHERE person_id = ?",
+            (pid,),
+        ) as cur:
+            rows = [r["provenance"] async for r in cur]
+        assert rows == ["voice_doa"]
+
+    def test_mark_admission_never_overrides_agent_identify(self, manager):
+        manager._claims["Person A"] = __import__(
+            "boxbot.perception.enrollment", fromlist=["SessionClaim"]
+        ).SessionClaim(
+            person_id="p_jacob", name="Jacob", source="agent_identify",
+        )
+        manager.mark_admission(
+            "Person A", person_id="p_other", person_name="Carina",
+            source="voice_visual_agree", score=0.95,
+        )
+        claim = manager.get_claim("Person A")
+        assert claim.source == "agent_identify"
+        assert claim.name == "Jacob"

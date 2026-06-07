@@ -347,6 +347,18 @@ async def _init_perception(hal_modules: dict[str, Any], config: Any) -> Any | No
         motion_threshold=config.perception.motion_threshold,
         reid_high_threshold=config.perception.reid_high_threshold,
         reid_low_threshold=config.perception.reid_low_threshold,
+        visual_confirmed_threshold=config.perception.visual_confirmed_threshold,
+        visual_maybe_threshold=config.perception.visual_maybe_threshold,
+        visual_cloud_topk=config.perception.visual_cloud_topk,
+        enable_voice_teaches_vision=(
+            config.perception.enable_voice_teaches_vision
+        ),
+        enable_voice_visual_voice_admit=(
+            config.perception.enable_voice_visual_voice_admit
+        ),
+        visual_admit_min_crop_area_px=(
+            config.perception.visual_admit_min_crop_area_px
+        ),
         presence_timeout=config.perception.presence_timeout,
         heartbeat_interval=config.perception.heartbeat_interval,
         scan_fps=config.camera.scan_fps,

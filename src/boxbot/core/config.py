@@ -502,6 +502,23 @@ class PerceptionConfig(BaseModel):
     voice_confirmed_threshold: float = 0.55
     voice_maybe_threshold: float = 0.44
     voice_cloud_topk: int = 3
+    # Cloud-based VISUAL matching (docs/plans/person-id-overhaul.md). Mirrors
+    # the voice cloud model: score = provenance-weighted mean of the top-k
+    # cosine to a person's visual embedding cloud. Middle-road defaults —
+    # RepVGG person-ReID is appearance-based so the genuine distribution sits
+    # lower/wider than voice; calibrate from real data once clouds accumulate.
+    visual_confirmed_threshold: float = 0.70
+    visual_maybe_threshold: float = 0.55
+    visual_cloud_topk: int = 3
+    # "Voice teaches vision" admission. When a speaker is voice-confirmed and
+    # DOA-associates to an in-FOV detection, admit that face to the matched
+    # person's visual cloud (bootstraps vision). Voice embeddings admit on
+    # voice+visual agreement. agent_identify always overrides.
+    enable_voice_teaches_vision: bool = True
+    enable_voice_visual_voice_admit: bool = True
+    # Quality gate: minimum crop area (px) to admit a visual embedding, so we
+    # don't enroll tiny/far/blurry detections. ~64x64.
+    visual_admit_min_crop_area_px: int = 4096
 
 
 class MemoryConfig(BaseModel):

@@ -54,14 +54,31 @@ class VisualReID:
 
     HIGH_THRESHOLD = 0.85
     LOW_THRESHOLD = 0.60
+    # Cloud-matching tiers (match_cloud), mirroring VoiceReID. confirmed → the
+    # "high" tier that can fire triggers; maybe → "medium" (verify/visual).
+    CONFIRMED_THRESHOLD = 0.70
+    MAYBE_THRESHOLD = 0.55
+    CLOUD_TOPK = 3
 
     def __init__(
         self,
         high_threshold: float = 0.85,
         low_threshold: float = 0.60,
+        confirmed_threshold: float | None = None,
+        maybe_threshold: float | None = None,
+        topk: int | None = None,
     ) -> None:
         self._high_threshold = high_threshold
         self._low_threshold = low_threshold
+        self._confirmed = (
+            confirmed_threshold if confirmed_threshold is not None
+            else self.CONFIRMED_THRESHOLD
+        )
+        self._maybe = (
+            maybe_threshold if maybe_threshold is not None
+            else self.MAYBE_THRESHOLD
+        )
+        self._topk = topk if topk is not None else self.CLOUD_TOPK
 
     def normalize_embedding(self, raw_output: np.ndarray) -> np.ndarray:
         """Normalize raw model output to unit L2 vector.
@@ -114,6 +131,88 @@ class VisualReID:
         if best_score >= self._high_threshold:
             tier = "high"
         elif best_score >= self._low_threshold:
+            tier = "medium"
+        else:
+            tier = "unknown"
+            best_id = None
+            best_name = None
+
+        return MatchResult(
+            person_id=best_id,
+            person_name=best_name,
+            confidence=best_score,
+            tier=tier,
+        )
+
+    def match_cloud(
+        self,
+        embedding: np.ndarray,
+        clouds: dict[str, tuple[str, np.ndarray, np.ndarray]],
+        *,
+        confirmed_threshold: float | None = None,
+        maybe_threshold: float | None = None,
+        topk: int | None = None,
+    ) -> MatchResult:
+        """Match an embedding against per-person visual embedding clouds.
+
+        Mirrors :meth:`VoiceReID.match_cloud`. For each person the score is the
+        **provenance-weighted mean of the top-k cosine** similarities to that
+        person's cloud — proximity to real stored points (preserving
+        per-appearance modes) rather than to a single averaged centroid, with
+        higher-provenance points (e.g. hand-confirmed anchors) weighted up.
+
+        Tiers: ``high`` ≥ confirmed_threshold (address by name / fire triggers),
+        ``medium`` ≥ maybe_threshold (tentative; verify), else ``unknown``.
+
+        Args:
+            embedding: (D,) float32 normalized query embedding.
+            clouds: ``{person_id: (name, embeddings (N,D), weights (N,))}``.
+            confirmed_threshold / maybe_threshold / topk: overrides.
+        """
+        confirmed = (
+            confirmed_threshold if confirmed_threshold is not None
+            else self._confirmed
+        )
+        maybe = maybe_threshold if maybe_threshold is not None else self._maybe
+        k_top = topk if topk is not None else self._topk
+
+        if not clouds:
+            return MatchResult(
+                person_id=None, person_name=None, confidence=0.0,
+                tier="unknown",
+            )
+
+        q = embedding.astype(np.float32)
+        qn = np.linalg.norm(q)
+        if qn > 0:
+            q = q / qn
+
+        best_id: str | None = None
+        best_name: str | None = None
+        best_score = -1.0
+
+        for person_id, (name, embs, weights) in clouds.items():
+            if embs.size == 0:
+                continue
+            sims = embs @ q  # cloud already L2-unit → cosine
+            k = min(k_top, sims.shape[0])
+            # Indices of the top-k most-similar points for this person.
+            top_idx = np.argpartition(sims, -k)[-k:]
+            top_sims = sims[top_idx]
+            top_w = weights[top_idx]
+            w_sum = float(top_w.sum())
+            if w_sum <= 0:
+                score = float(top_sims.mean())
+            else:
+                score = float((top_sims * top_w).sum() / w_sum)
+            if score > best_score:
+                best_score = score
+                best_id = person_id
+                best_name = name
+
+        if best_score >= confirmed:
+            tier = "high"
+        elif best_score >= maybe:
             tier = "medium"
         else:
             tier = "unknown"

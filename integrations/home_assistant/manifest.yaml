@@ -32,10 +32,19 @@ outputs:
     description: For get_state — ISO timestamp of last state change.
   ok:
     type: bool
-    description: For call_service — true if HA accepted the call.
+    description: For call_service — true if HA accepted the call (or it was dispatched but not yet confirmed).
+  confirmed:
+    type: bool
+    description: For call_service — true if HA confirmed completion; false if the call was sent but timed out awaiting confirmation (common for Alarm.com/Z-Wave devices on a cold call). When false, trust resulting_state, not affected.
   affected:
     type: array
-    description: For call_service — entity IDs HA reports as changed.
+    description: For call_service — entity IDs HA reports as changed. Empty when HA's cached state already matched the request (NOT a failure) — verify via resulting_state.
+  resulting_state:
+    type: dict
+    description: For call_service with an entity_id — the entity re-read right after the call ({state, attributes}). Use this to confirm the real outcome instead of inferring from affected.
+  note:
+    type: string
+    description: For call_service — present only when confirmed is false; explains the unconfirmed-but-dispatched situation.
   image_path:
     type: string
     description: For camera_snapshot — workspace-relative path of the saved JPEG (e.g. "tmp/ha/camera_front_door_2026-05-17T143052Z.jpg"). The integration does NOT interpret the image — caller chooses bb.workspace.view (agent sees pixels), small-model tagging, or bb.display.show.
@@ -48,4 +57,6 @@ outputs:
 secrets:
   - HOME_ASSISTANT_URL
   - HOME_ASSISTANT_TOKEN
-timeout: 20
+# Allows headroom for call_service's 45s read budget (slow cloud/Z-Wave
+# confirmation) plus the sandbox spawn + a state re-read. Reads are fast (~0.3s).
+timeout: 50

@@ -36,6 +36,11 @@ URL_SECRET = "HOME_ASSISTANT_URL"
 TOKEN_SECRET = "HOME_ASSISTANT_TOKEN"
 
 _TIMEOUT = httpx.Timeout(15.0)
+# HA's /api/services/<domain>/<service> blocks until the service finishes. For
+# state-tracked cloud devices (Alarm.com / Z-Wave lights, etc.) the first "cold"
+# command waits on a full cloud confirmation round-trip that routinely exceeds
+# 15s — so service calls get a longer read budget than plain state reads.
+_CALL_TIMEOUT = httpx.Timeout(15.0, read=45.0)
 
 # Domains whose state-changing service calls are blocked in V1.
 # Read operations (get_state) on these are always allowed.
@@ -136,6 +141,26 @@ def _get_state(url: str, token: str, args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _read_state(url: str, token: str, entity_id: str) -> dict[str, Any] | None:
+    """Best-effort re-read of one entity's state. Returns None on any failure —
+    callers use this only to enrich a service-call result, never as the result."""
+    try:
+        resp = httpx.get(
+            f"{url}/api/states/{entity_id}",
+            headers=_headers(token),
+            timeout=_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return {
+            "state": data.get("state"),
+            "attributes": data.get("attributes", {}),
+        }
+    except Exception:  # noqa: BLE001 — enrichment only, never fatal
+        return None
+
+
 def _call_service(url: str, token: str, args: dict[str, Any]) -> dict[str, Any]:
     domain = (args.get("domain") or "").strip()
     service = (args.get("service") or "").strip()
@@ -157,19 +182,47 @@ def _call_service(url: str, token: str, args: dict[str, Any]) -> dict[str, Any]:
     entity_id = (args.get("entity_id") or "").strip()
     if entity_id:
         body["entity_id"] = entity_id
-    resp = httpx.post(
-        f"{url}/api/services/{domain}/{service}",
-        headers=_headers(token),
-        json=body,
-        timeout=_TIMEOUT,
-    )
+    try:
+        resp = httpx.post(
+            f"{url}/api/services/{domain}/{service}",
+            headers=_headers(token),
+            json=body,
+            timeout=_CALL_TIMEOUT,
+        )
+    except httpx.TimeoutException:
+        # HA didn't confirm within the window, but the command was almost
+        # certainly dispatched (slow cloud/Z-Wave confirmation). Don't report a
+        # hard failure — re-read the entity so the agent sees the real outcome.
+        observed = _read_state(url, token, entity_id) if entity_id else None
+        result = {
+            "ok": True,
+            "confirmed": False,
+            "affected": [],
+            "note": (
+                "HA did not confirm the service within the timeout — common for "
+                "Alarm.com/Z-Wave devices on a cold call. The command was sent; "
+                "the resulting_state below was re-read afterward. Verify it "
+                "matches intent rather than assuming the call failed."
+            ),
+        }
+        if observed:
+            result["resulting_state"] = observed
+        return result
     if resp.status_code == 400:
         return {"error": f"HA rejected call: {resp.text[:200]}"}
     resp.raise_for_status()
-    # HA returns a list of entities whose state changed as a result.
+    # HA returns a list of entities whose state changed as a result. This list is
+    # empty when HA's cached state already matched the request (e.g. turning off
+    # an already-off light) — which is NOT a failure. Re-read the entity so the
+    # agent can verify the actual resulting state instead of inferring from it.
     payload = resp.json() if resp.content else []
     affected = [e.get("entity_id", "") for e in payload if isinstance(e, dict)]
-    return {"ok": True, "affected": affected}
+    result = {"ok": True, "confirmed": True, "affected": affected}
+    if entity_id:
+        observed = _read_state(url, token, entity_id)
+        if observed:
+            result["resulting_state"] = observed
+    return result
 
 
 def _camera_snapshot(url: str, token: str, args: dict[str, Any]) -> dict[str, Any]:

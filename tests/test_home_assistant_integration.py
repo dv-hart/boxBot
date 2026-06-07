@@ -141,19 +141,25 @@ class _FakeHttpx:
     """
 
     def __init__(self):
-        self.responses: dict[tuple[str, str], _FakeResponse] = {}
+        # A canned response may be a _FakeResponse OR a BaseException — in
+        # the latter case _route raises it, to simulate httpx errors like
+        # a read timeout on a slow service call.
+        self.responses: dict[tuple[str, str], _FakeResponse | BaseException] = {}
         self.calls: list[dict[str, Any]] = []
         # Mirror httpx's exception classes — the script catches these.
         import httpx as real_httpx
         self.HTTPStatusError = real_httpx.HTTPStatusError
         self.ConnectError = real_httpx.ConnectError
         self.Timeout = real_httpx.Timeout
+        self.TimeoutException = real_httpx.TimeoutException
 
     def _route(self, method: str, url: str, **kwargs) -> _FakeResponse:
         self.calls.append({"method": method, "url": url, **kwargs})
         # Match by URL suffix to keep test setup decoupled from base URL.
         for (m, suffix), resp in self.responses.items():
             if m == method and url.endswith(suffix):
+                if isinstance(resp, BaseException):
+                    raise resp
                 return resp
         return _FakeResponse(404, text=f"no canned response for {method} {url}")
 
@@ -288,9 +294,25 @@ def test_get_state_missing_entity_id(script):
 # ---------------------------------------------------------------------------
 
 
+def _post_call(fake_httpx, suffix: str) -> dict[str, Any]:
+    """Return the recorded POST call to ``suffix``.
+
+    call_service issues a follow-up GET (state re-read) after the POST,
+    so the POST is no longer ``calls[-1]`` — look it up by method+suffix.
+    """
+    return next(
+        c for c in fake_httpx.calls
+        if c["method"] == "POST" and c["url"].endswith(suffix)
+    )
+
+
 def test_call_service_happy_path_with_data(script, fake_httpx, with_secrets):
     fake_httpx.responses[("POST", "/api/services/light/turn_on")] = _FakeResponse(
         200, json_body=[{"entity_id": "light.living_room"}],
+    )
+    # call_service re-reads the entity after the call; canned that read.
+    fake_httpx.responses[("GET", "/api/states/light.living_room")] = _FakeResponse(
+        200, json_body={"state": "on", "attributes": {"brightness": 80}},
     )
     result = script._call_service(
         "http://ha.test:8123",
@@ -303,15 +325,62 @@ def test_call_service_happy_path_with_data(script, fake_httpx, with_secrets):
         },
     )
     assert result["ok"] is True
+    assert result["confirmed"] is True
     assert result["affected"] == ["light.living_room"]
-    # Confirm the body merged entity_id + service_data.
-    call = fake_httpx.calls[-1]
-    body = call["json"]
+    # The post-call re-read is surfaced as resulting_state.
+    assert result["resulting_state"] == {
+        "state": "on",
+        "attributes": {"brightness": 80},
+    }
+    # Confirm the POST body merged entity_id + service_data.
+    body = _post_call(fake_httpx, "/api/services/light/turn_on")["json"]
     assert body == {
         "rgb_color": [180, 30, 90],
         "brightness": 80,
         "entity_id": "light.living_room",
     }
+
+
+def test_call_service_empty_affected_is_not_failure(script, fake_httpx, with_secrets):
+    """HA returns [] when its cached state already matched — not a failure.
+    The re-read still surfaces the real state."""
+    fake_httpx.responses[("POST", "/api/services/light/turn_off")] = _FakeResponse(
+        200, json_body=[],
+    )
+    fake_httpx.responses[("GET", "/api/states/light.living_room")] = _FakeResponse(
+        200, json_body={"state": "off", "attributes": {}},
+    )
+    result = script._call_service(
+        "http://ha.test:8123",
+        "tok",
+        {"domain": "light", "service": "turn_off", "entity_id": "light.living_room"},
+    )
+    assert result["ok"] is True
+    assert result["confirmed"] is True
+    assert result["affected"] == []
+    assert result["resulting_state"]["state"] == "off"
+
+
+def test_call_service_timeout_reports_dispatched(script, fake_httpx, with_secrets):
+    """A read timeout on the service call isn't a hard failure: the command
+    was dispatched, so report ok + confirmed=False + a re-read of the state."""
+    fake_httpx.responses[("POST", "/api/services/light/turn_on")] = (
+        fake_httpx.TimeoutException("read timed out")
+    )
+    fake_httpx.responses[("GET", "/api/states/light.porch")] = _FakeResponse(
+        200, json_body={"state": "on", "attributes": {}},
+    )
+    result = script._call_service(
+        "http://ha.test:8123",
+        "tok",
+        # light domain isn't blocked; modeling a slow-confirming light.
+        {"domain": "light", "service": "turn_on", "entity_id": "light.porch"},
+    )
+    assert result["ok"] is True
+    assert result["confirmed"] is False
+    assert "note" in result and result["note"]
+    assert result["affected"] == []
+    assert result["resulting_state"] == {"state": "on", "attributes": {}}
 
 
 @pytest.mark.parametrize("domain", ["alarm_control_panel", "lock", "cover"])

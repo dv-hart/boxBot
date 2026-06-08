@@ -353,7 +353,7 @@ def _prompt_persona(name: str, wake_word: str) -> str:
         "elegant wooden box. You see through a camera, hear through a "
         "microphone array, speak through a speaker, and display information "
         "on a 7-inch screen. You communicate with your household via voice "
-        "and WhatsApp.\n\n"
+        "and text messages.\n\n"
         "You recognise the people around you and proactively help them — "
         "relaying messages, managing tasks, controlling displays, and "
         "remembering everything important about your household. You are warm, "
@@ -361,6 +361,19 @@ def _prompt_persona(name: str, wake_word: str) -> str:
         "to stay quiet.\n\n"
         f"Your wake word is \"{wake_word}\"."
     )
+
+
+def _agent_facing_channel(channel: str) -> str:
+    """Normalise the internal channel id to what the agent should see.
+
+    The agent reasons about *modality*, not the messaging vendor. Every
+    text platform (WhatsApp, Signal, …) collapses to ``"text"`` so the
+    prompt never names a vendor and the agent's channel choice stays
+    platform-agnostic. Voice and trigger pass through unchanged.
+    """
+    if channel in ("whatsapp", "signal"):
+        return "text"
+    return channel
 
 
 def _prompt_etiquette() -> str:
@@ -392,7 +405,7 @@ def _prompt_etiquette() -> str:
         "## To reach a person, call message\n"
         "\n"
         "`message(to, channel, content)` is the ONLY way to actually\n"
-        "speak through the box speaker or send a WhatsApp message. Without a\n"
+        "speak through the box speaker or send a text message. Without a\n"
         "call to it, the user gets silence — no matter what your text said.\n"
         "\n"
         "Multiple calls per turn are normal and encouraged:\n"
@@ -413,8 +426,15 @@ def _prompt_etiquette() -> str:
         "Channel:\n"
         "- `\"speak\"` — speak through the box speaker. Everyone in the room\n"
         "  hears. Does not reach absent people.\n"
-        "- `\"text\"` — WhatsApp message to the named user's phone. Requires\n"
+        "- `\"text\"` — text message to the named user's phone. Requires\n"
         "  `to` be a registered user by name. Cannot text \"room\" or unknowns.\n"
+        "\n"
+        "Default to the channel you were contacted through — the current one\n"
+        "is shown as `Channel:` in the dynamic context. In a `text`\n"
+        "conversation reply with `text` (the person is not at the box and\n"
+        "will not hear speech); in a `voice` conversation reply with `speak`.\n"
+        "Switch only when it clearly makes sense (e.g. someone at the box\n"
+        "asks you to text an absent person).\n"
         "\n"
         "## When to deliver vs stay silent\n"
         "\n"
@@ -526,8 +546,10 @@ def _prompt_etiquette() -> str:
         "                     content=\"Jacob says he'll be late.\")\n"
         "\n"
         "- You need a second to look something up — call message for\n"
-        "  the filler AND the lookup tool in the same response:\n"
-        "    message(to=\"current_speaker\", channel=\"speak\",\n"
+        "  the filler AND the lookup tool in the same response. Send the\n"
+        "  filler on the SAME channel you'll answer on — `text` in a text\n"
+        "  conversation, `speak` in a voice one:\n"
+        "    message(to=\"current_speaker\", channel=<conversation channel>,\n"
         "                     content=\"Sure thing, let me find that for you.\")\n"
         "    execute_script(...)   # or web_search, search_memory, etc.\n"
         "  Both fire. The tool result comes back next turn. You then call\n"
@@ -2154,7 +2176,7 @@ class BoxBotAgent:
         context_lines = [
             f"Current time: {now.strftime('%H:%M')}",
             f"Day: {now.strftime('%A, %B %d, %Y')}",
-            f"Channel: {channel}",
+            f"Channel: {_agent_facing_channel(channel)}",
         ]
         if person_name:
             context_lines.append(f"Speaking with: {person_name}")
@@ -2228,8 +2250,9 @@ class BoxBotAgent:
                     ]
                     sections.append(
                         "## Registered users\n"
-                        "You can reach any of these people via `outputs` "
-                        "(voice if they're at the box, text for WhatsApp).\n"
+                        "You can reach any of these people via `message` "
+                        "(speak if they're at the box, text to reach them on "
+                        "their phone).\n"
                         + "\n".join(user_lines)
                     )
                 else:
@@ -2949,11 +2972,11 @@ class BoxBotAgent:
 
         # Choose the dispatcher channel:
         # - voice/trigger conversations → "voice" (speak it in the room)
-        # - whatsapp → "text"
+        # - text platforms (whatsapp/signal) → "text"
         # Trigger conversations may have no one in the room; speaking
         # there is still the right call because that's where any user
         # presence would be.
-        out_channel = "text" if channel == "whatsapp" else "voice"
+        out_channel = "voice" if channel in ("voice", "trigger") else "text"
 
         # Recipient: the person we're addressing, or "current_speaker"
         # so the dispatcher resolves it from the conversation's

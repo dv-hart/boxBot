@@ -87,7 +87,7 @@ class MuteMicTool(Tool):
         "while you were thinking — that's the point, those queued lines "
         "are the same side-talk you are choosing to ignore.\n"
         "\n"
-        "No effect on WhatsApp or trigger conversations."
+        "No effect on text or trigger conversations."
     )
     parameters = {
         "type": "object",

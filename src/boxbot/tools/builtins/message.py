@@ -3,7 +3,7 @@
 The agent's text output is constrained to a private internal-notes JSON
 shape (see ``output_dispatcher.INTERNAL_NOTES_SCHEMA``); nothing the
 agent says in text reaches a human. To actually speak through the box
-speaker or send a WhatsApp message, the agent calls this tool.
+speaker or send a text message, the agent calls this tool.
 
 Multiple calls per turn are allowed and expected (e.g. an interim
 "One moment, looking that up" alongside an ``execute_script`` call, or
@@ -62,9 +62,14 @@ class MessageTool(Tool):
         "Channel:\n"
         "- \"speak\" — speak through the box speaker (everyone in the "
         "  room hears). Good for replies in person and announcements.\n"
-        "- \"text\" — send a WhatsApp message to the named user's "
+        "- \"text\" — send a text message to the named user's "
         "  registered phone. Requires `to` be a registered user by name. "
         "  Cannot text \"room\" or unknown people.\n\n"
+        "Default to the channel you were contacted through: reply by "
+        "\"text\" in a text conversation, by \"speak\" in a voice one. The "
+        "current channel is in the dynamic context. Switch only when it "
+        "makes sense (e.g. someone at the box asks you to text an absent "
+        "person).\n\n"
         "Be concise when speaking — no one wants a lecture from a box. "
         "Stay silent (do not call this tool) when people are talking to "
         "each other, not to you."
@@ -88,7 +93,7 @@ class MessageTool(Tool):
                 "description": (
                     "Delivery medium. \"speak\" plays TTS through the box "
                     "speaker (everyone in the room hears). \"text\" sends "
-                    "a WhatsApp message to the named user's registered "
+                    "a text message to the named user's registered "
                     "phone."
                 ),
             },

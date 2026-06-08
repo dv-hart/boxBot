@@ -199,10 +199,13 @@ for tag in ("family", "vacation"):
 
 ## Known gaps
 
-- `show_on_screen` is wired to the display manager but the `picture`
-  display itself isn't fully implemented yet — until it lands, the
-  call returns `dispatched: False`. `view()` (pixels to tool result)
-  works now.
+- `show_on_screen(ids)` renders the given photos full-screen on the
+  `picture` display. Switching to `picture` with no ids runs slideshow
+  mode: it pulls the slideshow-enabled set (`add_to_slideshow`) and
+  rotates through it. With an empty slideshow set it shows a "No photos
+  yet" notice. `view()` (pixels to tool result) also works. The call
+  returns `dispatched: False` only when the display manager isn't
+  running (e.g. headless).
 - Metadata mutation (`set_tags`, `delete`, etc.) currently acks the
   action but the main-process handlers are stubs. Read/view works;
   write doesn't yet.

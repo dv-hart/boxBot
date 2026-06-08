@@ -1217,7 +1217,10 @@ def _render_image(ctx: RenderContext, block: Block, rect: Rect) -> None:
             radius=radius, fill=bg,
         )
         font = _get_font(ctx.theme.fonts.family, ctx.theme.fonts.caption.size)
-        label = source[:30] if source else "[image]"
+        # Never leak an internal source string (photo:<id>, url:..., a raw
+        # file path) onto the household screen — an unresolved source means
+        # the image is simply unavailable, so say that instead.
+        label = "[image unavailable]"
         tw, th = _measure_text(label, font)
         ctx.draw.text(
             (rect.x + (rect.w - tw) // 2, rect.y + (rect.h - th) // 2),

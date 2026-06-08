@@ -122,15 +122,15 @@ src/boxbot/photos/search.py               <- search backend
           Emits JSON action -> main process routes to search backend.
 ```
 
-### `slideshow.py`
-Photo selection logic for the `picture` display's slideshow mode:
-- Select photos from the slideshow-enabled set (active, not soft-deleted)
-- Rotation strategies: random, chronological, tag-based, seasonal
-- Provide ordered photo list to the display module
-- Respect configured timing (seconds per photo)
-
-Note: transition effects and rendering are handled by the `picture`
-display module, not this file. This module only handles photo selection.
+### Slideshow selection
+Slideshow mode for the `picture` display is driven by the
+`in_slideshow` flag (set via `add_to_slideshow` / `remove_from_slideshow`,
+default on at intake). When the display manager switches to `picture`
+with no explicit `image_ids`, it selects the slideshow-enabled set
+(active, not soft-deleted, newest first) and rotates through it on a
+timer — see `DisplayManager._load_slideshow_ids` and
+`_maybe_start_slideshow` in `src/boxbot/displays/manager.py`. Transition
+effects and rendering are handled by the `picture` display module.
 
 ### `maintenance.py`
 Daily background job (extends the system-wide maintenance schedule):

@@ -736,3 +736,121 @@ class TestUpdateData:
             assert not (paths.DISPLAYS_DIR / "builtin_glance.json").exists()
         finally:
             set_display_manager(None)
+
+
+class TestPictureSlideshow:
+    """Picture display slideshow mode.
+
+    Regression: switching to ``picture`` with no ``image_ids`` rendered a
+    tiny "photo:" placeholder on a black screen because nothing populated
+    the slideshow list. Slideshow mode must pull the ``in_slideshow`` set,
+    and an empty set must fall back to a friendly notice rather than a
+    broken image block.
+    """
+
+    @staticmethod
+    def _register_builtins(mgr) -> None:
+        from boxbot.displays.builtins import get_builtin_specs
+
+        for spec in get_builtin_specs():
+            mgr.register_spec(spec)
+
+    @staticmethod
+    def _fake_config(storage_path):
+        import types
+
+        return types.SimpleNamespace(
+            photos=types.SimpleNamespace(storage_path=str(storage_path)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_slideshow_populates_ids_from_set(self, tmp_path, monkeypatch):
+        from boxbot.displays.manager import DisplayManager
+        from boxbot.photos.store import PhotoStore
+
+        storage = tmp_path / "photos"
+        storage.mkdir()
+        store = PhotoStore(db_path=storage / "photos.db")
+        await store.initialize()
+        try:
+            await store.create_photo(
+                filename="a.jpg", source="camera", photo_id="aaa")
+            await store.create_photo(
+                filename="b.jpg", source="camera", photo_id="bbb")
+            # Excluded from the slideshow rotation.
+            await store.create_photo(
+                filename="c.jpg", source="camera",
+                in_slideshow=False, photo_id="ccc")
+        finally:
+            await store.close()
+
+        monkeypatch.setattr(
+            "boxbot.core.config.get_config",
+            lambda: self._fake_config(storage),
+        )
+
+        mgr = DisplayManager()
+        self._register_builtins(mgr)
+        try:
+            ok = await mgr.switch("picture", args={})
+            assert ok
+            assert mgr._active_display == "picture"
+            ids = mgr._active_args.get("image_ids")
+            assert set(ids) == {"aaa", "bbb"}
+            assert "ccc" not in ids
+        finally:
+            mgr._stop_slideshow()
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_empty_slideshow_falls_back_to_notice(
+        self, tmp_path, monkeypatch,
+    ):
+        from boxbot.displays.manager import DisplayManager
+        from boxbot.photos.store import PhotoStore
+
+        storage = tmp_path / "photos"
+        storage.mkdir()
+        store = PhotoStore(db_path=storage / "photos.db")
+        await store.initialize()
+        await store.close()  # empty DB — nothing in the slideshow set
+
+        monkeypatch.setattr(
+            "boxbot.core.config.get_config",
+            lambda: self._fake_config(storage),
+        )
+
+        mgr = DisplayManager()
+        self._register_builtins(mgr)
+        try:
+            ok = await mgr.switch("picture", args={})
+            assert ok
+            # Falls back to the notice display, not a broken picture.
+            assert mgr._active_display == "notice"
+            assert mgr._active_args.get("title") == "No photos yet"
+        finally:
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_explicit_ids_bypass_slideshow(self, tmp_path, monkeypatch):
+        from boxbot.displays.manager import DisplayManager
+
+        # No photos DB at all -> _load_slideshow_ids returns [], but explicit
+        # ids must still be honored without consulting the slideshow set.
+        storage = tmp_path / "photos"
+        storage.mkdir()
+        monkeypatch.setattr(
+            "boxbot.core.config.get_config",
+            lambda: self._fake_config(storage),
+        )
+
+        mgr = DisplayManager()
+        self._register_builtins(mgr)
+        try:
+            ok = await mgr.switch("picture", args={"image_ids": ["xyz"]})
+            assert ok
+            assert mgr._active_display == "picture"
+            assert mgr._active_args["image_ids"] == ["xyz"]
+        finally:
+            mgr._stop_slideshow()
+            await mgr._data_manager.stop_all()

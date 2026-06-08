@@ -494,6 +494,31 @@ class DisplayManager:
             logger.warning("Display '%s' not found. Available: %s", name, self.list_available())
             return False
 
+        args = dict(args) if args else {}
+
+        # Picture display without explicit image_ids => slideshow mode.
+        # Populate the id list from the slideshow-enabled photo set. With
+        # nothing to show, fall back to a friendly notice rather than the
+        # image block's raw-source placeholder (which rendered a tiny
+        # "photo:" on a black screen).
+        if name == "picture":
+            ids = args.get("image_ids")
+            if not isinstance(ids, list) or not ids:
+                slideshow_ids = self._load_slideshow_ids()
+                if slideshow_ids:
+                    args["image_ids"] = slideshow_ids
+                elif "notice" in self._specs:
+                    logger.info(
+                        "picture slideshow requested but no photos in "
+                        "rotation; showing empty-state notice",
+                    )
+                    name = "notice"
+                    spec = self._specs["notice"]
+                    args = {
+                        "title": "No photos yet",
+                        "lines": ["Send me a photo and it'll show up here."],
+                    }
+
         # Explicit pin: stop rotation and mark pinned. Internal calls
         # from the rotation loop pass pin=False to avoid stopping
         # themselves.
@@ -520,7 +545,7 @@ class DisplayManager:
 
         # Update active state
         self._active_display = name
-        self._active_args = args or {}
+        self._active_args = args
 
         # Render the initial frame
         self._render_and_update_frame()
@@ -544,6 +569,40 @@ class DisplayManager:
     # ------------------------------------------------------------------
     # Picture-display slideshow
     # ------------------------------------------------------------------
+
+    def _load_slideshow_ids(self, limit: int = 50) -> list[str]:
+        """Photo ids in the slideshow rotation, newest first.
+
+        Mirrors the direct-sqlite approach of :func:`_resolve_photo_sources`
+        so the manager doesn't depend on a live ``PhotoStore`` connection.
+        Best-effort: returns ``[]`` if the photo DB is absent or unreadable
+        (a fresh install, or photos disabled).
+        """
+        try:
+            from boxbot.core.config import get_config
+            config = get_config()
+        except Exception:
+            return []
+
+        db_path = Path(config.photos.storage_path) / "photos.db"
+        if not db_path.exists():
+            return []
+
+        import sqlite3
+
+        try:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT id FROM photos "
+                    "WHERE in_slideshow = 1 AND deleted_at IS NULL "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                return [r["id"] for r in rows]
+        except sqlite3.Error as e:
+            logger.warning("slideshow id load failed: %s", e)
+            return []
 
     def _maybe_start_slideshow(self) -> None:
         """Start a per-photo tick when the picture display has >1 id.

@@ -519,6 +519,11 @@ class PerceptionConfig(BaseModel):
     # Quality gate: minimum crop area (px) to admit a visual embedding, so we
     # don't enroll tiny/far/blurry detections. ~64x64.
     visual_admit_min_crop_area_px: int = 4096
+    # Nightly identity-cloud reconciliation (dream-cycle hygiene, NEXT phase —
+    # docs/plans/person-id-overhaul.md). Audit-only by default: it reports
+    # outliers / duplicate-person / mislabel candidates without mutating.
+    id_reconcile_enabled: bool = True
+    id_reconcile_audit_only: bool = True
 
 
 class MemoryConfig(BaseModel):

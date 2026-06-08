@@ -931,3 +931,180 @@ class TestEnrollmentAdmission:
         claim = manager.get_claim("Person A")
         assert claim.source == "agent_identify"
         assert claim.name == "Jacob"
+
+
+# ---------------------------------------------------------------------------
+# Identity-cloud reconciliation (person-id-overhaul: NEXT)
+# ---------------------------------------------------------------------------
+
+
+def _basis(idx: int, dim: int = 512) -> np.ndarray:
+    v = np.zeros(dim, np.float32)
+    v[idx] = 1.0
+    return v
+
+
+def _near(base: np.ndarray, eps: float = 0.03, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    v = base + eps * rng.standard_normal(base.shape).astype(np.float32)
+    return v / np.linalg.norm(v)
+
+
+class TestIdReconcile:
+    """Deterministic dream-cycle identity hygiene (audit-only by default)."""
+
+    @pytest_asyncio.fixture
+    async def store(self, tmp_path):
+        from boxbot.perception.clouds import CloudStore
+
+        s = CloudStore(db_path=tmp_path / "rec.db")
+        await s.initialize()
+        yield s
+        await s.close()
+
+    def test_levenshtein_eric_erik(self):
+        from boxbot.perception.reconcile import _levenshtein
+
+        assert _levenshtein("Eric", "Erik") == 1
+        assert _levenshtein("Jacob", "Jacob") == 0
+        assert _levenshtein("Jacob", "Carina") >= 3
+
+    @pytest.mark.asyncio
+    async def test_outlier_detection_flags_contamination(self, store):
+        from boxbot.perception.clouds import PROVENANCE_VOICE_DOA
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        pid = await store.create_person("Jacob")
+        base = _basis(0)
+        for i in range(4):
+            await store.add_visual_embedding(
+                pid, _near(base, seed=i), provenance=PROVENANCE_VOICE_DOA
+            )
+        # A contaminating face from a different direction.
+        outlier_id = await store.add_visual_embedding(
+            pid, _basis(1), provenance=PROVENANCE_VOICE_DOA
+        )
+
+        report = await run_id_reconcile(cloud_store=store, audit_only=True)
+        flagged = {o["embedding_id"] for o in report["outliers"]}
+        assert outlier_id in flagged
+
+    @pytest.mark.asyncio
+    async def test_anchor_not_flagged_as_outlier(self, store):
+        from boxbot.perception.clouds import (
+            PROVENANCE_AGENT_IDENTIFY,
+            PROVENANCE_VOICE_DOA,
+        )
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        pid = await store.create_person("Jacob")
+        base = _basis(0)
+        for i in range(4):
+            await store.add_visual_embedding(
+                pid, _near(base, seed=i), provenance=PROVENANCE_VOICE_DOA
+            )
+        # An isolated anchor must never be flagged for eviction.
+        anchor_id = await store.add_visual_embedding(
+            pid, _basis(1), provenance=PROVENANCE_AGENT_IDENTIFY
+        )
+        report = await run_id_reconcile(cloud_store=store, audit_only=True)
+        assert anchor_id not in {o["embedding_id"] for o in report["outliers"]}
+
+    @pytest.mark.asyncio
+    async def test_duplicate_person_by_name(self, store):
+        from boxbot.perception.clouds import PROVENANCE_VOICE_DOA
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        eric = await store.create_person("Eric")
+        erik = await store.create_person("Erik")
+        await store.add_visual_embedding(
+            eric, _basis(0), provenance=PROVENANCE_VOICE_DOA
+        )
+        await store.add_visual_embedding(
+            erik, _basis(5), provenance=PROVENANCE_VOICE_DOA
+        )
+        report = await run_id_reconcile(cloud_store=store, audit_only=True)
+        names = {frozenset((d["a"], d["b"])) for d in report["duplicate_persons"]}
+        assert frozenset(("Eric", "Erik")) in names
+
+    @pytest.mark.asyncio
+    async def test_duplicate_person_by_face(self, store):
+        from boxbot.perception.clouds import PROVENANCE_VOICE_DOA
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        a = await store.create_person("Alice")
+        b = await store.create_person("Bob")
+        base = _basis(0)
+        for i in range(3):
+            await store.add_visual_embedding(
+                a, _near(base, seed=i), provenance=PROVENANCE_VOICE_DOA
+            )
+            await store.add_visual_embedding(
+                b, _near(base, seed=100 + i), provenance=PROVENANCE_VOICE_DOA
+            )
+        report = await run_id_reconcile(cloud_store=store, audit_only=True)
+        pairs = {frozenset((d["a"], d["b"])) for d in report["duplicate_persons"]}
+        assert frozenset(("Alice", "Bob")) in pairs
+
+    @pytest.mark.asyncio
+    async def test_mislabel_against_anchor(self, store):
+        from boxbot.perception.clouds import (
+            PROVENANCE_AGENT_IDENTIFY,
+            PROVENANCE_VOICE_DOA,
+        )
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        jacob = await store.create_person("Jacob")
+        carina = await store.create_person("Carina")
+        await store.add_visual_embedding(
+            jacob, _basis(0), provenance=PROVENANCE_AGENT_IDENTIFY
+        )
+        await store.add_visual_embedding(
+            carina, _basis(5), provenance=PROVENANCE_AGENT_IDENTIFY
+        )
+        # A point filed under Carina that is actually Jacob's face.
+        stray = await store.add_visual_embedding(
+            carina, _basis(0), provenance=PROVENANCE_VOICE_DOA
+        )
+        report = await run_id_reconcile(cloud_store=store, audit_only=True)
+        hits = {
+            m["embedding_id"]: m["suggested_person"]
+            for m in report["mislabels"]
+        }
+        assert hits.get(stray) == "Jacob"
+
+    @pytest.mark.asyncio
+    async def test_audit_only_does_not_mutate(self, store):
+        from boxbot.perception.clouds import PROVENANCE_VOICE_DOA
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        pid = await store.create_person("Jacob")
+        base = _basis(0)
+        for i in range(4):
+            await store.add_visual_embedding(
+                pid, _near(base, seed=i), provenance=PROVENANCE_VOICE_DOA
+            )
+        await store.add_visual_embedding(
+            pid, _basis(1), provenance=PROVENANCE_VOICE_DOA
+        )
+        before = await store.count_visual_embeddings(pid)
+        await run_id_reconcile(cloud_store=store, audit_only=True)
+        assert await store.count_visual_embeddings(pid) == before
+
+    @pytest.mark.asyncio
+    async def test_apply_evicts_outliers(self, store):
+        from boxbot.perception.clouds import PROVENANCE_VOICE_DOA
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        pid = await store.create_person("Jacob")
+        base = _basis(0)
+        for i in range(4):
+            await store.add_visual_embedding(
+                pid, _near(base, seed=i), provenance=PROVENANCE_VOICE_DOA
+            )
+        await store.add_visual_embedding(
+            pid, _basis(1), provenance=PROVENANCE_VOICE_DOA
+        )
+        report = await run_id_reconcile(cloud_store=store, audit_only=False)
+        assert report["applied"]["evicted"] >= 1
+        assert await store.count_visual_embeddings(pid) == 4

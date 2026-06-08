@@ -431,6 +431,36 @@ class CloudStore:
             row = await cursor.fetchone()
             return row["cnt"]
 
+    async def get_visual_records(self, person_id: str) -> list[dict]:
+        """Get full visual embedding records for a person (for reconciliation).
+
+        Returns dicts with id, embedding (L2-unit), provenance, confidence,
+        crop_path, timestamp — everything the dream-cycle hygiene pass needs to
+        score, relabel, or evict a point. Ordered oldest-first.
+        """
+        db = self._ensure_db()
+        records: list[dict] = []
+        async with db.execute(
+            """SELECT id, embedding, provenance, confidence, crop_path, timestamp
+               FROM visual_embeddings WHERE person_id = ?
+               ORDER BY timestamp ASC""",
+            (person_id,),
+        ) as cursor:
+            async for row in cursor:
+                emb = _blob_to_embedding(row["embedding"])
+                n = np.linalg.norm(emb)
+                if n > 0:
+                    emb = emb / n
+                records.append({
+                    "id": row["id"],
+                    "embedding": emb.astype(np.float32),
+                    "provenance": row["provenance"],
+                    "confidence": row["confidence"],
+                    "crop_path": row["crop_path"],
+                    "timestamp": row["timestamp"],
+                })
+        return records
+
     async def get_visual_clouds(
         self,
     ) -> dict[str, tuple[str, np.ndarray, np.ndarray]]:

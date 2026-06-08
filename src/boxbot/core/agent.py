@@ -1536,6 +1536,27 @@ class BoxBotAgent:
         except Exception:
             logger.exception("Dream cycle failed")
 
+        # Identity-cloud hygiene shares the nightly dream window. It's
+        # independent of the memory dream (own data, own audit flag), so a
+        # failure here must not abort anything above.
+        if config.perception.id_reconcile_enabled:
+            try:
+                from boxbot.perception.reconcile import run_id_reconcile
+
+                id_report = await run_id_reconcile(
+                    audit_only=config.perception.id_reconcile_audit_only,
+                )
+                logger.info(
+                    "ID reconcile complete: %d outlier(s), %d duplicate "
+                    "candidate(s), %d mislabel(s) (audit_only=%s)",
+                    len(id_report.get("outliers", [])),
+                    len(id_report.get("duplicate_persons", [])),
+                    len(id_report.get("mislabels", [])),
+                    id_report.get("audit_only"),
+                )
+            except Exception:
+                logger.exception("ID reconcile failed")
+
     async def _on_person_identified(self, event: PersonIdentified) -> None:
         """Update the set of currently-present people."""
         if event.person_name:

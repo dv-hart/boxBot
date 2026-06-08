@@ -43,7 +43,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from boxbot.tools._sandbox_actions import ActionContext, process_action
+from boxbot.tools._sandbox_actions import (
+    SANDBOX_STREAM_LIMIT,
+    ActionContext,
+    process_action,
+    read_sandbox_line,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +249,7 @@ class SandboxRunner:
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
                     cwd=str(Path.cwd()),
+                    limit=SANDBOX_STREAM_LIMIT,
                 )
             except FileNotFoundError as e:
                 logger.warning(
@@ -425,7 +431,7 @@ class SandboxRunner:
         assert self._proc.stdin is not None
 
         while True:
-            raw = await self._proc.stdout.readline()
+            raw = await read_sandbox_line(self._proc.stdout)
             if not raw:
                 raise RuntimeError(
                     "Sandbox process exited mid-script "
@@ -476,7 +482,7 @@ class SandboxRunner:
         assert self._proc is not None
         assert self._proc.stderr is not None
         while True:
-            raw = await self._proc.stderr.readline()
+            raw = await read_sandbox_line(self._proc.stderr)
             if not raw:
                 return
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")

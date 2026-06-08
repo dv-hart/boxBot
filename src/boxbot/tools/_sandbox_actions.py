@@ -31,6 +31,7 @@ Security:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import io
@@ -44,6 +45,47 @@ from typing import Any
 from boxbot.photos.imageutil import sniff_image_file, sniff_image_mime
 
 logger = logging.getLogger(__name__)
+
+# Buffer ceiling for a single line read from a sandbox process's stdout/
+# stderr. The line protocol itself carries only small JSON action/DONE
+# payloads (images attach by *path*, never inline), but a user script can
+# ``print()`` an arbitrarily large blob on one line — e.g. raw image bytes.
+# asyncio's ``StreamReader.readline()`` raises ``ValueError``
+# (``LimitOverrunError``) once a line exceeds its buffer limit (default
+# 64 KiB); unhandled, that ``ValueError`` propagates out of the stdout pump
+# and crashes the entire ``execute_script`` tool call. We give the reader
+# generous headroom so realistic blobs pass through, and past the cap we
+# truncate + resync instead of dying. See :func:`read_sandbox_line`.
+SANDBOX_STREAM_LIMIT = 8 * 1024 * 1024  # 8 MiB StreamReader buffer
+_OVERSIZE_LINE_MARKER = b"[boxbot: oversized sandbox output line dropped]\n"
+
+
+async def read_sandbox_line(stream: asyncio.StreamReader) -> bytes:
+    """Read one line from a sandbox stream, tolerating oversized lines.
+
+    Same contract as ``StreamReader.readline`` — returns the line bytes
+    (with trailing newline when present) or ``b""`` at EOF — except that a
+    line longer than the stream's buffer limit is dropped (returning a
+    short marker line) instead of raising the ``ValueError`` (asyncio
+    ``LimitOverrunError``) that would otherwise propagate out of the stdout
+    pump and crash the whole tool call.
+
+    ``readline()`` itself already discards the offending bytes from its
+    buffer — consuming up to the next newline, or clearing the buffer — and
+    resyncs *before* re-raising, so we only need to swallow the error and
+    hand back a non-empty placeholder. The next call resumes cleanly on the
+    following line. A non-empty return is important: ``b""`` signals EOF to
+    callers, and we must not fake that.
+    """
+    try:
+        return await stream.readline()
+    except ValueError:
+        logger.warning(
+            "sandbox output line exceeded %d-byte buffer; line dropped",
+            SANDBOX_STREAM_LIMIT,
+        )
+        return _OVERSIZE_LINE_MARKER
+
 
 # Filesystem roots from which images may be attached to tool results.
 # Any absolute path outside these roots is refused. Project-anchored

@@ -37,9 +37,11 @@ from typing import Any
 from uuid import uuid4
 
 from boxbot.tools._sandbox_actions import (
+    SANDBOX_STREAM_LIMIT,
     ActionContext,
     build_image_block,
     process_action,
+    read_sandbox_line,
 )
 from boxbot.tools._tool_context import get_current_conversation
 from boxbot.tools.base import Tool
@@ -332,6 +334,7 @@ class ExecuteScriptTool(Tool):
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=str(Path.cwd()),
+                limit=SANDBOX_STREAM_LIMIT,
             )
         except FileNotFoundError:
             # The bootstrap never ran, so nothing unlinked the secrets
@@ -354,7 +357,7 @@ class ExecuteScriptTool(Tool):
             assert proc.stdout is not None
             assert proc.stdin is not None
             while True:
-                raw = await proc.stdout.readline()
+                raw = await read_sandbox_line(proc.stdout)
                 if not raw:
                     return
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")

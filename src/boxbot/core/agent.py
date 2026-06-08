@@ -1565,15 +1565,21 @@ class BoxBotAgent:
             try:
                 from boxbot.perception.reconcile import run_id_reconcile
 
+                judge_on = config.perception.id_reconcile_judge_enabled
                 id_report = await run_id_reconcile(
                     audit_only=config.perception.id_reconcile_audit_only,
+                    client=self._client if judge_on else None,
+                    model=config.models.large if judge_on else "",
+                    auto_apply=config.perception.id_reconcile_auto_apply,
                 )
+                judge = id_report.get("judge")
                 logger.info(
                     "ID reconcile complete: %d outlier(s), %d duplicate "
-                    "candidate(s), %d mislabel(s) (audit_only=%s)",
+                    "candidate(s), %d mislabel(s), judge=%s (audit_only=%s)",
                     len(id_report.get("outliers", [])),
                     len(id_report.get("duplicate_persons", [])),
                     len(id_report.get("mislabels", [])),
+                    "off" if judge is None else f"{judge['calls']} call(s)",
                     id_report.get("audit_only"),
                 )
             except Exception:

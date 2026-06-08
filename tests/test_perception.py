@@ -1108,3 +1108,195 @@ class TestIdReconcile:
         report = await run_id_reconcile(cloud_store=store, audit_only=False)
         assert report["applied"]["evicted"] >= 1
         assert await store.count_visual_embeddings(pid) == 4
+
+
+# ---------------------------------------------------------------------------
+# Multimodal judge (person-id-overhaul: NEXT-C)
+# ---------------------------------------------------------------------------
+
+
+class _FakeBlock:
+    type = "tool_use"
+
+    def __init__(self, inp):
+        self.input = inp
+
+
+class _FakeResp:
+    def __init__(self, inp):
+        self.content = [_FakeBlock(inp)]
+
+
+class _FakeClient:
+    """Returns queued verdicts in order from client.messages.create()."""
+
+    def __init__(self, verdicts):
+        self._verdicts = list(verdicts)
+        self.calls = []
+
+        async def _create(**kw):
+            self.calls.append(kw)
+            v = self._verdicts.pop(0) if self._verdicts else {
+                "verdict": "unsure", "confidence": 0.0, "reasoning": ""
+            }
+            return _FakeResp(v)
+
+        self.messages = type("M", (), {"create": staticmethod(_create)})()
+
+
+def _crop_file(tmp_path, name: str) -> str:
+    p = tmp_path / f"{name}.jpg"
+    p.write_bytes(b"fake-jpeg-bytes")
+    return str(p)
+
+
+class TestIdReconcileJudge:
+    """Multimodal LLM judge: dup-person (flag-only) + cluster verify (apply)."""
+
+    @pytest_asyncio.fixture
+    async def store(self, tmp_path):
+        from boxbot.perception.clouds import CloudStore
+
+        s = CloudStore(db_path=tmp_path / "judge.db")
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @pytest.mark.asyncio
+    async def test_dup_person_verdict_is_flag_only(self, store, tmp_path):
+        from boxbot.perception.clouds import PROVENANCE_VOICE_DOA
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        eric = await store.create_person("Eric")
+        erik = await store.create_person("Erik")
+        await store.add_visual_embedding(
+            eric, _basis(0), provenance=PROVENANCE_VOICE_DOA,
+            crop_path=_crop_file(tmp_path, "eric"),
+        )
+        await store.add_visual_embedding(
+            erik, _basis(5), provenance=PROVENANCE_VOICE_DOA,
+            crop_path=_crop_file(tmp_path, "erik"),
+        )
+        client = _FakeClient([
+            {"verdict": "same_person", "confidence": 0.97, "reasoning": "x"},
+        ])
+        report = await run_id_reconcile(
+            cloud_store=store, audit_only=False, auto_apply=True,
+            client=client, model="m",
+        )
+        dups = report["judge"]["duplicate_persons"]
+        assert dups and dups[0]["verdict"]["verdict"] == "same_person"
+        # Flag-only: person records are NOT merged.
+        assert len(await store.list_persons()) == 2
+
+    @pytest.mark.asyncio
+    async def test_cluster_relabel_auto_applied(self, store, tmp_path):
+        from boxbot.perception.clouds import (
+            PROVENANCE_AGENT_IDENTIFY,
+            PROVENANCE_VOICE_DOA,
+        )
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        jacob = await store.create_person("Jacob")
+        carina = await store.create_person("Carina")
+        await store.add_visual_embedding(
+            jacob, _basis(0), provenance=PROVENANCE_AGENT_IDENTIFY,
+            crop_path=_crop_file(tmp_path, "jacob_anchor"),
+        )
+        await store.add_visual_embedding(
+            carina, _basis(5), provenance=PROVENANCE_AGENT_IDENTIFY,
+            crop_path=_crop_file(tmp_path, "carina_anchor"),
+        )
+        # A stray Jacob-face filed under Carina.
+        stray = await store.add_visual_embedding(
+            carina, _basis(0), provenance=PROVENANCE_VOICE_DOA,
+            crop_path=_crop_file(tmp_path, "stray"),
+        )
+        client = _FakeClient([
+            {"verdict": "wrong_person", "suggested_person": "Jacob",
+             "confidence": 0.95, "reasoning": "looks like Jacob"},
+        ])
+        await run_id_reconcile(
+            cloud_store=store, audit_only=False, auto_apply=True,
+            client=client, model="m",
+        )
+        # Stray moved from Carina to Jacob.
+        jacob_ids = {r["id"] for r in await store.get_visual_records(jacob)}
+        carina_ids = {r["id"] for r in await store.get_visual_records(carina)}
+        assert stray in jacob_ids
+        assert stray not in carina_ids
+
+    @pytest.mark.asyncio
+    async def test_cluster_audit_only_does_not_apply(self, store, tmp_path):
+        from boxbot.perception.clouds import (
+            PROVENANCE_AGENT_IDENTIFY,
+            PROVENANCE_VOICE_DOA,
+        )
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        jacob = await store.create_person("Jacob")
+        carina = await store.create_person("Carina")
+        await store.add_visual_embedding(
+            jacob, _basis(0), provenance=PROVENANCE_AGENT_IDENTIFY,
+            crop_path=_crop_file(tmp_path, "j"),
+        )
+        await store.add_visual_embedding(
+            carina, _basis(5), provenance=PROVENANCE_AGENT_IDENTIFY,
+            crop_path=_crop_file(tmp_path, "c"),
+        )
+        stray = await store.add_visual_embedding(
+            carina, _basis(0), provenance=PROVENANCE_VOICE_DOA,
+            crop_path=_crop_file(tmp_path, "s"),
+        )
+        client = _FakeClient([
+            {"verdict": "wrong_person", "suggested_person": "Jacob",
+             "confidence": 0.99, "reasoning": "x"},
+        ])
+        report = await run_id_reconcile(
+            cloud_store=store, audit_only=True, auto_apply=True,
+            client=client, model="m",
+        )
+        # Verdict reported but nothing moved (audit-only).
+        carina_ids = {r["id"] for r in await store.get_visual_records(carina)}
+        assert stray in carina_ids
+        assert report["judge"]["calls"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_cluster_belongs_marks_reconciled(self, store, tmp_path):
+        from boxbot.perception.clouds import (
+            PROVENANCE_AGENT_IDENTIFY,
+            PROVENANCE_VOICE_DOA,
+        )
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        carina = await store.create_person("Carina")
+        await store.add_visual_embedding(
+            carina, _basis(5), provenance=PROVENANCE_AGENT_IDENTIFY,
+            crop_path=_crop_file(tmp_path, "c"),
+        )
+        good = await store.add_visual_embedding(
+            carina, _near(_basis(5), seed=7), provenance=PROVENANCE_VOICE_DOA,
+            crop_path=_crop_file(tmp_path, "g"),
+        )
+        client = _FakeClient([
+            {"verdict": "belongs", "confidence": 0.96, "reasoning": "x"},
+        ])
+        await run_id_reconcile(
+            cloud_store=store, audit_only=False, auto_apply=True,
+            client=client, model="m",
+        )
+        recs = {r["id"]: r for r in await store.get_visual_records(carina)}
+        assert recs[good]["reconciled"] is True
+
+    @pytest.mark.asyncio
+    async def test_judge_off_when_no_client(self, store, tmp_path):
+        from boxbot.perception.clouds import PROVENANCE_VOICE_DOA
+        from boxbot.perception.reconcile import run_id_reconcile
+
+        pid = await store.create_person("Jacob")
+        await store.add_visual_embedding(
+            pid, _basis(0), provenance=PROVENANCE_VOICE_DOA,
+            crop_path=_crop_file(tmp_path, "j"),
+        )
+        report = await run_id_reconcile(cloud_store=store, audit_only=True)
+        assert report["judge"] is None

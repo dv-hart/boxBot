@@ -28,7 +28,9 @@ and the only points mislabel-scoring compares against.
 
 from __future__ import annotations
 
+import base64
 import logging
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -44,6 +46,99 @@ DEFAULT_DUP_CENTROID_MIN_SIM = 0.80  # same face under two names
 DEFAULT_MISLABEL_MIN_SIM = 0.75      # looks strongly like another's anchor
 DEFAULT_MISLABEL_MARGIN = 0.10       # ... and clearly more than its own
 _TOPK = 3
+
+# --- Multimodal judge (NEXT-C) ---------------------------------------------
+# Provenances eligible for the cluster-verify judge (weak, unconfirmed admits).
+# Anchors + voice_visual_agree are trusted and skipped.
+JUDGE_WEAK_PROVENANCES = frozenset(
+    {"voice_doa", "visual_reid", "context_inferred", "legacy", "seed"}
+)
+DEFAULT_JUDGE_CLUSTER_SIM = 0.80     # greedy cluster threshold for daily admits
+DEFAULT_JUDGE_MIN_CONFIDENCE = 0.85  # auto-apply gate
+DEFAULT_JUDGE_MAX_CALLS = 20         # per-night budget cap (dup pairs + clusters)
+_MAX_REFERENCE_CROPS = 3
+
+_DUP_PERSON_TOOL = {
+    "name": "duplicate_person_verdict",
+    "description": "Decide whether two face crops are the same person.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "verdict": {
+                "type": "string",
+                "enum": ["same_person", "different", "unsure"],
+            },
+            "confidence": {"type": "number"},
+            "reasoning": {"type": "string"},
+        },
+        "required": ["verdict", "confidence", "reasoning"],
+    },
+}
+
+_CLUSTER_VERIFY_TOOL = {
+    "name": "cluster_identity_verdict",
+    "description": (
+        "Decide whether a face crop belongs to the person it was filed under. "
+        "If it is clearly a different person ON THE PROVIDED LIST, name them in "
+        "suggested_person; otherwise leave suggested_person empty. Never invent "
+        "a name that is not in the provided list."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "verdict": {
+                "type": "string",
+                "enum": ["belongs", "wrong_person", "unsure"],
+            },
+            "suggested_person": {
+                "type": "string",
+                "description": "An existing name from the provided list, or empty.",
+            },
+            "confidence": {"type": "number"},
+            "reasoning": {"type": "string"},
+        },
+        "required": ["verdict", "confidence", "reasoning"],
+    },
+}
+
+
+def _image_block(crop_path: str | None) -> dict | None:
+    """Build an Anthropic base64 image content block from a crop path, or None."""
+    if not crop_path:
+        return None
+    try:
+        data = Path(crop_path).read_bytes()
+    except OSError:
+        return None
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/jpeg",
+            "data": base64.standard_b64encode(data).decode("ascii"),
+        },
+    }
+
+
+async def _judge_call(
+    client: Any, model: str, tool: dict, content: list[dict]
+) -> dict | None:
+    """Run one structured-output multimodal judge call; return tool input or None."""
+    try:
+        resp = await client.messages.create(
+            model=model,
+            max_tokens=600,
+            tools=[tool],
+            tool_choice={"type": "tool", "name": tool["name"]},
+            messages=[{"role": "user", "content": content}],
+        )
+    except Exception:
+        logger.exception("id-reconcile judge call failed")
+        return None
+    for block in resp.content:
+        if getattr(block, "type", None) == "tool_use":
+            return dict(block.input)
+    return None
 
 
 def _levenshtein(a: str, b: str) -> int:
@@ -96,6 +191,12 @@ async def run_id_reconcile(
     dup_centroid_min_sim: float = DEFAULT_DUP_CENTROID_MIN_SIM,
     mislabel_min_sim: float = DEFAULT_MISLABEL_MIN_SIM,
     mislabel_margin: float = DEFAULT_MISLABEL_MARGIN,
+    client: Any = None,
+    model: str = "",
+    auto_apply: bool = False,
+    judge_min_confidence: float = DEFAULT_JUDGE_MIN_CONFIDENCE,
+    judge_max_calls: int = DEFAULT_JUDGE_MAX_CALLS,
+    judge_cluster_sim: float = DEFAULT_JUDGE_CLUSTER_SIM,
 ) -> dict[str, Any]:
     """Run the deterministic identity-cloud reconciliation pass.
 
@@ -151,21 +252,46 @@ async def run_id_reconcile(
             "outliers": outliers,
             "duplicate_persons": duplicate_persons,
             "mislabels": mislabels,
-            "applied": {"evicted": 0, "relabelled": 0},
+            "applied": {"evicted": 0, "relabelled": 0, "confirmed": 0},
+            "judge": None,
         }
 
+        # Deterministic eviction of pure outliers (geometry is reliable here).
+        # Relabels are NOT auto-applied deterministically — moving a face
+        # between people needs eyes, so that happens only via the judge.
         if not audit_only:
-            report["applied"] = await _apply(cloud_store, outliers, mislabels)
+            report["applied"]["evicted"] = await _evict_outliers(
+                cloud_store, outliers
+            )
+
+        # Multimodal LLM judge (NEXT-C): adjudicates what geometry can't.
+        if client is not None and model:
+            report["judge"] = await _run_judge(
+                cloud_store=cloud_store,
+                client=client,
+                model=model,
+                records=records,
+                name_by_id=name_by_id,
+                duplicate_persons=duplicate_persons,
+                audit_only=audit_only,
+                auto_apply=auto_apply,
+                min_confidence=judge_min_confidence,
+                max_calls=judge_max_calls,
+                cluster_sim=judge_cluster_sim,
+                report=report,
+            )
 
         logger.info(
             "id-reconcile (%s): %d persons, %d visual embeddings | "
-            "%d outliers, %d duplicate-person candidate(s), %d mislabel(s)%s",
+            "%d outliers, %d duplicate-person candidate(s), %d mislabel(s) | "
+            "applied evicted=%d relabelled=%d confirmed=%d | judge=%s",
             "audit" if audit_only else "apply",
             report["persons"], report["visual_embeddings"],
             len(outliers), len(duplicate_persons), len(mislabels),
-            "" if audit_only else
-            f" | evicted={report['applied']['evicted']} "
-            f"relabelled={report['applied']['relabelled']}",
+            report["applied"]["evicted"], report["applied"]["relabelled"],
+            report["applied"]["confirmed"],
+            "off" if report["judge"] is None
+            else f"{report['judge']['calls']} call(s)",
         )
         for dp in duplicate_persons:
             logger.info(
@@ -278,30 +404,248 @@ def _find_mislabels(
     return out
 
 
-async def _apply(
-    cloud_store: CloudStore,
-    outliers: list[dict],
-    mislabels: list[dict],
-) -> dict[str, int]:
-    """Apply non-destructive corrections (eviction + relabel). NOT person merge.
+async def _evict_outliers(
+    cloud_store: CloudStore, outliers: list[dict]
+) -> int:
+    """Evict geometrically-isolated outliers (deterministic, non-destructive).
 
-    Only reached when ``audit_only=False``. Person-record merges are never
-    auto-applied (decision 2026-06-07) — they stay flag-only in the report.
+    Only reached when ``audit_only=False``. Relabels and person-merges are NOT
+    done here — relabels require the multimodal judge (eyes), and person merges
+    are flag-only (decision 2026-06-07).
     """
-    db = cloud_store._ensure_db()
     evicted = 0
     for o in outliers:
-        await db.execute(
-            "DELETE FROM visual_embeddings WHERE id = ?", (o["embedding_id"],)
+        await cloud_store.delete_visual_embedding(o["embedding_id"])
+        await cloud_store.log_correction(
+            source="reconcile_outlier",
+            source_ref=o["embedding_id"],
+            from_person_id=o["person_id"],
+            detail=f"isolation={o['isolation']} provenance={o['provenance']}",
         )
         evicted += 1
-    relabelled = 0
-    for m in mislabels:
-        await db.execute(
-            "UPDATE visual_embeddings SET person_id = ?, provenance = ? "
-            "WHERE id = ?",
-            (m["suggested_person_id"], "context_inferred", m["embedding_id"]),
+    return evicted
+
+
+# ---------------------------------------------------------------------------
+# Multimodal LLM judge (NEXT-C)
+# ---------------------------------------------------------------------------
+
+
+def _greedy_clusters(
+    recs: list[dict], threshold: float
+) -> list[list[dict]]:
+    """Greedy single-pass clustering of records by cosine to a cluster seed."""
+    clusters: list[list[dict]] = []
+    seeds: list[np.ndarray] = []
+    for r in recs:
+        placed = False
+        for i, seed in enumerate(seeds):
+            if float(seed @ r["embedding"]) >= threshold:
+                clusters[i].append(r)
+                placed = True
+                break
+        if not placed:
+            clusters.append([r])
+            seeds.append(r["embedding"])
+    return clusters
+
+
+def _medoid(recs: list[dict]) -> dict:
+    """Return the record most central to its cluster (max mean cosine)."""
+    if len(recs) == 1:
+        return recs[0]
+    embs = np.stack([r["embedding"] for r in recs])
+    sims = embs @ embs.T
+    return recs[int(sims.mean(axis=1).argmax())]
+
+
+async def _run_judge(
+    *,
+    cloud_store: CloudStore,
+    client: Any,
+    model: str,
+    records: dict[str, list[dict]],
+    name_by_id: dict[str, str],
+    duplicate_persons: list[dict],
+    audit_only: bool,
+    auto_apply: bool,
+    min_confidence: float,
+    max_calls: int,
+    cluster_sim: float,
+    report: dict,
+) -> dict[str, Any]:
+    """Adjudicate ambiguous candidates with the multimodal model.
+
+    Two streams:
+    1. duplicate-person pairs → compare the two persons' representative crops
+       (flag-only; person merge is never auto-applied).
+    2. clustered unreconciled weak admits → verify each cluster's representative
+       belongs to the person it was filed under, against that person's anchor
+       crops. Auto-applies (confirm / relabel-to-existing / evict) when
+       ``auto_apply`` and confidence ≥ gate and not ``audit_only``.
+    """
+    calls = 0
+    dup_results: list[dict] = []
+    cluster_results: list[dict] = []
+    dropped = 0
+
+    # Representative crop per person (medoid of their cropped points).
+    person_rep_crop: dict[str, str] = {}
+    anchor_crops: dict[str, list[str]] = {}
+    for pid, recs in records.items():
+        cropped = [r for r in recs if r["crop_path"]]
+        if cropped:
+            person_rep_crop[pid] = _medoid(cropped)["crop_path"]
+        anchors = [
+            r["crop_path"] for r in recs
+            if r["provenance"] in ANCHOR_PROVENANCES and r["crop_path"]
+        ]
+        if anchors:
+            anchor_crops[pid] = anchors[:_MAX_REFERENCE_CROPS]
+
+    # --- Stream 1: duplicate-person confirmation (flag-only) ---------------
+    for dp in duplicate_persons:
+        if calls >= max_calls:
+            dropped += 1
+            continue
+        ca = _image_block(person_rep_crop.get(dp["a_id"]))
+        cb = _image_block(person_rep_crop.get(dp["b_id"]))
+        if ca is None or cb is None:
+            dup_results.append({**dp, "judge": "no_crops"})
+            continue
+        content = [
+            {"type": "text", "text": (
+                f"Two stored people may be the same person. Image 1 is filed "
+                f"as {dp['a']!r}; image 2 as {dp['b']!r}. Are these the same "
+                f"person? Return duplicate_person_verdict."
+            )},
+            ca, cb,
+        ]
+        calls += 1
+        v = await _judge_call(client, model, _DUP_PERSON_TOOL, content)
+        dup_results.append({**dp, "verdict": v})
+        # Person merges are flag-only — record, never auto-merge.
+
+    # --- Stream 2: cluster-verify of unreconciled weak admits -------------
+    for pid, recs in records.items():
+        refs = [_image_block(p) for p in anchor_crops.get(pid, [])]
+        refs = [r for r in refs if r is not None]
+        if not refs:
+            continue  # no reference faces for this person yet → can't verify
+        weak = [
+            r for r in recs
+            if not r["reconciled"]
+            and r["provenance"] in JUDGE_WEAK_PROVENANCES
+            and r["crop_path"]
+        ]
+        if not weak:
+            continue
+        for cluster in _greedy_clusters(weak, cluster_sim):
+            if calls >= max_calls:
+                dropped += 1
+                continue
+            rep = _medoid(cluster)
+            rep_img = _image_block(rep["crop_path"])
+            if rep_img is None:
+                continue
+            others = sorted({
+                n for i, n in name_by_id.items() if i != pid
+            })
+            content = [
+                {"type": "text", "text": (
+                    f"The first {len(refs)} image(s) are confirmed photos of "
+                    f"{name_by_id.get(pid)!r}. The LAST image was auto-filed "
+                    f"under {name_by_id.get(pid)!r} but is unconfirmed. Does the "
+                    f"last image show {name_by_id.get(pid)!r}? If it is clearly "
+                    f"someone else on this list, name them: {others}. "
+                    f"Return cluster_identity_verdict."
+                )},
+                *refs, rep_img,
+            ]
+            calls += 1
+            v = await _judge_call(client, model, _CLUSTER_VERIFY_TOOL, content)
+            member_ids = [c["id"] for c in cluster]
+            applied = await _apply_cluster_verdict(
+                cloud_store, pid, member_ids, v, name_by_id,
+                audit_only=audit_only, auto_apply=auto_apply,
+                min_confidence=min_confidence, report=report,
+            )
+            cluster_results.append({
+                "person": name_by_id.get(pid),
+                "person_id": pid,
+                "cluster_size": len(cluster),
+                "verdict": v,
+                "applied": applied,
+            })
+
+    if dropped:
+        logger.info(
+            "id-reconcile judge: budget cap hit, %d candidate group(s) dropped",
+            dropped,
         )
-        relabelled += 1
-    await db.commit()
-    return {"evicted": evicted, "relabelled": relabelled}
+    return {
+        "calls": calls,
+        "dropped": dropped,
+        "duplicate_persons": dup_results,
+        "clusters": cluster_results,
+    }
+
+
+async def _apply_cluster_verdict(
+    cloud_store: CloudStore,
+    person_id: str,
+    member_ids: list[str],
+    verdict: dict | None,
+    name_by_id: dict[str, str],
+    *,
+    audit_only: bool,
+    auto_apply: bool,
+    min_confidence: float,
+    report: dict,
+) -> str:
+    """Apply a cluster-verify verdict (confirm / relabel / evict). Returns action.
+
+    No-op (returns 'audit') when audit_only, auto_apply off, verdict missing,
+    or confidence below the gate.
+    """
+    if verdict is None:
+        return "no_verdict"
+    decision = verdict.get("verdict")
+    confidence = float(verdict.get("confidence") or 0.0)
+    if audit_only or not auto_apply or confidence < min_confidence:
+        return "audit"
+
+    name_to_id = {n: i for i, n in name_by_id.items()}
+
+    if decision == "belongs":
+        await cloud_store.mark_visual_reconciled(member_ids)
+        report["applied"]["confirmed"] += len(member_ids)
+        return "confirmed"
+
+    if decision == "wrong_person":
+        suggested = (verdict.get("suggested_person") or "").strip()
+        target_id = name_to_id.get(suggested)
+        if target_id and target_id != person_id:
+            for mid in member_ids:
+                await cloud_store.reassign_visual_embedding(
+                    mid, target_id, "context_inferred"
+                )
+            await cloud_store.log_correction(
+                source="reconcile_judge_relabel",
+                from_person_id=person_id, to_person_id=target_id,
+                detail=f"{len(member_ids)} embedding(s) relabelled",
+            )
+            report["applied"]["relabelled"] += len(member_ids)
+            return "relabelled"
+        # Wrong person but not anyone on file → evict (never create a person).
+        for mid in member_ids:
+            await cloud_store.delete_visual_embedding(mid)
+        await cloud_store.log_correction(
+            source="reconcile_judge_evict",
+            from_person_id=person_id,
+            detail=f"{len(member_ids)} embedding(s) evicted (wrong, unknown)",
+        )
+        report["applied"]["evicted"] += len(member_ids)
+        return "evicted"
+
+    return "unsure"

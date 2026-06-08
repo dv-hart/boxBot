@@ -76,6 +76,23 @@ Provenance tiers (strongest→weakest), with weights for matching:
   few times, watch visual cloud grow, ReID tier climb, `PersonIdentified`
   publish, named trigger fire.
 
+### NEXT-C firing policy (decided 2026-06-07, built)
+- **Always judge** deterministic flags: duplicate-person pairs (compare the two
+  persons' representative crops to each other — flag-only, never auto-merge) and
+  mislabel context.
+- **Sample representatives** of the day's weak admits: greedy-cluster each
+  person's unreconciled `voice_doa`/`visual_reid`/`context_inferred` points,
+  judge **per cluster** (one medoid crop vs the person's anchor crops). `reconciled`
+  flag is the watermark so clusters aren't re-judged.
+- **Skip** `voice_visual_agree` / `agent_identify` (trusted).
+- **Auto-apply** non-destructive verdicts at confidence ≥ gate when not
+  audit-only: belongs→confirm, wrong+existing-name→relabel, wrong+unknown→evict.
+  **Never creates a new person** (no files on unregistered people). Person-merge
+  stays flag-only.
+- Synchronous multimodal calls in the nightly window, budget-capped
+  (`judge_max_calls`), drops logged. Ships judge-on but audit-only — flip
+  `id_reconcile_audit_only=False` to let it act.
+
 ## PHASE NEXT — dream-cycle ID reconciliation (audit-only first)
 New `perception/reconcile.py::run_id_reconcile(...)`, folded into the nightly
 dream trigger. Mirrors memory dream (`gather → judge → apply`,

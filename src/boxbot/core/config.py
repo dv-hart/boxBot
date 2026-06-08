@@ -524,6 +524,14 @@ class PerceptionConfig(BaseModel):
     # outliers / duplicate-person / mislabel candidates without mutating.
     id_reconcile_enabled: bool = True
     id_reconcile_audit_only: bool = True
+    # Multimodal LLM judge (NEXT-C): adjudicates duplicate-person pairs and
+    # verifies clustered weak admits against anchor crops. When the judge is on
+    # AND audit_only is False AND auto_apply is True, non-destructive verdicts
+    # (confirm / relabel-to-existing / evict) auto-apply; person merge is always
+    # flag-only. Default ships judge-on but audit-only — flip
+    # id_reconcile_audit_only=False to let it act.
+    id_reconcile_judge_enabled: bool = True
+    id_reconcile_auto_apply: bool = True
 
 
 class MemoryConfig(BaseModel):

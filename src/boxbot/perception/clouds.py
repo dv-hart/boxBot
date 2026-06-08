@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS visual_embeddings (
     provenance TEXT NOT NULL DEFAULT 'legacy',
     confidence REAL,
     source_ref TEXT,
+    reconciled INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (person_id) REFERENCES persons(id)
 );
 
@@ -231,6 +232,15 @@ class CloudStore:
                     f"ALTER TABLE {table} ADD COLUMN source_ref TEXT"
                 )
                 logger.info("Migrated %s: added source_ref column", table)
+        # reconciled flag on visual_embeddings (NEXT-C dream judge watermark).
+        async with db.execute("PRAGMA table_info(visual_embeddings)") as cur:
+            vcols = {row[1] async for row in cur}
+        if "reconciled" not in vcols:
+            await db.execute(
+                "ALTER TABLE visual_embeddings ADD COLUMN "
+                "reconciled INTEGER NOT NULL DEFAULT 0"
+            )
+            logger.info("Migrated visual_embeddings: added reconciled column")
         await db.commit()
 
         # id_corrections table for older DBs created before it existed.
@@ -441,7 +451,8 @@ class CloudStore:
         db = self._ensure_db()
         records: list[dict] = []
         async with db.execute(
-            """SELECT id, embedding, provenance, confidence, crop_path, timestamp
+            """SELECT id, embedding, provenance, confidence, crop_path,
+                      timestamp, reconciled
                FROM visual_embeddings WHERE person_id = ?
                ORDER BY timestamp ASC""",
             (person_id,),
@@ -458,8 +469,65 @@ class CloudStore:
                     "confidence": row["confidence"],
                     "crop_path": row["crop_path"],
                     "timestamp": row["timestamp"],
+                    "reconciled": bool(row["reconciled"]),
                 })
         return records
+
+    # ------------------------------------------------------------------
+    # Reconciliation mutations (dream-cycle hygiene)
+    # ------------------------------------------------------------------
+
+    async def mark_visual_reconciled(self, embedding_ids: list[str]) -> None:
+        """Mark visual embeddings as reconciled so the judge won't re-examine."""
+        if not embedding_ids:
+            return
+        db = self._ensure_db()
+        await db.executemany(
+            "UPDATE visual_embeddings SET reconciled = 1 WHERE id = ?",
+            [(eid,) for eid in embedding_ids],
+        )
+        await db.commit()
+
+    async def delete_visual_embedding(self, embedding_id: str) -> None:
+        """Delete a single visual embedding (eviction)."""
+        db = self._ensure_db()
+        await db.execute(
+            "DELETE FROM visual_embeddings WHERE id = ?", (embedding_id,)
+        )
+        await db.commit()
+
+    async def reassign_visual_embedding(
+        self, embedding_id: str, new_person_id: str, provenance: str,
+    ) -> None:
+        """Move a visual embedding to another person (relabel), retag + mark."""
+        db = self._ensure_db()
+        await db.execute(
+            "UPDATE visual_embeddings SET person_id = ?, provenance = ?, "
+            "reconciled = 1 WHERE id = ?",
+            (new_person_id, provenance, embedding_id),
+        )
+        await db.commit()
+
+    async def log_correction(
+        self,
+        *,
+        source: str,
+        source_ref: str | None = None,
+        from_person_id: str | None = None,
+        to_person_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Append an id_corrections audit row (for undo + reconciliation history)."""
+        db = self._ensure_db()
+        await db.execute(
+            """INSERT INTO id_corrections
+               (id, timestamp, source_ref, from_person_id, to_person_id,
+                source, detail)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (_generate_id(), _now_iso(), source_ref, from_person_id,
+             to_person_id, source, detail),
+        )
+        await db.commit()
 
     async def get_visual_clouds(
         self,

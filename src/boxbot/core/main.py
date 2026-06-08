@@ -645,6 +645,22 @@ async def _maybe_seed_setup_todos(auth: Any) -> None:
                 "on what they share."
             ),
         ),
+        (
+            "setup:face_anchors — capture a confirmed reference face per person",
+            (
+                "Visual recognition needs at least one agent_identify ANCHOR "
+                "(a confirmed face crop) per person; until then visual ID and "
+                "the nightly identity-reconcile judge can't verify anyone. "
+                "HOW: during a voice conversation, once you're confident who "
+                "is speaking (they told you their name, or voice match is "
+                "high) AND they're visible to the camera, call "
+                "identify_person(name, ref) for that speaker — that binds "
+                "their current face as an anchor (with a crop). Do it once "
+                "per household member; a second time on a different day makes "
+                "recognition more robust. Mark complete once the regular "
+                "members each have an anchor."
+            ),
+        ),
     ]
 
     for description, notes in seeds:

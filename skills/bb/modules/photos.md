@@ -129,6 +129,34 @@ bb.photos.set_tags(photo_id, tags=["family", "party"])
 bb.photos.set_person(photo_id, person_index=0, name="Erik")
 ```
 
+`update()` rewrites the description and re-embeds it, so hybrid search
+stays consistent with the new text. `set_tags()` **replaces** the
+photo's whole tag list — to add or remove a single tag, read the
+current set first and write back the union/difference:
+
+```python
+p = bb.photos.get(photo_id)
+bb.photos.set_tags(photo_id, tags=sorted(set(p.tags) | {"birthday"}))
+```
+
+`set_person(person_index=…)` labels an already-detected face slot; if
+intake found no faces there are no slots to label (it returns an
+error), so fall back to a `people`/name tag or note it in the
+description.
+
+### Tag library (vocabulary curation)
+
+Tags are a shared, flat vocabulary across all photos. Keep it tidy:
+
+```python
+bb.photos.merge_tags("kids", into="children")  # fold a synonym in
+bb.photos.rename_tag("xmas", to="christmas")   # rename everywhere
+bb.photos.delete_tag("blurry")                 # drop from the library
+```
+
+These return nothing; the number of photos affected shows up in the
+tool result's `sdk_actions` entry for the call.
+
 ### Slideshow
 
 ```python
@@ -206,6 +234,3 @@ for tag in ("family", "vacation"):
   yet" notice. `view()` (pixels to tool result) also works. The call
   returns `dispatched: False` only when the display manager isn't
   running (e.g. headless).
-- Metadata mutation (`set_tags`, `delete`, etc.) currently acks the
-  action but the main-process handlers are stubs. Read/view works;
-  write doesn't yet.

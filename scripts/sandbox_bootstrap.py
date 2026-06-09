@@ -232,6 +232,27 @@ def _add_skills_to_path() -> None:
         sys.path.insert(0, parent)
 
 
+def _register_bb_alias() -> None:
+    """Make ``import bb`` resolve to the ``boxbot_sdk`` package.
+
+    The SDK is referred to as "the bb package" throughout the agent's
+    prompts and the ``skills/bb`` reference, and the project docs state it
+    is "importable as ``boxbot_sdk`` or just ``bb``". The package installs
+    under its canonical name ``boxbot_sdk`` only, so without this alias the
+    agent's natural first line — ``import bb`` — dies with
+    ModuleNotFoundError. Best-effort: scripts that never touch the SDK are
+    unaffected, and a real top-level ``bb`` module (should one ever be
+    shipped) wins via ``setdefault``.
+    """
+    if "bb" in sys.modules:
+        return
+    try:
+        import boxbot_sdk
+    except Exception:
+        return
+    sys.modules.setdefault("bb", boxbot_sdk)
+
+
 def _load_secrets_file() -> None:
     """Load secrets passed via a file into the environment, then delete it.
 
@@ -284,6 +305,7 @@ def main(argv: list[str]) -> int:
     _load_secrets_file()
     _maybe_apply_filter()
     _add_skills_to_path()
+    _register_bb_alias()
 
     script_path = argv[1]
     # Hand off to the user script. runpy.run_path mimics ``python script.py``:

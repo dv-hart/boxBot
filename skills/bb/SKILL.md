@@ -6,11 +6,12 @@ when_to_use: User mentions photos, the camera, the display/screen, taking notes,
 
 # bb — the boxBot SDK, in one package
 
-`bb` is importable as `boxbot_sdk` inside `execute_script`; the examples
-below use `import boxbot_sdk as bb` for brevity. Every call runs in the
-sandbox (separate venv, `boxbot-sandbox` user, seccomp, read-only
-site-packages) and communicates with the main process via structured
-JSON on stdout.
+Inside `execute_script` the package is importable both as `import bb`
+and as `import boxbot_sdk` (same module); the examples below use
+`import boxbot_sdk as bb`, but a bare `import bb` works identically.
+Every call runs in the sandbox (separate venv, `boxbot-sandbox` user,
+seccomp, read-only site-packages) and communicates with the main
+process via structured JSON on stdout.
 
 The key thing to internalise: **`bb` is about composition.** A single
 script can search memory, pull a few photos, write a note, and change the

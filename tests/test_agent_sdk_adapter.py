@@ -93,8 +93,15 @@ async def test_wrap_tool_returns_string_wraps_as_text_block():
 
 
 @pytest.mark.asyncio
-async def test_wrap_tool_returns_list_passes_through_as_content_blocks():
-    """execute_script and identify_person return multimodal content."""
+async def test_wrap_tool_converts_image_blocks_to_mcp_shape():
+    """execute_script / identify_person return multimodal content.
+
+    Text passes through; Anthropic-format image blocks
+    (``source.{media_type,data}``) MUST be rewritten to the MCP shape
+    (top-level ``data``/``mimeType``) the SDK's call_tool handler reads —
+    otherwise it raises ``KeyError('data')`` and the agent never sees the
+    pixels.
+    """
     multimodal = [
         {"type": "text", "text": "{\"ok\": true}"},
         {
@@ -111,7 +118,15 @@ async def test_wrap_tool_returns_list_passes_through_as_content_blocks():
 
     result = await wrapped.handler({"q": "snapshot"})
 
-    assert result == {"content": multimodal}
+    assert result == {
+        "content": [
+            {"type": "text", "text": "{\"ok\": true}"},
+            {"type": "image", "data": "Zm9v", "mimeType": "image/jpeg"},
+        ]
+    }
+    # The SDK's call_tool does item["data"] / item["mimeType"] — both present.
+    img = result["content"][1]
+    assert img["data"] == "Zm9v" and img["mimeType"] == "image/jpeg"
 
 
 @pytest.mark.asyncio

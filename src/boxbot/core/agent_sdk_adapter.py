@@ -86,21 +86,55 @@ def base_tool_name(name: str) -> str:
     return name[len(prefix):] if name.startswith(prefix) else name
 
 
+def _image_block_to_mcp(block: dict[str, Any]) -> dict[str, Any]:
+    """Translate an Anthropic-format image block into the MCP content shape.
+
+    boxBot's ``build_image_block`` emits the **Anthropic API** shape —
+    ``{"type": "image", "source": {"type": "base64", "media_type": …,
+    "data": …}}`` — but the ``claude_agent_sdk`` MCP server that fronts
+    every tool reads ``item["data"]`` / ``item["mimeType"]`` off the block
+    directly (MCP's ``ImageContent`` shape). An unconverted image block
+    therefore makes the SDK raise ``KeyError('data')`` *outside* this
+    adapter's try/except, which surfaces to the agent as the bare error
+    ``'data'`` and means it never actually sees the attached pixels.
+
+    Convert base64 image blocks to ``{"type": "image", "data": …,
+    "mimeType": …}``. Anything that isn't a recognised Anthropic image
+    block passes through untouched (text blocks, already-MCP blocks).
+    """
+    if block.get("type") != "image":
+        return block
+    source = block.get("source")
+    if not isinstance(source, dict) or source.get("type") != "base64":
+        return block
+    if "data" not in source:
+        return block
+    return {
+        "type": "image",
+        "data": source["data"],
+        "mimeType": source.get("media_type", "image/jpeg"),
+    }
+
+
 def _content_blocks(result: Any) -> list[dict[str, Any]]:
     """Coerce a ``Tool.execute`` return value into MCP content blocks.
 
     boxBot tools return one of:
       * ``str`` — wrap as a single text block.
-      * ``list[dict]`` — already in Anthropic content-block shape
-        (text + image blocks from ``execute_script`` /
-        ``identify_person``). Pass through.
+      * ``list[dict]`` — Anthropic content-block shape (text + image
+        blocks from ``execute_script`` / ``identify_person``). Image
+        blocks are translated to MCP shape (see
+        :func:`_image_block_to_mcp`); text passes through.
       * anything else — JSON-encode as a text block (defensive
         fallback; should not occur in practice).
     """
     if isinstance(result, str):
         return [{"type": "text", "text": result}]
     if isinstance(result, list):
-        return result
+        return [
+            _image_block_to_mcp(b) if isinstance(b, dict) else b
+            for b in result
+        ]
     return [{"type": "text", "text": json.dumps(result)}]
 
 

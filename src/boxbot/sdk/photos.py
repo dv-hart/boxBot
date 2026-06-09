@@ -200,10 +200,14 @@ def ingest(
     v.require_str(path, "path")
     v.require_str(source, "source")
     payload: dict[str, Any] = {"path": path, "source": source}
-    if sender is not None:
+    # Treat empty / whitespace-only sender and caption as "not provided"
+    # rather than rejecting them — callers (and the agent) naturally pass
+    # caption="" when there is no caption, and that should be a no-op, not
+    # a ValueError from require_str.
+    if sender and sender.strip():
         v.require_str(sender, "sender")
         payload["sender"] = sender
-    if caption is not None:
+    if caption and caption.strip():
         v.require_str(caption, "caption")
         payload["caption"] = caption
     resp = _check(_transport.request("photos.ingest", payload, timeout=120))

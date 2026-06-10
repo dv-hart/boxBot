@@ -6,7 +6,7 @@ operations, conditional logic, or combining task management with other
 SDK calls.
 
 All write calls (create_*, complete, cancel) wait for the main process
-to acknowledge and raise ``RuntimeError`` if the dispatcher rejects them.
+to acknowledge and raise ``bb.ActionError`` if the dispatcher rejects them.
 This is on purpose — silent failures previously let writes look like
 they had succeeded when no handler was wired up.
 
@@ -132,10 +132,12 @@ class TodoRecord:
 
 def _raise_on_error(response: dict, op: str) -> None:
     if response.get("status") != "ok":
-        raise RuntimeError(
+        raise _transport.ActionError(
             response.get("message")
             or response.get("error")
-            or f"{op} failed"
+            or f"{op} failed",
+            action=op,
+            response=response,
         )
 
 
@@ -166,7 +168,7 @@ def create_trigger(description: str, instructions: str, *,
         todo_id: Link to a to-do item.
 
     Raises:
-        RuntimeError: if the main process rejects the call.
+        ActionError: if the main process rejects the call.
     """
     v.require_str(description, "description")
     v.require_str(instructions, "instructions")
@@ -235,7 +237,7 @@ def create_todo(description: str, *,
         due_date: Due date string (YYYY-MM-DD).
 
     Raises:
-        RuntimeError: if the main process rejects the call.
+        ActionError: if the main process rejects the call.
     """
     v.require_str(description, "description")
 
@@ -299,7 +301,7 @@ def complete(item_id: str) -> None:
         item_id: To-do item ID.
 
     Raises:
-        RuntimeError: if the main process rejects the call.
+        ActionError: if the main process rejects the call.
     """
     v.require_str(item_id, "item_id")
     response = _transport.request("tasks.complete", {"id": item_id}, timeout=30)
@@ -313,7 +315,7 @@ def cancel(item_id: str) -> None:
         item_id: Item ID (trigger or to-do).
 
     Raises:
-        RuntimeError: if the main process rejects the call.
+        ActionError: if the main process rejects the call.
     """
     v.require_str(item_id, "item_id")
     response = _transport.request("tasks.cancel", {"id": item_id}, timeout=30)

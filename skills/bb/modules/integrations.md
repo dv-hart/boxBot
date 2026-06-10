@@ -93,7 +93,8 @@ return_output({"kwh": kwh})
 '''
 i.save()
 # → {"status": "ok", "name": "solar", "path": ".../integrations/solar"}
-# → {"status": "exists", ...}  if a "solar" integration already exists
+# Raises bb.ActionError if a "solar" integration already exists or
+# main-side validation fails.
 ```
 
 ### Update / delete
@@ -101,11 +102,11 @@ i.save()
 ```python
 bb.integrations.update("solar", script="…revised script…")
 bb.integrations.update("solar", manifest={"description": "…"})
-# Errors with status:"missing" if the name doesn't exist — never
+# Raises bb.ActionError if the name doesn't exist — never
 # auto-promotes. Use create() if you need a new one.
 
 bb.integrations.delete("solar")
-# Errors with status:"missing" if the name doesn't exist.
+# Raises bb.ActionError if the name doesn't exist.
 ```
 
 ## What lands on disk
@@ -191,10 +192,13 @@ configuration that's neither secret nor per-call.
 ## Conflict and lifecycle
 
 - States: **registered** or not. There is no active/paused/scheduled.
-- `create` refuses if the name is taken (`status: "exists"`); never
-  silently overwrites a community integration.
-- `update` errors with `status: "missing"` if the name is unknown.
-- `delete` errors with `status: "missing"` similarly.
+- Writes follow the SDK rule: `save()`, `update()`, `delete()` raise
+  `bb.ActionError` on rejection (name taken, name unknown, bad
+  manifest). `create` never silently overwrites a community
+  integration.
+- Reads return raw dicts: `get()` reports a failing *run* as
+  `{"status": "error" | "timeout", ...}` — that's data to inspect,
+  not an exception.
 
 ## Discovery and timing
 

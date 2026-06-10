@@ -77,19 +77,12 @@ def delete(name: str) -> dict[str, Any]:
         On success: ``{"status": "ok", "name": ..., "path": ...}``.
 
     Raises:
-        RuntimeError: If the skill does not exist, is built-in (not
+        ActionError: If the skill does not exist, is built-in (not
             agent-authored), or the name fails validation. The error
             message tells you which.
     """
     v.validate_skill_name(name)
-    resp = _transport.request("skill.delete", {"name": name})
-    status = resp.get("status")
-    if status == "ok":
-        return resp
-    raise RuntimeError(
-        resp.get("message")
-        or f"skill.delete returned status={status!r}"
-    )
+    return _transport.dispatch_or_raise("skill.delete", {"name": name})
 
 
 class SkillBuilder:
@@ -175,12 +168,19 @@ class SkillBuilder:
             raise ValueError("'SKILL.md' is reserved — set s.body instead")
         self._resources.append({"filename": filename, "content": content})
 
-    def save(self) -> None:
+    def save(self) -> dict[str, Any]:
         """Save the skill. The loader picks it up on next discovery scan.
 
         Refuses if a skill with the same name already exists — call
-        ``skill.delete`` first (when implemented), or pick a different
-        name. Never silently overwrites a community skill.
+        ``skill.delete`` first, or pick a different name. Never
+        silently overwrites a community skill.
+
+        Returns:
+            The ``status: "ok"`` response with the written file list.
+
+        Raises:
+            ActionError: If the name collides with an existing skill or
+                main-side validation fails.
         """
         if self._description is None:
             raise ValueError("Skill description is required — set s.description")
@@ -197,4 +197,4 @@ class SkillBuilder:
         if self._resources:
             payload["resources"] = self._resources
 
-        _transport.emit_action("skill.save", payload)
+        return _transport.dispatch_or_raise("skill.save", payload)

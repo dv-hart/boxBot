@@ -26,6 +26,10 @@ Usage:
 
 Naming: SCREAMING_SNAKE_CASE only (``[A-Z][A-Z0-9_]*``), ≤64 chars.
 This matches the shape integrations declare in their manifests.
+
+Error semantics: the write paths (``store``, ``delete``) raise
+``bb.ActionError`` when the main process rejects them; the read paths
+(``list``, ``has``, ``use``) return their documented shapes.
 """
 
 from __future__ import annotations
@@ -38,16 +42,18 @@ from . import _transport, _validators as v
 def store(name: str, value: str) -> dict[str, Any]:
     """Store a secret value under ``name``.
 
-    Returns the dispatcher response — typically
-    ``{"status": "ok", "name": ..., "previous": "created"|"replaced"}``,
-    or ``{"status": "error", "message": ...}`` on validation failure
-    (bad name shape, oversized value, store full).
+    Returns ``{"status": "ok", "name": ..., "previous":
+    "created"|"replaced"}`` on success.
+
+    Raises:
+        ActionError: on validation failure (bad name shape, oversized
+            value, store full) or any other dispatcher rejection.
 
     The value is never echoed back through any SDK call.
     """
     v.require_str(name, "name")
     v.require_str(value, "value")
-    return _transport.request("secrets.store", {
+    return _transport.dispatch_or_raise("secrets.store", {
         "name": name,
         "value": value,
     })
@@ -56,11 +62,16 @@ def store(name: str, value: str) -> dict[str, Any]:
 def delete(name: str) -> dict[str, Any]:
     """Remove a stored secret by name.
 
-    Returns ``{"status": "ok", "name": ...}`` on success,
-    ``{"status": "missing", "name": ...}`` if the name isn't stored.
+    Returns ``{"status": "ok", "name": ...}`` on success.
+
+    Raises:
+        ActionError: if the name isn't stored (``status: "missing"``)
+            or the dispatcher otherwise rejects the call. A delete that
+            removed nothing fails loudly instead of looking like it
+            worked.
     """
     v.require_str(name, "name")
-    return _transport.request("secrets.delete", {"name": name})
+    return _transport.dispatch_or_raise("secrets.delete", {"name": name})
 
 
 def list() -> dict[str, Any]:  # noqa: A001 — shadows builtin intentionally; SDK module convention

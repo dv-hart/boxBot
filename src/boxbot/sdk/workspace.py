@@ -44,14 +44,20 @@ from . import _transport, _validators as v
 _TIMEOUT = 15
 
 
-class WorkspaceError(Exception):
-    """Raised on workspace operation failures (bad path, quota, etc)."""
+class WorkspaceError(_transport.ActionError):
+    """Raised on workspace operation failures (bad path, quota, etc).
+
+    Subclasses ``bb.ActionError`` so a generic ``except bb.ActionError``
+    catches workspace failures too.
+    """
 
 
 def _check(resp: dict[str, Any]) -> dict[str, Any]:
     """Raise WorkspaceError if the main process returned an error."""
     if isinstance(resp, dict) and resp.get("status") == "error":
-        raise WorkspaceError(resp.get("error", "unknown workspace error"))
+        raise WorkspaceError(
+            resp.get("error", "unknown workspace error"), response=resp
+        )
     return resp
 
 

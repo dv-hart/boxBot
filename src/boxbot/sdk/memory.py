@@ -19,7 +19,7 @@ Usage:
     memory.delete(memory_id="abc-123")
 
 All write calls (save, delete) wait for the main process to acknowledge
-and raise ``MemoryError`` if the dispatcher rejects them. This is on
+and raise ``bb.ActionError`` if the dispatcher rejects them. This is on
 purpose — silent failures previously let writes look like they had
 succeeded when no handler was wired up.
 """
@@ -71,10 +71,12 @@ class MemoryRecord:
 
 def _raise_on_error(response: dict, op: str) -> None:
     if response.get("status") != "ok":
-        raise MemoryError(
+        raise _transport.ActionError(
             response.get("message")
             or response.get("error")
-            or f"{op} failed"
+            or f"{op} failed",
+            action=op,
+            response=response,
         )
 
 
@@ -100,7 +102,7 @@ def save(content: str, *,
             — not yet persisted by the store.
 
     Raises:
-        MemoryError: if the main process rejects the call (validation,
+        ActionError: if the main process rejects the call (validation,
             store error, missing handler).
     """
     v.require_str(content, "content")
@@ -185,7 +187,7 @@ def delete(memory_id: str, *, reason: str | None = None) -> dict[str, Any]:
         without a follow-up search.
 
     Raises:
-        MemoryError: if no memory matches the id/prefix, the prefix is
+        ActionError: if no memory matches the id/prefix, the prefix is
             ambiguous, or the main process otherwise rejects the call.
     """
     v.require_str(memory_id, "memory_id")

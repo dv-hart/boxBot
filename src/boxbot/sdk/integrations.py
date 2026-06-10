@@ -45,6 +45,12 @@ The full lifecycle::
     bb.integrations.update("solar", script="…new script…")
     bb.integrations.delete("solar")
 
+Error semantics: the write paths (``create``/``save``, ``update``,
+``delete``) raise ``bb.ActionError`` when the main process rejects
+them. The read paths (``list``, ``get``, ``get_source``, ``logs``)
+return raw response dicts — including ``status: "error" | "timeout"``
+for a failing integration *run*, which is data, not a transport fault.
+
 For the full authoring guide, load the ``integrations_authoring`` skill.
 """
 
@@ -140,11 +146,14 @@ def update(name: str, *, manifest: dict[str, Any] | None = None,
            script: str | None = None) -> Any:
     """Replace the manifest and/or script of an existing integration.
 
-    Errors with ``status: "missing"`` if no integration is registered
-    under that name — call :func:`create` instead.
-
     Either ``manifest`` (a dict matching the manifest schema, minus
     ``name`` which is implicit) or ``script`` (a string) must be provided.
+
+    Returns the ``status: "ok"`` response (with the written file list).
+
+    Raises:
+        ActionError: if no integration is registered under that name
+            (call :func:`create` instead), or validation fails.
     """
     v.require_str(name, "name")
     if manifest is None and script is None:
@@ -154,13 +163,19 @@ def update(name: str, *, manifest: dict[str, Any] | None = None,
         payload["manifest"] = v.require_dict(manifest, "manifest")
     if script is not None:
         payload["script"] = v.require_str(script, "script")
-    return _transport.request("integrations.update", payload)
+    return _transport.dispatch_or_raise("integrations.update", payload)
 
 
 def delete(name: str) -> Any:
-    """Remove an integration. Errors with ``status: "missing"`` if absent."""
+    """Remove an integration.
+
+    Returns the ``status: "ok"`` response.
+
+    Raises:
+        ActionError: if no integration is registered under that name.
+    """
     v.require_str(name, "name")
-    return _transport.request("integrations.delete", {"name": name})
+    return _transport.dispatch_or_raise("integrations.delete", {"name": name})
 
 
 # ---------------------------------------------------------------------------
@@ -267,12 +282,16 @@ class IntegrationBuilder:
             self._secrets.append(name)
 
     def save(self) -> Any:
-        """Persist the integration. Errors if a same-name one exists.
+        """Persist the integration.
 
         Builds the create payload from the current builder state and
         emits it as an ``integrations.create`` action. The main process
         validates again, writes ``manifest.yaml`` and ``script.py``,
         and returns the file list.
+
+        Raises:
+            ActionError: if a same-name integration already exists or
+                main-side validation fails.
         """
         if self._description is None:
             raise ValueError("integration description is required — set i.description")
@@ -293,4 +312,4 @@ class IntegrationBuilder:
         if self._timeout is not None:
             payload["timeout"] = self._timeout
 
-        return _transport.request("integrations.create", payload)
+        return _transport.dispatch_or_raise("integrations.create", payload)

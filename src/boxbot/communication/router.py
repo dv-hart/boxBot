@@ -7,6 +7,11 @@ to the correct channel based on user name resolution.
 Security:
 - Incoming messages from unknown numbers are silently dropped
 - Only the registration code exception allows unknown number processing
+- Package-approval replies (``approve pkg <id>`` / ``deny pkg <id>``)
+  from registered ADMINS are intercepted here (mirroring the
+  registration-code pattern) and handled by the package service instead
+  of reaching the agent; the same text from a non-admin routes as a
+  normal message and resolves nothing
 - All routing decisions are logged without message content
 
 Usage:
@@ -22,7 +27,7 @@ from __future__ import annotations
 
 import logging
 
-from boxbot.communication.auth import AuthManager
+from boxbot.communication.auth import AuthManager, User
 from boxbot.communication.channels import Channel
 from boxbot.communication.whatsapp import WhatsAppClient
 from boxbot.core.events import (
@@ -143,6 +148,11 @@ class MessageRouter:
             # Authorized user — route to agent
             await self._auth.update_last_seen(sender_phone)
 
+            if await self._maybe_handle_package_reply(
+                user, message, Channel.WHATSAPP
+            ):
+                return True
+
             event = WhatsAppMessage(
                 sender_name=user.name,
                 sender_phone=sender_phone,
@@ -246,6 +256,11 @@ class MessageRouter:
         if user is not None:
             await self._auth.update_last_seen(sender_phone)
 
+            if await self._maybe_handle_package_reply(
+                user, message, Channel.SIGNAL
+            ):
+                return True
+
             event = SignalMessage(
                 sender_name=user.name,
                 sender_phone=sender_phone,
@@ -307,6 +322,72 @@ class MessageRouter:
         # SILENT DROP — no response, no error.
         logger.debug("Unknown number on Signal, silent drop: %s", sender_phone)
         return False
+
+    async def _maybe_handle_package_reply(
+        self,
+        user: "User",
+        message: str | None,
+        inbound_channel: Channel,
+    ) -> bool:
+        """Intercept an admin's package approve/deny reply.
+
+        Returns True iff the message was a package-approval command from
+        a registered **admin** and was fully handled here (the agent
+        never sees it). The confirmation is sent back on the channel the
+        reply arrived on — the admin is demonstrably reachable there.
+
+        A matching command from a non-admin returns False: the message
+        routes to the agent as normal text and resolves nothing. No
+        privilege, no information leak — they're registered users anyway.
+        """
+        if not message:
+            return False
+
+        from boxbot.packages.service import handle_admin_reply, parse_admin_reply
+
+        parsed = parse_admin_reply(message)
+        if parsed is None:
+            return False
+        if user.role != "admin":
+            logger.warning(
+                "Non-admin %s sent a package-approval command; "
+                "routing as a normal message",
+                user.phone,
+            )
+            return False
+
+        verb, request_id, note = parsed
+        reply = await handle_admin_reply(
+            verb, request_id, note, admin=user
+        )
+        logger.info(
+            "Package %s for request %s handled from admin %s",
+            verb, request_id, user.phone,
+        )
+
+        from boxbot.communication.channels import get_outbound_channel
+
+        out = get_outbound_channel(inbound_channel)
+        if out is None:
+            # Fall back to the admin's registered outbound channel.
+            try:
+                out = get_outbound_channel(Channel(user.channel))
+            except ValueError:
+                out = None
+        if out is not None:
+            try:
+                await out.send_text(user.phone, reply)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Could not confirm package %s to admin %s",
+                    verb, user.phone,
+                )
+        else:
+            logger.warning(
+                "No outbound client to confirm package %s to admin %s",
+                verb, user.phone,
+            )
+        return True
 
     async def route_outgoing(
         self,

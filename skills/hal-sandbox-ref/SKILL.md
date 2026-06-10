@@ -171,18 +171,23 @@ do not — they run in the main process and require approval.)
 ```python
 from boxbot_sdk import packages
 
-result = packages.request(
+req = packages.request(
     "google-api-python-client",
     reason="Needed for Gmail integration",
 )
-if result.approved:
+print(req["id"], req["status"])    # "ab12cd34 pending"
+
+# Later — next script run, or after a fire_after trigger:
+req = packages.status("ab12cd34")
+if req["status"] == "installed":
     import googleapiclient
-else:
-    print(f"Denied: {result.reason}")
+elif req["status"] == "denied":
+    print(f"Denied by admin: {req.get('note')}")
 ```
 
-Blocks until the admin taps the screen or replies YES via WhatsApp.
-There is no way to spoof approval from inside the sandbox.
+Returns immediately with status `pending`; an admin approves or denies
+by messaging reply (`approve pkg <id>` / `deny pkg <id>`). There is no
+way to spoof approval from inside the sandbox.
 
 ## What you cannot do
 

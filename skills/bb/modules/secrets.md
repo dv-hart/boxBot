@@ -46,8 +46,15 @@ if bb.secrets.has("POLYGON_API_KEY"):
 
 # Delete when rotating or removing an account.
 bb.secrets.delete("OLD_API_KEY")
-# → {"status": "ok"|"missing", "name": "OLD_API_KEY"}
+# → {"status": "ok", "name": "OLD_API_KEY"}
+# Raises bb.ActionError if the name isn't stored — a delete that
+# removed nothing fails loudly.
 ```
+
+Error semantics: the writes (`store`, `delete`) raise `bb.ActionError`
+on rejection (bad name shape, oversized value, store full, name not
+stored); the reads (`list`, `has`, `use`) return the shapes shown
+above.
 
 ## Naming
 

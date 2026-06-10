@@ -26,8 +26,14 @@ Modules:
 
 The calendar surface lives behind the ``calendar`` integration —
 reach it via ``bb.integrations.get("calendar", action="...", ...)``.
+
+Error semantics: **mutating** calls raise :class:`ActionError` (or a
+module-specific subclass) when the main process rejects them; **read**
+calls return raw response dicts with shapes documented per function.
+Catch any failed SDK write with ``except bb.ActionError``.
 """
 
+from ._transport import ActionError
 from . import (
     audio,
     auth,
@@ -44,6 +50,7 @@ from . import (
 )
 
 __all__ = [
+    "ActionError",
     "audio",
     "auth",
     "camera",

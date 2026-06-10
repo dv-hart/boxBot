@@ -573,7 +573,10 @@ class TestSkillBuilder:
         s.body = "# Weather\n\nUse bb.weather.forecast()."
 
         fake_stdout = io.StringIO()
-        with patch("sys.stdout", fake_stdout):
+        with patch("sys.stdout", fake_stdout), patch(
+            "boxbot.sdk._transport.collect_response",
+            return_value={"status": "ok"},
+        ):
             s.save()
         output = fake_stdout.getvalue()
         data = json.loads(output.split(_MARKER, 1)[1].strip())
@@ -592,7 +595,10 @@ class TestSkillBuilder:
         s.add_script("helper.py", "def go():\n    return 42\n")
 
         fake_stdout = io.StringIO()
-        with patch("sys.stdout", fake_stdout):
+        with patch("sys.stdout", fake_stdout), patch(
+            "boxbot.sdk._transport.collect_response",
+            return_value={"status": "ok"},
+        ):
             s.save()
         data = json.loads(fake_stdout.getvalue().split(_MARKER, 1)[1].strip())
         assert len(data["scripts"]) == 1
@@ -623,7 +629,10 @@ class TestSkillBuilder:
         s.add_resource("REFERENCE.md", "# Reference\n\n…")
 
         fake_stdout = io.StringIO()
-        with patch("sys.stdout", fake_stdout):
+        with patch("sys.stdout", fake_stdout), patch(
+            "boxbot.sdk._transport.collect_response",
+            return_value={"status": "ok"},
+        ):
             s.save()
         data = json.loads(fake_stdout.getvalue().split(_MARKER, 1)[1].strip())
         assert data["resources"][0]["filename"] == "REFERENCE.md"
@@ -711,7 +720,8 @@ class TestSDKMemory:
              patch("boxbot.sdk._transport.collect_response",
                    return_value={"status": "error",
                                  "message": "no handler"}):
-            with pytest.raises(MemoryError, match="no handler"):
+            from boxbot.sdk._transport import ActionError
+            with pytest.raises(ActionError, match="no handler"):
                 memory.save(content="x", memory_type="household")
 
     def test_save_validates_memory_type(self):
@@ -844,15 +854,26 @@ class TestSDKSecrets:
 
 
 class TestSDKPackages:
-    """Test the SDK packages module."""
+    """Test the SDK packages module (full flow coverage: test_packages.py)."""
 
-    def test_package_result_repr(self):
-        from boxbot.sdk.packages import PackageResult
-        approved = PackageResult(approved=True)
-        assert "approved" in repr(approved)
-        denied = PackageResult(approved=False, reason="Not needed")
-        assert "denied" in repr(denied)
-        assert "Not needed" in repr(denied)
+    def test_request_emits_action_and_returns_pending(self):
+        from boxbot.sdk import packages
+
+        fake_stdout = io.StringIO()
+        with patch("sys.stdout", fake_stdout), \
+             patch("boxbot.sdk._transport.collect_response",
+                   return_value={"status": "ok",
+                                 "request": {"id": "ab12cd34",
+                                             "status": "pending"},
+                                 "admins_notified": 1}):
+            record = packages.request("requests", reason="http calls")
+        line = fake_stdout.getvalue()
+        data = json.loads(line.split(_MARKER, 1)[1].strip())
+        assert data["_sdk"] == "packages.request"
+        assert data["package"] == "requests"
+        assert data["reason"] == "http calls"
+        assert record["status"] == "pending"
+        assert record["id"] == "ab12cd34"
 
 
 # ---------------------------------------------------------------------------

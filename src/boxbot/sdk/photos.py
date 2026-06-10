@@ -21,13 +21,19 @@ from typing import Any
 from . import _transport, _validators as v
 
 
-class PhotosError(Exception):
-    """Raised when a photo operation fails on the main process side."""
+class PhotosError(_transport.ActionError):
+    """Raised when a photo operation fails on the main process side.
+
+    Subclasses ``bb.ActionError`` so a generic ``except bb.ActionError``
+    catches photo failures too.
+    """
 
 
 def _check(resp: dict[str, Any]) -> dict[str, Any]:
     if isinstance(resp, dict) and resp.get("status") == "error":
-        raise PhotosError(resp.get("error", "photo operation failed"))
+        raise PhotosError(
+            resp.get("error", "photo operation failed"), response=resp
+        )
     return resp
 
 

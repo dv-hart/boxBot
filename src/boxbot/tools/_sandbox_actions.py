@@ -1040,6 +1040,104 @@ async def _handle_auth_action(
 
 
 # ---------------------------------------------------------------------------
+# Packages action handler
+# ---------------------------------------------------------------------------
+
+
+@action_handler("packages")
+async def _handle_packages_action(
+    action_type: str,
+    payload: dict[str, Any],
+    ctx: ActionContext,  # unused; kept for uniform handler signature
+) -> dict[str, Any]:
+    """Dispatch ``packages.*`` — request, status, list.
+
+    ``request`` validates the package spec (bare PyPI name or exact
+    ``name==version`` pin — never URLs/paths/specifiers), durably
+    queues a pending request in ``data/packages/packages.db``, and
+    notifies every registered admin on their registered channel with
+    reply instructions (``approve pkg <id>`` / ``deny pkg <id>``).
+    Approval is **out-of-band**: the inbound MessageRouter intercepts
+    admin replies; nothing the sandbox emits can resolve a request.
+
+    ``status`` / ``get`` and ``list`` are reads over the request store
+    so the agent can check back on a pending request later.
+    """
+    from boxbot.packages import service
+    from boxbot.packages.store import VALID_STATUSES, get_package_store
+
+    sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+
+    try:
+        if sub == "request":
+            package = payload.get("package")
+            reason = payload.get("reason")
+            if not isinstance(package, str) or not package.strip():
+                return {"status": "error", "message": "'package' is required"}
+            if not isinstance(reason, str) or not reason.strip():
+                return {"status": "error", "message": "'reason' is required"}
+
+            # Stamp the requesting context so the admin notification
+            # (and a later status check) can say where this came from.
+            from boxbot.tools._tool_context import get_current_conversation
+
+            conv = get_current_conversation()
+            requested_by = conv.channel_key if conv is not None else None
+
+            try:
+                result = await service.submit_request(
+                    package, reason, requested_by=requested_by
+                )
+            except ValueError as e:
+                return {"status": "error", "message": str(e)}
+            return {
+                "status": "ok",
+                "request": result["request"],
+                "duplicate": result["duplicate"],
+                "admins_notified": result["admins_notified"],
+                "admins": result["admins"],
+            }
+
+        if sub in ("status", "get"):
+            request_id = payload.get("id")
+            if not isinstance(request_id, str) or not request_id:
+                return {"status": "error", "message": "'id' is required"}
+            request = await get_package_store().get_request(
+                request_id.strip().lower()
+            )
+            if request is None:
+                return {
+                    "status": "error",
+                    "message": f"no package request '{request_id}' found",
+                }
+            return {"status": "ok", "request": request}
+
+        if sub == "list":
+            status_filter = payload.get("request_status")
+            if status_filter is not None and status_filter not in VALID_STATUSES:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"invalid status filter {status_filter!r}; "
+                        f"valid: {', '.join(VALID_STATUSES)}"
+                    ),
+                }
+            requests = await get_package_store().list_requests(
+                status=status_filter
+            )
+            return {"status": "ok", "requests": requests}
+
+        return {
+            "status": "error",
+            "message": f"unknown packages action '{action_type}'",
+        }
+
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("%s failed", action_type)
+        return {"status": "error", "message": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Display action handler
 # ---------------------------------------------------------------------------
 

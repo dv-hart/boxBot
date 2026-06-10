@@ -131,6 +131,13 @@ The workspace has a soft cap (default 100 MB). Writes that would exceed
 the cap raise an error. Prune with `delete()` when you notice it filling
 up — images saved here count; images in the photo library do not.
 
+## Errors
+
+Every failing operation raises `WorkspaceError` (bad path, missing
+file, quota exceeded). `WorkspaceError` subclasses `bb.ActionError`,
+so a generic `except bb.ActionError` catches workspace failures along
+with any other rejected SDK call.
+
 ## Patterns
 
 ### Short note tied to a memory

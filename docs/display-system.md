@@ -446,12 +446,21 @@ display.update_data("morning_board", "greeting",
                     value={"text": "Stay warm today!"})
 ```
 
-**`memory_query`** — Run a memory search:
+**`memory_query`** — Re-run a memory search on every refresh (e.g. a
+standing "household reminders" board). Uses the shared hybrid
+vector + BM25 backend with **no model reranking** — a display
+refreshing every few minutes makes no model calls. Fact memories only;
+conversation summaries are excluded:
 ```python
 d.data("reminders", type="memory_query",
        query="household reminders and standing instructions",
-       refresh=300)
+       refresh=300, limit=5)   # limit defaults to 5
 ```
+
+Output shape: `{"results": [{"text", "type", "age"}], "count",
+"query"}` — `age` is a short string like `"3d"` or `"2w"`. Bind with a
+`repeat` block over `{reminders.results}` and `{.text}` / `{.age}` on
+the items.
 
 #### Field Extraction and Mapping
 

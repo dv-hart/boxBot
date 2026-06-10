@@ -394,21 +394,125 @@ class StaticSource(DataSource):
 
 
 class MemoryQuerySource(DataSource):
-    """Run a memory search query and return results."""
+    """Run a memory search on each refresh and return display-ready results.
+
+    Spec form::
+
+        {"name": "recent", "type": "memory_query",
+         "query": "kitchen renovation", "refresh": 600, "limit": 5}
+
+    Goes straight to the shared hybrid vector + BM25 backend
+    (:func:`boxbot.memory.search.hybrid_search`) — the same scoring the
+    ``search_memory`` tool and ``bb.memory.search`` use, but **without**
+    the Haiku reranking step. A display refreshing every few minutes
+    must not make model calls; raw hybrid ranking is plenty for a
+    standing board. Facts only — conversation summaries are excluded.
+
+    Output (binding-friendly)::
+
+        {"results": [{"text": str, "type": str, "age": "3d"}],
+         "count": int, "query": str}
+
+    Bind with a ``repeat`` block over ``{<name>.results}`` and
+    ``{.text}`` / ``{.age}`` on the items.
+
+    Backend errors propagate to :meth:`DataSource.do_fetch`, which logs
+    a warning, keeps the cached data, and sets ``_fetch_error``.
+    """
+
+    DEFAULT_LIMIT = 5
 
     def __init__(self, name: str, config: dict[str, Any]) -> None:
         super().__init__(name, config)
 
     @property
     def refresh_interval(self) -> int:
-        return self.config.get("refresh", 300)
+        # The manager passes refresh=None when the spec omits it, so a
+        # plain .get("refresh", 300) would leak None into the fetch loop.
+        refresh = self.config.get("refresh")
+        return 300 if refresh is None else refresh
 
     async def fetch(self) -> dict[str, Any]:
-        query = self.config.get("query", "")
+        query = (self.config.get("query") or "").strip()
         if not query:
-            return {"results": []}
-        # Stub: real implementation calls memory search backend
-        return {"results": [], "query": query}
+            return {"results": [], "count": 0, "query": ""}
+
+        limit = self.config.get("limit")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            limit = self.DEFAULT_LIMIT
+
+        from boxbot.memory.search import hybrid_search
+
+        store = await _get_memory_store()
+        candidates = await hybrid_search(
+            store, query,
+            include_conversations=False,
+            memory_limit=limit,
+        )
+
+        results = [
+            {
+                "text": c.summary or c.content,
+                "type": c.type,
+                "age": _format_age(c.metadata.get("created_at")),
+            }
+            for c in candidates[:limit]
+        ]
+        return {"results": results, "count": len(results), "query": query}
+
+
+# Memory store singleton for MemoryQuerySource. Mirrors the pattern in
+# tools/builtins/search_memory.py — each in-process consumer owns its
+# own connection to the shared SQLite DB (autocommit mode, safe).
+_memory_store: Any = None
+
+
+async def _get_memory_store() -> Any:
+    """Get or create the MemoryStore used by memory_query sources."""
+    global _memory_store
+    if _memory_store is None:
+        from boxbot.memory.store import MemoryStore
+
+        store = MemoryStore()
+        await store.initialize()
+        _memory_store = store
+    return _memory_store
+
+
+def _format_age(timestamp: str | None) -> str:
+    """Format an ISO timestamp as a short age string ("3d", "2w").
+
+    The memory store stamps naive-UTC ISO strings; tz-aware inputs are
+    normalized. Unparseable or missing input returns "" — an age must
+    never crash a display refresh.
+    """
+    if not timestamp:
+        return ""
+    from datetime import datetime, timezone
+
+    try:
+        dt = datetime.fromisoformat(timestamp)
+    except (ValueError, TypeError):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    seconds = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "now"
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    days = hours // 24
+    if days < 14:
+        return f"{days}d"
+    if days < 61:
+        return f"{days // 7}w"
+    if days < 365:
+        return f"{days // 30}mo"
+    return f"{days // 365}y"
 
 
 # ---------------------------------------------------------------------------

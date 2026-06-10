@@ -58,6 +58,7 @@ class DataSourceSpec:
     fields: dict[str, Any] = field(default_factory=dict)
     value: Any = None  # for static sources
     query: str | None = None  # for memory_query
+    limit: int | None = None  # for memory_query (max results, default 5)
 
 
 @dataclass
@@ -123,6 +124,7 @@ def _parse_data_source(data: dict[str, Any]) -> DataSourceSpec:
         fields=data.get("fields", {}),
         value=data.get("value"),
         query=data.get("query"),
+        limit=data.get("limit"),
     )
 
 
@@ -393,6 +395,14 @@ def validate_spec(spec: DisplaySpec) -> list[str]:
             errors.append(f"http_text source '{src.name}' requires a URL")
         if src.source_type == "memory_query" and not src.query:
             errors.append(f"memory_query source '{src.name}' requires a query")
+        if src.limit is not None and (
+            not isinstance(src.limit, int)
+            or isinstance(src.limit, bool)
+            or src.limit < 1
+        ):
+            errors.append(
+                f"Data source '{src.name}' limit must be a positive integer"
+            )
 
     # Validate block tree
     if spec.root_block:

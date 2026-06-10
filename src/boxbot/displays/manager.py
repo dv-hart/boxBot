@@ -750,6 +750,7 @@ class DisplayManager:
                 "fields": src_spec.fields,
                 "value": src_spec.value,
                 "query": src_spec.query,
+                "limit": src_spec.limit,
             }
             try:
                 source = create_source(

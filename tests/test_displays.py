@@ -274,6 +274,21 @@ class TestSpecParsing:
         assert spec.data_sources[0].name == "weather"
         assert spec.data_sources[1].url == "https://api.stock.com"
 
+    def test_parse_spec_memory_query_source(self):
+        data = {
+            "name": "reminders_board",
+            "data_sources": [
+                {"name": "recent", "type": "memory_query",
+                 "query": "kitchen renovation", "refresh": 600, "limit": 3},
+            ],
+        }
+        spec = parse_spec(data)
+        src = spec.data_sources[0]
+        assert src.source_type == "memory_query"
+        assert src.query == "kitchen renovation"
+        assert src.refresh == 600
+        assert src.limit == 3
+
     def test_parse_spec_with_layout(self):
         data = {
             "name": "layout_test",
@@ -330,6 +345,27 @@ class TestSpecValidation:
         )
         errors = validate_spec(spec)
         assert any("url" in e.lower() for e in errors)
+
+    def test_memory_query_source_without_query(self):
+        spec = DisplaySpec(
+            name="bad_source",
+            data_sources=[
+                DataSourceSpec(name="recent", source_type="memory_query"),
+            ],
+        )
+        errors = validate_spec(spec)
+        assert any("query" in e.lower() for e in errors)
+
+    def test_memory_query_source_bad_limit(self):
+        spec = DisplaySpec(
+            name="bad_limit",
+            data_sources=[
+                DataSourceSpec(name="recent", source_type="memory_query",
+                               query="reminders", limit=0),
+            ],
+        )
+        errors = validate_spec(spec)
+        assert any("limit" in e.lower() for e in errors)
 
     def test_text_block_without_content_produces_error(self):
         spec = DisplaySpec(

@@ -1189,6 +1189,7 @@ def write_dream_log(
     audit_only: bool,
     cost_usd: float | None = None,
     maintenance_stats: dict[str, int] | None = None,
+    submission_error: str | None = None,
     now: datetime | None = None,
 ) -> Path:
     """Write a per-cycle markdown audit log to the workspace.
@@ -1234,7 +1235,12 @@ def write_dream_log(
     lines.append("")
 
     lines.append("## Batch")
-    if batch_id is None:
+    if submission_error is not None:
+        lines.append(f"- SUBMISSION FAILED: {submission_error}")
+        lines.append(
+            "- watermark not advanced; next cycle re-covers this window"
+        )
+    elif batch_id is None:
         lines.append("- (no batch — nothing to dedup)")
     else:
         lines.append(f"- batch_id: `{batch_id}`")
@@ -1372,6 +1378,7 @@ async def run_dream_cycle(
 
     batch_id: str | None = None
     request_types: dict[str, int] = {}
+    submission_error: str | None = None
     if pairs and client is not None:
         try:
             batch_id = await submit_dream_batch(
@@ -1380,8 +1387,9 @@ async def run_dream_cycle(
                 max_pairs=max_dedup_pairs,
             )
             request_types = {"dedup": len(pairs)}
-        except Exception:
+        except Exception as e:
             logger.exception("Dream batch submission failed")
+            submission_error = f"{type(e).__name__}: {e}"
 
     # Phase 3 — deterministic maintenance, runs after submission so the
     # batch is durably queued first.
@@ -1404,13 +1412,23 @@ async def run_dream_cycle(
         decisions=None,
         audit_only=audit_only,
         maintenance_stats=maintenance_stats,
+        submission_error=submission_error,
         now=now,
     )
 
-    # Advance the watermark only after the cycle's work is durably
-    # queued (batch submitted) and logged. If anything above threw, we
-    # keep the old watermark so the next run re-covers this window.
-    await store.set_dream_state(DREAM_WATERMARK_KEY, now.isoformat())
+    # Advance the watermark only when this window's work is durably
+    # queued — either the batch was submitted, or there was nothing to
+    # submit (a no-pairs / no-client cycle is a successful no-op). If
+    # submission failed, keep the old watermark so the next run
+    # re-covers this window instead of silently dropping it.
+    if submission_error is None:
+        await store.set_dream_state(DREAM_WATERMARK_KEY, now.isoformat())
+    else:
+        logger.warning(
+            "Dream watermark not advanced (still %s): batch submission "
+            "failed, next cycle will re-cover this window",
+            since_iso,
+        )
 
     return {
         "now": now.isoformat(),
@@ -1421,5 +1439,6 @@ async def run_dream_cycle(
         "clusters_big": sum(1 for c in clusters if len(c.memory_ids) >= 3),
         "near_dup_pairs": len(pairs),
         "batch_id": batch_id,
+        "submission_error": submission_error,
         "maintenance": maintenance_stats,
     }

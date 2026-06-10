@@ -230,12 +230,26 @@ class DreamPoller:
                 pairs_by_custom_id={},  # not retained across boots
                 audit_only=self._audit_only,
             )
-        except Exception:
+        except Exception as e:
+            # Fail fast: an apply error is deterministic (same entries,
+            # same code path), so leaving the row 'submitted' would make
+            # _resume_pending_on_boot re-poll and re-throw identically
+            # on every boot. Mark the row failed with the error so it is
+            # terminal and visible. The batch results remain fetchable
+            # from Anthropic; an operator/agent can re-trigger a dream
+            # cycle to retry consolidation after fixing the cause.
             logger.exception(
-                "Apply failed for dream batch %s; leaving row submitted "
-                "for retry on next boot",
+                "Apply failed for dream batch %s; marking row failed "
+                "(results remain fetchable — re-trigger a dream cycle "
+                "to retry)",
                 batch_id,
             )
+            await self._store.mark_dream_failed(
+                batch_id,
+                f"apply failed: {type(e).__name__}: {e}",
+            )
+            self._next_check.pop(batch_id, None)
+            self._current_interval.pop(batch_id, None)
             return
 
         # Mark applied with a one-line summary.

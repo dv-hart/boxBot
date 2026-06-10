@@ -979,9 +979,9 @@ class BoxBotAgent:
         # alongside the agent and runs for the agent's lifetime.
         self._batch_poller: BatchPoller | None = None
         # Background poller for in-flight dream-phase batches (PR1:
-        # nightly dedup consolidation; runs in audit-only mode by
-        # default — flip ``memory.dream_audit_only=False`` in config to
-        # enable real merges).
+        # nightly dedup consolidation; applies real merges by default —
+        # set ``memory.dream_audit_only=True`` in config for an
+        # audit-only soft-launch window).
         self._dream_poller: DreamPoller | None = None
         # Background sweep that closes WhatsApp threads whose rolling
         # window has expired and queues their extraction. Runs only
@@ -1076,9 +1076,9 @@ class BoxBotAgent:
         )
         await self._batch_poller.start()
 
-        # Start the dream-phase poller. Audit-only by default; flip
-        # ``memory.dream_audit_only=False`` in config to enable real
-        # consolidation. Resumes any in-flight dream batches from the
+        # Start the dream-phase poller. Apply-mode by default; set
+        # ``memory.dream_audit_only=True`` in config to log decisions
+        # without merging. Resumes any in-flight dream batches from the
         # previous boot.
         self._dream_poller = DreamPoller(
             self._memory_store,
@@ -1525,8 +1525,9 @@ class BoxBotAgent:
         """Execute the nightly dream-phase consolidation directly.
 
         Called from :meth:`_on_trigger_fired` when a dream-cycle
-        trigger fires. Audit-only by default (config flag
-        ``memory.dream_audit_only``). Result is written to
+        trigger fires. Apply-mode by default (set config flag
+        ``memory.dream_audit_only=True`` for audit-only). Result is
+        written to
         ``data/workspace/notes/system/dream-log/<YYYY-MM-DD>.md``; the
         DreamPoller picks up the batch result later and applies any
         decisions.

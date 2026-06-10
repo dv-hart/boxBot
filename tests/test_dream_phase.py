@@ -1028,6 +1028,59 @@ class TestDreamPoller:
         assert mem_b.status == "invalidated"
         assert mem_b.superseded_by == a
 
+    @pytest.mark.asyncio
+    async def test_apply_failure_marks_row_failed(
+        self, fresh_store, fake_client, tmp_path,
+    ):
+        """If apply_dream_result throws, the row is marked failed (not
+        left 'submitted'), so _resume_pending_on_boot doesn't re-poll
+        it into the identical error forever."""
+        from boxbot.memory.dream_poller import DreamPoller
+
+        a = await _seed(fresh_store, content="aa", summary="aa")
+        b = await _seed(fresh_store, content="bb", summary="bb")
+        await fresh_store.create_pending_dream(
+            batch_id="msgbatch_boom",
+            candidate_ids=[a, b],
+            request_types={"dedup": 1},
+        )
+        fake_client.end_with_decisions(
+            "msgbatch_boom",
+            [(
+                "dream-z-0000",
+                {
+                    "decision": "merge_into_a",
+                    "merged_content": "merged",
+                    "merged_summary": "merged",
+                    "evidence": [a, b],
+                    "confidence": 0.95,
+                    "notes": "",
+                },
+            )],
+        )
+
+        with patch(
+            "boxbot.memory.dream.WORKSPACE_DIR", tmp_path / "workspace",
+        ), patch(
+            "boxbot.memory.dream_poller.apply_dream_result",
+            side_effect=RuntimeError("schema drift"),
+        ):
+            poller = DreamPoller(fresh_store, fake_client, audit_only=False)
+            await poller.start()
+            try:
+                poller._next_check["msgbatch_boom"] = 0.0
+                await poller._sweep_once()
+            finally:
+                await poller.stop()
+
+        row = await fresh_store.get_pending_dream("msgbatch_boom")
+        assert row["status"] == "failed"
+        assert "apply failed" in row["summary"]
+        assert "schema drift" in row["summary"]
+        # Backoff state cleared — the batch is terminal, no re-poll.
+        assert "msgbatch_boom" not in poller._next_check
+        assert "msgbatch_boom" not in poller._current_interval
+
 
 # ---------------------------------------------------------------------------
 # run_dream_cycle (integration)
@@ -1381,14 +1434,83 @@ class TestDreamWatermark:
     async def test_run_cycle_advances_watermark(
         self, fresh_store, fake_client, tmp_path,
     ):
+        """A no-pairs cycle is a successful no-op — watermark advances."""
         from boxbot.memory.dream import DREAM_WATERMARK_KEY, run_dream_cycle
 
         assert await fresh_store.get_dream_state(DREAM_WATERMARK_KEY) is None
         now = datetime.utcnow()
         with patch("boxbot.memory.dream.WORKSPACE_DIR", tmp_path / "ws"):
-            await run_dream_cycle(
+            summary = await run_dream_cycle(
                 fresh_store, fake_client, audit_only=True, now=now,
             )
+        assert summary["batch_id"] is None
+        assert summary["submission_error"] is None
         assert await fresh_store.get_dream_state(DREAM_WATERMARK_KEY) == (
             now.isoformat()
         )
+
+    @pytest.mark.asyncio
+    async def test_watermark_advances_after_successful_submission(
+        self, fresh_store, fake_client, tmp_path,
+    ):
+        from boxbot.memory.dream import DREAM_WATERMARK_KEY, run_dream_cycle
+
+        v_a = _unit([1.0, 0.0, 0.0])
+        v_b = _unit([0.97, 0.243, 0.0])  # cos > 0.85
+        await _seed(fresh_store, content="a", summary="a", embedding_vec=v_a)
+        await _seed(fresh_store, content="b", summary="b", embedding_vec=v_b)
+        now = datetime.utcnow()
+        with patch("boxbot.memory.dream.WORKSPACE_DIR", tmp_path / "ws"):
+            summary = await run_dream_cycle(
+                fresh_store, fake_client, audit_only=True, now=now,
+            )
+        assert summary["batch_id"] is not None
+        assert summary["submission_error"] is None
+        assert await fresh_store.get_dream_state(DREAM_WATERMARK_KEY) == (
+            now.isoformat()
+        )
+
+    @pytest.mark.asyncio
+    async def test_watermark_unchanged_on_submission_failure(
+        self, fresh_store, fake_client, tmp_path,
+    ):
+        """If batch submission throws, the watermark must NOT advance —
+        the next run re-covers the same window. The audit log records
+        the failure."""
+        from boxbot.memory.dream import DREAM_WATERMARK_KEY, run_dream_cycle
+
+        v_a = _unit([1.0, 0.0, 0.0])
+        v_b = _unit([0.97, 0.243, 0.0])  # cos > 0.85
+        await _seed(fresh_store, content="a", summary="a", embedding_vec=v_a)
+        await _seed(fresh_store, content="b", summary="b", embedding_vec=v_b)
+
+        # Pre-existing watermark from a prior successful run.
+        old_mark = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        await fresh_store.set_dream_state(DREAM_WATERMARK_KEY, old_mark)
+
+        async def _boom(*, requests):
+            raise RuntimeError("anthropic 529 overloaded")
+
+        fake_client.messages.batches.create = _boom
+
+        workspace = tmp_path / "ws"
+        with patch("boxbot.memory.dream.WORKSPACE_DIR", workspace):
+            summary = await run_dream_cycle(
+                fresh_store, fake_client, audit_only=True,
+            )
+
+        assert summary["batch_id"] is None
+        assert "anthropic 529 overloaded" in summary["submission_error"]
+        # Watermark untouched — window will be re-covered next run.
+        assert await fresh_store.get_dream_state(DREAM_WATERMARK_KEY) == (
+            old_mark
+        )
+        # Audit log reflects the failure, not "nothing to dedup".
+        log_files = list(
+            (workspace / "notes" / "system" / "dream-log").glob("*.md")
+        )
+        assert log_files, "Dream log not written"
+        text = log_files[0].read_text()
+        assert "SUBMISSION FAILED" in text
+        assert "anthropic 529 overloaded" in text
+        assert "nothing to dedup" not in text

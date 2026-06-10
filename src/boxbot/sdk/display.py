@@ -286,14 +286,19 @@ def update_data(display_name: str, source_name: str, *,
 
 
 def _check(resp: dict[str, Any]) -> dict[str, Any]:
-    """Raise ``RuntimeError`` with a multi-line message on a non-ok response.
+    """Raise ``bb.ActionError`` with a multi-line message on a non-ok response.
 
     The dispatcher returns either ``{"status": "ok", ...}`` or
     ``{"status": "error", "errors": [...]}`` (or ``{"error": "..."}``
     for single-message failures). This helper normalizes the error
     surface so callers always get the same exception shape.
+    (``ActionError`` subclasses ``RuntimeError``, so older ``except
+    RuntimeError`` handlers keep working.)
     """
     if resp.get("status") == "ok":
         return resp
     errors = resp.get("errors") or [resp.get("error", "unknown error")]
-    raise RuntimeError("display error:\n  " + "\n  ".join(str(e) for e in errors))
+    raise _transport.ActionError(
+        "display error:\n  " + "\n  ".join(str(e) for e in errors),
+        response=resp,
+    )

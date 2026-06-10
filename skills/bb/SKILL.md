@@ -18,6 +18,13 @@ script can search memory, pull a few photos, write a note, and change the
 display. That is usually cheaper and clearer than four separate tool
 calls.
 
+**Error rule:** mutating calls (saves, writes, deletes, creates) raise
+`bb.ActionError` when the main process rejects them — a write that
+failed never looks like it succeeded. Read calls return raw response
+dicts with documented shapes. Wrap risky writes in
+`try: … except bb.ActionError as e:` when you want to handle the
+failure instead of letting the script die.
+
 ## Modules
 
 | Module | What it does | When to reach for it |
@@ -32,7 +39,7 @@ calls.
 | `bb.auth` | Mint registration codes for new users, list registered users, message every admin. | Admin asks to add a new user (`generate_registration_code`), first-boot bootstrap (`generate_bootstrap_code`), or you need to know who's registered. See the `onboarding` skill for the full flow. |
 | `bb.skill` | Create new skills at runtime. | You want to teach yourself a new recurring workflow. |
 | `bb.integrations` | List, call, create, update, delete data-pipe integrations. Read execution logs. | You need fresh data from an external service (weather, calendar, stocks, …) or you want to register a new such pipe. **Calendar lives here** — call `bb.integrations.get("calendar", action="list_upcoming_events", …)`. |
-| `bb.packages` | Request package installation. | A script needs a new PyPI dependency. Requires human approval. |
+| `bb.packages` | Request package installation; check request status. | A script needs a new PyPI dependency. An admin approves out-of-band; the request returns `pending` immediately — check back with `status()`. |
 | `bb.secrets` | Store credentials (write-only); list names; hand them to scripts/integrations as env vars. | User pasted an API key; an integration declared a secret it needs; a one-off script needs a credential. |
 
 ## Progressive disclosure
@@ -42,10 +49,13 @@ This file is a map. For each module, there is a deeper doc under
 
 - `modules/workspace.md` — full API and patterns for the notebook
 - `modules/memory.md` — `bb.memory` API: save/search/invalidate, id-prefix handling, the correction pattern
+- `modules/tasks.md` — `bb.tasks` API for triggers (wake conditions) and to-do items
 - `modules/audio.md` — `bb.audio` API for playing workspace audio files
 - `modules/skill.md` — `bb.skill` API for creating new skills at runtime
 - `modules/integrations.md` — `bb.integrations` API for calling and authoring data-pipe integrations
 - `modules/secrets.md` — `bb.secrets` API for storing credentials and handing them to scripts/integrations
+- `modules/auth.md` — `bb.auth` API for user/admin state, registration codes, and admin notifications
+- `modules/packages.md` — `bb.packages` API for requesting PyPI installs (human-approved, async)
 - (further modules land here as they become stable; check `ls modules/`)
 
 Load a module doc only when you need it. The sandbox path to do so:

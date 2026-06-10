@@ -341,7 +341,8 @@ receiving **out-of-band human approval**.
 ### How It Actually Works
 
 ```
-Agent script calls packages.request("google-api-python-client")
+Agent script calls bb.packages.request("google-api-python-client",
+                                       reason="Gmail API access")
          │
          ▼
 SDK emits JSON to stdout:
@@ -349,36 +350,44 @@ SDK emits JSON to stdout:
    "reason": "Gmail API access"}
          │
          ▼
-execute_script tool (main process) sees the request
+packages action handler (main process):
+  1. Validates the spec — bare PyPI name or exact name==version pin
+     only. URLs, local paths, extras, range specifiers: rejected.
+  2. Durably queues a PENDING request in data/packages/packages.db.
+  3. Notifies every registered ADMIN on their registered channel
+     (Signal or WhatsApp — per-user `channel` field, resolved via the
+     outbound-channel registry):
+       "📦 boxBot package request ab12cd34
+        Package: google-api-python-client
+        Reason: Gmail API access
+        From: whatsapp:+1503…
+        Reply 'approve pkg ab12cd34' or 'deny pkg ab12cd34'."
          │
          ▼
-Script finishes or is suspended — the agent CANNOT proceed
-until the main process resolves the request
+request() returns IMMEDIATELY with {"id": "ab12cd34",
+"status": "pending"} — approval can take hours; the agent does not
+block. It checks back with bb.packages.status(id) / list()
+(e.g. after setting itself a fire_after trigger).
          │
          ▼
-Main process initiates approval on TWO out-of-band channels:
-  ┌──────────────────────────────────────────────────────┐
-  │  1. DISPLAY: Show approval prompt on 7" screen       │
-  │     "boxBot wants to install: google-api-python-..."  │
-  │     [ YES ]  [ NO ]    ← physical tap on touchscreen │
-  │                                                      │
-  │  2. WHATSAPP: Message to primary admin user          │
-  │     "boxBot wants to install google-api-python-..."   │
-  │     Reply YES to approve.                            │
-  │     ← only accepted from the admin's phone number    │
-  └──────────────────────────────────────────────────────┘
+Admin replies on Signal/WhatsApp. The inbound MessageRouter
+intercepts the reply (same pattern as registration codes) —
+ONLY registered admins; the same text from a non-admin routes to
+the agent as a normal message and resolves nothing.
          │
-         ▼
-Main process waits for approval from EITHER channel
-(timeout after configurable period, default: denied)
+         ├─ "approve pkg ab12cd34" ──► status: approved.
+         │     Main process (venv owner) runs
+         │     <runtime_dir>/venv/bin/pip install <spec>,
+         │     re-applies the venv permission policy (group boxbot,
+         │     dirs 750 / files 640, pip 700), pre-compiles bytecode,
+         │     then sets status: installed (or failed, with the pip
+         │     error tail in `note`) and confirms to the admin.
          │
-         ├─ Approved ──► Main process (as boxbot user) runs:
-         │               data/sandbox/venv/bin/pip install <package>
-         │               Logs to data/sandbox/installed.txt
-         │               Returns success to agent
-         │
-         └─ Denied ────► Returns denial to agent
-                         Agent must find alternative approach
+         └─ "deny pkg ab12cd34 [reason]" ──► status: denied,
+               reason recorded in `note`. The agent sees "denied"
+               on its next status() check — a human "no", cleanly
+               distinguishable from a system failure (which raises
+               bb.ActionError at request time).
 ```
 
 ### Why the Agent Cannot Spoof Approval
@@ -388,14 +397,14 @@ sandbox has no access to:
 
 | Spoofing Vector | Why It Fails |
 |----------------|-------------|
-| Forge "approved" JSON on stdout | The main process only accepts `packages.request` actions (a REQUEST, not an approval). There is no SDK action that means "already approved." The approval comes from a different input channel entirely |
+| Forge "approved" JSON on stdout | The packages handler only accepts `packages.request` / `status` / `list` actions. There is no SDK action that means "approve" — approval exists solely as an inbound admin message on a different transport entirely |
 | Call pip directly | seccomp blocks execve; pip not executable by sandbox user; site-packages read-only |
-| Write to site-packages | Owned by `boxbot`, read-only to `boxbot-sandbox` |
-| Inject "YES" into WhatsApp | WhatsApp approval validates the sender's phone number matches the admin. Sandbox has no access to WhatsApp API credentials |
-| Simulate screen tap | Physical touchscreen input. Sandbox is a subprocess with no display access |
+| Write to site-packages | Owned by the main user, read-only to `boxbot-sandbox` |
+| Inject "approve pkg …" into Signal/WhatsApp | The router only honours approval replies from senders whose **registered role is admin** — phone number checked against the auth DB. The sandbox has no access to any messaging credentials, and a non-admin's reply routes as ordinary text and resolves nothing |
+| Smuggle pip options in the package name | The spec is validated against a strict PyPI-name regex (or exact `name==version` pin) before it is queued — no leading dashes, URLs, paths, or whitespace ever reach the pip argv |
 | Import pip module | Even if importable, pip cannot write to site-packages (filesystem permissions) |
 | Download .whl and extract | Cannot write to site-packages |
-| Trick main process parser | SDK actions are schema-validated. Unknown action types are rejected. Only `packages.request` is valid for packages |
+| Trick main process parser | SDK actions are schema-validated. Unknown action types are rejected |
 
 The fundamental principle: **approval comes from a human through a
 physical or authenticated channel that is completely separate from the

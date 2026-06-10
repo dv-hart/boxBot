@@ -35,6 +35,10 @@ bb.memory.invalidate("fe98abdb", reason="Jacob: it's Erik's, not Zara's")
 `delete()` is the same operation as `invalidate()` (deletion is a soft
 invalidate); use `invalidate()` when you're acting on a correction.
 
+All writes (`save`, `delete`/`invalidate`) raise `bb.ActionError` when
+the main process rejects them — a memory that didn't persist never
+looks like it did.
+
 ## Ids: the prefix you see IS a valid handle
 
 Injected memories appear with an **8-char id prefix**, e.g.
@@ -42,7 +46,7 @@ Injected memories appear with an **8-char id prefix**, e.g.
 prefix straight to `invalidate()` / `delete()` — the main process resolves
 it to the full id.
 
-- **No match** → raises `MemoryError("no active memory matches id '…'")`.
+- **No match** → raises `bb.ActionError("no active memory matches id '…'")`.
 - **Ambiguous prefix** (matches >1 active memory) → raises with the list of
   candidates; pass a longer prefix or the full id.
 - **Success** → returns the invalidated record, so you can confirm *what*

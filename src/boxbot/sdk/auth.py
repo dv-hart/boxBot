@@ -10,15 +10,21 @@ Two distinct flows the agent owns end-to-end:
 2. Admin-initiated user registration. ``generate_registration_code()``
    uses the *current conversation's* sender as the inviting admin —
    the sandbox cannot pass an arbitrary ``created_by``. The agent
-   should send the returned code back to the admin (via WhatsApp
+   should send the returned code back to the admin (as a messaging
    reply) for them to share with the new user out-of-band.
 
-``notify_admins(text)`` reaches every registered admin via WhatsApp.
-Use sparingly — security notifications and "new user joined" pings only.
+``notify_admins(text)`` reaches every registered admin on their
+registered channel (Signal or WhatsApp — each user row carries a
+``channel`` field). Use sparingly — security notifications and
+"new user joined" pings only.
 
-The agent never sees raw secrets via this module. The four
-``WHATSAPP_*`` env vars stay in the main process; this SDK is just an
-RPC façade onto ``AuthManager``.
+The agent never sees raw secrets via this module. Channel credentials
+stay in the main process; this SDK is just an RPC façade onto
+``AuthManager``.
+
+Error semantics: the writes (code minting, ``notify_admins``) raise
+``bb.ActionError`` on rejection; ``list_users`` returns its documented
+list shape.
 """
 
 from __future__ import annotations
@@ -34,10 +40,11 @@ def list_users() -> list[dict[str, Any]]:
     Each entry has: ``id``, ``name``, ``phone``, ``role`` ("admin" or
     "user"), ``created_at``, ``last_seen``. Empty list if no admin has
     been bootstrapped yet — the canonical "is BB set up?" signal.
+
+    Raises:
+        ActionError: if the auth manager is unavailable.
     """
-    resp = _transport.request("auth.list_users", {})
-    if resp.get("status") != "ok":
-        raise RuntimeError(resp.get("error") or "auth.list_users failed")
+    resp = _transport.dispatch_or_raise("auth.list_users", {})
     return list(resp.get("users") or [])
 
 
@@ -51,9 +58,7 @@ def generate_bootstrap_code() -> str:
         property is *physical presence*, so don't relay it over voice
         or any messaging channel.
     """
-    resp = _transport.request("auth.generate_bootstrap_code", {})
-    if resp.get("status") != "ok":
-        raise RuntimeError(resp.get("error") or "auth.generate_bootstrap_code failed")
+    resp = _transport.dispatch_or_raise("auth.generate_bootstrap_code", {})
     return str(resp["code"])
 
 
@@ -69,21 +74,22 @@ def generate_registration_code() -> str:
         The agent should reply to the inviting admin with this code so
         they can forward it to the new user out-of-band.
     """
-    resp = _transport.request("auth.generate_registration_code", {})
-    if resp.get("status") != "ok":
-        raise RuntimeError(
-            resp.get("error") or "auth.generate_registration_code failed"
-        )
+    resp = _transport.dispatch_or_raise("auth.generate_registration_code", {})
     return str(resp["code"])
 
 
 def notify_admins(text: str) -> None:
-    """Send a WhatsApp message to every registered admin.
+    """Send a message to every registered admin on their registered channel.
 
-    Used for security alerts and "new user joined" notifications.
-    No-op (with a warning logged on the main side) if WhatsApp isn't
-    configured. Does not return a per-recipient delivery report.
+    Each admin's user row carries a ``channel`` field ("signal" or
+    "whatsapp"); the main process resolves the right outbound client
+    per admin. Used for security alerts and "new user joined"
+    notifications. Admins whose channel has no client registered are
+    skipped (logged main-side). Does not return a per-recipient
+    delivery report.
+
+    Raises:
+        ActionError: if the text is empty or the auth manager is
+            unavailable.
     """
-    resp = _transport.request("auth.notify_admins", {"text": str(text)})
-    if resp.get("status") != "ok":
-        raise RuntimeError(resp.get("error") or "auth.notify_admins failed")
+    _transport.dispatch_or_raise("auth.notify_admins", {"text": str(text)})

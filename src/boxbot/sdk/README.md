@@ -225,18 +225,24 @@ with `status: "exists"`. Skills are never silently overwritten.
 
 ### `packages` — Package Manager
 
-Request package installation. Triggers user approval flow.
+Request package installation. Queues a durable request and notifies
+the admins; approval is **asynchronous and out-of-band** (an admin
+replies ``approve pkg <id>`` / ``deny pkg <id>`` on Signal/WhatsApp).
+The request never blocks waiting for the human.
 
 ```python
 from boxbot_sdk import packages
 
-# Blocks until user approves or denies
-result = packages.request("google-api-python-client",
-                          reason="Needed for Gmail integration")
-if result.approved:
-    import googleapiclient  # now available
-else:
-    print(f"Denied: {result.reason}")
+req = packages.request("google-api-python-client",
+                       reason="Needed for Gmail integration")
+print(req["id"], req["status"])     # "ab12cd34 pending"
+
+# …later (next run / after a fire_after trigger):
+req = packages.status("ab12cd34")
+if req["status"] == "installed":
+    import googleapiclient          # now available
+elif req["status"] == "denied":
+    print(f"Denied by admin: {req.get('note')}")
 ```
 
 ### `memory` — Memory Store
@@ -424,8 +430,9 @@ tasks.cancel(trig_id)
    Invalid specs are rejected with clear error messages
 3. **Declarative displays** — the agent describes what to show using
    building blocks, never writes raw render code that runs in main process
-4. **Approval gates** — `packages.request()` blocks for out-of-band
-   human approval (screen tap or admin WhatsApp YES). Display saves do
+4. **Approval gates** — `packages.request()` only *queues*; the install
+   happens after out-of-band human approval (admin messaging reply).
+   There is no SDK action that means "approve". Display saves do
    *not* gate: the render spec is declarative, so there is no executable
    code path to police
 5. **No core access** — the SDK cannot import from `boxbot.*` (different

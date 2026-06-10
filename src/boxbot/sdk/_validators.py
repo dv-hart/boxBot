@@ -279,6 +279,8 @@ def validate_data_source_config(name: str, source_type: str | None = None,
         if "query" not in kwargs:
             raise ValueError("'memory_query' data source requires 'query'")
         config["query"] = require_str(kwargs["query"], "query")
+        if "limit" in kwargs:
+            config["limit"] = require_int(kwargs["limit"], "limit", min_val=1)
         if "refresh" in kwargs:
             config["refresh"] = require_int(kwargs["refresh"], "refresh", min_val=1)
 

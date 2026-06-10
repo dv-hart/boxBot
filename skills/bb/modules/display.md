@@ -368,11 +368,32 @@ Hardcoded values the agent can later change with
 
 ### Custom: ``memory_query``
 
-Run a memory search on every refresh:
+Re-runs a memory search on every refresh — e.g. a standing "household
+reminders" board. Hybrid vector + keyword scoring only (no model
+reranking, no conversation summaries), so it is free to refresh:
 
 ```json
 {"name": "recent", "type": "memory_query",
- "query": "kitchen renovation", "refresh": 600}
+ "query": "kitchen renovation", "refresh": 600, "limit": 5}
+```
+
+``limit`` caps the result count (default 5 — screen space is small).
+Output fields:
+
+- ``results`` — array of ``{text, type, age}``. ``text`` is the memory
+  summary, ``type`` its memory type (person / household / methodology),
+  ``age`` a short age string like ``"3d"`` or ``"2w"``.
+- ``count`` — number of results returned.
+- ``query`` — the query that produced them.
+
+Bind with a ``repeat`` block:
+
+```json
+{"type": "repeat", "source": "{recent.results}",
+ "children": [{"type": "row", "gap": 12, "children": [
+   {"type": "text", "content": "{.text}"},
+   {"type": "text", "content": "{.age}", "color": "muted"}
+ ]}]}
 ```
 
 ## Bindings

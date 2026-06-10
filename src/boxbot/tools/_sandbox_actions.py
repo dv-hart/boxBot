@@ -2576,10 +2576,29 @@ def _data_source_schema() -> dict[str, Any]:
                 "name": {"type": "str", "required": True},
                 "query": {"type": "str", "required": True,
                           "describe": "Memory search query string"},
+                "limit": {"type": "int", "required": False, "default": 5,
+                          "describe": (
+                              "Max results — screen space is small."
+                          )},
                 "refresh": {"type": "int (seconds)", "required": False,
                             "default": 300},
             },
-            "describe": "Bind results as {<name>.results}",
+            "output": {
+                "results": (
+                    "array of {text, type, age} — fact memories ranked "
+                    "by hybrid vector+BM25 score (no model reranking, "
+                    "no conversations). `age` is a short string like "
+                    "'3d' or '2w'. Use a 'repeat' block with "
+                    "source='{<name>.results}' and bind {.text}."
+                ),
+                "count": "int — number of results returned",
+                "query": "str — the query that produced them",
+            },
+            "describe": (
+                "Re-runs a memory search on every refresh. Free to "
+                "refresh: hybrid scoring only, no model calls. Bind "
+                "results as {<name>.results}."
+            ),
         },
     }
 
@@ -2625,6 +2644,8 @@ def _spec_to_dict(spec: Any) -> dict[str, Any]:
             d["value"] = src.value
         if src.query:
             d["query"] = src.query
+        if src.limit is not None:
+            d["limit"] = src.limit
         sources.append(d)
     if sources:
         out["data_sources"] = sources

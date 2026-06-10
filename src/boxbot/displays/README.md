@@ -75,7 +75,10 @@ Data source implementations:
 
 Built-in sources deliver display-ready data including resolved icon
 names and semantic color tokens. Custom sources support `fields` with
-`map` transforms for declarative value mapping.
+`map` transforms for declarative value mapping. `memory_query` re-runs
+a memory search on each refresh using hybrid vector+BM25 scoring only
+(no model calls) and yields `{results: [{text, type, age}], count,
+query}`.
 
 ### `themes/`
 Built-in theme definitions: `boxbot` (default), `midnight`, `daylight`,

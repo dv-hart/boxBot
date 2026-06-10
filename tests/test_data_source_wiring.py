@@ -19,6 +19,7 @@ from boxbot.core.events import (
 from boxbot.displays.data_sources import (
     AgentStatusSource,
     IntegrationSource,
+    MemoryQuerySource,
     TasksSource,
     create_source,
 )
@@ -63,6 +64,227 @@ class TestTasksSourceWiring:
             data = await TasksSource().fetch()
 
         assert data == {"items": [], "count": 0}
+
+
+# ---------------------------------------------------------------------------
+# Memory query
+# ---------------------------------------------------------------------------
+
+
+def _candidate(i: int, *, created_at: str | None = None,
+               summary: str | None = None):
+    """Build a SearchCandidate like hybrid_search returns."""
+    from boxbot.memory.search import SearchCandidate
+
+    return SearchCandidate(
+        id=f"mem_{i}",
+        source="memory",
+        type="household",
+        person=None,
+        content=f"Full content of memory {i}",
+        summary=summary if summary is not None else f"Memory {i}",
+        combined_score=1.0 - i * 0.1,
+        metadata={"created_at": created_at or "2026-06-07T00:00:00"},
+    )
+
+
+class TestMemoryQuerySourceWiring:
+    """memory_query goes straight to hybrid_search — no reranking, no
+    model calls — and returns the display-ready
+    ``{results: [{text, type, age}], count, query}`` shape."""
+
+    async def test_returns_shaped_results(self):
+        calls = {}
+
+        async def fake_hybrid(store, query, **kwargs):
+            calls["query"] = query
+            calls["kwargs"] = kwargs
+            return [_candidate(0), _candidate(1)]
+
+        async def fake_store():
+            return object()
+
+        with patch("boxbot.memory.search.hybrid_search", new=fake_hybrid), \
+             patch("boxbot.displays.data_sources._get_memory_store",
+                   new=fake_store):
+            src = MemoryQuerySource(
+                "recent", {"query": "kitchen renovation"},
+            )
+            data = await src.fetch()
+
+        assert calls["query"] == "kitchen renovation"
+        # Cost constraint: facts only, hybrid scoring only.
+        assert calls["kwargs"]["include_conversations"] is False
+        assert data["query"] == "kitchen renovation"
+        assert data["count"] == 2
+        assert data["results"][0] == {
+            "text": "Memory 0", "type": "household",
+            "age": data["results"][0]["age"],
+        }
+        assert all(set(r) == {"text", "type", "age"}
+                   for r in data["results"])
+        # created_at 2026-06-07 vs frozen "now" — age is a short string.
+        assert data["results"][0]["age"]
+
+    async def test_text_falls_back_to_content(self):
+        async def fake_hybrid(store, query, **kwargs):
+            return [_candidate(0, summary="")]
+
+        async def fake_store():
+            return object()
+
+        with patch("boxbot.memory.search.hybrid_search", new=fake_hybrid), \
+             patch("boxbot.displays.data_sources._get_memory_store",
+                   new=fake_store):
+            data = await MemoryQuerySource("m", {"query": "x"}).fetch()
+
+        assert data["results"][0]["text"] == "Full content of memory 0"
+
+    async def test_empty_query_returns_empty_without_backend_call(self):
+        async def explode():
+            raise AssertionError("backend must not be touched")
+
+        with patch("boxbot.displays.data_sources._get_memory_store",
+                   new=explode):
+            src = MemoryQuerySource("recent", {"query": "   "})
+            data = await src.fetch()
+
+        assert data == {"results": [], "count": 0, "query": ""}
+
+    async def test_limit_respected_and_passed_to_backend(self):
+        captured = {}
+
+        async def fake_hybrid(store, query, **kwargs):
+            captured.update(kwargs)
+            return [_candidate(i) for i in range(10)]
+
+        async def fake_store():
+            return object()
+
+        with patch("boxbot.memory.search.hybrid_search", new=fake_hybrid), \
+             patch("boxbot.displays.data_sources._get_memory_store",
+                   new=fake_store):
+            data = await MemoryQuerySource(
+                "recent", {"query": "x", "limit": 3},
+            ).fetch()
+
+        assert data["count"] == 3
+        assert len(data["results"]) == 3
+        assert captured["memory_limit"] == 3
+
+    async def test_default_limit_is_five(self):
+        async def fake_hybrid(store, query, **kwargs):
+            return [_candidate(i) for i in range(10)]
+
+        async def fake_store():
+            return object()
+
+        with patch("boxbot.memory.search.hybrid_search", new=fake_hybrid), \
+             patch("boxbot.displays.data_sources._get_memory_store",
+                   new=fake_store):
+            data = await MemoryQuerySource("recent", {"query": "x"}).fetch()
+
+        assert data["count"] == 5
+
+    async def test_backend_error_keeps_cache_and_sets_fetch_error(self):
+        """do_fetch semantics: a failing fetch logs a warning, keeps the
+        previously cached data, and sets _fetch_error."""
+        async def fake_store():
+            return object()
+
+        async def good_hybrid(store, query, **kwargs):
+            return [_candidate(0)]
+
+        async def bad_hybrid(store, query, **kwargs):
+            raise RuntimeError("memory DB unavailable")
+
+        src = MemoryQuerySource("recent", {"query": "x"})
+
+        with patch("boxbot.displays.data_sources._get_memory_store",
+                   new=fake_store):
+            with patch("boxbot.memory.search.hybrid_search", new=good_hybrid):
+                first = await src.do_fetch()
+            assert first["count"] == 1
+            assert src._fetch_error is None
+
+            with patch("boxbot.memory.search.hybrid_search", new=bad_hybrid):
+                second = await src.do_fetch()
+
+        assert second == first          # cached data survives
+        assert src.cached_data == first
+        assert src._fetch_error is not None
+        assert "memory DB unavailable" in src._fetch_error
+
+    async def test_backend_error_with_no_cache_returns_empty(self):
+        async def fake_store():
+            raise RuntimeError("no store")
+
+        src = MemoryQuerySource("recent", {"query": "x"})
+        with patch("boxbot.displays.data_sources._get_memory_store",
+                   new=fake_store):
+            data = await src.do_fetch()
+
+        assert data == {}               # never crashes the refresh loop
+        assert src._fetch_error is not None
+
+    def test_refresh_default_300_even_when_manager_passes_none(self):
+        assert MemoryQuerySource("m", {"query": "x"}).refresh_interval == 300
+        # The display manager passes refresh=None when the spec omits it.
+        assert MemoryQuerySource(
+            "m", {"query": "x", "refresh": None},
+        ).refresh_interval == 300
+        assert MemoryQuerySource(
+            "m", {"query": "x", "refresh": 600},
+        ).refresh_interval == 600
+
+    def test_create_source_routes_memory_query_type(self):
+        src = create_source("recent", "memory_query", {"query": "x"})
+        assert isinstance(src, MemoryQuerySource)
+
+
+class TestFormatAge:
+    """_format_age renders short age strings for display bindings."""
+
+    def _age(self, **delta_kwargs):
+        from datetime import datetime, timedelta, timezone
+
+        from boxbot.displays.data_sources import _format_age
+
+        ts = datetime.now(timezone.utc) - timedelta(**delta_kwargs)
+        # The memory store stamps naive-UTC ISO strings.
+        return _format_age(ts.replace(tzinfo=None).isoformat())
+
+    def test_buckets(self):
+        assert self._age(seconds=30) == "now"
+        assert self._age(minutes=5) == "5m"
+        assert self._age(hours=3) == "3h"
+        assert self._age(days=3) == "3d"
+        assert self._age(days=15) == "2w"
+        assert self._age(days=90) == "3mo"
+        assert self._age(days=800) == "2y"
+
+    def test_aware_timestamp_accepted(self):
+        from datetime import datetime, timedelta, timezone
+
+        from boxbot.displays.data_sources import _format_age
+
+        ts = datetime.now(timezone.utc) - timedelta(days=3)
+        assert _format_age(ts.isoformat()) == "3d"
+
+    def test_garbage_and_missing_are_empty(self):
+        from boxbot.displays.data_sources import _format_age
+
+        assert _format_age(None) == ""
+        assert _format_age("") == ""
+        assert _format_age("not-a-date") == ""
+
+    def test_future_timestamp_clamps_to_now(self):
+        from datetime import datetime, timedelta, timezone
+
+        from boxbot.displays.data_sources import _format_age
+
+        ts = datetime.now(timezone.utc) + timedelta(days=2)
+        assert _format_age(ts.isoformat()) == "now"
 
 
 # ---------------------------------------------------------------------------

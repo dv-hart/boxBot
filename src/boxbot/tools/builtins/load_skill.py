@@ -5,19 +5,8 @@ The short skills index is injected into the system prompt; this tool
 exists so the agent can pull the full body (or a specific sub-file)
 only when the task calls for it.
 
-Registration
-------------
-This file defines ``LoadSkillTool`` following the ``Tool`` base-class
-convention used by the other builtins. It is **intentionally not
-registered** in ``src/boxbot/tools/registry.py`` yet — wiring is left
-for a human review step so the caller can decide when to make it live
-(the spec pairs it with removing ``speak`` from ``_load_tools`` to keep
-the always-loaded tool count at nine).
-
-To register:
-    1. Add ``from boxbot.tools.builtins.load_skill import LoadSkillTool``
-       to ``src/boxbot/tools/registry.py``.
-    2. Add ``LoadSkillTool()`` to the list returned by ``_load_tools``.
+Registered in ``src/boxbot/tools/registry.py`` as one of the ten
+always-loaded tools.
 
 Error handling
 --------------

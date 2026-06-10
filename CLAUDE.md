@@ -53,7 +53,10 @@ The big shift (2026-04): most capability lives in the `bb` Python
 package (sandbox SDK), reached through `execute_script`. Only genuinely
 hot-path or security-sensitive operations remain as standalone tools.
 
-**Tools** (`src/boxbot/tools/`) — 7 always-loaded tools:
+**Tools** (`src/boxbot/tools/`) — 10 always-loaded tools:
+- `message` — the ONLY way to reach a human (channel "speak" or
+  "text"); the model's text output is private internal notes and
+  never reaches a person
 - `execute_script` — primary gateway: run Python in the sandbox with
   the `bb` package (photos, camera, workspace, display, memory, tasks,
   skill, secrets, packages, integrations). Composes many ops per turn.
@@ -66,13 +69,17 @@ hot-path or security-sensitive operations remain as standalone tools.
   into memory
 - `manage_tasks` — triggers + to-dos (hot-path, every-turn)
 - `search_memory` — memory lookup (hot-path, every-turn)
+- `search_photos` — photo-library search/get (pairs with the
+  `picture` display for showing results on screen)
+- `mute_mic` — stop mic input on the current voice conversation
+  (wake word stays armed; clears on next spoken message)
 - `web_search` — web fetch + small-model content firewall
 - `load_skill` — progressive-disclosure entry point (loads a skill's
   SKILL.md and optional sub-files into context on demand)
 
-Speech and WhatsApp replies flow through the structured output
-(`response_text` / `outputs` array) rather than tools — see
-`output_dispatcher` and the `tools/registry.py` module docstring.
+All outgoing speech and texts flow through the `message` tool; the
+model's text output is constrained to a private internal-notes shape —
+see `output_dispatcher` and the `tools/registry.py` module docstring.
 
 **SDK** (`src/boxbot/sdk/`, importable as `boxbot_sdk` or just `bb`
 inside `execute_script`) — the constrained, immutable Python API:
@@ -132,9 +139,10 @@ level** (not Python level):
   with the live display manager and immediately switchable. The render
   spec is declarative (block tree only, no executable code), so there
   is no privileged code path to gate
-- **Package installation requires out-of-band human approval** — physical
-  screen tap or WhatsApp reply from admin. The sandbox can only emit
-  requests; there is no way to spoof approval
+- **Package installation requires out-of-band human approval** — an
+  admin replies `approve pkg <id>` / `deny pkg <id>` on their
+  registered messaging channel (Signal or WhatsApp). The sandbox can
+  only emit requests; there is no way to spoof approval
 - See [docs/sandbox.md](docs/sandbox.md) for full details
 
 ### 5. Two-Model Architecture
@@ -271,17 +279,17 @@ processes conversations independent of transport.
 │           Claude Agent (large model)              │
 │      conversations · reasoning · authoring        │
 ├──────────────────────┬───────────────────────────┤
-│  Tools (7)           │  Small model (async)      │
-│  execute_script      │  photo tagging            │
-│  switch_display      │  intent classification    │
-│  identify_person     │  structured extraction    │
-│  manage_tasks        │  transcript filtering     │
-│  search_memory       │  memory search reranking  │
-│  web_search          │  web search filtering     │
+│  Tools (10)          │  Small model (async)      │
+│  message             │  photo tagging            │
+│  execute_script      │  intent classification    │
+│  switch_display      │  structured extraction    │
+│  identify_person     │  transcript filtering     │
+│  manage_tasks        │  memory search reranking  │
+│  search_memory       │  web search filtering     │
+│  search_photos       │                           │
+│  mute_mic            │                           │
+│  web_search          │                           │
 │  load_skill          │                           │
-│  (+ structured       │                           │
-│   outputs[voice,     │                           │
-│   text] for speech)  │                           │
 ├──────────────────────┴───────────────────────────┤
 │  Sandbox (isolated venv, streaming IO)            │
 │  ┌──────────────────────────────────────────────┐ │

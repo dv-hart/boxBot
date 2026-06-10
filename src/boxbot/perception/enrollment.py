@@ -73,6 +73,9 @@ class IdentifyOutcome(str, enum.Enum):
     - RENAME: prior claim named someone; new name doesn't exist in the
       store. Treated as creating a new person and pointing the session
       at them — the prior-claim person is NOT renamed in the store.
+      (To actually rename an existing record — "call me Jake" — use
+      ``identify_person(action="rename")``, which hits
+      ``CloudStore.rename_person`` instead of this path.)
     """
 
     CREATE = "create"
@@ -549,6 +552,43 @@ class EnrollmentManager:
         self._claims.clear()
 
         return summary
+
+    def repoint_person(
+        self,
+        old_person_id: str,
+        new_person_id: str,
+        new_name: str | None = None,
+    ) -> int:
+        """Re-point in-session claims after a rename or merge.
+
+        After ``identify_person(action="rename")`` the person keeps
+        their id but changes name (call with ``old == new`` id); after
+        ``action="merge"`` the loser's id is dead and claims must point
+        at the winner. Without this, ``commit_session`` at voice-session
+        end would write buffered embeddings to a stale/merged-away
+        person.
+
+        Returns the number of claims updated.
+        """
+        updated = 0
+        for ref, claim in list(self._claims.items()):
+            if claim.person_id != old_person_id:
+                continue
+            self._claims[ref] = SessionClaim(
+                person_id=new_person_id,
+                name=new_name if new_name is not None else claim.name,
+                source=claim.source,
+                match_tier=claim.match_tier,
+                match_score=claim.match_score,
+                established_at=claim.established_at,
+            )
+            updated += 1
+        if updated:
+            logger.info(
+                "repoint_person: %d session claim(s) moved %s -> %s (%s)",
+                updated, old_person_id, new_person_id, new_name,
+            )
+        return updated
 
     def clear_session(self) -> None:
         """Clear all buffered session and claim state without committing."""

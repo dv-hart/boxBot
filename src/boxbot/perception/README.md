@@ -97,7 +97,8 @@ Cross-modal identity fusion and the confirmation gate:
 Embedding cloud management:
 - Per-person storage of visual (512-dim) and voice (192-dim) embeddings
 - Centroid computation and updates
-- Pruning: oldest-first, capped at 200 visual / 50 voice per person
+- Pruning: isolation+age eviction (anchors protected), capped at
+  200 visual / 50 voice per person
 - Natural drift: dropping old embeddings lets the cloud adapt to
   appearance changes over time
 - Crop image retention: 1 day (normal) / 7 days (debug mode)
@@ -112,6 +113,23 @@ tool when the agent names or identifies someone:
 - The agent provides semantic labels; this module handles all embedding
   bookkeeping
 
+### `presence.py`
+The agent-facing presence surface:
+- `format_presence_line(people)` — renders the `[Present: ...]` header
+  (tiers: confirmed / likely / new) injected at voice + trigger
+  conversation start
+- `PresenceDebouncer` — gates mid-conversation `[Presence update: ...]`
+  lines: a change must be stable ~7s and updates are rate-limited, so
+  tracking flicker never reaches the agent
+
+### `reconcile.py`
+Nightly identity-cloud hygiene (dream window): outlier detection,
+duplicate-person candidates, mislabel candidates, optional multimodal
+judge. Persists its audit report to
+`data/perception/id-reconcile-latest.json` (read by
+`identify_person(action="list_flags")`) and creates a one-line
+`[id-reconcile]` to-do for newly flagged duplicate pairs.
+
 ### `models/`
 Model files and conversion scripts for Hailo deployment:
 - YOLOv5s-personface detection (`yolov5s_personface_h8l.hef` — pre-compiled,
@@ -124,7 +142,8 @@ Model files and conversion scripts for Hailo deployment:
 ## Embedding Database
 
 Stored in `data/perception/perception.db` (SQLite):
-- `persons` — name, first_seen, last_seen, is_user, whatsapp_number
+- `persons` — name, first_seen, last_seen, is_user, merged_into
+  (soft merge tombstone)
 - `visual_embeddings` — 512-dim float vectors, timestamped, with
   voice_confirmed flag
 - `voice_embeddings` — 192-dim float vectors, timestamped
@@ -147,7 +166,12 @@ confidence scores:
 ```
 
 If the agent learns Person B's name, it calls `identify_person` to
-create the record. The backend handles all embedding storage.
+create the record. The backend handles all embedding storage. The same
+tool also handles renames (`action="rename"` — "call me Jake"), merging
+duplicate records (`action="merge"`, confirm with the humans first),
+and reading the nightly reconcile audit (`action="list_flags"`).
+Presence changes mid-conversation arrive as debounced
+`[Presence update: ...]` lines (see `presence.py`).
 
 ## Privacy
 

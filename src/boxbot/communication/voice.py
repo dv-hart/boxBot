@@ -196,6 +196,34 @@ class VoiceSession:
         """Update the speaker identity mapping for transcript attribution."""
         self._speaker_identities.update(identities)
 
+    def rename_identity(self, old_name: str, new_name: str) -> int:
+        """Rewrite a person's name across the session's speaker maps.
+
+        Called (via the agent's ``PersonRenamed`` handler) after
+        ``identify_person`` renames or merges a person, so in-session
+        transcript attribution doesn't keep using the stale name.
+        Returns the number of entries updated.
+        """
+        updated = 0
+        for label, display in list(self._speaker_identities.items()):
+            if display == old_name:
+                self._speaker_identities[label] = new_name
+                updated += 1
+        for info in self._latest_speaker_identities.values():
+            if isinstance(info, dict) and info.get("person_name") == old_name:
+                info["person_name"] = new_name
+                updated += 1
+        if old_name in self._latest_speaker_identities:
+            self._latest_speaker_identities[new_name] = (
+                self._latest_speaker_identities.pop(old_name)
+            )
+        if updated:
+            logger.info(
+                "Voice session: renamed identity %r -> %r (%d entr%s)",
+                old_name, new_name, updated, "y" if updated == 1 else "ies",
+            )
+        return updated
+
     def mute_mic(self) -> bool:
         """Mute the utterance pipeline. Wake-word stays armed.
 

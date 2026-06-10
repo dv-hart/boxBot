@@ -84,7 +84,10 @@ CREATE TABLE IF NOT EXISTS persons (
     name TEXT NOT NULL UNIQUE,
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
-    is_user INTEGER NOT NULL DEFAULT 0
+    is_user INTEGER NOT NULL DEFAULT 0,
+    -- Soft-kept merge tombstone: when person B is merged into person A,
+    -- B's row survives with merged_into = A.id (embeddings are moved).
+    merged_into TEXT
 );
 
 CREATE TABLE IF NOT EXISTS visual_embeddings (
@@ -243,6 +246,16 @@ class CloudStore:
             logger.info("Migrated visual_embeddings: added reconciled column")
         await db.commit()
 
+        # merged_into tombstone column on persons (ws5 rename/merge).
+        async with db.execute("PRAGMA table_info(persons)") as cur:
+            pcols = {row[1] async for row in cur}
+        if "merged_into" not in pcols:
+            await db.execute(
+                "ALTER TABLE persons ADD COLUMN merged_into TEXT"
+            )
+            await db.commit()
+            logger.info("Migrated persons: added merged_into column")
+
         # id_corrections table for older DBs created before it existed.
         await db.execute(
             """CREATE TABLE IF NOT EXISTS id_corrections (
@@ -297,10 +310,15 @@ class CloudStore:
         return person_id
 
     async def get_person_by_name(self, name: str) -> dict | None:
-        """Look up person by name.
+        """Look up person by name, resolving merge tombstones.
+
+        If the named row was merged into another person, follow the
+        ``merged_into`` chain and return the surviving record — so
+        "It's Erik" keeps working after Erik was merged into Eric.
 
         Returns:
-            Dict with id, name, first_seen, last_seen, is_user — or None.
+            Dict with id, name, first_seen, last_seen, is_user,
+            merged_into — or None.
         """
         db = self._ensure_db()
         async with db.execute(
@@ -309,7 +327,18 @@ class CloudStore:
             row = await cursor.fetchone()
             if row is None:
                 return None
-            return _row_to_person(row)
+            person = _row_to_person(row)
+
+        # Follow the merge chain (bounded — chains are short and a
+        # cycle would be a bug, not a feature).
+        hops = 0
+        while person.get("merged_into") and hops < 5:
+            target = await self.get_person(person["merged_into"])
+            if target is None:
+                break
+            person = target
+            hops += 1
+        return person
 
     async def get_person(self, person_id: str) -> dict | None:
         """Look up person by ID.
@@ -326,20 +355,172 @@ class CloudStore:
                 return None
             return _row_to_person(row)
 
-    async def list_persons(self) -> list[dict]:
+    async def list_persons(self, include_merged: bool = False) -> list[dict]:
         """List all known persons.
+
+        Args:
+            include_merged: Include merge tombstones (rows whose
+                ``merged_into`` is set). Default False — merged-away
+                identities are invisible to matching/reconciliation.
 
         Returns:
             List of person dicts sorted by last_seen (newest first).
         """
         db = self._ensure_db()
+        where = "" if include_merged else "WHERE merged_into IS NULL"
         persons: list[dict] = []
         async with db.execute(
-            "SELECT * FROM persons ORDER BY last_seen DESC"
+            f"SELECT * FROM persons {where} ORDER BY last_seen DESC"
         ) as cursor:
             async for row in cursor:
                 persons.append(_row_to_person(row))
         return persons
+
+    async def rename_person(self, person_id: str, new_name: str) -> dict:
+        """Rename a person record (pure metadata; embeddings untouched).
+
+        Args:
+            person_id: The person to rename.
+            new_name: The new name. Must not collide with any other
+                person row (active or tombstoned).
+
+        Returns:
+            ``{old_name, new_name, person_id}``.
+
+        Raises:
+            ValueError: if the person doesn't exist, or *new_name*
+                already belongs to a different person (use merge for
+                that case).
+        """
+        db = self._ensure_db()
+        person = await self.get_person(person_id)
+        if person is None:
+            raise ValueError(f"No person with id {person_id!r}")
+
+        # Collision guard — names are UNIQUE; a live holder means the
+        # caller probably wants a merge instead.
+        async with db.execute(
+            "SELECT id, merged_into FROM persons WHERE name = ?", (new_name,)
+        ) as cursor:
+            holder = await cursor.fetchone()
+        if holder is not None and holder["id"] != person_id:
+            if holder["merged_into"]:
+                raise ValueError(
+                    f"The name {new_name!r} belongs to a previously merged "
+                    f"person record. Choose a different name."
+                )
+            raise ValueError(
+                f"{new_name!r} already belongs to another person. If they "
+                f"are the same human, use merge instead of rename."
+            )
+
+        old_name = person["name"]
+        await db.execute(
+            "UPDATE persons SET name = ? WHERE id = ?", (new_name, person_id)
+        )
+        await db.commit()
+        await self.log_correction(
+            source="rename_person",
+            from_person_id=person_id,
+            to_person_id=person_id,
+            detail=f"renamed {old_name!r} -> {new_name!r}",
+        )
+        logger.info(
+            "Renamed person %s: %r -> %r", person_id, old_name, new_name
+        )
+        return {
+            "old_name": old_name,
+            "new_name": new_name,
+            "person_id": person_id,
+        }
+
+    async def merge_persons(self, loser_id: str, winner_id: str) -> dict:
+        """Merge person *loser* into person *winner*.
+
+        Moves all visual and voice embeddings from loser to winner
+        (per-person caps are then re-enforced by the standard janitor:
+        isolation+age scoring, anchors protected, 200 visual / 50
+        voice), recomputes the winner's centroids, deletes the loser's
+        centroid row, and soft-keeps the loser row with
+        ``merged_into = winner_id`` so historical references resolve.
+
+        Returns:
+            ``{loser_id, loser_name, winner_id, winner_name,
+               visual_moved, voice_moved}``.
+
+        Raises:
+            ValueError: missing persons, self-merge, or merging
+                into/from an already-merged tombstone.
+        """
+        if loser_id == winner_id:
+            raise ValueError("Cannot merge a person into themselves.")
+        loser = await self.get_person(loser_id)
+        winner = await self.get_person(winner_id)
+        if loser is None:
+            raise ValueError(f"No person with id {loser_id!r}")
+        if winner is None:
+            raise ValueError(f"No person with id {winner_id!r}")
+        if loser.get("merged_into"):
+            raise ValueError(
+                f"{loser['name']!r} was already merged into another person."
+            )
+        if winner.get("merged_into"):
+            raise ValueError(
+                f"{winner['name']!r} is a merge tombstone — merge into the "
+                f"surviving record instead."
+            )
+
+        db = self._ensure_db()
+        cur = await db.execute(
+            "UPDATE visual_embeddings SET person_id = ? WHERE person_id = ?",
+            (winner_id, loser_id),
+        )
+        visual_moved = cur.rowcount
+        cur = await db.execute(
+            "UPDATE voice_embeddings SET person_id = ? WHERE person_id = ?",
+            (winner_id, loser_id),
+        )
+        voice_moved = cur.rowcount
+        await db.execute(
+            "DELETE FROM centroids WHERE person_id = ?", (loser_id,)
+        )
+        await db.execute(
+            "UPDATE persons SET merged_into = ? WHERE id = ?",
+            (winner_id, loser_id),
+        )
+        await db.commit()
+
+        # Re-enforce per-person caps on the combined cloud, then refresh
+        # the winner's centroids.
+        await self._enforce_visual_cap(winner_id)
+        await self._enforce_voice_cap(winner_id)
+        await self.recompute_centroid(winner_id)
+        await self.recompute_voice_centroid(winner_id)
+        await self.update_last_seen(winner_id)
+
+        await self.log_correction(
+            source="merge_persons",
+            from_person_id=loser_id,
+            to_person_id=winner_id,
+            detail=(
+                f"merged {loser['name']!r} into {winner['name']!r} "
+                f"({visual_moved} visual, {voice_moved} voice moved)"
+            ),
+        )
+        logger.info(
+            "Merged person %r (%s) into %r (%s): %d visual + %d voice "
+            "embeddings moved",
+            loser["name"], loser_id, winner["name"], winner_id,
+            visual_moved, voice_moved,
+        )
+        return {
+            "loser_id": loser_id,
+            "loser_name": loser["name"],
+            "winner_id": winner_id,
+            "winner_name": winner["name"],
+            "visual_moved": visual_moved,
+            "voice_moved": voice_moved,
+        }
 
     async def update_last_seen(self, person_id: str) -> None:
         """Update a person's last_seen timestamp to now."""
@@ -978,4 +1159,7 @@ def _row_to_person(row: aiosqlite.Row) -> dict:
         "first_seen": row["first_seen"],
         "last_seen": row["last_seen"],
         "is_user": bool(row["is_user"]),
+        "merged_into": (
+            row["merged_into"] if "merged_into" in row.keys() else None
+        ),
     }

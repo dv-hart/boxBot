@@ -463,6 +463,39 @@ async def cancel_trigger(trigger_id: str) -> bool:
     return await update_trigger(trigger_id, status="cancelled")
 
 
+async def repoint_person_triggers(old_name: str, new_name: str) -> int:
+    """Re-point person-condition triggers after an identity rename/merge.
+
+    Person conditions match on *names* (``PersonIdentified.person_name``),
+    so when a person record is renamed or merged away, active triggers
+    waiting on the old name would never fire again. Updates both the
+    ``person`` condition and the ``for_person`` audience field on active
+    triggers. Returns the number of rows updated.
+    """
+    db = await _get_db()
+    try:
+        c1 = await db.execute(
+            "UPDATE triggers SET person = ? "
+            "WHERE person = ? AND status = 'active'",
+            (new_name, old_name),
+        )
+        c2 = await db.execute(
+            "UPDATE triggers SET for_person = ? "
+            "WHERE for_person = ? AND status = 'active'",
+            (new_name, old_name),
+        )
+        await db.commit()
+        updated = c1.rowcount + c2.rowcount
+        if updated:
+            logger.info(
+                "Repointed %d trigger field(s): person %r -> %r",
+                updated, old_name, new_name,
+            )
+        return updated
+    finally:
+        await db.close()
+
+
 # ── Todos ─────────────────────────────────────────────────────────────────
 
 

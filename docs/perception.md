@@ -67,8 +67,8 @@ via the separate code-based flow. See
 │  ▼ conversation ends                               │         │
 ├────────────────────────────────────────────────────┤         │
 │  POST_CONVERSATION                                 │         │
-│  Store voice-confirmed visual embeddings           │         │
-│  Recompute centroids for updated clouds            │         │
+│  Commit nothing here — embedding commits happen at │         │
+│  voice-session end (EnrollmentManager session)     │         │
 │  Prune expired crop images                         │         │
 │  Unload pyannote models (or keep warm briefly)     │         │
 │  → DORMANT                                         │         │
@@ -228,13 +228,16 @@ Clouds are capped to allow natural drift over time:
 ```
 MAX_VISUAL_EMBEDDINGS = 200 per person
 MAX_VOICE_EMBEDDINGS = 50 per person
-PRUNING_STRATEGY = oldest_first
+PRUNING_STRATEGY = isolation + age (anchors never evicted)
 ```
 
-When a new confirmed embedding would exceed the cap, the oldest
-embedding is dropped. This lets the cloud gradually adapt to appearance
-changes (new haircut, glasses, seasonal clothing) without manual
-re-enrollment.
+When the cap is exceeded, embeddings are evicted in one batch down to
+~90% of cap, choosing the highest `isolation + λ·age` first — isolated
+points (likely contamination) go before merely-old ones, and
+`agent_identify` anchors are never evicted. This lets the cloud
+gradually adapt to appearance changes (new haircut, glasses, seasonal
+clothing) without manual re-enrollment. The same janitor re-enforces
+the caps after a person merge combines two clouds.
 
 Centroids are recomputed whenever the cloud changes.
 
@@ -385,30 +388,65 @@ The agent sees `[Person B]` (the diarization label) and can engage
 naturally. If Person B identifies themselves or Jacob introduces them,
 the agent calls `identify_person` to create a named record.
 
-**Context header (injected before transcript):**
+**Presence header (injected into the dynamic context):**
 ```
 [Present: Jacob (confirmed), Person B (new)]
-[Time: 2026-02-21 14:30]
 ```
 
-The `(confirmed)` tag means voice-confirmed identity. `(new)` means
-no match in any known profile.
+Built from the perception pipeline's tracked people
+(`boxbot.perception.presence.format_presence_line`) and injected into
+the dynamic system context for **voice and trigger** conversations
+(WhatsApp/Signal have no notion of room presence). Three tiers:
+
+- `(confirmed)` — high-confidence identification (voice-confirmed or a
+  high-tier visual match)
+- `(likely)` — named, but only a medium/low-tier match
+- `(new)` — no match in any known profile; shown by session ref
+  (e.g. `Person B`)
+
+The header is rebuilt every turn, so it is always current at the
+moment the agent thinks.
+
+**Mid-conversation updates.** When the tracked-person set changes
+while a voice conversation is active, an update line is injected into
+the thread as a user-style turn:
+
+```
+[Presence update: Jacob (confirmed), Sarah (likely)]
+```
+
+Updates are event-driven (PersonDetected / PersonIdentified — no
+polling) and debounced: a change must be stable for ~7 s (aligned with
+the DETECTED-state YOLO heartbeat of 5 s) before it is announced, and
+updates are rate-limited to at most one per 30 s per conversation, so
+tracking flicker never reaches the agent. Two known limits: visual
+heartbeats pause while perception is in the CONVERSATION state (Hailo
+is freed), so updates mostly fire between utterances; and departures
+have no dedicated event — they surface on the next person event or
+the next turn's header.
 
 ## The `identify_person` Tool
 
-A single tool that bridges the agent's semantic understanding to the
-perception backend's embedding storage. The agent provides a name and
-a diarization reference label; the backend handles all embedding
-bookkeeping.
-
-### Parameters
+The single identity gateway. One tool, four actions — the agent never
+touches embeddings directly:
 
 ```
-name:   str  — the person's name ("Erik", "Jacob")
-ref:    str  — the perception reference label ("Person B", "Speaker C")
+action: "identify" (default) | "rename" | "merge" | "list_flags"
+
+identify:   name + ref      — session speaker → person (create/confirm/
+                              correct via session claims)
+rename:     name + new_name — rename an existing record ("call me Jake").
+                              Metadata only; errors if new_name belongs
+                              to another person (that's a merge).
+merge:      name + duplicate_name — merge duplicate records of the SAME
+                              human ("Erik" → "Eric"). Destructive; the
+                              agent must confirm with the people
+                              involved before calling it.
+list_flags: (no params)     — read the latest nightly reconcile audit
+                              (duplicate-person candidates etc.).
 ```
 
-### Behavior
+### `action="identify"` Behavior
 
 **If `name` matches an existing person record:**
 Link `ref`'s embeddings (voice + associated visual) to that person's
@@ -444,6 +482,40 @@ On receiving an `identify_person` call:
 
 The agent never sees or handles embeddings. Token cost: one short tool
 call.
+
+### Rename and Merge
+
+`action="rename"` updates the person's name in place — embeddings are
+untouched. `action="merge"` moves the duplicate's visual + voice
+embeddings into the surviving record (the per-person caps are then
+re-enforced by the standard eviction janitor) and soft-keeps the
+duplicate row with a `merged_into` pointer, so "It's Erik" still
+resolves to Eric afterwards.
+
+Both actions re-point everything keyed on the person:
+
+- **photo person tags** (`photo_people.person_id` + label) — re-pointed
+- **active person-condition triggers** (name-keyed) — re-pointed
+- **in-session enrollment claims** — re-pointed, so the voice-session
+  commit can't write embeddings to a stale/merged-away person
+- **live speaker/presence maps** (agent + voice session) — refreshed
+  via the `PersonRenamed` event
+- **memory records** — deliberately NOT rewritten (names live inside
+  free text); the tool response tells the agent to save a memory noting
+  the change
+
+### Reconcile Flags and the Merge Nudge
+
+The nightly identity reconcile (`perception/reconcile.py`, runs in the
+dream window) flags person-record pairs that are probably the same
+human (small name edit distance and/or high centroid similarity). The
+audit report is persisted to `data/perception/id-reconcile-latest.json`;
+the agent reads it with `identify_person(action="list_flags")`. Newly
+flagged pairs also create a one-line `[id-reconcile]` to-do (deduped by
+description, suppressed once completed), so the `[To-do: N]` status
+line nudges the agent to investigate. Merging itself is never
+automatic — the agent confirms with the household first, then calls
+`action="merge"`.
 
 ### What This Tool Does NOT Do
 
@@ -504,7 +576,9 @@ persons table (SQLite):
   first_seen:      datetime
   last_seen:       datetime
   is_user:         bool        # admin-approved via registration flow
-  whatsapp_number: str | null  # only if is_user=true
+  merged_into:     uuid | null # soft merge tombstone — set when this
+                               # record was merged into another person;
+                               # name lookups follow the chain
 
 visual_embeddings table:
   id:              uuid

@@ -732,6 +732,40 @@ class PhotoStore:
         await db.commit()
         return True
 
+    async def repoint_person(
+        self,
+        old_person_id: str,
+        new_person_id: str,
+        new_label: str | None = None,
+    ) -> int:
+        """Re-point photo person tags after an identity rename or merge.
+
+        For a rename, call with ``old_person_id == new_person_id`` and
+        the new name as *new_label*. For a merge, the loser's id maps
+        to the winner's id (and the winner's name as label).
+
+        Returns the number of photo_people rows updated.
+        """
+        db = self._ensure_db()
+        if new_label is not None:
+            cursor = await db.execute(
+                "UPDATE photo_people SET person_id = ?, label = ? "
+                "WHERE person_id = ?",
+                (new_person_id, new_label, old_person_id),
+            )
+        else:
+            cursor = await db.execute(
+                "UPDATE photo_people SET person_id = ? WHERE person_id = ?",
+                (new_person_id, old_person_id),
+            )
+        await db.commit()
+        if cursor.rowcount:
+            logger.info(
+                "Repointed %d photo person tag(s): %s -> %s (%s)",
+                cursor.rowcount, old_person_id, new_person_id, new_label,
+            )
+        return cursor.rowcount
+
     # ------------------------------------------------------------------
     # Slideshow
     # ------------------------------------------------------------------

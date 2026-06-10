@@ -29,15 +29,22 @@ and the only points mislabel-scoring compares against.
 from __future__ import annotations
 
 import base64
+import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from boxbot.core.paths import PERCEPTION_DIR
 from boxbot.perception.clouds import ANCHOR_PROVENANCES, CloudStore
 
 logger = logging.getLogger(__name__)
+
+# Latest audit report — persisted after every run so the agent can read
+# the findings later (identify_person action="list_flags").
+REPORT_PATH = PERCEPTION_DIR / "id-reconcile-latest.json"
 
 # Defaults — middle-road, calibrate from audit reports over time.
 DEFAULT_ISOLATION_THRESHOLD = 0.55   # flag if mean top-k neighbour cosine < 0.45
@@ -197,13 +204,17 @@ async def run_id_reconcile(
     judge_min_confidence: float = DEFAULT_JUDGE_MIN_CONFIDENCE,
     judge_max_calls: int = DEFAULT_JUDGE_MAX_CALLS,
     judge_cluster_sim: float = DEFAULT_JUDGE_CLUSTER_SIM,
+    report_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run the deterministic identity-cloud reconciliation pass.
 
     Opens its own CloudStore if one isn't injected (file-backed, WAL — safe to
     read alongside the live perception process). Returns an audit report;
     mutates nothing unless ``audit_only=False`` (eviction + relabel; person
-    merge is never auto-applied here).
+    merge is never auto-applied here). The report is also persisted to
+    ``report_path`` (default ``data/perception/id-reconcile-latest.json``)
+    so the agent can read the latest findings via
+    ``identify_person(action="list_flags")``.
     """
     own_store = cloud_store is None
     if own_store:
@@ -300,10 +311,106 @@ async def run_id_reconcile(
                 dp["a"], dp["b"], dp["name_distance"],
                 dp["centroid_sim"], dp["reason"],
             )
+        _persist_report(report, report_path)
         return report
     finally:
         if own_store:
             await cloud_store.close()
+
+
+def _persist_report(report: dict[str, Any], report_path: Path | None) -> None:
+    """Write the audit report to disk (best-effort; never raises)."""
+    path = report_path or REPORT_PATH
+    try:
+        report["ran_at"] = datetime.now(timezone.utc).isoformat()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2, default=str))
+    except Exception:
+        logger.exception("Failed to persist id-reconcile report to %s", path)
+
+
+def load_latest_report(report_path: Path | None = None) -> dict[str, Any] | None:
+    """Read the most recent persisted reconcile report, or None.
+
+    This is the read side of the flag surface: the agent consumes it via
+    ``identify_person(action="list_flags")``.
+    """
+    path = report_path or REPORT_PATH
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.exception("Failed to read id-reconcile report at %s", path)
+        return None
+
+
+def duplicate_todo_description(pair: dict[str, Any]) -> str:
+    """One-line to-do description for a flagged duplicate-person pair.
+
+    Stable for a given (a, b) pair so repeat nightly flags can be
+    deduplicated against existing to-dos by exact description match.
+    """
+    a, b = sorted([str(pair.get("a")), str(pair.get("b"))])
+    return (
+        f"[id-reconcile] Possible duplicate people: '{a}' and '{b}' — "
+        f"verify with the household, then identify_person(action=\"merge\") "
+        f"if they are the same person"
+    )
+
+
+async def nudge_duplicate_todos(report: dict[str, Any]) -> int:
+    """Create a to-do for each NEWLY flagged duplicate-person pair.
+
+    "New" means no existing to-do (any status) already carries the
+    pair's stable description — so a pair flagged every night until it's
+    resolved produces exactly one nudge, and completing/cancelling the
+    to-do suppresses re-nudging. The to-do surfaces through the
+    ``[To-do: N items]`` status line, prompting the agent to investigate
+    via ``identify_person(action="list_flags")``.
+
+    Returns the number of to-dos created. Best-effort: scheduler
+    failures are logged, not raised (this runs inside the dream cycle).
+    """
+    pairs = report.get("duplicate_persons") or []
+    if not pairs:
+        return 0
+    try:
+        from boxbot.core import scheduler
+
+        existing = {
+            t.get("description") for t in await scheduler.list_todos()
+        }
+        created = 0
+        for pair in pairs:
+            desc = duplicate_todo_description(pair)
+            if desc in existing:
+                continue
+            await scheduler.create_todo(
+                desc,
+                notes=(
+                    f"Flagged by the nightly identity reconcile "
+                    f"(reason: {pair.get('reason')}, "
+                    f"name_distance={pair.get('name_distance')}, "
+                    f"centroid_sim={pair.get('centroid_sim')}). "
+                    f"Read the full findings with "
+                    f"identify_person(action=\"list_flags\"). Merging is "
+                    f"destructive — confirm with the people involved "
+                    f"before calling identify_person(action=\"merge\")."
+                ),
+                source="agent",
+            )
+            existing.add(desc)
+            created += 1
+        if created:
+            logger.info(
+                "id-reconcile: created %d duplicate-person to-do nudge(s)",
+                created,
+            )
+        return created
+    except Exception:
+        logger.exception("id-reconcile: duplicate to-do nudge failed")
+        return 0
 
 
 def _find_outliers(

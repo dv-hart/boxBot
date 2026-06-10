@@ -1940,11 +1940,27 @@ class BoxBotAgent:
         )
         conv.sandbox_runner = runner
         # Kick start in the background so create() doesn't block on
-        # subprocess spawn / sudo prompt resolution.
-        asyncio.create_task(
+        # subprocess spawn / sudo prompt resolution. start() handles
+        # its own failures (logs + poisons the runner), but if it ever
+        # raises anyway, surface it now instead of waiting for task GC
+        # to mutter "exception was never retrieved".
+        start_task = asyncio.create_task(
             runner.start(),
             name=f"sandbox-start-{conv.conversation_id}",
         )
+
+        def _log_start_failure(task: "asyncio.Task[None]") -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(
+                    "Sandbox runner eager-start for %s raised: %r — "
+                    "execute_script will fall back to per-call subprocess",
+                    conv.conversation_id, exc,
+                )
+
+        start_task.add_done_callback(_log_start_failure)
 
     async def _on_conversation_ended(self, event: ConversationEnded) -> None:
         """Remove the conversation from the index and fire memory extraction.

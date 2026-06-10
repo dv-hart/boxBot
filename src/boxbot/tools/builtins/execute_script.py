@@ -218,6 +218,19 @@ class ExecuteScriptTool(Tool):
                     "falling back to per-call subprocess",
                     e,
                 )
+        elif runner is not None:
+            # A runner was attached to this conversation but is not
+            # running — eager start failed or the server died. Falling
+            # back to per-call is correct; doing it silently is not:
+            # without this warning a permanently dead warm runner is
+            # invisible (every call quietly pays the per-call spawn
+            # cost and loses cross-turn Python state).
+            logger.warning(
+                "Conversation sandbox runner is down; falling back to "
+                "per-call subprocess. Reason: %s",
+                runner.failure_reason
+                or "unknown (eager start may still be in flight)",
+            )
 
         # Lazy import to avoid pulling boxbot.core at module load (which
         # triggers the core package __init__ and a registry cycle).

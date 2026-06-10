@@ -75,7 +75,10 @@ step in setup is what links them for the admin.
      "Got it, Brian. I've got you down now."
    - `correct`: you had a different belief; updated.
      "Sorry about the mix-up, Brian. Got it now."
-   - `rename` / `no_op`: rare; just acknowledge naturally.
+   - `rename` / `no_op`: rare; just acknowledge naturally. (If
+     someone wants their EXISTING record called something else — "call
+     me Bri" — that's `identify_person(action="rename", name="Brian",
+     new_name="Bri")`, not a new identify.)
 
 4. **Continue the conversation normally.** They reached out for some
    reason — ask what you can help with.
@@ -221,9 +224,15 @@ answer, mark complete or cancel — this todo is optional.
 
 - **Multiple unknowns at once (voice):** handle one at a time. Onboard
   the most recent speaker; tell the other you'll get to them next.
-- **"Actually, call me Bri" after Brian was pinned:** call
-  `identify_person(name="Bri", ref=…)` — the tool reports `correct` /
-  `rename`. Acknowledge: "Got it, Bri."
+- **"Actually, call me Bri" after Brian was pinned:** same human,
+  new name — call `identify_person(action="rename", name="Brian",
+  new_name="Bri")`. This renames the existing record (embeddings,
+  photos, and triggers follow). Acknowledge: "Got it, Bri."
+- **Two records turn out to be the same person (e.g. "Eric" and
+  "Erik"):** confirm with them first ("Are Eric and Erik the same
+  person?"), then `identify_person(action="merge", name="Eric",
+  duplicate_name="Erik")`. Merge is destructive — never call it
+  without confirmation.
 - **Admin asks to add a user but isn't actually admin:** the
   `bb.auth.generate_registration_code()` call fails with "only admins
   can generate registration codes". Don't pretend it worked — tell

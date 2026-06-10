@@ -308,11 +308,13 @@ class PerceptionStateMachine:
                 "ref": ref,
                 "name": None,
                 "confidence": 0.0,
+                "tier": None,
                 "since": person.last_detected.isoformat(),
             }
             if person.match_result is not None:
                 entry["name"] = person.match_result.person_name
                 entry["confidence"] = person.match_result.confidence
+                entry["tier"] = person.match_result.tier
             people.append(entry)
         return people
 

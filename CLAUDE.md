@@ -58,9 +58,12 @@ hot-path or security-sensitive operations remain as standalone tools.
   the `bb` package (photos, camera, workspace, display, memory, tasks,
   skill, secrets, packages, integrations). Composes many ops per turn.
 - `switch_display` — change what's on the 7" screen (hot-path singleton)
-- `identify_person` — register / correct a speaker's identity; returns
-  a cropped still of the speaker on new-person outcomes so the agent
-  can note appearance into memory
+- `identify_person` — the identity gateway: register / correct a
+  speaker's identity, rename a person ("call me Jake"), merge
+  duplicate records (confirm with the humans first), and read the
+  nightly duplicate-flag audit; returns a cropped still of the
+  speaker on new-person outcomes so the agent can note appearance
+  into memory
 - `manage_tasks` — triggers + to-dos (hot-path, every-turn)
 - `search_memory` — memory lookup (hot-path, every-turn)
 - `web_search` — web fetch + small-model content firewall

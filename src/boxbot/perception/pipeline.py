@@ -45,7 +45,7 @@ from boxbot.perception.clouds import CloudStore
 from boxbot.perception.crops import CropManager
 from boxbot.perception.doa import DOATracker
 from boxbot.perception.enrollment import EnrollmentManager
-from boxbot.perception.fusion import FusionResult, IdentityFusion
+from boxbot.perception.fusion import IdentityFusion
 from boxbot.perception.motion import MotionDetector
 from boxbot.perception.person_detector import PersonDetector
 from boxbot.perception.state_machine import PerceptionState, PerceptionStateMachine
@@ -191,8 +191,6 @@ class PerceptionPipeline:
             debug_retention_days=crop_retention_days_debug,
         )
         self._fusion: IdentityFusion | None = None  # created in start()
-        self._session_data: dict = {}  # speaker_label -> session data
-        self._conversation_active = False
 
         self._scan_fps = scan_fps
         self._scan_interval = 1.0 / scan_fps
@@ -585,8 +583,6 @@ class PerceptionPipeline:
     async def _on_conversation_started(self, event: ConversationStarted) -> None:
         """Handle conversation start — freeze heartbeats."""
         self._state_machine.on_conversation_started()
-        self._conversation_active = True
-        self._session_data.clear()
         logger.info(
             "Perception: CONVERSATION state (conversation %s)",
             event.conversation_id,
@@ -595,7 +591,6 @@ class PerceptionPipeline:
     async def _on_conversation_ended(self, event: ConversationEnded) -> None:
         """Handle conversation end — run post-conversation processing."""
         self._state_machine.on_conversation_ended()
-        self._conversation_active = False
         await self._run_post_conversation()
         logger.info(
             "Perception: POST_CONVERSATION complete (conversation %s)",
@@ -711,57 +706,29 @@ class PerceptionPipeline:
     # ── Post-conversation ─────────────────────────────────────────
 
     async def _run_post_conversation(self) -> None:
-        """Run post-conversation embedding confirmation."""
-        if not self._fusion or not self._cloud_store:
-            self._state_machine.on_post_conversation_done(
-                people_still_present=bool(self._state_machine.active_persons)
-            )
-            return
+        """Transition out of POST_CONVERSATION.
 
-        try:
-            # Build session data for fusion confirmation
-            session_data: dict = {}
-            if hasattr(self._fusion, "session_speakers"):
-                for label, speaker in self._fusion.session_speakers.items():
-                    session_data[label] = {
-                        "fusion_result": speaker.fusion_result
-                        if hasattr(speaker, "fusion_result")
-                        else speaker,
-                        "voice_embeddings": getattr(
-                            speaker, "voice_embeddings", []
-                        ),
-                        "visual_embeddings": [],
-                    }
+        Embedding persistence does NOT happen here — buffered voice and
+        visual embeddings are committed by ``EnrollmentManager.
+        commit_session`` when the *voice session* ends (see
+        ``_on_voice_session_ended``). A vestigial fusion-confirmation
+        path used to live here; it always ran on empty data and was
+        removed (2026-06, ws5).
+        """
+        people_present = bool(self._state_machine.active_persons)
+        self._state_machine.on_post_conversation_done(
+            people_still_present=people_present
+        )
 
-            results = await self._fusion.confirm_session_embeddings(
-                session_data, self._cloud_store
-            )
-
-            logger.info(
-                "Post-conversation: confirmed %d speakers", len(results)
-            )
-        except Exception:
-            logger.exception("Post-conversation embedding confirmation failed")
-        finally:
-            if hasattr(self._fusion, "clear_session"):
-                self._fusion.clear_session()
-            self._session_data.clear()
-
-            # Transition out of POST_CONVERSATION
-            people_present = bool(self._state_machine.active_persons)
-            self._state_machine.on_post_conversation_done(
-                people_still_present=people_present
-            )
-
-            if not people_present:
-                self._motion.reset()
-                _reset_ref_counter()
-                # Do NOT clear enrollment buffers here. The enrollment
-                # session is voice-session scoped and is committed +
-                # cleared by ``_on_voice_session_ended`` / ``commit_session``.
-                # Clearing here drops buffered voice embeddings before the
-                # voice session ends, so identify_person calls within a
-                # conversation never persist their embeddings.
+        if not people_present:
+            self._motion.reset()
+            _reset_ref_counter()
+            # Do NOT clear enrollment buffers here. The enrollment
+            # session is voice-session scoped and is committed +
+            # cleared by ``_on_voice_session_ended`` / ``commit_session``.
+            # Clearing here drops buffered voice embeddings before the
+            # voice session ends, so identify_person calls within a
+            # conversation never persist their embeddings.
 
     # ── Helpers ────────────────────────────────────────────────────
 

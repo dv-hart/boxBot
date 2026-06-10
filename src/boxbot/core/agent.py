@@ -87,7 +87,9 @@ from boxbot.core.events import (
     AgentSpeakingDone,
     ConversationEnded,
     ConversationInterruptRequested,
+    PersonDetected,
     PersonIdentified,
+    PersonRenamed,
     SignalMessage,
     SpeakerIdentified,
     TranscriptReady,
@@ -95,6 +97,10 @@ from boxbot.core.events import (
     VoiceSessionEnded,
     WhatsAppMessage,
     get_event_bus,
+)
+from boxbot.perception.presence import (
+    PresenceDebouncer,
+    get_presence_snapshot,
 )
 from boxbot.core.output_dispatcher import (
     INTERNAL_NOTES_SCHEMA,
@@ -1002,6 +1008,17 @@ class BoxBotAgent:
         # context prompt so the agent can reason about confidence.
         self._latest_speaker_identities: dict[str, dict[str, Any]] = {}
 
+        # Presence-change announcer (the mid-conversation counterpart of
+        # the [Present: ...] header). Fed by PersonDetected /
+        # PersonIdentified events; injects a [Presence update: ...]
+        # line into the active voice conversation once a change has
+        # been stable for a few seconds. _last_presence_announced maps
+        # conversation_id -> last snapshot the agent saw (seeded when
+        # the header renders, cleaned up on conversation end).
+        self._presence_debouncer = PresenceDebouncer()
+        self._presence_task: asyncio.Task[None] | None = None
+        self._last_presence_announced: dict[str, tuple[str, ...]] = {}
+
         # Active conversations, keyed by conversation_id. Each
         # Conversation is its own state machine with its own generation
         # task; cross-conversation concurrency is natural.
@@ -1098,6 +1115,9 @@ class BoxBotAgent:
         bus.subscribe(SignalMessage, self._on_signal_message)
         bus.subscribe(TriggerFired, self._on_trigger_fired)
         bus.subscribe(PersonIdentified, self._on_person_identified)
+        bus.subscribe(PersonIdentified, self._on_presence_event)
+        bus.subscribe(PersonDetected, self._on_presence_event)
+        bus.subscribe(PersonRenamed, self._on_person_renamed)
         bus.subscribe(SpeakerIdentified, self._on_speaker_identified)
         bus.subscribe(TranscriptReady, self._on_transcript_ready)
         bus.subscribe(VoiceSessionEnded, self._on_voice_session_ended)
@@ -1145,6 +1165,9 @@ class BoxBotAgent:
         bus.unsubscribe(SignalMessage, self._on_signal_message)
         bus.unsubscribe(TriggerFired, self._on_trigger_fired)
         bus.unsubscribe(PersonIdentified, self._on_person_identified)
+        bus.unsubscribe(PersonIdentified, self._on_presence_event)
+        bus.unsubscribe(PersonDetected, self._on_presence_event)
+        bus.unsubscribe(PersonRenamed, self._on_person_renamed)
         bus.unsubscribe(SpeakerIdentified, self._on_speaker_identified)
         bus.unsubscribe(TranscriptReady, self._on_transcript_ready)
         bus.unsubscribe(VoiceSessionEnded, self._on_voice_session_ended)
@@ -1183,6 +1206,14 @@ class BoxBotAgent:
             except (asyncio.CancelledError, Exception):
                 pass
             self._extraction_sweep_task = None
+
+        if self._presence_task is not None:
+            self._presence_task.cancel()
+            try:
+                await self._presence_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._presence_task = None
 
         self._client = None
         logger.info("BoxBotAgent stopped")
@@ -1582,6 +1613,12 @@ class BoxBotAgent:
                     "off" if judge is None else f"{judge['calls']} call(s)",
                     id_report.get("audit_only"),
                 )
+                # Nudge: newly flagged duplicate pairs become to-dos so
+                # the [To-do: N] status line prompts the agent to
+                # investigate via identify_person(action="list_flags").
+                from boxbot.perception.reconcile import nudge_duplicate_todos
+
+                await nudge_duplicate_todos(id_report)
             except Exception:
                 logger.exception("ID reconcile failed")
 
@@ -1589,6 +1626,123 @@ class BoxBotAgent:
         """Update the set of currently-present people."""
         if event.person_name:
             self._present_people[event.person_name] = datetime.now()
+
+    async def _on_person_renamed(self, event: PersonRenamed) -> None:
+        """Refresh name-keyed session state after a rename/merge.
+
+        Published by ``identify_person`` (action=rename/merge). The
+        durable stores were already re-pointed by the tool; this handler
+        fixes the *live* session maps so transcripts and presence don't
+        keep using the stale name mid-session.
+        """
+        old, new = event.old_name, event.new_name
+        if not old or not new or old == new:
+            return
+
+        # Transcript attribution map (SPEAKER_XX -> name).
+        for label, name in list(self._speaker_identities.items()):
+            if name == old:
+                self._speaker_identities[label] = new
+
+        # Presence map (name -> last seen).
+        if old in self._present_people:
+            seen = self._present_people.pop(old)
+            self._present_people[new] = max(
+                seen, self._present_people.get(new, seen)
+            )
+
+        # Per-session identity block (display label keyed).
+        for info in self._latest_speaker_identities.values():
+            if info.get("person_name") == old:
+                info["person_name"] = new
+        if old in self._latest_speaker_identities:
+            self._latest_speaker_identities[new] = (
+                self._latest_speaker_identities.pop(old)
+            )
+
+        # Voice adapter's own session maps.
+        try:
+            from boxbot.communication.voice import get_voice_session
+
+            session = get_voice_session()
+            if session is not None:
+                session.rename_identity(old, new)
+        except Exception:
+            logger.debug("Voice session rename failed", exc_info=True)
+
+        logger.info("Session identity renamed: %r -> %r", old, new)
+
+    # ------------------------------------------------------------------
+    # Presence updates (mid-conversation [Presence update: ...] lines)
+    # ------------------------------------------------------------------
+
+    async def _on_presence_event(self, event: Any) -> None:
+        """Feed person events into the presence debouncer.
+
+        Subscribed to ``PersonDetected`` and ``PersonIdentified``. Cheap:
+        snapshots the pipeline's tracked people and (re)arms a single
+        debounce task. The actual injection happens in
+        ``_presence_debounce_worker`` once the set has been stable for
+        a few seconds — tracking flicker never reaches the agent. Note
+        that visual heartbeats pause while perception is in
+        CONVERSATION state, so these events mostly fire between
+        utterances; departures surface on the next event or next turn's
+        header.
+        """
+        snapshot = get_presence_snapshot()
+        if snapshot is None:
+            return  # pipeline not running
+        self._presence_debouncer.offer(snapshot)
+        if self._presence_task is None or self._presence_task.done():
+            self._presence_task = asyncio.create_task(
+                self._presence_debounce_worker(),
+                name="presence-debounce",
+            )
+
+    async def _presence_debounce_worker(self) -> None:
+        """Wait out the debounce window, then inject a presence update."""
+        try:
+            while True:
+                remaining = self._presence_debouncer.seconds_until_ready()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+        except asyncio.CancelledError:
+            return
+
+        # Only the room's voice conversation gets live updates —
+        # trigger conversations are one-shot (header only) and text
+        # channels have no notion of room presence.
+        async with self._index_lock:
+            conv_id = self._conversation_by_key.get("voice:room")
+            conv = self._conversations.get(conv_id) if conv_id else None
+        if conv is None or conv.is_ended:
+            return
+
+        snapshot = self._presence_debouncer.ready()
+        if snapshot is None:
+            return
+        # Skip if the agent already saw exactly this set (header or a
+        # prior update in this conversation).
+        if self._last_presence_announced.get(conv.conversation_id) == snapshot:
+            self._presence_debouncer.mark_announced(snapshot)
+            return
+
+        line = (
+            f"[Presence update: {', '.join(snapshot)}]"
+            if snapshot
+            else "[Presence update: nobody visible]"
+        )
+        self._presence_debouncer.mark_announced(snapshot)
+        self._last_presence_announced[conv.conversation_id] = snapshot
+        logger.info(
+            "Injecting presence update into %s: %s",
+            conv.conversation_id, line,
+        )
+        try:
+            await conv.handle_input(line, source="user")
+        except Exception:
+            logger.exception("Presence update injection failed")
 
     async def _on_speaker_identified(self, event: SpeakerIdentified) -> None:
         """Update speaker identity mapping from perception fusion."""
@@ -1961,6 +2115,7 @@ class BoxBotAgent:
                 if cid == conv_id:
                     self._conversation_by_key.pop(key, None)
                     break
+        self._last_presence_announced.pop(conv_id, None)
         if conv is None:
             return
 
@@ -2186,9 +2341,30 @@ class BoxBotAgent:
         ]
         if person_name:
             context_lines.append(f"Speaking with: {person_name}")
-        present = self._get_present_people_with_status(exclude=person_name)
-        if present:
-            context_lines.append(f"Also present: {', '.join(present)}")
+        # Presence header — [Present: Jacob (confirmed), Person B (new)]
+        # (docs/perception.md). Tiers: confirmed = high-confidence ID,
+        # likely = named but medium/low match, new = unrecognized.
+        # Voice and trigger conversations only; text channels have no
+        # notion of room presence. Rebuilt every turn, so the header is
+        # always current; mid-turn changes additionally arrive as
+        # [Presence update: ...] lines (see _presence_debounce_worker).
+        if channel in ("voice", "trigger"):
+            snapshot = get_presence_snapshot()
+            if snapshot:
+                context_lines.append(f"[Present: {', '.join(snapshot)}]")
+            elif snapshot is None:
+                # Pipeline not running — fall back to recently-seen names.
+                fallback = self._get_present_people(exclude=None)
+                if fallback:
+                    context_lines.append(
+                        f"[Present: {', '.join(fallback)}]"
+                    )
+            # Baseline for the mid-conversation announcer: the agent has
+            # now seen exactly this set, so only a *change* from here is
+            # worth an update line.
+            if conv is not None and snapshot is not None:
+                self._last_presence_announced[conv.conversation_id] = snapshot
+                self._presence_debouncer.sync_baseline(snapshot)
         display_line = self._format_active_display_line()
         if display_line:
             context_lines.append(display_line)
@@ -3598,35 +3774,6 @@ class BoxBotAgent:
             if elapsed <= window_minutes * 60:
                 present.append(name)
         return sorted(present)
-
-    def _get_present_people_with_status(
-        self,
-        exclude: str | None = None,
-    ) -> list[str]:
-        """Return formatted strings of present people with status.
-
-        Queries the perception pipeline for richer presence data including
-        confirmation status. Falls back to the basic list if the pipeline
-        is not running.
-        """
-        try:
-            from boxbot.perception.pipeline import get_pipeline
-
-            people = get_pipeline().get_present_people()
-            result = []
-            for p in people:
-                name = p.get("name")
-                if name and name != exclude:
-                    if p.get("confidence", 0) > 0.8:
-                        result.append(f"{name} (confirmed)")
-                    else:
-                        result.append(f"{name} (visual)")
-                elif not name:
-                    result.append(f"{p.get('ref', 'unknown')} (new)")
-            return result
-        except (RuntimeError, Exception):
-            # Pipeline not running
-            return self._get_present_people(exclude=exclude)
 
     def _format_active_display_line(self) -> str | None:
         """Return a single-line summary of what is currently on the screen.

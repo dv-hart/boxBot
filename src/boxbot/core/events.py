@@ -101,6 +101,26 @@ class SpeakerIdentified(Event):
 
 
 @dataclass(frozen=True)
+class PersonRenamed(Event):
+    """A person record was renamed or merged (identify_person tool).
+
+    ``old_name`` is the name that no longer resolves (the renamed-away
+    name, or the merge loser's name); ``new_name``/``person_id`` are the
+    surviving identity. Consumers refresh any name-keyed session state
+    (speaker mappings, presence maps) so transcripts and triggers don't
+    keep pointing at a stale identity.
+
+    Source: identify_person tool
+    Consumers: Agent (session maps + voice session)
+    """
+
+    old_name: str = ""
+    new_name: str = ""
+    person_id: str = ""  # surviving person's id
+    merged_from_id: str = ""  # loser's id when this was a merge, else ""
+
+
+@dataclass(frozen=True)
 class WakeWordHeard(Event):
     """Wake word was detected in the audio stream.
 

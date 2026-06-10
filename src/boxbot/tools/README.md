@@ -125,15 +125,24 @@ Send a WhatsApp message to a whitelisted user.
   conversation
 
 #### `identify_person.py`
-Name or identify a person detected by the perception pipeline.
-- **Parameters:** `name` (string) — the person's name,
-  `ref` (string) — the perception reference label (e.g., "Person B")
-- **Behavior:** If `name` matches an existing person record, links
-  `ref`'s session embeddings (voice + associated visual) to that
+The single identity gateway — establish, correct, rename, or merge
+person identities.
+- **Parameters:** `action` (identify | rename | merge | list_flags,
+  default identify); `name` + `ref` for identify; `name` + `new_name`
+  for rename; `name` (keep) + `duplicate_name` (merge away) for merge
+- **Behavior (identify):** If `name` matches an existing person record,
+  links `ref`'s session embeddings (voice + associated visual) to that
   record. If `name` is new, creates a new person record and stores
   `ref`'s embeddings. The agent never sees or handles embeddings —
   it provides semantic labels, the backend does all embedding
   bookkeeping
+- **Behavior (rename/merge):** rename is metadata-only ("call me
+  Jake"); merge moves the duplicate's embeddings into the kept record
+  and tombstones the duplicate. Both re-point photo tags, active
+  person triggers, in-session claims, and live speaker maps. Merge is
+  destructive — the agent confirms with the humans involved first
+- **Behavior (list_flags):** returns the latest nightly identity-audit
+  findings (possible duplicate people) so the agent can investigate
 - **Why a tool?** The agent learns identity through conversation
   (someone says their name, or is introduced). This bridges the
   agent's semantic understanding to the perception backend's

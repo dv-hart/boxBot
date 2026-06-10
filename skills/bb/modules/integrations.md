@@ -136,12 +136,49 @@ args = inputs()             # dict the runner passed in (after default fill)
 return_output({"...": ...}) # set this call's result; last call wins
 ```
 
+**`return_output()` is last-call-wins.** If you return an error early
+and keep executing, a later `return_output({...})` silently overwrites
+the error. Always exit immediately after an early error return:
+
+```python
+if not token:
+    return_output({"error": "GOOGLE_CALENDAR_TOKEN_JSON not stored"})
+    sys.exit(0)   # REQUIRED — without this, later code can clobber the error
+```
+
 Subprocess invocation does **not** work — seccomp blocks
 `execve`/`fork` in the sandbox. Use `httpx`/`requests`, in-process
 libraries, and stdlib only.
 
 Secrets declared in the manifest are injected as `BOXBOT_SECRET_<NAME>`
 env vars at runtime. Read them with `os.environ.get(...)`.
+
+## Timeouts — 300s hard ceiling
+
+The manifest's `timeout` field caps how long one call may run before
+the runner kills the subprocess (`status: "timeout"`). The validator
+rejects anything over **300 seconds (5 minutes)** — longer-running
+work belongs in a scheduled trigger, not an integration call.
+Integrations are request/response pipes; if a job legitimately needs
+more than 5 minutes, register a trigger (`bb.tasks`) that wakes you to
+do the work in stages, or restructure the integration to fetch
+incrementally and cache.
+
+## Concurrency — calls are NOT serialized
+
+Every call spawns a fresh sandbox subprocess. Two consumers calling
+the same integration at the same time (e.g. the agent plus a display
+refresh) run **concurrently** — there is no per-integration lock.
+Write your script so concurrent runs can't corrupt shared state:
+
+- Pure reads (weather, stock quotes) are naturally safe.
+- Anything that **mutates state** — OAuth token refresh that writes
+  back via `bb.secrets.store(...)` (the calendar integration does
+  this), counters, caches — must be idempotent and tolerate another
+  run doing the same mutation in parallel. The calendar pattern:
+  refresh on 401, persist the rotated token, retry once. Safe under
+  concurrency because the long-lived refresh token stays valid when
+  two runs refresh at once — last write wins, both runs succeed.
 
 ## Pipe model — no internal schedule
 
@@ -163,6 +200,43 @@ data-source manager handles refresh cadence:
 The manager calls ``bb.integrations.get(<name>, **inputs)`` on each
 tick and binds the output dict to the source name. See
 [display.md](display.md) for the full spec form.
+
+Backward compat: an old display source spec of
+``{"type": "builtin", "name": "weather"}`` (or ``"calendar"``, or any
+name that isn't clock/tasks/people/agent_status) resolves to the
+integration of the same name — weather and calendar *are*
+integrations now, not built-ins.
+
+## Built-in integrations — setup
+
+Three integrations ship with boxBot. What each needs before it works:
+
+**calendar** — Google Calendar v3.
+- Secret: `GOOGLE_CALENDAR_TOKEN_JSON` — the OAuth token JSON produced
+  by `scripts/calendar_auth.py` (the installed-app flow; same shape as
+  `google.oauth2.credentials.Credentials.to_json()`, must include
+  `refresh_token`, `client_id`, `client_secret`). The script
+  auto-refreshes on 401 and persists the rotated token back to the
+  secret store.
+- Actions: `list_upcoming_events`, `create_event`, `update_event`,
+  `delete_event`.
+- Example:
+  `bb.integrations.get("calendar", action="list_upcoming_events", max_results=5)`
+
+**home_assistant** — Home Assistant REST API.
+- Secrets: `HOME_ASSISTANT_URL` (e.g. `http://homeassistant.local:8123`)
+  and `HOME_ASSISTANT_TOKEN` (a long-lived access token from the HA
+  user profile page).
+- Actions: `get_states`, `get_state`, `call_service`,
+  `camera_snapshot`, `list_services`.
+- Example:
+  `bb.integrations.get("home_assistant", action="get_state", entity_id="light.living_room")`
+
+**weather** — NOAA forecasts (api.weather.gov), US lat/lon only.
+- No secrets. `lat`/`lon` are required but fall back to the
+  `BOXBOT_WEATHER_LAT` / `BOXBOT_WEATHER_LON` env vars via
+  `default_env`, so on a configured device you can omit them.
+- Example: `bb.integrations.get("weather", forecast_days=5)`
 
 ## Device-level config: ``default_env``
 

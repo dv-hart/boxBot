@@ -103,3 +103,96 @@ class TestRunLog:
 
     def test_unknown_integration_returns_empty(self, tmp_path: Path):
         assert run_logs.list_runs("ghost", root=tmp_path) == []
+
+
+class TestTruncationKeepsTail:
+    """Head+tail truncation — Python tracebacks put the actual
+    exception at the END, so the tail must survive."""
+
+    def test_head_and_tail_both_kept(self):
+        head = "Traceback (most recent call last):\n"
+        middle = "x" * (run_logs.MAX_LOGGED_BYTES * 3)
+        tail = "\nKeyError: 'access_token'"
+        out = run_logs._truncate_for_log(head + middle + tail)
+        assert out.startswith(head)
+        assert out.endswith(tail)
+        assert "truncated" in out
+        # Bounded: head + tail + a small marker.
+        assert len(out) <= (
+            run_logs.HEAD_LOGGED_BYTES + run_logs.TAIL_LOGGED_BYTES + 200
+        )
+
+    def test_short_values_untouched(self):
+        assert run_logs._truncate_for_log("hello") == "hello"
+        exact = "y" * run_logs.MAX_LOGGED_BYTES
+        assert run_logs._truncate_for_log(exact) == exact
+
+    def test_error_tail_survives_in_recorded_run(self, tmp_path: Path):
+        error = (
+            "Traceback (most recent call last):\n"
+            + ("  File \"script.py\", line 1, in <module>\n" * 4000)
+            + "RuntimeError: token refresh failed"
+        )
+        _record(tmp_path, "calendar", status="error", error=error)
+        runs = run_logs.list_runs("calendar", root=tmp_path)
+        assert runs[0]["error"].endswith("RuntimeError: token refresh failed")
+        assert runs[0]["error"].startswith("Traceback")
+
+
+class TestInputRedaction:
+    """Sensitive-looking input values must never land in the run log —
+    the agent can read logs back via list_runs."""
+
+    def test_sensitive_keys_redacted(self, tmp_path: Path):
+        _record(
+            tmp_path,
+            "stocks",
+            inputs={
+                "api_key": "sk-live-12345",
+                "Authorization": "Bearer abc",
+                "refresh_token": "rt-999",
+                "PASSWORD": "hunter2",
+                "client_secret": "shhh",
+                "credentials": "user:pass",
+                "symbol": "AAPL",
+            },
+        )
+        runs = run_logs.list_runs("stocks", root=tmp_path)
+        logged = runs[0]["inputs"]
+        for key in (
+            "api_key", "Authorization", "refresh_token",
+            "PASSWORD", "client_secret", "credentials",
+        ):
+            assert logged[key] == "***redacted***", key
+        # Non-sensitive values pass through; key names stay visible.
+        assert logged["symbol"] == "AAPL"
+        raw = str(runs[0]["inputs"])
+        assert "sk-live-12345" not in raw
+        assert "hunter2" not in raw
+
+    def test_redaction_recurses_into_nested_structures(self, tmp_path: Path):
+        _record(
+            tmp_path,
+            "stocks",
+            inputs={
+                "config": {"auth": {"token": "deep"}, "region": "us"},
+                "accounts": [
+                    {"name": "a", "secret": "s1"},
+                    {"name": "b", "api_token": "s2"},
+                ],
+            },
+        )
+        logged = run_logs.list_runs("stocks", root=tmp_path)[0]["inputs"]
+        # "auth" matches the sensitive pattern, so the whole subtree goes.
+        assert logged["config"]["auth"] == "***redacted***"
+        assert logged["config"]["region"] == "us"
+        assert logged["accounts"][0]["secret"] == "***redacted***"
+        assert logged["accounts"][0]["name"] == "a"
+        assert logged["accounts"][1]["api_token"] == "***redacted***"
+
+    def test_outputs_not_redacted(self, tmp_path: Path):
+        """Scope is inputs only — outputs keep their shape (e.g. a
+        calendar event titled 'pick up key')."""
+        _record(tmp_path, "calendar", output={"events": [{"title": "pick up key"}]})
+        runs = run_logs.list_runs("calendar", root=tmp_path)
+        assert runs[0]["output"] == {"events": [{"title": "pick up key"}]}

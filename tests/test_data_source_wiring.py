@@ -107,32 +107,38 @@ class TestCalendarSourceWiring:
         assert data["count"] == 1
         assert data["events"][0]["title"] == "Team Standup"
 
-    async def test_returns_empty_when_script_reports_error(self):
-        """Unified behavior: script-reported errors come back empty so the
-        renderer falls through to its preview placeholder. The old
-        CalendarSource synthesised placeholder events here; that
-        special-case was the bifurcation we just removed."""
+    async def test_script_error_marks_source_stale(self):
+        """Unified behavior: script-reported errors surface through
+        ``do_fetch`` — empty data (renderer falls through to its
+        preview placeholder) plus ``is_stale``. The old CalendarSource
+        synthesised placeholder events here; that special-case was the
+        bifurcation we removed."""
         async def fake_run(name, inputs, **_kwargs):
             return {
                 "status": "ok",
                 "output": {"error": "Calendar token not stored."},
             }
 
+        src = _calendar_source()
         with patch("boxbot.integrations.runner.run", new=fake_run):
-            data = await _calendar_source().fetch()
+            data = await src.do_fetch()
 
         assert data == {}
+        assert src.is_stale
+        assert "Calendar token not stored" in (src._fetch_error or "")
 
-    async def test_returns_empty_when_integration_missing(self):
+    async def test_missing_integration_marks_source_stale(self):
         from boxbot.integrations.runner import IntegrationRunError
 
         async def fake_run(name, inputs, **_kwargs):
             raise IntegrationRunError("unknown integration 'calendar'")
 
+        src = _calendar_source()
         with patch("boxbot.integrations.runner.run", new=fake_run):
-            data = await _calendar_source().fetch()
+            data = await src.do_fetch()
 
         assert data == {}
+        assert src.is_stale
 
 
 # ---------------------------------------------------------------------------
@@ -271,29 +277,31 @@ class TestWeatherSourceWiring:
         assert data["icon"] == "cloud"
         assert len(data["forecast"]) == 1
 
-    async def test_returns_empty_on_runner_error(self):
+    async def test_runner_error_marks_source_stale(self):
         from boxbot.integrations import runner as runner_mod
 
         async def boom(name, inputs, *, timeout_override=None):
             return {"status": "error", "error": "API down"}
 
+        src = _weather_source({"lat": 47.6062, "lon": -122.3321})
         with patch.object(runner_mod, "run", new=boom):
-            data = await _weather_source(
-                {"lat": 47.6062, "lon": -122.3321}
-            ).fetch()
+            data = await src.do_fetch()
         assert data == {}
+        assert src.is_stale
+        assert "API down" in (src._fetch_error or "")
 
-    async def test_returns_empty_on_unregistered_integration(self):
+    async def test_unregistered_integration_marks_source_stale(self):
         from boxbot.integrations import runner as runner_mod
 
         async def absent(name, inputs, *, timeout_override=None):
             raise runner_mod.IntegrationRunError(f"unknown integration '{name}'")
 
+        src = _weather_source({"lat": 47.6062, "lon": -122.3321})
         with patch.object(runner_mod, "run", new=absent):
-            data = await _weather_source(
-                {"lat": 47.6062, "lon": -122.3321}
-            ).fetch()
+            data = await src.do_fetch()
         assert data == {}
+        assert src.is_stale
+        assert "unknown integration" in (src._fetch_error or "")
 
 
 class TestIntegrationSourceGeneric:
@@ -345,6 +353,80 @@ class TestIntegrationSourceGeneric:
         no longer in the builtin allowlist."""
         src = create_source("weather", "builtin", {})
         assert isinstance(src, IntegrationSource)
+
+
+class TestIntegrationSourceFailureSurfacing:
+    """Integration failures must be observable, not silently swallowed.
+
+    ``fetch`` raises on failure; ``do_fetch`` logs at WARNING, sets
+    ``_fetch_error`` (so ``is_stale`` is True), and serves the last
+    good data rather than blanking the display.
+    """
+
+    @staticmethod
+    def _src():
+        return IntegrationSource("stocks", {"inputs": {}})
+
+    async def test_failure_logged_at_warning(self, caplog):
+        async def boom(name, inputs, **_kwargs):
+            return {"status": "error", "error": "401 Unauthorized"}
+
+        src = self._src()
+        with patch("boxbot.integrations.runner.run", new=boom):
+            with caplog.at_level("WARNING", logger="boxbot.displays.data_sources"):
+                await src.do_fetch()
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings, "expected a WARNING record for the failed fetch"
+        assert "401 Unauthorized" in warnings[0].getMessage()
+
+    async def test_failure_preserves_last_good_data(self):
+        async def ok(name, inputs, **_kwargs):
+            return {"status": "ok", "output": {"price": 184.20}}
+
+        async def boom(name, inputs, **_kwargs):
+            raise ConnectionError("network down")
+
+        src = self._src()
+        with patch("boxbot.integrations.runner.run", new=ok):
+            await src.do_fetch()
+        assert not src.is_stale
+
+        with patch("boxbot.integrations.runner.run", new=boom):
+            data = await src.do_fetch()
+        # Stale-but-real data served, failure queryable.
+        assert data == {"price": 184.20}
+        assert src.cached_data == {"price": 184.20}
+        assert src.is_stale
+        assert "network down" in (src._fetch_error or "")
+
+    async def test_script_reported_error_marks_stale(self):
+        async def script_error(name, inputs, **_kwargs):
+            return {"status": "ok", "output": {"error": "missing secret"}}
+
+        src = self._src()
+        with patch("boxbot.integrations.runner.run", new=script_error):
+            data = await src.do_fetch()
+        assert data == {}
+        assert src.is_stale
+        assert "missing secret" in (src._fetch_error or "")
+
+    async def test_recovery_clears_error_state(self):
+        async def boom(name, inputs, **_kwargs):
+            return {"status": "timeout", "error": "took too long"}
+
+        async def ok(name, inputs, **_kwargs):
+            return {"status": "ok", "output": {"price": 190.0}}
+
+        src = self._src()
+        with patch("boxbot.integrations.runner.run", new=boom):
+            await src.do_fetch()
+        assert src.is_stale
+
+        with patch("boxbot.integrations.runner.run", new=ok):
+            data = await src.do_fetch()
+        assert data == {"price": 190.0}
+        assert not src.is_stale
+        assert src._fetch_error is None
 
 
 class TestCalendarIntegrationNormalization:

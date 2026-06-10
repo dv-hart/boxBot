@@ -26,7 +26,7 @@ The memory system has three components:
 │  FACT MEMORIES (data/memory/memory.db → memories table)     │
 │  Typed, tagged, searchable. Retrieved contextually based    │
 │  on who is present and what is being discussed.             │
-│  Four types: person, household, methodology, operational.   │
+│  Three types: person, household, methodology.                │
 │  Managed by access-based retention.                         │
 ├─────────────────────────────────────────────────────────────┤
 │  CONVERSATION LOG (data/memory/memory.db → conversations)   │
@@ -103,7 +103,6 @@ summaries are archived but remain searchable with `include_archived`.
 | **person** | Facts about a specific individual | "Erik goes to GISC on Murray Blvd, 1st grade" | 6 months |
 | **household** | Shared environment facts not tied to one person | "The WiFi password is on the fridge" | 6 months |
 | **methodology** | Agent's learned approaches and lessons | "Weather API requires zip code, not city name" | 3 months |
-| **operational** | Actions the agent took, activity log | "Removed 8 old slideshow photos, added 4 from Carina on 1/1/2026" | 2 months |
 
 **Notes:**
 - **person** memories are not siloed per person. If Carina tells BB
@@ -114,8 +113,10 @@ summaries are archived but remain searchable with `include_archived`.
   awkwardly tagged to every household member.
 - **methodology** memories are global — they capture the agent's own
   learning regardless of which person was involved in the conversation.
-- **operational** memories serve as an activity log, useful for
-  "when did I last update the slideshow?" queries.
+- There is no "operational" activity-log type (dropped in lifecycle
+  step 7) — the conversation log covers "when did I do X?" queries,
+  and standing operational notes live in system memory or the
+  workspace.
 
 ## Database Schema
 
@@ -123,7 +124,7 @@ summaries are archived but remain searchable with `include_archived`.
 -- Fact memories
 CREATE TABLE memories (
     id                TEXT PRIMARY KEY,    -- uuid
-    type              TEXT NOT NULL,       -- person | household | methodology | operational
+    type              TEXT NOT NULL,       -- person | household | methodology
     content           TEXT NOT NULL,       -- the full memory content
     summary           TEXT NOT NULL,       -- one-line summary for injection
     person            TEXT,                -- primary person (null for household/methodology)
@@ -186,7 +187,7 @@ search_memory(
     mode:       "lookup" | "summary" | "get"
     query:      str | null       -- required for lookup and summary
     memory_id:  str | null       -- required for get
-    types:      list[str] | null -- optional filter: person, household, methodology, operational
+    types:      list[str] | null -- optional filter: person, household, methodology
     person:     str | null       -- optional filter by person name
     include_conversations: bool = true   -- include conversation log in results
     include_archived:      bool = false  -- include archived memories
@@ -362,7 +363,6 @@ them for invalidation when contradictions are detected.
 [Active Memories]
 #541 (person/Jacob): Jacob has no known food allergies
 #223 (person/Erik): Erik's school pickup is 3:15 PM on weekdays
-#890 (operational): Updated slideshow 1/15/2026 — added 5 photos from Carina
 #102 (household): Family car is a blue 2022 Subaru Outback
 
 [Recent Conversations]
@@ -445,14 +445,6 @@ The extraction agent returns a single structured response:
       "content": "Jacob prefers chicken pesto pizza",
       "summary": "Jacob's pizza preference: chicken pesto",
       "tags": ["food", "preference"],
-      "action": "create"
-    },
-    {
-      "type": "operational",
-      "person": null,
-      "content": "Sent grocery shopping list to Carina via WhatsApp on 2/21/2026: mozzarella, pesto, chicken breast, pizza dough",
-      "summary": "Sent grocery list to Carina 2/21/2026",
-      "tags": ["groceries", "whatsapp"],
       "action": "create"
     },
     {
@@ -580,7 +572,6 @@ Each memory type has a **retention window**:
 | person | 6 months |
 | household | 6 months |
 | methodology | 3 months |
-| operational | 2 months |
 | conversation | 2 months |
 
 ### Daily Maintenance Job

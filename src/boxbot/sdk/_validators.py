@@ -46,7 +46,9 @@ VALID_DATA_SOURCE_TYPES = {"integration", "http_json", "http_text", "static", "m
 # now — declare them as ``type: "integration"`` in the display spec.
 VALID_BUILTIN_SOURCES = {"clock", "tasks", "people", "agent_status"}
 
-VALID_MEMORY_TYPES = {"person", "household", "methodology", "operational"}
+# "operational" was dropped in lifecycle step 7 — extraction rejects it
+# and retrieval gives it no budget. Taxonomy is these three only.
+VALID_MEMORY_TYPES = {"person", "household", "methodology"}
 
 VALID_TRIGGER_STATUSES = {"active", "expired", "cancelled"}
 VALID_TODO_STATUSES = {"pending", "completed", "cancelled"}

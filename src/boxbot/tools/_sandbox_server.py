@@ -23,9 +23,15 @@ Protocol (one JSON object per line, newline-terminated):
 The shared globals dict carries Python state (e.g. ``last_image``) across
 runs within the conversation. It does **not** carry SDK action context —
 each ``run`` gets a fresh tool result on the host side.
-"""
 
-from __future__ import annotations
+NOTE: no ``from __future__ import annotations`` here, deliberately. The
+runner prepends a seccomp prologue to this file's source and passes the
+composition to ``python3 -c`` (see ``sandbox_runner.py``); a
+``__future__`` import below the prologue is a SyntaxError that kills
+the server at startup. All annotations in this file are natively valid
+on Python 3.11+, and ``tests/test_sandbox_runner.py`` compiles the
+exact composed string to keep it that way.
+"""
 
 import json
 import os

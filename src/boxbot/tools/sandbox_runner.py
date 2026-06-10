@@ -39,6 +39,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import deque
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -172,6 +173,10 @@ class SandboxRunner:
         # died mid-script). Once poisoned, run_script raises and the
         # caller should rebuild a new runner.
         self._poisoned = False
+        # Human-readable reason the runner is down (None while healthy).
+        # Surfaced by execute_script when it falls back to the per-call
+        # subprocess path, so a dead warm runner is visible in logs.
+        self._failure_reason: str | None = None
         self._start_lock = asyncio.Lock()
 
     # ── Lifecycle ──────────────────────────────────────────────────
@@ -183,6 +188,11 @@ class SandboxRunner:
             and self._proc.returncode is None
             and not self._poisoned
         )
+
+    @property
+    def failure_reason(self) -> str | None:
+        """Why the runner is down, if known. ``None`` while healthy."""
+        return self._failure_reason
 
     async def start(self) -> None:
         """Spawn the sandbox subprocess. Idempotent."""
@@ -196,6 +206,10 @@ class SandboxRunner:
                     SERVER_SCRIPT,
                 )
                 self._poisoned = True
+                self._failure_reason = (
+                    f"server code unavailable ({SERVER_SCRIPT} could not "
+                    "be loaded at import)"
+                )
                 return
             if not self._venv_python.exists():
                 logger.warning(
@@ -204,6 +218,9 @@ class SandboxRunner:
                     self._venv_python,
                 )
                 self._poisoned = True
+                self._failure_reason = (
+                    f"sandbox venv python missing at {self._venv_python}"
+                )
                 return
 
             # Pass the server source via ``python3 -c`` so the sandbox
@@ -258,13 +275,16 @@ class SandboxRunner:
                     cmd[0], e,
                 )
                 self._poisoned = True
+                self._failure_reason = f"spawn failed: {cmd[0]} not found ({e})"
                 return
-            except Exception:
+            except Exception as e:
                 logger.exception("Sandbox runner spawn failed")
                 self._poisoned = True
+                self._failure_reason = f"spawn failed: {e!r}"
                 return
 
             self._poisoned = False
+            self._failure_reason = None
             self._stderr_task = asyncio.create_task(
                 self._pump_stderr(), name=f"{self._label}-stderr"
             )
@@ -365,6 +385,7 @@ class SandboxRunner:
                 await self._proc.stdin.drain()
             except (BrokenPipeError, ConnectionResetError) as e:
                 self._poisoned = True
+                self._failure_reason = f"sandbox stdin write failed: {e}"
                 raise RuntimeError(
                     f"Sandbox stdin write failed: {e}"
                 ) from e
@@ -381,6 +402,10 @@ class SandboxRunner:
                     script_id, self._timeout, self._label,
                 )
                 self._poisoned = True
+                self._failure_reason = (
+                    f"script {script_id} timed out after {self._timeout}s; "
+                    "runner torn down"
+                )
                 # Kill the subprocess; caller will rebuild if needed.
                 await self.stop()
                 return (
@@ -393,8 +418,9 @@ class SandboxRunner:
                     },
                     [],
                 )
-            except RuntimeError:
+            except RuntimeError as e:
                 self._poisoned = True
+                self._failure_reason = str(e)
                 raise
 
             body: dict[str, Any] = {
@@ -478,13 +504,43 @@ class SandboxRunner:
                     )
 
     async def _pump_stderr(self) -> None:
-        """Drain stderr to the host log; never blocks the main read loop."""
-        assert self._proc is not None
-        assert self._proc.stderr is not None
+        """Drain stderr to the host log; never blocks the main read loop.
+
+        Keeps a bounded tail of recent stderr lines so that when the
+        subprocess dies on its own — e.g. the composed server source
+        fails at startup — the death is loud: a WARNING with the exit
+        code and the stderr tail, plus a recorded ``failure_reason``
+        that execute_script surfaces when it falls back to the
+        per-call subprocess path. A deliberate ``stop()`` clears
+        ``self._proc`` first, so it never trips this warning.
+        """
+        proc = self._proc
+        assert proc is not None
+        assert proc.stderr is not None
+        tail: deque[str] = deque(maxlen=20)
         while True:
-            raw = await read_sandbox_line(self._proc.stderr)
+            raw = await read_sandbox_line(proc.stderr)
             if not raw:
-                return
+                break
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             if line:
+                tail.append(line)
                 logger.debug("sandbox[%s] stderr: %s", self._label, line)
+
+        # stderr EOF — the subprocess is going away. If this runner is
+        # still the active one (not torn down by stop()), it died
+        # unexpectedly: record why and say so loudly.
+        rc = await proc.wait()
+        if self._proc is proc:
+            self._poisoned = True
+            tail_text = "\n".join(tail) or "<no stderr output>"
+            self._failure_reason = (
+                f"sandbox server exited unexpectedly (rc={rc}); "
+                f"stderr tail: {tail_text}"
+            )
+            logger.warning(
+                "SandboxRunner[%s] subprocess exited unexpectedly (rc=%s) "
+                "— execute_script will fall back to per-call subprocess. "
+                "stderr tail:\n%s",
+                self._label, rc, tail_text,
+            )

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -32,8 +33,21 @@ MAX_RUNS_PER_INTEGRATION = 100
 
 # Truncate large payloads in the log to keep one row from blowing the
 # budget. Logs are debugging info, not the source of truth — the
-# caller already has the live output.
+# caller already has the live output. The split favors the tail:
+# Python tracebacks put the actual exception at the END, so a
+# head-only cut would discard the one line that matters.
 MAX_LOGGED_BYTES = 32 * 1024
+HEAD_LOGGED_BYTES = 8 * 1024
+TAIL_LOGGED_BYTES = 24 * 1024
+
+# Input keys whose values get redacted before logging. Inputs are
+# logged verbatim otherwise; an agent that passes an API key as an
+# input (instead of via bb.secrets) must not leak it into a log it
+# can later read back via list_runs.
+_SENSITIVE_KEY_RE = re.compile(
+    r"token|key|secret|password|auth|credential", re.IGNORECASE
+)
+_REDACTED = "***redacted***"
 
 
 def _db_path(root: Path | None = None) -> Path:
@@ -45,9 +59,41 @@ def _db_path(root: Path | None = None) -> Path:
 
 
 def _truncate_for_log(value: str) -> str:
+    """Cap ``value`` at MAX_LOGGED_BYTES, keeping the head AND the tail.
+
+    Keeps the first HEAD_LOGGED_BYTES and the last TAIL_LOGGED_BYTES
+    with an elision marker in between.
+    """
     if len(value) <= MAX_LOGGED_BYTES:
         return value
-    return value[:MAX_LOGGED_BYTES] + f"\n…(truncated, original {len(value)} bytes)"
+    omitted = len(value) - HEAD_LOGGED_BYTES - TAIL_LOGGED_BYTES
+    return (
+        value[:HEAD_LOGGED_BYTES]
+        + f"\n…(truncated {omitted} bytes, original {len(value)} bytes)…\n"
+        + value[-TAIL_LOGGED_BYTES:]
+    )
+
+
+def _redact_sensitive(value: Any) -> Any:
+    """Replace values under sensitive-looking keys with a marker.
+
+    Recurses into nested dicts and lists. Key names stay visible so
+    the agent can still see *what* was passed — only values whose key
+    matches ``_SENSITIVE_KEY_RE`` (case-insensitive substring) are
+    replaced.
+    """
+    if isinstance(value, dict):
+        return {
+            k: (
+                _REDACTED
+                if isinstance(k, str) and _SENSITIVE_KEY_RE.search(k)
+                else _redact_sensitive(v)
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
 
 
 @contextmanager
@@ -101,7 +147,9 @@ def record_run(
 
     duration_ms = max(0, int((finished_at - started_at) * 1000))
     inputs_json = (
-        _truncate_for_log(json.dumps(inputs, default=str)) if inputs is not None else None
+        _truncate_for_log(json.dumps(_redact_sensitive(inputs), default=str))
+        if inputs is not None
+        else None
     )
     output_json = (
         _truncate_for_log(json.dumps(output, default=str)) if output is not None else None

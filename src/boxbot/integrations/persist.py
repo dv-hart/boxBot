@@ -56,6 +56,18 @@ def _validate_script(script: Any) -> str:
     return script
 
 
+def _exists_result(name: str, target: Path) -> dict[str, Any]:
+    return {
+        "status": "exists",
+        "name": name,
+        "path": str(target),
+        "message": (
+            f"integration '{name}' already exists at {target}; "
+            "delete it or call update() instead"
+        ),
+    }
+
+
 def create_integration(
     payload: dict[str, Any],
     *,
@@ -82,17 +94,15 @@ def create_integration(
         return {"status": "error", "message": str(exc)}
 
     if target.exists():
-        return {
-            "status": "exists",
-            "name": manifest["name"],
-            "path": str(target),
-            "message": (
-                f"integration '{manifest['name']}' already exists at {target}; "
-                "delete it or call update() instead"
-            ),
-        }
+        return _exists_result(manifest["name"], target)
 
-    target.mkdir(parents=True, exist_ok=False)
+    try:
+        target.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        # TOCTOU: a concurrent create won the race between the exists()
+        # check above and this mkdir. Same outcome as the pre-check —
+        # the loser reports "exists" instead of crashing.
+        return _exists_result(manifest["name"], target)
     (target / _MANIFEST_FILE).write_text(
         render_manifest_yaml(manifest), encoding="utf-8"
     )

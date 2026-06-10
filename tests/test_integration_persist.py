@@ -62,6 +62,25 @@ class TestCreate:
             "from boxbot_sdk.integration"
         )
 
+    def test_concurrent_create_race_returns_exists(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """TOCTOU: a concurrent create lands between the exists() check
+        and mkdir. The loser must report "exists", not crash with an
+        unhandled FileExistsError."""
+        # Blind the pre-check so the flow reaches mkdir...
+        monkeypatch.setattr(Path, "exists", lambda self: False)
+        # ...while the winner has already created the directory.
+        (tmp_path / "weather").mkdir(parents=True)
+
+        result = create_integration(_BASE_PAYLOAD, integrations_root=tmp_path)
+        assert result["status"] == "exists"
+        assert result["name"] == "weather"
+        assert "already exists" in result["message"]
+        # The loser must not have written into the winner's directory.
+        assert not (tmp_path / "weather" / "manifest.yaml").is_file()
+        assert not (tmp_path / "weather" / "script.py").is_file()
+
     def test_invalid_name_rejected(self, tmp_path: Path):
         result = create_integration(
             {**_BASE_PAYLOAD, "name": "Anthropic"},

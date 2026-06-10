@@ -147,9 +147,14 @@ class IntegrationSource(DataSource):
          "integration": "solar",   # optional; defaults to ``name``
          "inputs": {"date": "2026-05-15"}, "refresh": 3600}
 
-    On error (unknown integration, non-``ok`` status, runner exception)
-    the source returns an empty dict so the renderer falls through to
-    its placeholder paths. The error is logged once per fetch.
+    On error (unknown integration, non-``ok`` status, runner exception,
+    script-reported error) ``fetch`` raises; the ``do_fetch`` wrapper in
+    :class:`DataSource` logs the failure at WARNING, records it in
+    ``_fetch_error`` (so ``is_stale`` is True and the failure is
+    queryable via ``DataSourceManager.get_source(name).is_stale``), and
+    serves the last good data instead of blanking the display. A source
+    that has never fetched successfully serves ``{}`` so the renderer
+    falls through to its placeholder paths.
     """
 
     def __init__(self, name: str, config: dict[str, Any] | None = None) -> None:
@@ -164,39 +169,27 @@ class IntegrationSource(DataSource):
         return self.config.get("refresh", 300)
 
     async def fetch(self) -> dict[str, Any]:
-        from boxbot.integrations.runner import IntegrationRunError, run
+        from boxbot.integrations.runner import run
 
-        try:
-            result = await run(self._integration_name, self._inputs)
-        except IntegrationRunError as e:
-            logger.warning(
-                "Integration source '%s' (-> '%s') not registered: %s",
-                self.name, self._integration_name, e,
-            )
-            return {}
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Integration source '%s' (-> '%s') call failed: %s",
-                self.name, self._integration_name, e,
-            )
-            return {}
+        # Failures propagate (including IntegrationRunError for an
+        # unregistered integration): do_fetch sets _fetch_error and
+        # logs at WARNING, so is_stale reflects the failure instead of
+        # the display silently rendering placeholder data.
+        result = await run(self._integration_name, self._inputs)
 
         if result.get("status") != "ok":
-            logger.debug(
-                "Integration source '%s' (-> '%s') returned %s: %s",
-                self.name, self._integration_name,
-                result.get("status"),
-                result.get("error", "no error message"),
+            raise RuntimeError(
+                f"integration '{self._integration_name}' returned "
+                f"{result.get('status')}: "
+                f"{result.get('error', 'no error message')}"
             )
-            return {}
 
         output = result.get("output") or {}
         if isinstance(output, dict) and output.get("error"):
-            logger.debug(
-                "Integration source '%s' (-> '%s') script reported error: %s",
-                self.name, self._integration_name, output["error"],
+            raise RuntimeError(
+                f"integration '{self._integration_name}' script reported "
+                f"error: {output['error']}"
             )
-            return {}
         return output if isinstance(output, dict) else {"value": output}
 
 

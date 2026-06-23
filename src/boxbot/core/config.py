@@ -465,6 +465,17 @@ class SignalConfig(BaseModel):
     # at a different daemon's storage.
     attachments_dir: str = "/home/jhart/.local/share/signal-cli/attachments"
 
+    # Inbound liveness watchdog interval. In --receive-mode on-start the
+    # daemon auto-pushes inbound to connected JSON-RPC clients, but a
+    # client's long-lived connection can silently stop receiving pushes
+    # after the daemon's receive-websocket to Signal cycles (observed
+    # 2026-06-10: outbound kept working, inbound went dead for ~12 days
+    # with no error). A fresh connection re-arms delivery, so the inbound
+    # subscriber refreshes its dedicated connection on this interval using
+    # make-before-break (new connection subscribes before the old one is
+    # torn down — no gap, dedup covers the overlap). Set 0 to disable.
+    inbound_refresh_seconds: int = 900
+
 
 class PerceptionConfig(BaseModel):
     """Perception pipeline thresholds and settings."""

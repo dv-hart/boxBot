@@ -349,6 +349,14 @@ signal:
   # home; override if you moved the daemon's account-data directory.
   attachments_dir: "/home/jhart/.local/share/signal-cli/attachments"
 
+  # Inbound liveness watchdog. The daemon auto-pushes inbound messages to
+  # connected clients in --receive-mode on-start, but a long-lived client
+  # connection can silently stop receiving them after the daemon's link to
+  # Signal cycles (outbound is unaffected, so it fails silently). The
+  # inbound subscriber refreshes its dedicated connection on this interval
+  # (make-before-break, so no message is missed). Set 0 to disable.
+  inbound_refresh_seconds: 900
+
 # ── Logging ───────────────────────────────────────────────────────────
 logging:
   level: "INFO"

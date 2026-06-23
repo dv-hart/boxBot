@@ -114,6 +114,20 @@ handler, calls `subscribeReceive`, and routes every Signal-side
 `receive` envelope through `MessageRouter` — same auth gate as
 WhatsApp, same silent-drop semantics for unknown senders.
 
+Inbound uses its **own dedicated `SignalClient`**, separate from the
+outbound/send client, with a liveness watchdog (`inbound_refresh_seconds`,
+default 900s). The daemon runs `--receive-mode on-start`, so it auto-pushes
+inbound to connected clients — but a long-lived connection can silently
+stop receiving those pushes after the daemon's receive-websocket to Signal
+cycles (observed 2026-06-10: inbound went dead for ~12 days while outbound
+kept working, with no error). A fresh connection re-arms delivery, so the
+watchdog periodically recycles the dedicated connection using
+make-before-break (the new connection subscribes before the old is torn
+down — no gap; dedup covers the overlap). Keeping it on a separate socket
+means recycling inbound never disturbs in-flight sends. `SignalClient` also
+re-subscribes automatically whenever its own socket reconnects (e.g. a
+daemon restart), via `set_reconnect_handler`.
+
 Both channels run in parallel when both are enabled — the user's
 `channel` column picks which outbound transport carries BB's replies,
 while inbound is accepted on either (auth lookups ignore channel).

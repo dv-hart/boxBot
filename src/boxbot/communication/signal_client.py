@@ -108,6 +108,7 @@ class SignalClient:
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._notification_handler: NotificationHandler | None = None
+        self._reconnect_handler: Callable[[], Awaitable[None]] | None = None
 
         self._stopped = asyncio.Event()
 
@@ -123,6 +124,18 @@ class SignalClient:
         extracting the envelope, and routing.
         """
         self._notification_handler = handler
+
+    def set_reconnect_handler(
+        self, handler: "Callable[[], Awaitable[None]] | None"
+    ) -> None:
+        """Register a callback fired after the reader re-opens the socket.
+
+        The daemon does NOT remember a client's ``subscribeReceive`` across
+        a socket disconnect, so the inbound layer registers a handler here
+        that re-subscribes. Without it, a daemon restart (local-socket EOF)
+        would leave the reconnected client silently receiving nothing.
+        """
+        self._reconnect_handler = handler
 
     # -----------------------------------------------------------------
     # Connection lifecycle
@@ -191,6 +204,15 @@ class SignalClient:
                 try:
                     await self._open()
                     backoff = 1.0
+                    # The daemon forgets our subscription across the
+                    # disconnect — re-arm it before looping back to read.
+                    if self._reconnect_handler is not None:
+                        try:
+                            await self._reconnect_handler()
+                        except Exception:
+                            logger.exception(
+                                "signal-cli reconnect handler failed"
+                            )
                 except ConnectionError:
                     logger.warning(
                         "signal-cli reconnect failed; retrying in %.1fs", backoff,

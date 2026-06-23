@@ -710,21 +710,35 @@ async def _init_signal_inbound(router: Any) -> Any | None:
     """Subscribe to the signal-cli daemon's notification stream, if enabled.
 
     Returns the SignalInbound instance if started, otherwise None.
-    Depends on _init_communication having already connected the
-    SignalClient singleton — this just attaches the subscriber.
+
+    Inbound owns a **dedicated** SignalClient connection (separate from
+    the outbound/send singleton) so its liveness watchdog can recycle the
+    connection on a timer without disturbing in-flight sends. We hand it a
+    factory that builds fresh clients from the same daemon config.
     """
-    from boxbot.communication.signal_client import get_signal_client
+    from boxbot.communication.signal_client import SignalClient
     from boxbot.communication.signal_inbound import SignalInbound
     from boxbot.core.config import get_config
 
-    if not get_config().signal.enabled:
+    config = get_config()
+    if not config.signal.enabled:
         return None
-    client = get_signal_client()
-    if client is None:
-        logger.info("Signal inbound: client not registered; skipping")
+    if not config.api_keys.signal_account:
+        logger.info("Signal inbound: SIGNAL_ACCOUNT not set; skipping")
         return None
 
-    inbound = SignalInbound(router=router, client=client)
+    def _make_client() -> SignalClient:
+        return SignalClient(
+            socket_path=config.signal.socket_path,
+            account=config.api_keys.signal_account,
+            attachments_dir=config.signal.attachments_dir,
+        )
+
+    inbound = SignalInbound(
+        router=router,
+        client_factory=_make_client,
+        refresh_interval=float(config.signal.inbound_refresh_seconds),
+    )
     try:
         await inbound.start()
     except Exception:
@@ -803,10 +817,10 @@ async def _shutdown(
             elif name == "whatsapp_inbound":
                 await instance.stop()
             elif name == "signal_inbound":
+                # instance.stop() closes the dedicated inbound connection;
+                # the outbound/send singleton is separate, so close it here
+                # too so the shutdown chain doesn't leak a connection.
                 await instance.stop()
-                # Inbound holds a reference to the SignalClient; close
-                # the daemon socket here so the agent shutdown chain
-                # doesn't leak a connection.
                 from boxbot.communication.signal_client import (
                     get_signal_client, set_signal_client,
                 )

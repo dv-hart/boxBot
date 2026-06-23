@@ -13,9 +13,10 @@ into that connection.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import deque
-from typing import Any
+from typing import Any, Callable
 
 from boxbot.communication.channels import Channel
 from boxbot.communication.router import MessageRouter
@@ -48,50 +49,147 @@ def _media_category(mime: str | None) -> str | None:
 class SignalInbound:
     """Bridges signal-cli notifications into the MessageRouter.
 
+    Owns a **dedicated** ``SignalClient`` connection used only for the
+    inbound notification stream — separate from the outbound/send client.
+    That separation lets the liveness watchdog recycle the inbound
+    connection on a timer without ever disturbing in-flight sends.
+
+    Why the watchdog exists: in ``--receive-mode on-start`` the daemon
+    auto-pushes inbound messages to connected JSON-RPC clients, but a
+    long-lived client connection can silently stop receiving those pushes
+    after the daemon's receive-websocket to Signal cycles (observed
+    2026-06-10 — inbound went dead for ~12 days while outbound kept
+    working, no error logged). A fresh connection re-arms delivery, so we
+    periodically refresh using make-before-break: a new connection
+    subscribes before the old one is torn down, so there is no window in
+    which a message could slip through unreceived. Dedup covers the brief
+    overlap when both connections are live.
+
     Args:
         router: The MessageRouter that handles channel-agnostic auth and
             event publication.
-        client: The connected ``SignalClient`` whose notification stream
-            we subscribe to.
+        client_factory: Builds a fresh, unconnected ``SignalClient`` for
+            the inbound stream. Called once at ``start`` and again on each
+            watchdog refresh.
+        refresh_interval: Seconds between liveness refreshes. 0 disables
+            the watchdog (the connection is then only re-armed on its own
+            socket reconnects).
         dedup_window: Number of (sender, timestamp) tuples to remember
             for duplicate suppression. signal-cli can re-deliver a
-            message if a JSON-RPC reconnect happens mid-ack. 1024 covers
-            several hours at household-scale volumes.
+            message if a JSON-RPC reconnect happens mid-ack, and the
+            make-before-break overlap can briefly double-deliver. 1024
+            covers several hours at household-scale volumes.
     """
 
     def __init__(
         self,
         *,
         router: MessageRouter,
-        client: SignalClient,
+        client_factory: Callable[[], SignalClient],
+        refresh_interval: float = 900.0,
         dedup_window: int = 1024,
     ) -> None:
         self._router = router
-        self._client = client
+        self._client_factory = client_factory
+        self._refresh_interval = refresh_interval
         self._dedup_window = dedup_window
         self._seen_keys: deque[tuple[str, int]] = deque(maxlen=dedup_window)
         self._seen_set: set[tuple[str, int]] = set()
-        self._subscribed = False
+        self._client: SignalClient | None = None
+        self._watchdog_task: asyncio.Task[None] | None = None
+        self._stopped = asyncio.Event()
 
     async def start(self) -> None:
-        """Wire up the notification handler and subscribe on the daemon."""
-        if self._subscribed:
+        """Connect the dedicated inbound client, subscribe, start watchdog."""
+        if self._client is not None:
             return
-        self._client.set_notification_handler(self._on_notification)
-        # If the client isn't connected yet, connect now. Idempotent.
-        await self._client.connect()
-        await self._client.subscribe_receive()
-        self._subscribed = True
-        logger.info("Signal inbound subscribed (account=%s)", self._client.account)
+        self._stopped.clear()
+        self._client = await self._connect_subscribed()
+        if self._refresh_interval > 0:
+            self._watchdog_task = asyncio.create_task(
+                self._watchdog_loop(), name="signal-inbound-watchdog"
+            )
+        logger.info(
+            "Signal inbound subscribed (account=%s); refresh every %.0fs",
+            self._client.account,
+            self._refresh_interval,
+        )
 
     async def stop(self) -> None:
-        """Detach the notification handler. Does not unsubscribe on the
-        daemon — disconnecting the socket implicitly unsubscribes, and
-        callers that want a clean shutdown should call
-        ``SignalClient.disconnect`` after this.
+        """Stop the watchdog and disconnect the dedicated inbound client."""
+        self._stopped.set()
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("Signal inbound watchdog stop error", exc_info=True)
+            self._watchdog_task = None
+        if self._client is not None:
+            self._client.set_notification_handler(None)
+            self._client.set_reconnect_handler(None)
+            try:
+                await self._client.disconnect()
+            except Exception:
+                logger.debug("Signal inbound client disconnect error", exc_info=True)
+            self._client = None
+
+    # -----------------------------------------------------------------
+    # Connection lifecycle / liveness
+    # -----------------------------------------------------------------
+
+    async def _connect_subscribed(self) -> SignalClient:
+        """Build, connect, and subscribe a fresh inbound client."""
+        client = self._client_factory()
+        client.set_notification_handler(self._on_notification)
+        # Re-arm the subscription if this client's own socket reconnects
+        # (e.g. the daemon restarts) — the daemon forgets it otherwise.
+        client.set_reconnect_handler(client.subscribe_receive)
+        await client.connect()
+        await client.subscribe_receive()
+        return client
+
+    async def _watchdog_loop(self) -> None:
+        """Periodically refresh the inbound connection (make-before-break)."""
+        while not self._stopped.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stopped.wait(), timeout=self._refresh_interval
+                )
+                return  # stopped
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._refresh()
+            except Exception:
+                # Keep the existing connection; try again next cycle.
+                logger.exception(
+                    "Signal inbound refresh failed; keeping current connection"
+                )
+
+    async def _refresh(self) -> None:
+        """Stand up a new subscribed connection, then retire the old one.
+
+        Make-before-break: the new client is connected and subscribed
+        *before* the old one is detached, so there is no instant during
+        which no client is receiving. Any message delivered by both during
+        the overlap is suppressed by dedup.
         """
-        self._client.set_notification_handler(None)
-        self._subscribed = False
+        new_client = await self._connect_subscribed()
+        old_client = self._client
+        self._client = new_client
+        logger.debug("Signal inbound connection refreshed")
+        if old_client is not None:
+            old_client.set_notification_handler(None)
+            old_client.set_reconnect_handler(None)
+            try:
+                await old_client.disconnect()
+            except Exception:
+                logger.debug(
+                    "Signal inbound: old client disconnect error", exc_info=True
+                )
 
     # -----------------------------------------------------------------
     # Notification handling

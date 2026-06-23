@@ -15,13 +15,28 @@ from boxbot.communication.channels import Channel
 from boxbot.communication.signal_inbound import SignalInbound
 
 
-def _make_inbound() -> tuple[SignalInbound, MagicMock]:
-    router = MagicMock()
-    router.route_incoming = AsyncMock(return_value=True)
+def _make_client() -> MagicMock:
+    """A MagicMock SignalClient with async lifecycle methods."""
     client = MagicMock()
     client.account = "+15039858519"
     client.set_notification_handler = MagicMock()
-    inbound = SignalInbound(router=router, client=client)
+    client.set_reconnect_handler = MagicMock()
+    client.connect = AsyncMock()
+    client.disconnect = AsyncMock()
+    client.subscribe_receive = AsyncMock(return_value=1)
+    return client
+
+
+def _make_inbound(
+    *, refresh_interval: float = 0.0
+) -> tuple[SignalInbound, MagicMock]:
+    router = MagicMock()
+    router.route_incoming = AsyncMock(return_value=True)
+    inbound = SignalInbound(
+        router=router,
+        client_factory=_make_client,
+        refresh_interval=refresh_interval,
+    )
     return inbound, router
 
 
@@ -202,3 +217,79 @@ async def test_non_receive_method_ignored():
     msg = {"jsonrpc": "2.0", "method": "control", "params": {}}
     await inbound._on_notification(msg)
     router.route_incoming.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Connection lifecycle / liveness watchdog
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_connects_subscribes_and_arms_reconnect():
+    """start() connects a dedicated client, subscribes, sets handlers."""
+    inbound, _ = _make_inbound(refresh_interval=0.0)  # watchdog off
+    await inbound.start()
+    client = inbound._client
+    assert client is not None
+    client.connect.assert_awaited_once()
+    client.subscribe_receive.assert_awaited()
+    client.set_notification_handler.assert_called_with(inbound._on_notification)
+    # Reconnect handler re-arms the subscription on socket reconnect.
+    client.set_reconnect_handler.assert_called_with(client.subscribe_receive)
+    assert inbound._watchdog_task is None  # disabled at interval 0
+    await inbound.stop()
+
+
+@pytest.mark.asyncio
+async def test_refresh_is_make_before_break():
+    """_refresh subscribes the new client before disconnecting the old."""
+    inbound, _ = _make_inbound(refresh_interval=0.0)
+    await inbound.start()
+    old = inbound._client
+    assert old is not None
+
+    await inbound._refresh()
+
+    new = inbound._client
+    assert new is not old
+    # New client was connected + subscribed...
+    new.connect.assert_awaited_once()
+    new.subscribe_receive.assert_awaited()
+    # ...and only then the old one was detached + disconnected.
+    old.set_notification_handler.assert_called_with(None)
+    old.disconnect.assert_awaited_once()
+    await inbound.stop()
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_keeps_current_connection():
+    """If the new connection can't subscribe, the old one stays in place."""
+    inbound, _ = _make_inbound(refresh_interval=0.0)
+    await inbound.start()
+    old = inbound._client
+
+    # Next factory-built client fails to connect.
+    def _bad_factory() -> MagicMock:
+        c = _make_client()
+        c.connect = AsyncMock(side_effect=ConnectionError("daemon down"))
+        return c
+
+    inbound._client_factory = _bad_factory
+    with pytest.raises(ConnectionError):
+        await inbound._refresh()
+
+    # Old connection untouched and still active.
+    assert inbound._client is old
+    old.disconnect.assert_not_awaited()
+    await inbound.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_disconnects_and_clears_client():
+    inbound, _ = _make_inbound(refresh_interval=0.0)
+    await inbound.start()
+    client = inbound._client
+    await inbound.stop()
+    client.disconnect.assert_awaited_once()
+    client.set_notification_handler.assert_called_with(None)
+    assert inbound._client is None

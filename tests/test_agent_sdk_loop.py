@@ -40,6 +40,7 @@ def _result_message(
     total_cost_usd: float = 0.05,
     is_error: bool = False,
     stop_reason: str | None = "end_turn",
+    structured_output: Any = None,
 ) -> ResultMessage:
     """Build a realistic ResultMessage. All fields populated."""
     return ResultMessage(
@@ -58,7 +59,7 @@ def _result_message(
             "cache_read_input_tokens": 0,
         },
         result=None,
-        structured_output=None,
+        structured_output=structured_output,
         model_usage={
             "claude-opus-4-7-20260415": {
                 "inputTokens": 100,
@@ -256,6 +257,70 @@ async def test_sdk_loop_records_cost_event_on_result_message(mock_config):
     assert ev.purpose == "conversation"
     assert ev.cost_usd == pytest.approx(0.123)
     assert ev.metadata.get("backend") == "claude_agent_sdk"
+
+
+@pytest.mark.asyncio
+async def test_sdk_loop_reads_notes_from_structured_output(mock_config, caplog):
+    """Internal notes come from ResultMessage.structured_output, and a
+    free-form (non-JSON) assistant text block does NOT log a parse error.
+
+    On the claude_agent_sdk backend the schema constrains the run's final
+    structured result, not each text block — so the per-block prose the
+    model emits after a tool call must not be treated as internal-notes
+    JSON (that produced spurious ERROR spam and dropped every thought).
+    """
+    import logging
+    from boxbot.core import config as config_module
+
+    mock_config.agent.backend = "claude_agent_sdk"
+    config_module._config = mock_config
+
+    agent = BoxBotAgent(memory_store=MagicMock())
+
+    fake = _FakeSdkClient(messages=[
+        AssistantMessage(
+            content=[
+                # Free-form prose — exactly what briefing wrap-ups look
+                # like. This used to log "Could not parse internal notes".
+                TextBlock(text="Briefings delivered to Jacob and Carina."),
+                ToolUseBlock(
+                    id="t1",
+                    name=A.mcp_tool_name("message"),
+                    input={"to": "Jacob", "channel": "text", "content": "hi"},
+                ),
+            ],
+            model="opus", parent_tool_use_id=None, error=None, usage=None,
+            message_id="m1", stop_reason=None, session_id="s", uuid="u1",
+        ),
+        _result_message(
+            num_turns=2,
+            structured_output={
+                "thought": "Morning briefing complete.",
+                "observations": ["Calendar pulled cleanly."],
+            },
+        ),
+    ])
+    conv = _FakeConv("c_notes")
+    conv._sdk_client = fake
+
+    with caplog.at_level(logging.INFO, logger="boxbot.core.agent"), \
+            patch("boxbot.core.agent.record_cost", new=AsyncMock()):
+        await agent._agent_loop_sdk(
+            conv=conv,
+            channel="trigger",
+            system_prompt_blocks=[{"type": "text", "text": "sys"}],
+            initial_message="[trigger] morning briefing",
+            person_name=None,
+            max_turns=20,
+            prior_history=None,
+        )
+
+    text = caplog.text
+    # Notes surfaced from structured_output...
+    assert "Morning briefing complete." in text
+    assert "Calendar pulled cleanly." in text
+    # ...and the free-form text block did NOT trigger a parse error.
+    assert "Could not parse internal notes" not in text
 
 
 @pytest.mark.asyncio

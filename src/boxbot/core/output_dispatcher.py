@@ -166,6 +166,42 @@ def parse_internal_notes(raw_text: str) -> ParsedNotes | None:
     return ParsedNotes(thought=thought, observations=observations, raw=raw_text)
 
 
+def parse_structured_notes(value: Any) -> ParsedNotes | None:
+    """Build ``ParsedNotes`` from an SDK ``ResultMessage.structured_output``.
+
+    The two backends surface the ``INTERNAL_NOTES_SCHEMA`` output in
+    different places. On the raw-Anthropic path ``output_config.format``
+    constrains every ``messages.create`` call, so each assistant text
+    block *is* the JSON (use :func:`parse_internal_notes`). On the
+    claude_agent_sdk path the schema is applied to the run's final
+    structured result and returned **already parsed** as
+    ``ResultMessage.structured_output`` (a dict) — the per-turn text
+    blocks are free-form prose, not JSON.
+
+    Accepts a dict directly; tolerates a JSON string for forward-compat;
+    returns ``None`` for anything else (including ``None``).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return parse_internal_notes(value)
+    if not isinstance(value, dict):
+        logger.warning(
+            "structured_output is not a dict: %r", type(value).__name__
+        )
+        return None
+    thought = str(value.get("thought") or "")
+    obs_raw = value.get("observations")
+    observations: list[str] = []
+    if isinstance(obs_raw, list):
+        for entry in obs_raw:
+            if isinstance(entry, str) and entry.strip():
+                observations.append(entry)
+    return ParsedNotes(
+        thought=thought, observations=observations, raw=json.dumps(value)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------

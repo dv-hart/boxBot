@@ -105,6 +105,7 @@ from boxbot.perception.presence import (
 from boxbot.core.output_dispatcher import (
     INTERNAL_NOTES_SCHEMA,
     parse_internal_notes,
+    parse_structured_notes,
 )
 from boxbot.core.scheduler import get_status_line
 from boxbot.memory.batch_poller import BatchPoller
@@ -3020,33 +3021,19 @@ class BoxBotAgent:
                         assistant_content: list[dict[str, Any]] = []
                         for block in sdk_msg.content:
                             if isinstance(block, TextBlock):
+                                # On the claude_agent_sdk backend the
+                                # INTERNAL_NOTES_SCHEMA is applied to the
+                                # run's final structured result
+                                # (ResultMessage.structured_output, read
+                                # below) — NOT to each assistant text
+                                # block. These blocks are the model's
+                                # free-form private prose; keep them in
+                                # history for context but do not try to
+                                # parse them as internal-notes JSON.
                                 assistant_content.append({
                                     "type": "text",
                                     "text": block.text,
                                 })
-                                parsed = parse_internal_notes(block.text)
-                                if parsed is None:
-                                    if block.text.strip():
-                                        logger.error(
-                                            "Could not parse internal "
-                                            "notes JSON (conv=%s). "
-                                            "First 200 chars: %r",
-                                            conv.conversation_id,
-                                            block.text[:200],
-                                        )
-                                    continue
-                                if parsed.thought:
-                                    logger.info(
-                                        "agent thought (conv=%s): %s",
-                                        conv.conversation_id,
-                                        parsed.thought,
-                                    )
-                                if parsed.observations:
-                                    logger.info(
-                                        "agent observations (conv=%s): %s",
-                                        conv.conversation_id,
-                                        " | ".join(parsed.observations),
-                                    )
                             elif isinstance(block, ToolUseBlock):
                                 # Track whether the model dispatched a
                                 # message tool at any point. The SDK
@@ -3069,6 +3056,26 @@ class BoxBotAgent:
                             })
                     elif isinstance(sdk_msg, ResultMessage):
                         turn_count = sdk_msg.num_turns or 0
+                        # Internal notes (thought + observations) live in
+                        # the schema-constrained structured output, not the
+                        # free-form text blocks. Log them the same way the
+                        # raw path logs its per-turn notes; they also feed
+                        # post-conversation memory extraction via the thread.
+                        notes = parse_structured_notes(
+                            getattr(sdk_msg, "structured_output", None)
+                        )
+                        if notes is not None:
+                            if notes.thought:
+                                logger.info(
+                                    "agent thought (conv=%s): %s",
+                                    conv.conversation_id, notes.thought,
+                                )
+                            if notes.observations:
+                                logger.info(
+                                    "agent observations (conv=%s): %s",
+                                    conv.conversation_id,
+                                    " | ".join(notes.observations),
+                                )
                         # The whole receive_response() loop runs inside
                         # one latency.span("api") above, which records
                         # one wall-clock duration with count=1. The SDK

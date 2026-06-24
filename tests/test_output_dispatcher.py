@@ -10,6 +10,7 @@ from boxbot.core.output_dispatcher import (
     DispatchResult,
     dispatch_outputs,
     parse_internal_notes,
+    parse_structured_notes,
 )
 
 
@@ -92,6 +93,51 @@ class TestParseInternalNotes:
         parsed = parse_internal_notes(raw)
         assert parsed is not None
         assert parsed.observations == ["kept", "also kept"]
+
+
+# ---------------------------------------------------------------------------
+# parse_structured_notes — the claude_agent_sdk ResultMessage.structured_output
+# path, where the schema output arrives already parsed as a dict.
+# ---------------------------------------------------------------------------
+
+
+class TestParseStructuredNotes:
+
+    def test_dict_is_parsed_directly(self):
+        parsed = parse_structured_notes({
+            "thought": "briefing delivered",
+            "observations": ["calendar pulled cleanly"],
+        })
+        assert parsed is not None
+        assert parsed.thought == "briefing delivered"
+        assert parsed.observations == ["calendar pulled cleanly"]
+
+    def test_none_returns_none(self):
+        # The common case when a run produces no structured output.
+        assert parse_structured_notes(None) is None
+
+    def test_missing_observations_is_empty(self):
+        parsed = parse_structured_notes({"thought": "ok"})
+        assert parsed is not None
+        assert parsed.observations == []
+
+    def test_non_string_observations_are_skipped(self):
+        parsed = parse_structured_notes(
+            {"thought": "", "observations": [1, "kept", None, "also"]}
+        )
+        assert parsed is not None
+        assert parsed.observations == ["kept", "also"]
+
+    def test_json_string_is_tolerated(self):
+        parsed = parse_structured_notes(
+            json.dumps({"thought": "via string", "observations": []})
+        )
+        assert parsed is not None
+        assert parsed.thought == "via string"
+
+    def test_unexpected_type_returns_none(self):
+        assert parse_structured_notes([1, 2, 3]) is None
+        assert parse_structured_notes(42) is None
 
 
 # ---------------------------------------------------------------------------

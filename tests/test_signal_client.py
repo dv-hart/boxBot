@@ -159,3 +159,87 @@ def test_phone_normalisation_adds_leading_plus_for_e164():
     assert _to_e164("15035086292") == "+15035086292"
     assert _to_e164("+15035086292") == "+15035086292"
     assert _to_e164("  15035086292  ") == "+15035086292"
+
+
+class _FakeReader:
+    """StreamReader stand-in driven by an in-process queue of frames."""
+
+    def __init__(self) -> None:
+        self._q: asyncio.Queue[bytes] = asyncio.Queue()
+
+    def feed(self, line: bytes) -> None:
+        self._q.put_nowait(line)
+
+    async def readline(self) -> bytes:
+        return await self._q.get()
+
+
+class _FakeWriter:
+    def __init__(self, on_write) -> None:
+        self._on_write = on_write
+
+    def write(self, data: bytes) -> None:
+        self._on_write(data)
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_reconnect_handler_runs_concurrently_without_deadlock():
+    """Regression: re-subscribe on reconnect must not deadlock the reader.
+
+    The reconnect handler issues a JSON-RPC request (``subscribeReceive``)
+    and awaits the daemon's reply — but only ``_read_loop`` can read and
+    dispatch that reply. If the loop awaits the handler inline, the
+    response is never read and the request times out, leaving the
+    reconnected client subscribed to nothing (the bug that left Signal
+    deaf after a daemon restart). The handler must run concurrently.
+    """
+    client = _make_client()
+
+    reader = _FakeReader()
+
+    def on_write(data: bytes) -> None:
+        # Daemon side: answer subscribeReceive so the in-flight request
+        # can resolve once the read loop reads this frame.
+        msg = json.loads(data.decode())
+        if msg.get("method") == "subscribeReceive":
+            reader.feed(
+                (json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": 99}) + "\n").encode()
+            )
+
+    writer = _FakeWriter(on_write)
+
+    async def fake_open() -> None:
+        client._reader = reader
+        client._writer = writer
+
+    client._open = fake_open  # type: ignore[assignment]
+
+    subscribed = asyncio.Event()
+    sub_ids: list[int] = []
+
+    async def reconnect_handler() -> None:
+        sub_ids.append(await client.subscribe_receive())
+        subscribed.set()
+
+    client.set_reconnect_handler(reconnect_handler)
+
+    # Force the open branch so the loop reconnects and arms the handler.
+    client._reader = None
+    task = asyncio.create_task(client._read_loop())
+
+    # Inline-await would deadlock here and never set the event.
+    await asyncio.wait_for(subscribed.wait(), timeout=2.0)
+    assert sub_ids == [99]
+
+    client._stopped.set()
+    reader.feed(b"")  # EOF unblocks readline so the loop can exit
+    await asyncio.wait_for(task, timeout=2.0)

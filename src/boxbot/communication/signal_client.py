@@ -103,6 +103,7 @@ class SignalClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
 
         self._next_id = 1
@@ -157,6 +158,9 @@ class SignalClient:
     async def disconnect(self) -> None:
         """Close the connection and stop the reader task."""
         self._stopped.set()
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         if self._writer is not None:
             try:
                 self._writer.close()
@@ -190,6 +194,31 @@ class SignalClient:
             ) from e
         logger.info("signal-cli daemon connected via %s", self._socket_path)
 
+    def _spawn_reconnect_task(self) -> None:
+        """Run the reconnect handler concurrently with the read loop.
+
+        Must not be awaited from inside ``_read_loop`` — see the caller.
+        Any prior reconnect task is cancelled first so overlapping
+        reconnects can't race two ``subscribeReceive`` calls.
+        """
+        handler = self._reconnect_handler
+        if handler is None:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+
+        async def _run() -> None:
+            try:
+                await handler()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("signal-cli reconnect handler failed")
+
+        self._reconnect_task = asyncio.create_task(
+            _run(), name="signal-cli-resubscribe"
+        )
+
     async def _read_loop(self) -> None:
         """Read JSON-RPC frames from the daemon, dispatch by id or method.
 
@@ -205,14 +234,15 @@ class SignalClient:
                     await self._open()
                     backoff = 1.0
                     # The daemon forgets our subscription across the
-                    # disconnect — re-arm it before looping back to read.
+                    # disconnect — re-arm it. Do NOT await it here: the
+                    # handler issues a JSON-RPC request (subscribeReceive)
+                    # and waits for the daemon's reply, but only THIS read
+                    # loop can read and dispatch that reply. Awaiting inline
+                    # deadlocks until the request times out, leaving the
+                    # reconnected client subscribed to nothing. Schedule it
+                    # so we loop back to readline() and resolve its response.
                     if self._reconnect_handler is not None:
-                        try:
-                            await self._reconnect_handler()
-                        except Exception:
-                            logger.exception(
-                                "signal-cli reconnect handler failed"
-                            )
+                        self._spawn_reconnect_task()
                 except ConnectionError:
                     logger.warning(
                         "signal-cli reconnect failed; retrying in %.1fs", backoff,

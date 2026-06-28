@@ -247,8 +247,26 @@ def build_options(
     """
     from claude_agent_sdk import ClaudeAgentOptions
 
+    from boxbot.core.config import get_config
+
     mcp_server = build_mcp_server(tools, conv=conv)
     allowed = [mcp_tool_name(t.name) for t in tools]
+
+    # Route the main conversation turn through the Claude subscription
+    # (OAuth) credit rather than the metered API key. The spawned CLI
+    # subprocess inherits the parent environment, and Claude Code prefers
+    # ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN when both are present
+    # — so we must explicitly hand the subprocess the OAuth token and
+    # blank the API key for that process only. The parent process keeps
+    # its real ANTHROPIC_API_KEY for all peripheral/batch work (memory
+    # rerank, dream/batch pollers, web_search firewall, photo tagging),
+    # which has no subscription path. ``env`` is merged on top of the
+    # inherited environment; an empty ANTHROPIC_API_KEY reads as unset.
+    env: dict[str, str] = {}
+    oauth_token = get_config().api_keys.claude_code_oauth_token
+    if oauth_token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+        env["ANTHROPIC_API_KEY"] = ""
 
     return ClaudeAgentOptions(
         model=model,
@@ -258,6 +276,7 @@ def build_options(
         allowed_tools=allowed,
         output_format=output_format,
         can_use_tool=can_use_tool,
+        env=env,
     )
 
 

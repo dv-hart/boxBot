@@ -304,6 +304,33 @@ sdk:
   # (display code is generated from declarative specs but runs in main process)
   auto_activate_displays: false
 
+# ── Prefetch layer ────────────────────────────────────────────────────
+# A small read-only mini-agent (Haiku) that pre-assembles the context the
+# main agent will likely need into its first turn — relevant memories,
+# skills, workspace docs, message history, pulled calendar/weather — to
+# cut repeat tool-call turns and context bloat.
+#
+# Ships disabled. Enable in "shadow" mode first: it runs and logs what it
+# WOULD prefetch (into the prefetch_events table) but injects nothing, so
+# the offline harness (scripts/prefetch_analysis.py) can prove precision
+# before you flip to "active". shadow -> active is a one-line change here
+# plus a restart — no redeploy.
+prefetch:
+  enabled: false
+  mode: shadow            # shadow (log only) | active (inject bundles)
+  # Channels that get prefetch. Voice is deferred from v1 (latency-
+  # sensitive + ephemeral); its tool usage is still logged regardless.
+  channels: [whatsapp, signal, trigger]
+  # Scheduled triggers: precompute this many minutes before fire_at.
+  # Keep small so pulled data (calendar/weather) isn't stale at fire.
+  lookahead_minutes: 5
+  # Hard cap on the assembled bundle — the point is to REDUCE bloat.
+  token_budget: 1500
+  timeout_seconds: 8.0
+  max_iterations: 6
+  # Override the mini-agent model; null falls back to models.small (Haiku).
+  model: null
+
 # ── WhatsApp ──────────────────────────────────────────────────────────
 # WhatsApp credentials live in a separate file: config/whatsapp.yaml
 # (see config/whatsapp.example.yaml). The lifecycle settings below

@@ -59,8 +59,9 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -76,6 +77,8 @@ from boxbot.cost import (
     from_anthropic_usage,
     record as record_cost,
 )
+from boxbot.telemetry import ToolInvocation, record_tool_invocation
+from boxbot import prefetch as prefetch_layer
 from boxbot.core.conversation import (
     Conversation,
     ConversationState,
@@ -94,6 +97,7 @@ from boxbot.core.events import (
     SpeakerIdentified,
     TranscriptReady,
     TriggerFired,
+    TriggerUpcoming,
     VoiceSessionEnded,
     WhatsAppMessage,
     get_event_bus,
@@ -1118,6 +1122,7 @@ class BoxBotAgent:
         bus.subscribe(WhatsAppMessage, self._on_whatsapp_message)
         bus.subscribe(SignalMessage, self._on_signal_message)
         bus.subscribe(TriggerFired, self._on_trigger_fired)
+        bus.subscribe(TriggerUpcoming, self._on_trigger_upcoming)
         bus.subscribe(PersonIdentified, self._on_person_identified)
         bus.subscribe(PersonIdentified, self._on_presence_event)
         bus.subscribe(PersonDetected, self._on_presence_event)
@@ -1168,6 +1173,7 @@ class BoxBotAgent:
         bus.unsubscribe(WhatsAppMessage, self._on_whatsapp_message)
         bus.unsubscribe(SignalMessage, self._on_signal_message)
         bus.unsubscribe(TriggerFired, self._on_trigger_fired)
+        bus.unsubscribe(TriggerUpcoming, self._on_trigger_upcoming)
         bus.unsubscribe(PersonIdentified, self._on_person_identified)
         bus.unsubscribe(PersonIdentified, self._on_presence_event)
         bus.unsubscribe(PersonDetected, self._on_presence_event)
@@ -1435,6 +1441,9 @@ class BoxBotAgent:
             lifecycle_mode=lifecycle_mode,
             thread_window_seconds=thread_window,
         )
+        prefetch_ctx = await self._prefetch_context_for_text(
+            conv, "whatsapp", event.sender_name or None, text,
+        )
         await conv.handle_input(
             text,
             speaker_name=event.sender_name or None,
@@ -1444,6 +1453,7 @@ class BoxBotAgent:
                 "media_url": event.media_url,
                 "media_type": event.media_type,
                 "attachment_path": str(attachment_path) if attachment_path else None,
+                **prefetch_ctx,
             },
         )
 
@@ -1491,6 +1501,9 @@ class BoxBotAgent:
             lifecycle_mode=lifecycle_mode,
             thread_window_seconds=thread_window,
         )
+        prefetch_ctx = await self._prefetch_context_for_text(
+            conv, "signal", event.sender_name or None, text,
+        )
         await conv.handle_input(
             text,
             speaker_name=event.sender_name or None,
@@ -1500,8 +1513,140 @@ class BoxBotAgent:
                 "media_url": event.media_url,
                 "media_type": event.media_type,
                 "attachment_path": str(attachment_path) if attachment_path else None,
+                **prefetch_ctx,
             },
         )
+
+    async def _run_prefetch(
+        self, req: "prefetch_layer.PrefetchRequest",
+    ) -> "prefetch_layer.PrefetchBundle | None":
+        """Run the prefetch mini-agent for one request (both modes).
+
+        Always logs a prefetch_event (shadow and active) so the offline
+        harness can measure precision. Returns the assembled bundle so
+        callers can inject/cache it — but ONLY the caller decides whether
+        to use it, gated on ``prefetch_layer.is_active()``. Best-effort:
+        any failure returns None and never disturbs the conversation.
+        """
+        if not prefetch_layer.should_prefetch(req.channel):
+            return None
+        client = prefetch_layer.resolve_client()
+        if client is None:
+            return None
+        cfg = prefetch_layer.get_prefetch_config()
+        timeout = float(getattr(cfg, "timeout_seconds", 8.0))
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                prefetch_layer.run_prefetch(
+                    req, store=self._memory_store, client=client, config=cfg,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("prefetch timed out (key=%s)", req.key)
+            return None
+        except Exception:
+            logger.exception("prefetch failed (key=%s)", req.key)
+            return None
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        try:
+            await prefetch_layer.record_prefetch_event(
+                self._memory_store,
+                key=req.key,
+                key_kind=req.key_kind,
+                channel=req.channel,
+                mode=prefetch_layer.prefetch_mode(),
+                bundle=result.bundle,
+                latency_ms=latency_ms,
+                cost_usd=result.cost_usd,
+            )
+        except Exception:
+            logger.debug("prefetch_event write failed", exc_info=True)
+        return result.bundle
+
+    async def _prefetch_context_for_text(
+        self, conv: Conversation, channel: str, sender_name: str | None,
+        text: str,
+    ) -> dict[str, Any]:
+        """Build the extra context dict entries from a text-channel prefetch.
+
+        Returns ``{"prefetch_bundle": bundle}`` when active and the bundle
+        is non-empty, else ``{}``. Runs the mini-agent (shadow logs only).
+        """
+        try:
+            req = prefetch_layer.PrefetchRequest(
+                key=conv.conversation_id,
+                key_kind="conversation",
+                channel=channel,
+                person=sender_name,
+                text=text,
+                recent_thread_tail=list(conv.thread) or None,
+            )
+            bundle = await self._run_prefetch(req)
+        except Exception:
+            logger.debug("text prefetch failed", exc_info=True)
+            return {}
+        if (
+            bundle is not None
+            and prefetch_layer.is_active()
+            and not bundle.is_empty()
+        ):
+            return {"prefetch_bundle": bundle}
+        return {}
+
+    async def _load_todo_notes(self, todo_id: str | None) -> str | None:
+        """Fetch detailed notes for a linked to-do (for prefetch context)."""
+        if not todo_id:
+            return None
+        try:
+            from boxbot.core.scheduler import get_todo
+
+            rec = await get_todo(todo_id)
+            if rec is None:
+                return None
+            if isinstance(rec, dict):
+                return rec.get("notes")
+            return getattr(rec, "notes", None)
+        except Exception:
+            return None
+
+    async def _on_trigger_upcoming(self, event: TriggerUpcoming) -> None:
+        """Precompute a prefetch bundle before a scheduled trigger fires.
+
+        Runs the mini-agent at T-minus-N and (active mode only) caches the
+        bundle so :meth:`_on_trigger_fired` can inject it. Shadow mode
+        still runs + logs so the offline harness sees trigger predictions.
+        """
+        if event.description.startswith("[dream-cycle]"):
+            return
+        req = prefetch_layer.PrefetchRequest(
+            key=event.trigger_id,
+            key_kind="trigger",
+            channel="trigger",
+            person=event.for_person,
+            text=(
+                f"{event.description}\nInstructions: {event.instructions}"
+            ),
+            todo_notes=await self._load_todo_notes(event.todo_id),
+        )
+        bundle = await self._run_prefetch(req)
+        if (
+            bundle is None
+            or bundle.is_empty()
+            or not prefetch_layer.is_active()
+        ):
+            return
+        try:
+            expires = datetime.now(timezone.utc) + timedelta(minutes=20)
+            await prefetch_layer.cache_put(
+                self._memory_store,
+                trigger_id=event.trigger_id,
+                bundle=bundle,
+                expires_at=expires,
+            )
+        except Exception:
+            logger.debug("prefetch cache_put failed", exc_info=True)
 
     async def _on_trigger_fired(self, event: TriggerFired) -> None:
         """Create a one-shot conversation from a scheduler trigger.
@@ -1543,17 +1688,41 @@ class BoxBotAgent:
             # keeps them from lingering after the agent's response.
             silence_timeout=10.0,
         )
+
+        # Pick up any bundle precomputed at T-minus-N by the prefetch
+        # layer (active mode only). Stamp the minted conversation_id back
+        # into the cache so the offline harness can bridge trigger_id ->
+        # conversation_id when joining prefetch_events to tool_invocations.
+        prefetch_bundle = None
+        if prefetch_layer.is_active():
+            try:
+                prefetch_bundle = await prefetch_layer.cache_get(
+                    self._memory_store, event.trigger_id,
+                )
+                if prefetch_bundle is not None:
+                    await prefetch_layer.cache_stamp_conversation(
+                        self._memory_store, event.trigger_id,
+                        conv.conversation_id,
+                    )
+            except Exception:
+                logger.debug("prefetch cache_get failed", exc_info=True)
+                prefetch_bundle = None
+
+        trigger_context: dict[str, Any] = {
+            "trigger_id": event.trigger_id,
+            "trigger_description": event.description,
+            "is_recurring": event.is_recurring,
+            "person": event.person,
+            "todo_id": event.todo_id,
+        }
+        if prefetch_bundle is not None:
+            trigger_context["prefetch_bundle"] = prefetch_bundle
+
         await conv.handle_input(
             initial_msg,
             speaker_name=event.for_person,
             source="trigger",
-            context={
-                "trigger_id": event.trigger_id,
-                "trigger_description": event.description,
-                "is_recurring": event.is_recurring,
-                "person": event.person,
-                "todo_id": event.todo_id,
-            },
+            context=trigger_context,
         )
 
     async def _run_dream_cycle_for_trigger(self, event: TriggerFired) -> None:
@@ -2527,6 +2696,31 @@ class BoxBotAgent:
                     + "\n".join(f"- {line}" for line in trigger_lines)
                 )
 
+        # Prefetched bundle — the prefetch layer pre-assembled likely-
+        # needed context for this turn (active mode only; in shadow mode
+        # no bundle is ever attached to the context dict).
+        prefetch_bundle = context.get("prefetch_bundle") if context else None
+        if prefetch_bundle is not None:
+            try:
+                pf_cfg = prefetch_layer.get_prefetch_config()
+                token_budget = (
+                    int(getattr(pf_cfg, "token_budget", 1500))
+                    if pf_cfg else 1500
+                )
+                rendered = prefetch_bundle.render(token_budget=token_budget)
+                if rendered.strip():
+                    sections.append(rendered)
+                # Record prefetched memory IDs on the conversation so
+                # post-conversation extraction knows the model saw them.
+                if conv is not None:
+                    seen = set(conv.accessed_memory_ids)
+                    for mid in prefetch_bundle.predicted_memory_ids():
+                        if mid not in seen:
+                            conv.accessed_memory_ids.append(mid)
+                            seen.add(mid)
+            except Exception:
+                logger.debug("prefetch render failed", exc_info=True)
+
         # Injected memories
         memory_block, surfaced_ids = await self._inject_memories(
             person_name=person_name,
@@ -2821,6 +3015,7 @@ class BoxBotAgent:
                 with latency.span(conversation_id, "tools"):
                     tool_results = await self._process_tool_calls(
                         response, tools, conversation_id=conversation_id,
+                        turn_number=turn_count, channel=channel,
                     )
                 # Inject-don't-interrupt: drain any utterances that
                 # arrived during this iteration's API call + tool
@@ -3057,6 +3252,38 @@ class BoxBotAgent:
                                 })
                                 if block.name == message_tool_full_name:
                                     message_dispatched = True
+                                # Lower-fidelity telemetry: the SDK runs
+                                # tools inside its own MCP server, so we
+                                # see only the dispatched call, not its
+                                # latency or result. Full fidelity here
+                                # needs an SDK PostToolUse hook (deferred
+                                # phase). Best-effort — never break the
+                                # loop.
+                                try:
+                                    await record_tool_invocation(
+                                        self._memory_store,
+                                        ToolInvocation(
+                                            tool_name=block.name,
+                                            conversation_id=conv.conversation_id,
+                                            channel=channel,
+                                            turn_number=None,
+                                            tool_input=block.input
+                                            if isinstance(block.input, dict)
+                                            else None,
+                                            result_status="dispatched",
+                                            latency_ms=None,
+                                            metadata={
+                                                "backend": "claude_agent_sdk",
+                                            },
+                                        ),
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "tool_invocations write failed "
+                                        "(sdk conv=%s tool=%s)",
+                                        conv.conversation_id, block.name,
+                                        exc_info=True,
+                                    )
                         if assistant_content:
                             messages.append({
                                 "role": "assistant",
@@ -3257,6 +3484,8 @@ class BoxBotAgent:
         tools: list[Any],
         *,
         conversation_id: str | None = None,
+        turn_number: int | None = None,
+        channel: str | None = None,
     ) -> list[dict[str, Any]]:
         """Dispatch tool calls from a model response.
 
@@ -3305,13 +3534,16 @@ class BoxBotAgent:
             )
 
             tool = get_tool(tool_name)
+            _t0 = time.monotonic()
             if tool is None:
                 result_content: Any = json.dumps({
                     "error": f"Unknown tool: {tool_name}",
                 })
                 logger.warning("Unknown tool requested: %s", tool_name)
+                _status = "unknown_tool"
             else:
                 token = current_conversation.set(conv)
+                _status = "ok"
                 try:
                     result_content = await tool.execute(**tool_input)
                 except Exception as e:
@@ -3321,8 +3553,33 @@ class BoxBotAgent:
                     result_content = json.dumps({
                         "error": f"Tool execution failed: {e}",
                     })
+                    _status = "error"
                 finally:
                     current_conversation.reset(token)
+
+            # Best-effort telemetry — one row per tool call, every
+            # channel (voice included). Never let a logging failure break
+            # the turn (mirrors the record_cost try/except above).
+            try:
+                await record_tool_invocation(
+                    self._memory_store,
+                    ToolInvocation(
+                        tool_name=tool_name,
+                        conversation_id=conversation_id,
+                        channel=channel,
+                        turn_number=turn_number,
+                        tool_input=tool_input if isinstance(tool_input, dict)
+                        else None,
+                        result_status=_status,
+                        latency_ms=int((time.monotonic() - _t0) * 1000),
+                        metadata={"backend": "raw"},
+                    ),
+                )
+            except Exception:
+                logger.debug(
+                    "tool_invocations write failed (conv=%s tool=%s)",
+                    conversation_id, tool_name, exc_info=True,
+                )
 
             tool_results.append({
                 "type": "tool_result",

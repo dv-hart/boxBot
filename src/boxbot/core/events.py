@@ -214,6 +214,28 @@ class TriggerFired(Event):
 
 
 @dataclass(frozen=True)
+class TriggerUpcoming(Event):
+    """A time-based trigger will fire within the prefetch lookahead window.
+
+    Emitted once per (current) fire_at so the agent can precompute a
+    prefetch bundle before the trigger actually fires. Carries the same
+    fields as TriggerFired plus the resolved fire_at.
+
+    Source: Scheduler
+    Consumers: Agent (prefetch layer)
+    """
+
+    trigger_id: str = ""
+    description: str = ""
+    instructions: str = ""
+    person: str | None = None
+    for_person: str | None = None
+    todo_id: str | None = None
+    is_recurring: bool = False
+    fire_at: str = ""
+
+
+@dataclass(frozen=True)
 class ConversationStarted(Event):
     """Agent began a conversation (voice or WhatsApp).
 

@@ -275,6 +275,64 @@ CREATE TABLE IF NOT EXISTS cost_log (
     metadata                 TEXT                           -- JSON: conversation_id, batch_id, etc.
 );
 
+-- Append-only log of every tool call the agent makes, one row per
+-- invocation, across every channel (voice included). Ground truth for
+-- the prefetch layer: which searches/loads happened, in what turn, and
+-- whether a repeat could have been avoided. Joins to cost_log and the
+-- conversation stores on conversation_id. prefetch_attribution is null
+-- until an active-mode matcher or the offline harness fills it in.
+CREATE TABLE IF NOT EXISTS tool_invocations (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp              TEXT NOT NULL,
+    conversation_id        TEXT,                    -- join key (= cost_log.correlation_id)
+    channel                TEXT,                    -- voice|whatsapp|signal|trigger
+    turn_number            INTEGER,                 -- agentic-loop iteration index
+    tool_name              TEXT NOT NULL,
+    tool_input_redacted    TEXT,                    -- secrets stripped, truncated ~200 chars
+    result_status          TEXT,                    -- ok|error|unknown_tool|dispatched
+    latency_ms             INTEGER,
+    prefetch_attribution   TEXT,                    -- hit|miss|satisfiable (filled later)
+    metadata               TEXT                     -- JSON: backend, sdk actions, etc.
+);
+
+-- One row per prefetch run (shadow or active). Records what the
+-- prefetcher PREDICTED the agent would need. The offline harness joins
+-- this to tool_invocations on conversation_id to compute hit-rate
+-- (did the agent fetch what we predicted?) and precision (did the
+-- agent use what we prefetched?). For scheduled triggers the run is
+-- keyed by trigger_id at T-minus-N; the minted conversation_id is
+-- back-filled via prefetch_cache at fire time.
+CREATE TABLE IF NOT EXISTS prefetch_events (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp                   TEXT NOT NULL,
+    key                         TEXT NOT NULL,       -- conversation_id or trigger_id
+    key_kind                    TEXT,                -- conversation | trigger
+    channel                     TEXT,
+    mode                        TEXT NOT NULL,       -- shadow | active
+    predicted_memory_ids        TEXT,                -- JSON list
+    predicted_skills            TEXT,                -- JSON list of skill names inlined
+    predicted_workspace_paths   TEXT,                -- JSON list
+    predicted_integration_calls TEXT,               -- JSON: [{source, action, pulled_at}]
+    bundle_token_estimate       INTEGER,
+    prefetch_latency_ms         INTEGER,
+    prefetch_cost_usd           REAL,
+    note                        TEXT,                -- 'what you'll likely need' (truncated)
+    pulled_at                   TEXT
+);
+
+-- Precomputed bundles for scheduled triggers, produced T-minus-N before
+-- fire_at and consumed by _on_trigger_fired. Survives restart (the
+-- lookahead may straddle a deploy). TTL via expires_at; conversation_id
+-- is stamped at fire time so the offline harness can bridge
+-- trigger_id -> conversation_id.
+CREATE TABLE IF NOT EXISTS prefetch_cache (
+    trigger_id       TEXT PRIMARY KEY,
+    bundle_json      TEXT NOT NULL,
+    pulled_at        TEXT NOT NULL,
+    expires_at       TEXT NOT NULL,
+    conversation_id  TEXT
+);
+
 -- Small key/value scratch for cross-run dream-phase state (e.g. the
 -- watermark of the last processed memory window). Avoids a misaligned
 -- "since midnight" window that left a daily blind spot.
@@ -293,6 +351,10 @@ CREATE INDEX IF NOT EXISTS idx_pending_purge ON pending_extractions(transcript_p
 CREATE INDEX IF NOT EXISTS idx_pending_dreams_status ON pending_dreams(status);
 CREATE INDEX IF NOT EXISTS idx_cost_log_timestamp ON cost_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_cost_log_purpose ON cost_log(purpose);
+CREATE INDEX IF NOT EXISTS idx_tool_inv_conv ON tool_invocations(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_tool_inv_ts ON tool_invocations(timestamp);
+CREATE INDEX IF NOT EXISTS idx_prefetch_events_key ON prefetch_events(key);
+CREATE INDEX IF NOT EXISTS idx_prefetch_cache_conv ON prefetch_cache(conversation_id);
 """
 
 FTS_SCHEMA_SQL = """

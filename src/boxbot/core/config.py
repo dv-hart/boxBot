@@ -712,6 +712,42 @@ class ModelsConfig(BaseModel):
     small: str = "claude-haiku-4-5-20251001"
 
 
+class PrefetchConfig(BaseModel):
+    """Prefetch layer — a small read-only mini-agent that pre-assembles
+    the context the main agent will likely need into its first turn.
+
+    Ships disabled. When enabled it runs in ``shadow`` mode first: it
+    logs what it *would* prefetch (into ``prefetch_events``) but injects
+    nothing, so the offline analysis harness can prove precision before
+    ``active`` mode starts actually injecting bundles. The shadow→active
+    flip is a one-line change here + restart, no redeploy.
+    """
+
+    enabled: bool = False
+    # shadow: run + log predictions, inject nothing.
+    # active: inject the assembled bundle into the first turn.
+    mode: str = "shadow"
+    # Which channels get prefetch. Voice is deferred from v1 (latency-
+    # sensitive + ephemeral) but its tool usage is still logged by the
+    # telemetry layer regardless of this list.
+    channels: list[str] = Field(
+        default_factory=lambda: ["whatsapp", "signal", "trigger"]
+    )
+    # Scheduled triggers: run the precompute this many minutes before
+    # fire_at. Small by default so pulled data (calendar/weather) isn't
+    # stale at fire; the bundle stamps pull-time regardless.
+    lookahead_minutes: int = 5
+    # Hard cap on the assembled bundle. The whole point is to REDUCE
+    # bloat, so the bundle is truncated to this budget by priority.
+    token_budget: int = 1500
+    # Wall-clock ceiling for one prefetch run (mini-agent loop).
+    timeout_seconds: float = 8.0
+    # Max mini-agent iterations before it must return best-effort.
+    max_iterations: int = 6
+    # Override the model; null falls back to ``models.small`` (Haiku).
+    model: str | None = None
+
+
 class ApiKeysConfig(BaseModel):
     """API keys and secrets (populated from env vars, never from YAML).
 
@@ -833,6 +869,7 @@ class BoxBotConfig(BaseModel):
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     sdk: SDKConfig = Field(default_factory=SDKConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    prefetch: PrefetchConfig = Field(default_factory=PrefetchConfig)
     api_keys: ApiKeysConfig = Field(default_factory=ApiKeysConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)

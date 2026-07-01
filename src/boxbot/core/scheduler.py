@@ -40,6 +40,7 @@ from boxbot.core.events import (
     PersonDetected,
     PersonIdentified,
     TriggerFired,
+    TriggerUpcoming,
     get_event_bus,
 )
 from boxbot.core.paths import SCHEDULER_DIR
@@ -875,6 +876,10 @@ class Scheduler:
         # appeared) so "greet the next person" feels instant.
         self._last_any_person_check: datetime | None = None
         self._any_person_check_interval = timedelta(seconds=2)
+        # Trigger ids we've already emitted a TriggerUpcoming for (for the
+        # current fire_at). Cleared when the trigger fires so a recurring
+        # trigger's next occurrence gets prefetched again.
+        self._prefetch_signaled: set[str] = set()
 
     async def start(self) -> None:
         """Start the background scheduler loop and event subscriptions."""
@@ -922,6 +927,7 @@ class Scheduler:
         while self._running:
             try:
                 self._refresh_present_people()
+                await self._check_upcoming_triggers()
                 await self._check_time_triggers()
 
                 # Run expiry sweep once per hour
@@ -1007,6 +1013,57 @@ class Scheduler:
             if evaluate_trigger(trigger, self._present_people):
                 await self._fire_trigger(trigger)
 
+    async def _check_upcoming_triggers(self) -> None:
+        """Emit TriggerUpcoming for time-triggers about to fire.
+
+        The prefetch layer listens for these and precomputes a bundle at
+        T-minus-``lookahead_minutes``. Only time-based (fire_at) triggers
+        qualify — person-only triggers have no reliable lead time. Gated
+        on ``config.prefetch`` so this is a no-op when prefetch is off or
+        excludes the trigger channel. Emits at most once per fire_at.
+        """
+        config = _try_get_config()
+        prefetch = getattr(config, "prefetch", None) if config else None
+        if (
+            prefetch is None
+            or not getattr(prefetch, "enabled", False)
+            or "trigger" not in getattr(prefetch, "channels", [])
+        ):
+            return
+
+        lookahead = timedelta(
+            minutes=float(getattr(prefetch, "lookahead_minutes", 5))
+        )
+        now = _now_utc()
+        horizon = now + lookahead
+        try:
+            triggers = await list_triggers(status="active")
+        except Exception:
+            logger.debug("upcoming-trigger scan failed", exc_info=True)
+            return
+
+        for trigger in triggers:
+            tid = trigger["id"]
+            if tid in self._prefetch_signaled:
+                continue
+            fire_at = _parse_iso(trigger.get("fire_at"))
+            if fire_at is None:
+                continue  # person-only trigger — no lead time
+            if not (now < fire_at <= horizon):
+                continue
+            self._prefetch_signaled.add(tid)
+            bus = get_event_bus()
+            await bus.publish(TriggerUpcoming(
+                trigger_id=tid,
+                description=trigger["description"],
+                instructions=trigger["instructions"],
+                person=trigger.get("person"),
+                for_person=trigger.get("for_person"),
+                todo_id=trigger.get("todo_id"),
+                is_recurring=trigger.get("cron") is not None,
+                fire_at=trigger.get("fire_at") or "",
+            ))
+
     async def _check_person_triggers(self, *person_keys: str) -> None:
         """Check active triggers whose person condition matches any of the keys.
 
@@ -1031,6 +1088,9 @@ class Scheduler:
         trigger_id = trigger["id"]
         is_recurring = trigger.get("cron") is not None
         now = _now_iso()
+
+        # Allow the next occurrence (recurring) to be prefetched again.
+        self._prefetch_signaled.discard(trigger_id)
 
         logger.info(
             "Firing trigger %s: %s", trigger_id, trigger["description"]

@@ -379,6 +379,39 @@ class TestConversationCRUD:
         # Newest first
         assert convs[0].summary == "Second"
 
+    @pytest.mark.asyncio
+    async def test_delete_conversation_detaches_source_memories(
+        self, memory_store
+    ):
+        """Deleting a conversation must not fail when a memory still points
+        at it, and must leave that memory intact with a null source.
+
+        Regression: memories outlive their source conversation (180d vs
+        60d retention), so nightly maintenance deletes conversations that
+        still have child memories. Without detaching first, the enforced
+        ``source_conversation`` FK raised ``FOREIGN KEY constraint failed``
+        and aborted the whole maintenance pass.
+        """
+        cid = await memory_store.create_conversation(
+            channel="voice", participants=["Jacob", "BB"], summary="Chat"
+        )
+        mid = await memory_store.create_memory(
+            type="person",
+            content="Jacob likes hiking",
+            summary="Jacob likes hiking",
+            person="Jacob",
+            source_conversation=cid,
+        )
+
+        # Must not raise despite the surviving child memory.
+        await memory_store.delete_conversation(cid)
+
+        assert await memory_store.get_conversation(cid) is None
+        survivor = await memory_store.get_memory_no_touch(mid)
+        assert survivor is not None
+        assert survivor.content == "Jacob likes hiking"
+        assert survivor.source_conversation is None
+
 
 # ---------------------------------------------------------------------------
 # System memory

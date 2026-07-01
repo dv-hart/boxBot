@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS memories (
     superseded_by     TEXT,
     embedding         BLOB,
 
-    FOREIGN KEY (source_conversation) REFERENCES conversations(id),
+    FOREIGN KEY (source_conversation) REFERENCES conversations(id) ON DELETE SET NULL,
     FOREIGN KEY (superseded_by) REFERENCES memories(id)
 );
 
@@ -1196,7 +1196,24 @@ class MemoryStore:
         return [_row_to_conversation(r) for r in rows]
 
     async def delete_conversation(self, conv_id: str) -> None:
-        """Permanently delete a conversation (used by storage cap eviction)."""
+        """Permanently delete a conversation (retention pruning + cap eviction).
+
+        Extracted facts persist independently of their source conversation,
+        so we detach any memory that still points at this conversation before
+        deleting it. Without this, ``memories.source_conversation`` (an
+        enforced FK with no ``ON DELETE`` action) blocks the delete with
+        ``FOREIGN KEY constraint failed`` whenever a memory outlives the
+        conversation it came from — which is the common case, since person/
+        household memories are retained far longer (180d) than conversations
+        (60d). Detaching matches the FK's intended ``ON DELETE SET NULL``
+        semantics; provenance lookups already tolerate a null source. Both
+        statements share one transaction so the detach and delete are atomic.
+        """
+        await self.db.execute(
+            "UPDATE memories SET source_conversation = NULL "
+            "WHERE source_conversation = ?",
+            (conv_id,),
+        )
         await self.db.execute(
             "DELETE FROM conversations WHERE id = ?", (conv_id,)
         )

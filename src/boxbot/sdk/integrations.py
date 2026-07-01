@@ -144,16 +144,26 @@ def create(name: str) -> IntegrationBuilder:
 
 def update(name: str, *, manifest: dict[str, Any] | None = None,
            script: str | None = None) -> Any:
-    """Replace the manifest and/or script of an existing integration.
+    """Patch the manifest and/or script of an existing integration.
 
-    Either ``manifest`` (a dict matching the manifest schema, minus
-    ``name`` which is implicit) or ``script`` (a string) must be provided.
+    Provide ``script`` (a string) to replace the script, and/or
+    ``manifest`` (a dict) to patch the manifest. At least one is required.
+
+    The manifest patch is a **field-level merge** onto what's on disk:
+    send only the fields you want to change. ``manifest={"timeout": 60}``
+    bumps the timeout and leaves description/inputs/outputs/secrets
+    untouched. A field you *do* send replaces that whole section, so
+    ``manifest={"secrets": []}`` clears the secret list. ``name`` can't
+    be changed here — delete and recreate to rename.
+
+    To read the current source before patching, use :func:`get_source`.
 
     Returns the ``status: "ok"`` response (with the written file list).
 
     Raises:
         ActionError: if no integration is registered under that name
-            (call :func:`create` instead), or validation fails.
+            (call :func:`create` instead), or the merged manifest fails
+            validation.
     """
     v.require_str(name, "name")
     if manifest is None and script is None:

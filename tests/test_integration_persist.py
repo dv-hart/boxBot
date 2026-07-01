@@ -140,6 +140,37 @@ class TestUpdate:
         assert "EXTRA_KEY" in text
         assert "timeout: 20" in text
 
+    def test_partial_manifest_patch_preserves_other_fields(self, tmp_path: Path):
+        # A single-field manifest patch must NOT require re-sending the
+        # whole contract — the omitted fields are merged from disk.
+        create_integration(_BASE_PAYLOAD, integrations_root=tmp_path)
+        result = update_integration(
+            {"name": "weather", "manifest": {"timeout": 99}},
+            integrations_root=tmp_path,
+        )
+        assert result["status"] == "ok"
+        meta = integ_loader.get_integration("weather", root=tmp_path)
+        assert meta is not None
+        assert meta.timeout == 99
+        # Everything else survives the patch.
+        assert meta.description == "Get NOAA weather forecasts."
+        assert meta.secrets == ("NWS_USER_AGENT",)
+        assert "lat" in meta.inputs
+
+    def test_partial_manifest_patch_replaces_named_section(self, tmp_path: Path):
+        # A section the caller DOES send replaces that whole section.
+        create_integration(_BASE_PAYLOAD, integrations_root=tmp_path)
+        result = update_integration(
+            {"name": "weather", "manifest": {"secrets": []}},
+            integrations_root=tmp_path,
+        )
+        assert result["status"] == "ok"
+        meta = integ_loader.get_integration("weather", root=tmp_path)
+        assert meta is not None
+        assert meta.secrets == ()
+        # Untouched fields still present.
+        assert meta.timeout == 15
+
     def test_missing_returns_missing(self, tmp_path: Path):
         result = update_integration(
             {"name": "ghost", "script": "# x"},

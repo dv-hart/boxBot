@@ -27,6 +27,7 @@ from typing import Any
 from boxbot.integrations.loader import _DEFAULT_INTEGRATIONS_ROOT
 from boxbot.integrations.manifest import (
     ManifestError,
+    load_manifest_file,
     render_manifest_yaml,
     validate_manifest,
 )
@@ -156,8 +157,18 @@ def update_integration(
 
     written: list[str] = []
     if manifest_payload is not None:
+        if not isinstance(manifest_payload, dict):
+            return {"status": "error", "message": "'manifest' must be a dict"}
+        # Patch semantics: overlay the provided top-level fields onto the
+        # current on-disk manifest. A caller can tweak one field (e.g.
+        # {"timeout": 60}) without re-sending the whole contract — fields
+        # they omit are preserved, and a field they do send replaces that
+        # whole section (e.g. {"secrets": []} clears secrets). The merged
+        # result is fully re-validated before it's written.
+        current = load_manifest_file(target / _MANIFEST_FILE) or {}
+        merged = {**current, **manifest_payload, "name": name}
         try:
-            manifest = validate_manifest({**manifest_payload, "name": name})
+            manifest = validate_manifest(merged)
         except (ManifestError, ValueError) as exc:
             return {"status": "error", "message": str(exc)}
         (target / _MANIFEST_FILE).write_text(

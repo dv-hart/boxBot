@@ -131,20 +131,24 @@ def _coerce_env_value(raw: str, declared_type: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_script_path(meta: IntegrationMeta, runtime_dir: Path) -> Path:
-    """Return the path the sandbox should ``runpy`` for this integration.
+def _staged_script_path(meta: IntegrationMeta, runtime_dir: Path) -> Path | None:
+    """Return the staged, sandbox-readable copy of this script, or ``None``.
 
     setup-sandbox.sh stages ``integrations/`` into
     ``<runtime_dir>/integrations/<name>/script.py`` so the sandbox user
     (which can't traverse a 0700 home directory to reach the project
-    tree) has a path it actually owns. If the staged copy doesn't
-    exist (dev runs, tests with sandbox enforcement off), fall back to
-    the in-tree path.
+    tree) has a path it can read. That staging only runs at setup/deploy
+    time, so it covers the git-tracked built-ins but **not** an
+    integration the agent authored at runtime via
+    ``bb.integrations.create``.
+
+    Returns the staged path when it exists, else ``None``. On ``None``
+    the caller copies the in-tree script into the sandbox tmp dir on the
+    fly (see :func:`run`) so a just-created integration is runnable
+    immediately, with no re-stage required.
     """
     staged = runtime_dir / "integrations" / meta.name / "script.py"
-    if staged.exists():
-        return staged
-    return meta.script_path
+    return staged if staged.exists() else None
 
 
 def _build_command(
@@ -322,6 +326,7 @@ async def run(
     inputs_path: Path | None = None
     output_path: Path | None = None
     secrets_path: Path | None = None
+    script_tmp_path: Path | None = None
     status = "error"
     output: Any = None
     error: str | None = None
@@ -373,7 +378,37 @@ async def run(
         secrets_path = _write_secrets_file(secrets, tmp_root)
         if secrets_path is not None:
             env["BOXBOT_SECRETS_PATH"] = str(secrets_path)
-        script_path = _resolve_script_path(meta, runtime_dir)
+
+        # Resolve the script the sandbox will runpy. Prefer the staged
+        # copy (built-ins, placed by setup-sandbox.sh). If it isn't
+        # staged — the normal case for an integration the agent just
+        # authored — copy the in-tree script into the sandbox tmp dir,
+        # exactly the way execute_script handles ad-hoc scripts. The
+        # in-tree path lives under the operator's 0700 home and the
+        # boxbot-sandbox user can't traverse it, so a copy into the
+        # group-readable tmp dir is what makes a freshly-created
+        # integration runnable without a re-stage.
+        staged_script = _staged_script_path(meta, runtime_dir)
+        if staged_script is not None:
+            script_path = staged_script
+        else:
+            try:
+                script_source = meta.script_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                error = (
+                    f"integration '{name}': cannot read script at "
+                    f"{meta.script_path}: {exc}"
+                )
+                return {"status": "error", "error": error}
+            script_tmp_path = tmp_root / f"integration-{run_id}-script.py"
+            script_tmp_path.write_text(script_source, encoding="utf-8")
+            try:
+                os.chmod(script_tmp_path, 0o640)
+            except OSError as exc:
+                logger.warning(
+                    "could not chmod integration script tmp file: %s", exc
+                )
+            script_path = script_tmp_path
         cmd = _build_command(
             meta,
             venv_python=venv_python,
@@ -457,7 +492,7 @@ async def run(
         # Best-effort cleanup of temp files. The bootstrap normally
         # unlinks the secrets file itself; this is a backstop for the
         # case where the sandbox never started.
-        for p in (inputs_path, output_path, secrets_path):
+        for p in (inputs_path, output_path, secrets_path, script_tmp_path):
             if p is not None:
                 try:
                     p.unlink()

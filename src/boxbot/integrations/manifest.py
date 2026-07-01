@@ -12,9 +12,9 @@ There is **no schedule** in the manifest. Integrations are pipes:
 consumers (display data sources, the agent, the scheduler) decide
 when to call them.
 
-On-disk layout::
+On-disk layout (repo-root ``integrations/``, sibling to ``skills/``)::
 
-    src/boxbot/integrations/<name>/
+    integrations/<name>/
       manifest.yaml
       script.py
 

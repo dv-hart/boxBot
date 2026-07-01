@@ -100,14 +100,27 @@ i.save()
 ### Update / delete
 
 ```python
+# Replace the script wholesale.
 bb.integrations.update("solar", script="…revised script…")
-bb.integrations.update("solar", manifest={"description": "…"})
+
+# Patch the manifest field-by-field — send ONLY what changes.
+bb.integrations.update("solar", manifest={"timeout": 60})
+bb.integrations.update("solar", manifest={"description": "…new description…"})
+
 # Raises bb.ActionError if the name doesn't exist — never
 # auto-promotes. Use create() if you need a new one.
 
 bb.integrations.delete("solar")
 # Raises bb.ActionError if the name doesn't exist.
 ```
+
+`update(manifest=…)` is a **field-level merge** onto the current
+manifest, not a full replace. You do not have to re-send the whole
+contract to change one field — `{"timeout": 60}` is enough. Fields you
+omit are preserved; a field you send replaces that whole section
+(`{"secrets": []}` clears the secret list). The `name` can't be changed
+— delete and recreate to rename. Call `get_source(name)` first if you
+want to see the current manifest before patching.
 
 ## What lands on disk
 
@@ -280,3 +293,36 @@ The loader scans `integrations/` at startup and on every read call,
 so a freshly-saved integration is reachable from
 `bb.integrations.list()` and `bb.integrations.get()` immediately —
 no restart needed.
+
+An integration you author with `create().save()` is **runnable on the
+very next `get()` call** — you don't have to wait for a deploy or ask
+anyone to re-run setup. Author it, then call it. Same for `update()`:
+the next `get()` runs the revised script.
+
+## What can go wrong, and what each failure means
+
+Read calls (`get`, `logs`) return a `status`; branch on it:
+
+- `{"status": "ok", "output": …}` — the script ran and returned a value.
+- `{"status": "error", "error": …}` — the script crashed, exited
+  non-zero, or never called `return_output()`. The `error` string
+  carries the script's stderr. Common causes: a bug in the script, a
+  missing/expired secret (often surfaces as a `401`/`403` in the
+  error), or a bad input. Read `logs(name)` — several identical auth
+  errors in a row almost always mean a secret needs refreshing.
+- `{"status": "timeout", "error": …}` — the script ran past the
+  manifest's `timeout`. Make the script faster, raise `timeout` with
+  `update(name, manifest={"timeout": …})` (300s ceiling), or move the
+  work to a scheduled trigger.
+
+Write calls (`save`, `update`, `delete`) **raise `bb.ActionError`**
+rather than returning a status — wrap them in `try/except` if you want
+to react. The message tells you why: name already taken (`save`), name
+not registered (`update`/`delete` — call `create` instead), or the
+manifest failed validation (e.g. a non-lowercase name, a secret that
+isn't `SCREAMING_SNAKE_CASE`, or a `timeout` over 300).
+
+What you **can't** do: rename in place (delete + recreate), run an
+integration on a schedule from inside its own manifest (register a
+`bb.tasks` trigger that calls it), or spawn subprocesses from the
+script (seccomp blocks `execve`/`fork` — use in-process HTTP libraries).

@@ -93,8 +93,11 @@ health flag, no version pin.
 CRUD via the SDK:
 - `bb.integrations.create(name)` → builder → `save()`. Refuses if the
   name is taken (`status: "exists"`).
-- `bb.integrations.update(name, manifest=…, script=…)`. Errors with
-  `status: "missing"` if the name isn't registered. Never auto-creates.
+- `bb.integrations.update(name, manifest=…, script=…)`. `script`
+  replaces the script; `manifest` is a field-level patch merged onto
+  the current manifest (send only what changes — `{"timeout": 60}`
+  leaves the rest intact). Errors with `status: "missing"` if the name
+  isn't registered. Never auto-creates.
 - `bb.integrations.delete(name)`. Errors with `status: "missing"` if
   the name isn't there.
 - `bb.integrations.list()` → metadata for everything registered.

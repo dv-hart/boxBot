@@ -11,6 +11,7 @@ import asyncio
 import os
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -175,6 +176,53 @@ async def test_run_logs_success(tmp_path, monkeypatch, isolated_logs):
     assert len(runs) == 1
     assert runs[0]["status"] == "ok"
     assert runs[0]["output"] == {"value": 42}
+
+
+# ---------------------------------------------------------------------------
+# Script resolution — staged copy vs. on-the-fly copy of an un-staged script
+# ---------------------------------------------------------------------------
+
+
+def test_staged_script_path_prefers_staged(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    staged = runtime_dir / "integrations" / "weather" / "script.py"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("# staged\n")
+    meta = SimpleNamespace(name="weather", script_path=tmp_path / "intree" / "script.py")
+    assert run_mod._staged_script_path(meta, runtime_dir) == staged
+
+
+def test_staged_script_path_none_when_unstaged(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    meta = SimpleNamespace(name="weather", script_path=tmp_path / "intree" / "script.py")
+    assert run_mod._staged_script_path(meta, runtime_dir) is None
+
+
+@pytest.mark.asyncio
+async def test_unstaged_integration_is_runnable(tmp_path, monkeypatch, isolated_logs):
+    """An integration that was never staged into the sandbox runtime dir
+    (the normal case for one the agent just authored) must still run —
+    the runner copies the in-tree script into the sandbox tmp dir on the
+    fly. The fake config's runtime_dir has no staged copy, so this run
+    exercises exactly that path.
+    """
+    _patch_integrations_root(monkeypatch, tmp_path)
+    _make_integration(
+        tmp_path,
+        "fresh",
+        script=(
+            "from boxbot_sdk.integration import return_output\n"
+            "return_output({'ran': True})\n"
+        ),
+    )
+    assert run_mod._staged_script_path(
+        SimpleNamespace(name="fresh", script_path=tmp_path / "fresh" / "script.py"),
+        Path("/tmp"),
+    ) is None
+    result = await run_mod.run("fresh", {})
+    assert result["status"] == "ok", result
+    assert result["output"] == {"ran": True}
 
 
 @pytest.mark.asyncio

@@ -56,31 +56,22 @@ class IdentifyPersonTool(Tool):
 
     name = "identify_person"
     description = (
-        "The single gateway for person identity. Four actions:\n"
-        "- action=\"identify\" (default): record that a session speaker "
-        "is a specific person — first meetings (\"I'm Erik\") and "
-        "mis-identification corrections (\"I'm actually Sarah, not "
-        "Carina\"). Requires `name` + `ref`. The system decides "
-        "create/confirm/correct/rename/no_op and tells you which "
-        "happened. Buffered session embeddings commit to the named "
-        "person at voice-session end.\n"
-        "- action=\"rename\": rename an existing person record (\"call "
-        "me Jake instead of Jacob\"). Requires `name` (current name) + "
-        "`new_name`. Metadata only — embeddings, photos, triggers, and "
-        "memory tags follow automatically. Errors if `new_name` already "
-        "belongs to someone else (that's a merge, not a rename).\n"
-        "- action=\"merge\": merge two person records that are the SAME "
-        "human (e.g. 'Erik' was accidentally created alongside 'Eric'). "
-        "Requires `name` (the record to KEEP) + `duplicate_name` (the "
-        "record merged away). Embeddings move to the kept record; the "
-        "duplicate becomes a tombstone. MERGE IS DESTRUCTIVE AND NOT "
-        "UNDOABLE — always confirm with the humans involved before "
-        "calling it (\"Are Eric and Erik the same person?\").\n"
-        "- action=\"list_flags\": read the latest nightly identity-audit "
-        "findings (possible duplicate people, etc.). Use when a "
-        "[id-reconcile] to-do appears or you suspect duplicates.\n"
-        "This is NOT for lookup of who is present — presence is injected "
-        "automatically via the [Present: ...] header."
+        "Gateway for person identity. Actions:\n"
+        "- identify (default): record a session speaker as a person — "
+        "first meetings (\"I'm Erik\") or corrections (\"I'm actually "
+        "Sarah\"). Needs `name` + `ref`; buffered embeddings commit at "
+        "voice-session end.\n"
+        "- rename: change an existing person's name (\"call me Jake\"). "
+        "Needs `name` (current) + `new_name`. Metadata only; errors if "
+        "`new_name` already belongs to someone else.\n"
+        "- merge: combine two records for the SAME human. Needs `name` "
+        "(the record to KEEP) + `duplicate_name` (merged away). "
+        "DESTRUCTIVE and not undoable — confirm with the humans first "
+        "(\"Are Eric and Erik the same person?\").\n"
+        "- list_flags: read the nightly duplicate-audit findings (use on "
+        "an [id-reconcile] to-do).\n"
+        "Not for looking up who is present — that's injected via the "
+        "[Present: ...] header."
     )
     parameters = {
         "type": "object",
@@ -105,14 +96,10 @@ class IdentifyPersonTool(Tool):
             "ref": {
                 "type": "string",
                 "description": (
-                    "identify only: the session speaker reference — the "
-                    "stable pyannote label for this speaker. You'll find "
-                    "this in the speaker_identities block of the "
-                    "conversation context; each entry is keyed by the "
-                    "display name you see in the transcript, and carries "
-                    "the raw ref internally. If unsure, use the display "
-                    "label shown in brackets in the transcript (e.g. "
-                    "'Speaker A')."
+                    "identify only: the speaker's stable pyannote label, "
+                    "from the speaker_identities block in the conversation "
+                    "context. If unsure, use the bracketed display label "
+                    "in the transcript (e.g. 'Speaker A')."
                 ),
             },
             "new_name": {

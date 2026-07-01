@@ -2317,7 +2317,12 @@ class BoxBotAgent:
             {
                 "type": "text",
                 "text": static_text,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                # 5-minute (default) TTL: conversation turns are seconds
+                # apart so they hit the warm cache, while wake-cycle
+                # firings are hours apart and would miss a 1h cache
+                # anyway — the 1h write premium (2x vs 1.25x) never paid
+                # off. See the token-budget analysis (2026-06).
+                "cache_control": {"type": "ephemeral"},
             },
             {
                 "type": "text",
@@ -3225,7 +3230,7 @@ class BoxBotAgent:
     ) -> list[dict[str, Any]]:
         """Convert boxBot Tool instances to Anthropic API tool definitions.
 
-        Attaches a 1h ephemeral ``cache_control`` marker to the LAST tool
+        Attaches a 5m ephemeral ``cache_control`` marker to the LAST tool
         definition so the entire tools array (+ anything earlier in the
         render order) caches together. See spec §5.
 
@@ -3243,10 +3248,7 @@ class BoxBotAgent:
                 "input_schema": tool.parameters,
             })
         if definitions:
-            definitions[-1]["cache_control"] = {
-                "type": "ephemeral",
-                "ttl": "1h",
-            }
+            definitions[-1]["cache_control"] = {"type": "ephemeral"}
         return definitions
 
     async def _process_tool_calls(

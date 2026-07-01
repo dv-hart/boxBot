@@ -40,38 +40,18 @@ class MessageTool(Tool):
 
     name = "message"
     description = (
-        "The ONLY way to reach a person. Call this when you want a human "
-        "to actually hear or read what you have to say. Without a "
-        "message call, the user gets silence — your text output is "
-        "private notes, not speech.\n\n"
-        "Call it as many times per turn as you need:\n"
-        "- Interim acknowledgement before a tool call: "
-        "  message(\"current_speaker\", \"speak\", \"Sure thing, let me find that.\") "
-        "  alongside execute_script(...) in the same response.\n"
-        "- Final answer after a tool returns.\n"
-        "- Multi-recipient: speak to the room AND text to an absent user "
-        "  in the same response (two calls).\n\n"
-        "Recipient (`to`):\n"
-        "- \"current_speaker\" — whoever just addressed you in this "
-        "  conversation. Resolves to their name at dispatch time.\n"
-        "- \"room\" — broadcast voice to anyone physically present. "
-        "  Speak channel only.\n"
-        "- A registered user's name exactly as it appears in the "
-        "  Registered users list (e.g. \"Sarah\") — reach an absent person "
-        "  via text, or address someone present by name via speak.\n\n"
-        "Channel:\n"
-        "- \"speak\" — speak through the box speaker (everyone in the "
-        "  room hears). Good for replies in person and announcements.\n"
-        "- \"text\" — send a text message to the named user's "
-        "  registered phone. Requires `to` be a registered user by name. "
-        "  Cannot text \"room\" or unknown people.\n\n"
-        "Default to the channel you were contacted through: reply by "
-        "\"text\" in a text conversation, by \"speak\" in a voice one. The "
-        "current channel is in the dynamic context. Switch only when it "
-        "makes sense (e.g. someone at the box asks you to text an absent "
-        "person).\n\n"
-        "Be concise when speaking — no one wants a lecture from a box. "
-        "Stay silent (do not call this tool) when people are talking to "
+        "The ONLY way to reach a human; your text output is private "
+        "notes, not speech. Call as many times per turn as needed (e.g. "
+        "an interim acknowledgement before a tool call, then the final "
+        "answer; multiple recipients = multiple calls).\n"
+        "`to`: \"current_speaker\" (whoever just addressed you), \"room\" "
+        "(broadcast spoken audio, speak channel only), or a registered "
+        "user's exact name.\n"
+        "`channel`: \"speak\" (box speaker, everyone in the room hears) or "
+        "\"text\" (text a registered user by name — cannot text \"room\" "
+        "or unknown people).\n"
+        "Default to the channel you were contacted through. Be concise, "
+        "and stay silent (don't call this) when people are talking to "
         "each other, not to you."
     )
     parameters = {
@@ -80,21 +60,17 @@ class MessageTool(Tool):
             "to": {
                 "type": "string",
                 "description": (
-                    "Recipient identifier. Use \"current_speaker\" for "
-                    "whoever addressed you most recently, \"room\" to "
-                    "broadcast spoken audio to anyone present, or a "
-                    "registered user's name exactly as it appears in the "
-                    "Registered users list."
+                    "\"current_speaker\" (whoever just addressed you), "
+                    "\"room\" (spoken broadcast), or a registered user's "
+                    "exact name."
                 ),
             },
             "channel": {
                 "type": "string",
                 "enum": ["speak", "text"],
                 "description": (
-                    "Delivery medium. \"speak\" plays TTS through the box "
-                    "speaker (everyone in the room hears). \"text\" sends "
-                    "a text message to the named user's registered "
-                    "phone."
+                    "\"speak\" (box speaker) or \"text\" (text a "
+                    "registered user)."
                 ),
             },
             "content": {

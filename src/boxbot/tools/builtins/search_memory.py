@@ -36,12 +36,7 @@ class SearchMemoryTool(Tool):
             "mode": {
                 "type": "string",
                 "enum": ["lookup", "summary", "get", "transcript"],
-                "description": (
-                    "Search mode: 'lookup' for ranked results, "
-                    "'summary' for a synthesized answer, "
-                    "'get' for full record by memory ID, "
-                    "'transcript' for raw conversation text."
-                ),
+                "description": "Operation to run (see tool description).",
             },
             "query": {
                 "type": "string",

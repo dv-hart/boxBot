@@ -21,12 +21,10 @@ class ManageTasksTool(Tool):
 
     name = "manage_tasks"
     description = (
-        "Manage your triggers (wake conditions) and to-do list. Actions: "
-        "create_trigger (set wake conditions with AND logic — fire_at, "
-        "fire_after, cron, person), create_todo (add persistent action items), "
-        "list (view triggers/todos), get (full details), update (modify fields), "
-        "complete (mark todo done), cancel (cancel trigger or todo). "
-        "This is your internal planning system, not the family calendar."
+        "Manage your triggers (wake conditions) and to-do list — your "
+        "internal planning, not the family calendar. Actions: "
+        "create_trigger (AND-combined conditions: fire_at, fire_after, "
+        "cron, person), create_todo, list, get, update, complete, cancel."
     )
     parameters = {
         "type": "object",
@@ -74,11 +72,10 @@ class ManageTasksTool(Tool):
             "person": {
                 "type": "string",
                 "description": (
-                    "Person-presence condition. A name (e.g. 'Jacob') fires "
-                    "when that person is visually identified. Use '*' for ANY "
-                    "person, no identification required — fires on the first "
-                    "person seen (the 'greet whoever walks up next' case). "
-                    "Combine with time fields for compound triggers (AND)."
+                    "Person-presence condition: a name (e.g. 'Jacob') "
+                    "fires when that person is seen; '*' fires on the "
+                    "first person seen (no identification). Combine with "
+                    "time fields for compound (AND) triggers."
                 ),
             },
             "for_person": {

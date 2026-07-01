@@ -191,6 +191,75 @@ class TestMemoryStoreCRUD:
         assert affected == 0
 
     @pytest.mark.asyncio
+    async def test_repoint_person_name_updates_person_and_people(
+        self, memory_store
+    ):
+        """A merge/rename must move the structured name fields so the
+        survivor's recall reaches the merged-away memories."""
+        mid = await memory_store.create_memory(
+            type="person",
+            content="Eric likes Mario",
+            summary="Eric Mario",
+            person="Eric",
+            people=["Eric"],
+        )
+        n = await memory_store.repoint_person_name("Eric", "Erik")
+        assert n >= 1
+        m = await memory_store.get_memory_no_touch(mid)
+        assert m.person == "Erik"
+        assert m.people == ["Erik"]
+        # Free-text prose is deliberately left untouched.
+        assert m.content == "Eric likes Mario"
+
+    @pytest.mark.asyncio
+    async def test_repoint_person_name_preserves_other_people(
+        self, memory_store
+    ):
+        mid = await memory_store.create_memory(
+            type="person",
+            content="Eric and Jacob at the park",
+            summary="Eric Jacob park",
+            person="Erik",
+            people=["Eric", "Jacob"],
+        )
+        await memory_store.repoint_person_name("Eric", "Erik")
+        m = await memory_store.get_memory_no_touch(mid)
+        assert m.people == ["Erik", "Jacob"]
+
+    @pytest.mark.asyncio
+    async def test_repoint_person_name_no_substring_clobber(
+        self, memory_store
+    ):
+        """'Eric' must not rewrite 'Erica' — quoted-token match only."""
+        mid = await memory_store.create_memory(
+            type="person",
+            content="Erica fact",
+            summary="Erica",
+            person="Erica",
+            people=["Erica"],
+        )
+        await memory_store.repoint_person_name("Eric", "Erik")
+        m = await memory_store.get_memory_no_touch(mid)
+        assert m.person == "Erica"
+        assert m.people == ["Erica"]
+
+    @pytest.mark.asyncio
+    async def test_repoint_person_name_skips_invalidated(self, memory_store):
+        mid = await memory_store.create_memory(
+            type="person", content="dead", summary="dead", person="Eric",
+            people=["Eric"],
+        )
+        await memory_store.invalidate_memory(mid, invalidated_by="c")
+        await memory_store.repoint_person_name("Eric", "Erik")
+        m = await memory_store.get_memory_no_touch(mid)
+        assert m.person == "Eric"  # untouched: dead rows stay as-is
+
+    @pytest.mark.asyncio
+    async def test_repoint_person_name_noop_when_same(self, memory_store):
+        assert await memory_store.repoint_person_name("Eric", "Eric") == 0
+        assert await memory_store.repoint_person_name("", "Erik") == 0
+
+    @pytest.mark.asyncio
     async def test_resolve_memory_id_exact_and_prefix(self, memory_store):
         mid = await memory_store.create_memory(
             type="person",

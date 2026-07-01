@@ -359,6 +359,19 @@ def _no_side_effects(monkeypatch):
 
     monkeypatch.setattr(photo_search, "get_store", _get_store)
 
+    class _FakeMemoryStore:
+        async def repoint_person_name(self, *a, **k):
+            return 0
+
+    async def _get_memory_store():
+        return _FakeMemoryStore()
+
+    import boxbot.tools.builtins.search_memory as search_memory
+
+    monkeypatch.setattr(
+        search_memory, "_get_memory_store", _get_memory_store
+    )
+
 
 class TestIdentifyPersonToolActions:
     @pytest.mark.asyncio

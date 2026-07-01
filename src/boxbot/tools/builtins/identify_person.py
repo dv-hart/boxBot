@@ -15,10 +15,11 @@ than grow a second identity surface):
   report (duplicate-person candidates etc.) so the agent can act on it.
 
 Rename and merge re-point everything keyed on the person: photo person
-tags, active person-condition triggers, in-session enrollment claims,
-and live speaker mappings (via the ``PersonRenamed`` event). Memory
-records reference people by name inside free text and are deliberately
-NOT rewritten — the tool reminds the agent to update memories itself.
+tags, active person-condition triggers, the structured ``person``/
+``people`` name fields on memories (what retrieval keys on), in-session
+enrollment claims, and live speaker mappings (via the ``PersonRenamed``
+event). Only free-text prose inside memory bodies is left as-is — the
+nightly dream cycle reconciles that wording over time.
 """
 
 from __future__ import annotations
@@ -65,10 +66,9 @@ class IdentifyPersonTool(Tool):
         "person at voice-session end.\n"
         "- action=\"rename\": rename an existing person record (\"call "
         "me Jake instead of Jacob\"). Requires `name` (current name) + "
-        "`new_name`. Metadata only — embeddings, photos, and triggers "
-        "follow automatically; update any memories mentioning the old "
-        "name yourself. Errors if `new_name` already belongs to someone "
-        "else (that's a merge, not a rename).\n"
+        "`new_name`. Metadata only — embeddings, photos, triggers, and "
+        "memory tags follow automatically. Errors if `new_name` already "
+        "belongs to someone else (that's a merge, not a rename).\n"
         "- action=\"merge\": merge two person records that are the SAME "
         "human (e.g. 'Erik' was accidentally created alongside 'Eric'). "
         "Requires `name` (the record to KEEP) + `duplicate_name` (the "
@@ -351,11 +351,11 @@ class IdentifyPersonTool(Tool):
             **repointed,
             "message": (
                 f"Merged '{result['loser_name']}' into "
-                f"'{result['winner_name']}'. Embeddings, photo tags, and "
-                f"triggers now point at '{result['winner_name']}'. Memory "
-                f"records mentioning '{result['loser_name']}' were NOT "
-                f"rewritten — save a memory noting the merge so future "
-                f"lookups connect the names."
+                f"'{result['winner_name']}'. Embeddings, photo tags, "
+                f"triggers, and memory tags now point at "
+                f"'{result['winner_name']}'. Older free-text notes may "
+                f"still say '{result['loser_name']}'; the nightly "
+                f"consolidation reconciles that wording over time."
             ),
         })
 
@@ -435,17 +435,18 @@ async def _repoint_references(
     """Re-point everything keyed on a renamed/merged person.
 
     Covers: photo person tags (by person_id), active person-condition
-    triggers (by name), in-session enrollment claims (by person_id),
-    and — via the ``PersonRenamed`` event — the agent's and voice
-    session's live speaker/presence maps. Memory records are
-    deliberately left alone (names live inside free text; the tool
-    response tells the agent to update memories itself).
+    triggers (by name), the structured ``person``/``people`` name fields on
+    memories (by name — what retrieval keys on), in-session enrollment
+    claims (by person_id), and — via the ``PersonRenamed`` event — the
+    agent's and voice session's live speaker/presence maps. Free-text
+    memory prose is left alone; the nightly dream cycle reconciles stale
+    wording over time.
 
     Each leg is best-effort: a photos or scheduler hiccup must not
     abort an already-committed store mutation.
     """
     counts = {"photos_repointed": 0, "triggers_repointed": 0,
-              "session_claims_repointed": 0}
+              "memories_repointed": 0, "session_claims_repointed": 0}
 
     # Photo person tags (person_id-keyed, label refreshed to new name).
     try:
@@ -467,6 +468,19 @@ async def _repoint_references(
         )
     except Exception:
         logger.exception("identify_person: trigger repoint failed")
+
+    # Structured memory name fields (name-keyed, like triggers). Retrieval
+    # boosts on person/people, so a merged-away name would orphan its
+    # memories from the survivor's recall.
+    try:
+        from boxbot.tools.builtins.search_memory import _get_memory_store
+
+        mem_store = await _get_memory_store()
+        counts["memories_repointed"] = await mem_store.repoint_person_name(
+            old_name, new_name,
+        )
+    except Exception:
+        logger.exception("identify_person: memory repoint failed")
 
     # In-session enrollment claims (so commit_session at voice-session
     # end doesn't write embeddings to a stale/merged-away person).

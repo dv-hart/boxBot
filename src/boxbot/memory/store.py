@@ -720,6 +720,42 @@ class MemoryStore:
         await self.db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         await self.db.commit()
 
+    async def repoint_person_name(self, old_name: str, new_name: str) -> int:
+        """Re-point person-keyed memory fields after an identity rename/merge.
+
+        Retrieval filters and boosts on the ``person``/``people`` name
+        columns (see ``memory.search``), so when a person record is renamed
+        or merged away, memories tagged with the old name become unreachable
+        for the surviving person — the memory still exists, but a search for
+        the new name never matches it. This rewrites the structured name
+        fields to close that gap. The free-text ``content``/``summary`` prose
+        is deliberately left alone (the nightly dream cycle reconciles stale
+        wording over time); invalidated rows are skipped. Returns the number
+        of field updates applied.
+        """
+        if not old_name or not new_name or old_name == new_name:
+            return 0
+        c1 = await self.db.execute(
+            "UPDATE memories SET person = ? "
+            "WHERE person = ? AND status != 'invalidated'",
+            (new_name, old_name),
+        )
+        # ``people`` is a JSON array of quoted names; match the quoted token
+        # (e.g. '"Eric"') so 'Eric' does not clobber 'Erica'.
+        c2 = await self.db.execute(
+            "UPDATE memories SET people = replace(people, ?, ?) "
+            "WHERE people LIKE ? AND status != 'invalidated'",
+            (f'"{old_name}"', f'"{new_name}"', f'%"{old_name}"%'),
+        )
+        await self.db.commit()
+        updated = c1.rowcount + c2.rowcount
+        if updated:
+            logger.info(
+                "Repointed %d memory field(s): person %r -> %r",
+                updated, old_name, new_name,
+            )
+        return updated
+
     async def get_dream_state(self, key: str) -> str | None:
         """Read a dream-phase scratch value (e.g. the run watermark)."""
         cursor = await self.db.execute(

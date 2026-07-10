@@ -108,6 +108,25 @@ class SpokenSegment:
     interrupted: bool = False  # True if TTS/text was cut off mid-delivery
 
 
+@dataclass(frozen=True)
+class RelayContext:
+    """Why BB is speaking into the room on someone else's behalf.
+
+    Built by the output dispatcher when a text-channel conversation
+    (signal / whatsapp / trigger) sends ``message(channel="speak")``,
+    and consumed once by the voice-room conversation that the spoken
+    question opens. Carries everything needed to answer the two
+    questions the room conversation cannot otherwise answer: *what was
+    asked*, and *who gets the reply*.
+    """
+
+    origin_conversation_id: str
+    origin_channel: str  # "signal" | "whatsapp" | "trigger"
+    origin_person: str  # who asked BB to speak (e.g. "Jacob")
+    addressee: str  # who BB spoke to in the room (e.g. "Carina")
+    spoken_text: str
+
+
 @dataclass
 class GenerationResult:
     """Outcome of one agent-loop generation cycle.
@@ -539,19 +558,65 @@ class Conversation:
             {"role": "assistant", "content": delivered},
         ]
 
+    @staticmethod
+    def build_relay_context_turns(relay: "RelayContext") -> list[dict[str, Any]]:
+        """Turns recording a relayed question into the room's thread.
+
+        When someone on a text channel asks BB to say something aloud,
+        BB opens a room conversation to hear the answer. That room
+        conversation is brand new: without this seed it would receive
+        "yeah, after bath time" with no idea what was asked, who asked,
+        or where to send the answer.
+
+        Shape mirrors :meth:`build_trigger_context_turns` — a framing
+        ``[relay]`` user turn (proactive context, not a human reply)
+        followed by an assistant turn carrying what BB actually spoke,
+        so the block ends on an assistant turn and the next inbound
+        transcript preserves role-alternation.
+        """
+        framing = (
+            f"[relay] {relay.origin_person} messaged you on "
+            f"{relay.origin_channel} and asked you to put a question to "
+            f"{relay.addressee} out loud in the room, then report the "
+            f"answer back. You have just spoken the message below aloud "
+            f"and the microphone is now open. This is context for "
+            f"whatever the room says next — it is not a new request.\n\n"
+            f"When {relay.addressee} answers, relay the answer to "
+            f"{relay.origin_person} using the message tool with "
+            f'channel="text". If nobody answers, let it go — do not '
+            f"repeat yourself."
+        )
+        return [
+            {"role": "user", "content": framing},
+            {"role": "assistant", "content": relay.spoken_text.strip()},
+        ]
+
     async def ingest_trigger_delivery(
         self, *, recipient: str, turns: list[dict[str, Any]],
     ) -> bool:
-        """Record a trigger run's context into this conversation's thread
+        """Record a trigger run's context into this conversation's thread.
+
+        Thin alias over :meth:`ingest_context_turns` — see there for the
+        dispatch-as-bridge rationale and concurrency semantics.
+        """
+        return await self.ingest_context_turns(
+            source=f"trigger delivery to {recipient}", turns=turns,
+        )
+
+    async def ingest_context_turns(
+        self, *, source: str, turns: list[dict[str, Any]],
+    ) -> bool:
+        """Record externally-produced context into this thread
         (dispatch-as-bridge).
 
-        When a trigger conversation delivers to ``recipient``, the run's
-        context (built by :meth:`build_trigger_context_turns`) is also
-        recorded here — in the recipient's own real conversation — so a
-        later reply continues a thread that actually contains the
-        briefing and its reasoning, rather than landing in a fresh
-        conversation with no context. It is history only: it never
-        starts a generation.
+        Used when BB did something outside this conversation that the
+        conversation needs in its history for a reply to make sense: a
+        trigger run's briefing (:meth:`build_trigger_context_turns`), or
+        a relayed question spoken into the room on someone else's behalf
+        (:meth:`build_relay_context_turns`). Without it, the reply lands
+        in a fresh thread with no idea what it is answering.
+
+        It is history only: it never starts a generation.
 
         Concurrency: if the conversation is mid-generation
         (THINKING / SPEAKING) the turns are persisted to the store
@@ -576,8 +641,8 @@ class Conversation:
                     )
                 except Exception:
                     logger.exception(
-                        "Conversation %s: failed to persist trigger "
-                        "delivery", self.conversation_id,
+                        "Conversation %s: failed to persist context turns "
+                        "(%s)", self.conversation_id, source,
                     )
 
             if self._state in (
@@ -594,9 +659,8 @@ class Conversation:
                 # Already persisted above.
                 self._pending_external_turns.extend(turns)
             logger.info(
-                "Conversation %s: ingested trigger delivery to %s "
-                "(state=%s)",
-                self.conversation_id, recipient, self._state.value,
+                "Conversation %s: ingested context turns (%s) (state=%s)",
+                self.conversation_id, source, self._state.value,
             )
             return True
 

@@ -152,9 +152,15 @@ class TestParseStructuredNotes:
 class _FakeVoiceSession:
     def __init__(self):
         self.spoken = []
+        self.relays = []
 
     async def speak(self, text: str) -> None:
         self.spoken.append(text)
+
+    async def speak_and_listen(self, text: str, *, relay=None) -> None:
+        """Speak, then leave the mic open — used for relays only."""
+        self.spoken.append(text)
+        self.relays.append(relay)
 
 
 class _FakeUser:
@@ -244,6 +250,65 @@ class TestDispatchOutputs:
             current_speaker=None,
         )
         assert fake_voice.spoken == ["Timer done."]
+
+    @pytest.mark.asyncio
+    async def test_trigger_announcement_does_not_open_the_mic(self, fake_voice):
+        """A timer or briefing has nobody waiting — it speaks and stops."""
+        await dispatch_outputs(
+            [{"to": "room", "channel": "voice", "content": "Timer done."}],
+            conversation_id="c2",
+            channel_context="trigger",
+            current_speaker=None,
+        )
+        assert fake_voice.relays == []
+
+    @pytest.mark.asyncio
+    async def test_speak_from_text_channel_relays_and_opens_the_mic(
+        self, fake_voice
+    ):
+        """The 2026-07-08 case: Jacob texts, BB asks the room, mic opens."""
+        await dispatch_outputs(
+            [{
+                "to": "Carina",
+                "channel": "voice",
+                "content": "Carina — books tonight?",
+            }],
+            conversation_id="conv_934cf4780ab5",
+            channel_context="signal",
+            current_speaker="Jacob",
+        )
+
+        assert fake_voice.spoken == ["Carina — books tonight?"]
+        [relay] = fake_voice.relays
+        assert relay is not None, "speech on a human's behalf must relay"
+        assert relay.origin_person == "Jacob"
+        assert relay.addressee == "Carina"
+        assert relay.origin_channel == "signal"
+        assert relay.origin_conversation_id == "conv_934cf4780ab5"
+        assert relay.spoken_text == "Carina — books tonight?"
+
+    @pytest.mark.asyncio
+    async def test_voice_channel_speech_is_not_a_relay(self, fake_voice):
+        """Already in the room: the voice session owns the mic, not us."""
+        await dispatch_outputs(
+            [{"to": "current_speaker", "channel": "voice", "content": "Sure."}],
+            conversation_id="c1",
+            channel_context="voice",
+            current_speaker="Jacob",
+        )
+        assert fake_voice.relays == []
+
+    @pytest.mark.asyncio
+    async def test_no_relay_without_a_known_asker(self, fake_voice):
+        """An unattributed text turn has no one to report back to."""
+        await dispatch_outputs(
+            [{"to": "room", "channel": "voice", "content": "Anyone home?"}],
+            conversation_id="c3",
+            channel_context="signal",
+            current_speaker=None,
+        )
+        assert fake_voice.relays == []
+        assert fake_voice.spoken == ["Anyone home?"]
 
     @pytest.mark.asyncio
     async def test_text_to_named_user(self, fake_voice, fake_auth, fake_whatsapp):

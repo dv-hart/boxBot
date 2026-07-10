@@ -570,6 +570,11 @@ class Microphone(HardwareModule):
 
     # ── LED ring ──────────────────────────────────────────────────
 
+    @property
+    def current_led_pattern(self) -> str:
+        """The pattern name currently displayed on the ring."""
+        return self._current_pattern
+
     async def set_led_pattern(
         self, pattern: str, params: dict[str, Any] | None = None
     ) -> None:

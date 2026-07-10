@@ -52,6 +52,13 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Conversation channels that carry a human who can be replied to. Speech
+# dispatched from one of these is a relay — BB was asked to put something
+# to the room and report the answer back, so the mic opens. Notably absent:
+# "trigger" (a scheduled run announcing into an empty room has nobody
+# waiting) and "voice" (already in the room, mic already managed).
+_RELAY_ORIGIN_CHANNELS = frozenset({"signal", "whatsapp"})
+
 
 # Callback signature used by Conversation.record_segment. Imported
 # lazily to avoid a circular dependency — output_dispatcher is imported
@@ -282,6 +289,7 @@ async def dispatch_outputs(
                     content=content,
                     conversation_id=conversation_id,
                     channel_context=channel_context,
+                    origin_person=current_speaker,
                 )
             except BaseException:
                 # Mark the segment interrupted if the delivery was
@@ -344,13 +352,27 @@ async def _dispatch_voice(
     content: str,
     conversation_id: str,
     channel_context: str,
+    origin_person: str | None = None,
 ) -> DispatchResult:
     """Speak ``content`` through the active voice session's TTS.
 
     ``to`` is logged for audit but does not change routing — the speaker
     plays to the room regardless of who the intended addressee is.
+
+    When the speech originates from a human's *text* conversation, BB is
+    relaying: someone asked it to put a question to the room and report
+    back. Speaking alone is not enough — the mic must be open to hear the
+    answer, and the room conversation that hears it must know what was
+    asked and who to tell. We hand the voice session a
+    :class:`RelayContext` and let it open the room, rather than speaking
+    into a box that is not listening.
+
+    A trigger conversation is *not* a relay even though it is not voice:
+    a timer announcement or a morning briefing has nobody on the other
+    end waiting for an answer. It speaks and stops — the mic stays shut.
     """
     from boxbot.communication.voice import get_voice_session
+    from boxbot.core.conversation import RelayContext
 
     session = get_voice_session()
     if session is None:
@@ -367,12 +389,28 @@ async def _dispatch_voice(
             ),
         )
 
+    # A relay needs a human to report back to. Both halves matter: the
+    # channel must be one we can reply on, and we must know who asked.
+    is_relay = channel_context in _RELAY_ORIGIN_CHANNELS and bool(origin_person)
     logger.info(
-        "output: voice → %s (conv=%s chan=%s): %s",
-        to, conversation_id, channel_context, content[:120],
+        "output: voice → %s (conv=%s chan=%s%s): %s",
+        to, conversation_id, channel_context,
+        " relay" if is_relay else "", content[:120],
     )
     try:
-        await session.speak(content)
+        if is_relay:
+            await session.speak_and_listen(
+                content,
+                relay=RelayContext(
+                    origin_conversation_id=conversation_id,
+                    origin_channel=channel_context,
+                    origin_person=origin_person or "",
+                    addressee=to,
+                    spoken_text=content,
+                ),
+            )
+        else:
+            await session.speak(content)
     except Exception:
         logger.exception(
             "Voice dispatch failed (conv=%s to=%s)", conversation_id, to

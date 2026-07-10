@@ -40,6 +40,7 @@ from boxbot.communication.tts import ElevenLabsTTS, TTSStream
 from boxbot.communication.vad import VoiceActivityDetector
 from boxbot.communication.wake_word import WakeWordDetector
 from boxbot.core import latency
+from boxbot.core.conversation import RelayContext
 from boxbot.core.events import (
     AgentSpeaking,
     AgentSpeakingDone,
@@ -58,6 +59,10 @@ if TYPE_CHECKING:
     from boxbot.hardware.speaker import Speaker
 
 logger = logging.getLogger(__name__)
+
+# Ring patterns that only make sense while a voice session is live. If one
+# of these is still showing when the session is gone, the ring is lying.
+_SESSION_LED_PATTERNS = frozenset({"listening", "thinking", "speaking"})
 
 # ---------------------------------------------------------------------------
 # Singleton accessor
@@ -133,6 +138,12 @@ class VoiceSession:
 
         self._state = VoiceSessionState.ENDED
         self._conversation_id: str = ""
+
+        # Set when a text-channel conversation asks BB to speak into the
+        # room on its behalf. Consumed once, by the voice-room
+        # conversation that the spoken question opens — see
+        # ``consume_relay_context`` and ``Agent._on_transcript_ready``.
+        self._pending_relay: RelayContext | None = None
 
         # Voice pipeline components (built lazily in start())
         self._wake_word: WakeWordDetector | None = None
@@ -582,6 +593,10 @@ class VoiceSession:
 
         self._state = VoiceSessionState.DORMANT
 
+        # The mic is closing with no answer — the relay is dead. A later
+        # wake word resumes this session, and must not inherit it.
+        self._discard_pending_relay("mic went dormant")
+
         if self._audio_capture:
             await self._audio_capture.stop()
             self._audio_capture.reset()
@@ -636,6 +651,8 @@ class VoiceSession:
             self._vad.reset()
 
         self._cancel_timers()
+
+        self._discard_pending_relay("session ended")
 
         # Clear session-scoped identity state.
         self._speaker_identities.clear()
@@ -987,10 +1004,26 @@ class VoiceSession:
           interrupted=True)``. ``_tts_interrupted`` is the flag the
           handler sets; we honour it to avoid double-publish.
 
+        The ceremony is *symmetric*: it snapshots the ring pattern and
+        the capture state on entry and restores them on exit. Speaking
+        is not allowed to leave the box in a state it did not create.
+        Previously the two teardown steps were gated on ``ACTIVE``
+        while the two setup steps were unconditional, so speech from a
+        text-channel conversation (no wake word, so state is IDLE) lit
+        the ring green and never cleared it — the box advertised that
+        it was listening while no consumer was attached to the mic.
+
         Used by both :meth:`speak` (TTS) and :meth:`play_audio` (file
         playback) so the two share identical mic / event semantics.
         """
         self._tts_interrupted = False
+
+        prior_pattern = (
+            self._microphone.current_led_pattern if self._microphone else "off"
+        )
+        was_capturing = (
+            self._audio_capture is not None and self._audio_capture.is_running
+        )
 
         if self._microphone:
             try:
@@ -1025,27 +1058,35 @@ class VoiceSession:
                 # interrupt path skips this — the wake-word handler
                 # re-attaches via _activate_session itself.
                 #
-                # Also clears any agent-set mute. Speech implies BB is
-                # engaging the room; the user should be able to follow
-                # up without re-saying the wake word. This is the
-                # contract documented on the ``mute_mic`` tool.
-                if (
-                    self._state == VoiceSessionState.ACTIVE
-                    and self._audio_capture is not None
-                    and self._microphone is not None
-                ):
-                    self._audio_capture.unmute()
-                    try:
-                        await self._audio_capture.start(self._microphone)
-                    except Exception:
-                        logger.exception(
-                            "Failed to re-attach audio_capture "
-                            "after speaker output"
-                        )
+                # ACTIVE additionally clears any agent-set mute: speech
+                # implies BB is engaging the room, so the user should be
+                # able to follow up without re-saying the wake word.
+                # This is the contract documented on ``mute_mic``.
+                # Outside ACTIVE we only put back what we took, and
+                # never unmute — muting was a deliberate agent choice.
+                if self._audio_capture is not None and self._microphone is not None:
+                    if self._state is VoiceSessionState.ACTIVE:
+                        self._audio_capture.unmute()
+                    if self._state is VoiceSessionState.ACTIVE or was_capturing:
+                        try:
+                            await self._audio_capture.start(self._microphone)
+                        except Exception:
+                            logger.exception(
+                                "Failed to re-attach audio_capture "
+                                "after speaker output"
+                            )
 
-            if self._state == VoiceSessionState.ACTIVE and self._microphone:
+            if self._microphone:
+                if self._state is VoiceSessionState.ACTIVE:
+                    target = "listening"
+                elif prior_pattern in _SESSION_LED_PATTERNS:
+                    # The session ended while we were speaking — don't
+                    # resurrect its ring. Fall back to dark.
+                    target = "off"
+                else:
+                    target = prior_pattern
                 try:
-                    await self._microphone.set_led_pattern("listening")
+                    await self._microphone.set_led_pattern(target)
                 except Exception:
                     pass
 
@@ -1125,6 +1166,74 @@ class VoiceSession:
             )
         return result
 
+    def consume_relay_context(self) -> RelayContext | None:
+        """Take the pending relay context, clearing it.
+
+        Consume-once: the room conversation that hears the answer needs
+        the context, and only that one. A second transcript in the same
+        session is an ordinary follow-up, not another relay.
+        """
+        relay, self._pending_relay = self._pending_relay, None
+        return relay
+
+    def _discard_pending_relay(self, reason: str) -> None:
+        """Drop an unanswered relay so it can't seed a later conversation.
+
+        Called wherever the mic closes without an answer. A relay left
+        stashed here would be seeded into whatever unrelated conversation
+        opens next — possibly hours later, with BB abruptly reporting an
+        answer to a question nobody remembers asking.
+        """
+        if self._pending_relay is None:
+            return
+        logger.info(
+            "Relay for %s (via %s) went unanswered (%s) — discarding",
+            self._pending_relay.origin_person,
+            self._pending_relay.origin_channel,
+            reason,
+        )
+        self._pending_relay = None
+
+    async def speak_and_listen(
+        self, text: str, *, relay: RelayContext | None = None
+    ) -> None:
+        """Speak into the room and leave the mic open for the answer.
+
+        The mic-open half is the point. Plain :meth:`speak` detaches
+        capture for the duration of TTS and re-attaches it only if a
+        voice session was already ACTIVE — so speaking from a text
+        conversation talks at a room that is not listening. Here we
+        activate first, which arms capture and lights the ring, and the
+        speaking ceremony hands it back on the way out.
+
+        Safe from any state: ACTIVE speaks into the running session,
+        IDLE opens a fresh one, DORMANT re-engages the existing room
+        conversation (same session id, so the answer threads into it).
+
+        Args:
+            text: What to say out loud.
+            relay: Why we are speaking, when it is on someone else's
+                behalf. Stashed for the room conversation to consume.
+        """
+        if relay is not None:
+            self._pending_relay = relay
+
+        if self._state is not VoiceSessionState.ACTIVE:
+            await self._activate_session()
+
+        await self.speak(text)
+
+        # Re-arm the no-utterance grace window. ``_activate_session``
+        # armed it, but ``_on_agent_speaking`` cancels it the moment TTS
+        # begins — and the post-response idle timer that normally takes
+        # over only arms on a *voice*-channel AgentTurnEnded, which never
+        # fires here because the turn belongs to the text conversation.
+        # Without this the mic would stay hot indefinitely when nobody
+        # answers. Grace runs from the end of speech, which is also when
+        # a human would actually start replying.
+        if self._state is VoiceSessionState.ACTIVE:
+            self._reset_wake_word_grace_timer()
+
     async def initiate_conversation(
         self, text: str, person_name: str | None = None
     ) -> None:
@@ -1144,11 +1253,7 @@ class VoiceSession:
             )
             return
 
-        # Activate without wake word
-        await self._activate_session()
-
-        # Speak the initiating text
-        await self.speak(text)
+        await self.speak_and_listen(text)
 
     # ------------------------------------------------------------------
     # Transcript building

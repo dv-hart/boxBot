@@ -1992,6 +1992,14 @@ class BoxBotAgent:
         # Conversation id. Register the alias so gen_start/api/tools marks
         # land on the live tracker.
         latency.alias(conv.conversation_id, voice_session_id)
+
+        # If this room conversation exists because a text-channel
+        # conversation asked BB to speak here, seed the thread with what
+        # was asked and who is waiting on the answer — otherwise this
+        # transcript arrives as a non-sequitur and the asker never hears
+        # back. Consume-once; a follow-up transcript is not a new relay.
+        await self._ingest_pending_relay(conv)
+
         await conv.handle_input(
             transcript,
             speaker_name=person_name,
@@ -2001,6 +2009,44 @@ class BoxBotAgent:
                 "speaker_identities": dict(event.speaker_identities or {}),
             },
         )
+
+    async def _ingest_pending_relay(self, conv: Conversation) -> None:
+        """Seed ``conv`` with relay context, if BB spoke here on request.
+
+        No-op in the ordinary case (wake word, no relay pending). When a
+        relay *is* pending, the turns explain what BB asked the room and
+        which text conversation is waiting on the answer, so the agent
+        can route the reply back with the ``message`` tool.
+        """
+        from boxbot.communication.voice import get_voice_session
+
+        session = get_voice_session()
+        if session is None:
+            return
+        relay = session.consume_relay_context()
+        if relay is None:
+            return
+
+        turns = Conversation.build_relay_context_turns(relay)
+        recorded = await conv.ingest_context_turns(
+            source=(
+                f"relay for {relay.origin_person} via {relay.origin_channel}"
+            ),
+            turns=turns,
+        )
+        if recorded:
+            logger.info(
+                "Seeded relay context into %s: %s asked %s via %s "
+                "(origin conv=%s)",
+                conv.conversation_id, relay.origin_person, relay.addressee,
+                relay.origin_channel, relay.origin_conversation_id,
+            )
+        else:
+            logger.warning(
+                "Relay context dropped — conversation %s already ended "
+                "(origin conv=%s)",
+                conv.conversation_id, relay.origin_conversation_id,
+            )
 
     def _get_voice_room_conversation(self) -> Conversation | None:
         """Return the live voice:room conversation, if any."""

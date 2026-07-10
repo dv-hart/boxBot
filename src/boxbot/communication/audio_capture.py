@@ -71,6 +71,11 @@ class AudioCapture:
         # unmutes via ``unmute()`` at TTS-end before re-attaching.
         self._muted = False
 
+    @property
+    def is_running(self) -> bool:
+        """True iff the consumer is attached to a microphone."""
+        return self._consumer_handle is not None
+
     async def start(self, microphone: object) -> None:
         """Register as microphone consumer and start capturing.
 
@@ -87,13 +92,21 @@ class AudioCapture:
         logger.info("AudioCapture started (consumer=%d)", self._consumer_handle)
 
     async def stop(self) -> None:
-        """Unregister and release resources."""
+        """Unregister and release resources.
+
+        Logs only when a consumer was actually detached. A stop() on an
+        already-stopped capture is a silent no-op — an unconditional
+        "AudioCapture stopped" line makes the log claim the mic was
+        turned off when it was never on.
+        """
+        was_running = self._consumer_handle is not None
         if self._microphone is not None and self._consumer_handle is not None:
             self._microphone.remove_consumer(self._consumer_handle)  # type: ignore[attr-defined]
             self._consumer_handle = None
             self._microphone = None
         self.reset()
-        logger.info("AudioCapture stopped")
+        if was_running:
+            logger.info("AudioCapture stopped")
 
     def set_utterance_callback(
         self, callback: Callable[[Utterance], Awaitable[None]]

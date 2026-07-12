@@ -260,7 +260,11 @@ async def _pump_actions(proc: asyncio.subprocess.Process) -> tuple[list[str], li
     full bb.* surface — ``bb.secrets.get`` is the load-bearing case.
     """
     # Lazy import to dodge the boxbot.core init chain at module import time.
-    from boxbot.tools._sandbox_actions import ActionContext, process_action
+    from boxbot.tools._sandbox_actions import (
+        ActionContext,
+        process_action,
+        read_sandbox_line,
+    )
 
     ctx = ActionContext()
     output_lines: list[str] = []
@@ -268,7 +272,7 @@ async def _pump_actions(proc: asyncio.subprocess.Process) -> tuple[list[str], li
     assert proc.stdout is not None
     assert proc.stdin is not None
     while True:
-        raw = await proc.stdout.readline()
+        raw = await read_sandbox_line(proc.stdout)
         if not raw:
             break
         line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -419,6 +423,12 @@ async def run(
             script_path=script_path,
         )
 
+        # Same lazy import as _pump_actions — dodge the boxbot.core init chain.
+        # asyncio's default StreamReader limit is 64 KiB per line, far too
+        # small for large action payloads (e.g. camera_snapshot pushing a
+        # base64 JPEG through workspace.write in a single JSON line).
+        from boxbot.tools._sandbox_actions import SANDBOX_STREAM_LIMIT
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -427,6 +437,7 @@ async def run(
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=str(Path.cwd()),
+                limit=SANDBOX_STREAM_LIMIT,
             )
         except FileNotFoundError as exc:
             error = f"sandbox python not found at {venv_python}: {exc}"

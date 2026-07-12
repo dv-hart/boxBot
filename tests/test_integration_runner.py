@@ -161,6 +161,36 @@ async def test_run_returns_output(tmp_path, monkeypatch, isolated_logs):
 
 
 @pytest.mark.asyncio
+async def test_large_payload_line_survives_stream_limit(tmp_path, monkeypatch, isolated_logs):
+    """A single stdout line far above asyncio's 64 KiB default must not kill the run.
+
+    Regression test for the camera_snapshot failure: the home_assistant
+    integration ships a base64 JPEG through one JSON action line, which
+    blew asyncio's default StreamReader limit ("Separator is not found,
+    and chunk exceed the limit") because the runner's subprocess was
+    spawned without limit=SANDBOX_STREAM_LIMIT.
+    """
+    _patch_integrations_root(monkeypatch, tmp_path)
+    _make_integration(
+        tmp_path,
+        "bigout",
+        script=(
+            "import sys\n"
+            # One giant stdout line, like an SDK action carrying a base64
+            # image. 1 MiB is far above asyncio's 64 KiB default limit but
+            # under SANDBOX_STREAM_LIMIT, so it must pass through intact.
+            "sys.stdout.write('x' * (1024 * 1024) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "from boxbot_sdk.integration import return_output\n"
+            "return_output({'ok': True})\n"
+        ),
+    )
+    result = await run_mod.run("bigout", {})
+    assert result["status"] == "ok", result
+    assert result["output"] == {"ok": True}
+
+
+@pytest.mark.asyncio
 async def test_run_logs_success(tmp_path, monkeypatch, isolated_logs):
     _patch_integrations_root(monkeypatch, tmp_path)
     _make_integration(

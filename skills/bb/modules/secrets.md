@@ -1,74 +1,56 @@
-# bb.secrets — store credentials, hand them to scripts and integrations
+# bb.secrets — write-only credential vault
 
-`bb.secrets` is a write-only credential vault. The agent stores values
-once (typically when the user pastes a key into chat), and scripts and
-integrations receive only the specific values they declared they need
-— never as Python strings the agent can read back, only as
-`BOXBOT_SECRET_<NAME>` environment variables injected at launch.
+Store a value once (usually when the user pastes a key). Scripts and
+integrations receive only the values they declared, as
+`BOXBOT_SECRET_<NAME>` env vars injected at launch. Never as Python
+strings you can read back.
 
-## When to use it
+**Use when:** the user pastes an API key, OAuth refresh token, or
+webhook secret; an integration manifest declares `secrets: [...]` and
+the runner reports one missing; a one-off `execute_script` needs a
+credential — pass `secrets=[...]` on the tool call, **not** `env_vars`
+(that would require you to know the value).
 
-- The user pastes an API key, OAuth refresh token, webhook secret, or
-  any other credential the agent should keep on file.
-- An integration manifest declares `secrets: [...]` and the runner
-  reports the secret is missing — store the value and rerun.
-- A one-off `execute_script` call needs a credential. Use the
-  `secrets=[...]` parameter on `execute_script`; do **not** pass the
-  value through `env_vars` (the agent would have to know the value).
-
-## When NOT to use it
-
-- Plain config that isn't sensitive — the manifest's `inputs:` field
-  or the data source's `params` is a better home.
-- Anything the agent should be able to *read*. `bb.secrets` is
-  one-way: store and forget. If the agent needs to see a value to
-  reason about it, it doesn't belong here.
-- Long values (>8 KB) or many-of-the-same (>64 stored). The store is
-  intentionally small; if you need more, the design has drifted.
+**Not for:** non-sensitive config → the manifest's `inputs:` or the
+data source's `params`. Anything you need to *read* — this is one-way.
+Values over 8 KB, or more than 64 stored; the store is deliberately
+small.
 
 ## Lifecycle
 
 ```python
 import boxbot_sdk as bb
 
-# Store (write-only).
 bb.secrets.store("POLYGON_API_KEY", "pk_live_…")
 # → {"status": "ok", "name": "POLYGON_API_KEY", "previous": "created"}
 
-# Inventory — names + when they were stored. No values.
-bb.secrets.list()
+bb.secrets.list()          # names + timestamps. No values.
 # → {"status": "ok",
 #    "secrets": [{"name": "POLYGON_API_KEY", "stored_at": "2026-05-02T…Z"}]}
 
-# Quick existence check.
 if bb.secrets.has("POLYGON_API_KEY"):
     ...
 
-# Delete when rotating or removing an account.
 bb.secrets.delete("OLD_API_KEY")
 # → {"status": "ok", "name": "OLD_API_KEY"}
 # Raises bb.ActionError if the name isn't stored — a delete that
 # removed nothing fails loudly.
 ```
 
-Error semantics: the writes (`store`, `delete`) raise `bb.ActionError`
-on rejection (bad name shape, oversized value, store full, name not
-stored); the reads (`list`, `has`, `use`) return the shapes shown
-above.
+`store` and `delete` raise `bb.ActionError` on rejection (bad name
+shape, oversized value, store full, name absent). `list`, `has`, `use`
+return the shapes above.
 
 ## Naming
 
-Names are SCREAMING_SNAKE_CASE — `^[A-Z][A-Z0-9_]*$`, ≤64 chars. Same
-shape integrations declare in their manifests, so the same name works
-end-to-end. `secrets.store("polygon_api_key", …)` errors; use
-`POLYGON_API_KEY`.
+SCREAMING_SNAKE_CASE, `^[A-Z][A-Z0-9_]*$`, ≤64 chars. Same shape
+integrations declare in manifests, so one name works end to end.
+`bb.secrets.store("polygon_api_key", …)` errors.
 
 ## Reaching a secret from a script
 
-### From an integration script
-
-The integration's manifest declares `secrets: [...]`; the runner
-injects `BOXBOT_SECRET_<NAME>` at launch.
+Integration script — the manifest declares `secrets: [...]`, the runner
+injects:
 
 ```python
 # integrations/polygon/script.py
@@ -78,55 +60,39 @@ if not api_key:
     return_output({"error": "POLYGON_API_KEY not stored"})
 ```
 
-If a declared secret isn't on file, the runner logs a warning and
-launches anyway — your script sees an empty/missing env var and
-should surface a helpful error.
+A declared-but-absent secret logs a warning and launches anyway. Your
+script sees a missing env var and should surface a helpful error.
 
-### From an ad-hoc execute_script call
-
-Pass `secrets=[NAMES]` on the tool call. The tool resolves names
-against the store and injects the values for the duration of the
-script. Unknown names are silently skipped.
+Ad-hoc `execute_script` — pass `secrets=["POLYGON_API_KEY"]` on the
+tool call; unknown names are skipped silently:
 
 ```python
-# tool call args:
-#   secrets: ["POLYGON_API_KEY"]
 import os
 key = os.environ["BOXBOT_SECRET_POLYGON_API_KEY"]
 ```
 
-The agent never sees the value. Do **not** call
-`bb.secrets.use("…")` and pass the result through `env_vars`: that
-defeats the point — `use()` returns the env-var name only iff the
-secret exists, as a diagnostic.
+Do **not** call `bb.secrets.use("…")` and route the result through
+`env_vars`. `use()` returns the env-var *name* only, as a diagnostic.
 
-## What the agent can and can't see
+## What you can see
 
-- ✅ Names (`list`, `has`).
-- ✅ Stored-at timestamps.
-- ✅ Whether a stored secret is reachable for a given script call
-  (via the `secrets=` parameter's silent-skip behaviour, observable
-  in the script's own error handling).
-- ❌ Values. Once stored, the value never returns through any
-  SDK call — only through env vars in the launched subprocess.
+Names, stored-at timestamps, and whether a secret was reachable for a
+given call (observable in your script's own error handling). **Never
+values** — once stored, a value returns through no SDK call, only
+through env vars in the launched subprocess.
 
-## Conversation start hint
-
-The status line injected at conversation start now includes a count:
+## Conversation-start hint
 
 ```
 [To-do: 3 items | Triggers: 1 active | Secrets: 7 stored]
 ```
 
-If the count is `0`, you don't have credentials on file yet. If it's
-non-zero and you need to know what's available, call
+`0` means no credentials on file. Non-zero and you need specifics:
 `bb.secrets.list()`.
 
 ## Storage
 
-Values live at `data/credentials/secrets.json`, mode `0600`, owned by
-the main-process user. The `boxbot-sandbox` user has no read on the
-file. Values are unencrypted at rest — same protection class as
-`.env`, which sits next to it. If that protection class becomes
-inadequate, the right fix is filesystem-level encryption (LUKS on
-`/data`), not per-file crypto.
+`data/credentials/secrets.json`, mode `0600`, owned by the main-process
+user. `boxbot-sandbox` has no read. Unencrypted at rest — same
+protection class as the `.env` beside it. If that stops being enough,
+the fix is filesystem encryption (LUKS on `/data`), not per-file crypto.

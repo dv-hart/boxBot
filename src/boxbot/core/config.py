@@ -205,6 +205,19 @@ class ScheduleConfig(BaseModel):
     person_trigger_expiry_days: int = 7
 
 
+class HomeAssistantConfig(BaseModel):
+    """Home Assistant events bridge settings.
+
+    The bridge feeds entity trigger conditions (scheduler) with real-time
+    state changes over an outbound WebSocket. It only activates when the
+    HOME_ASSISTANT_URL / HOME_ASSISTANT_TOKEN secrets are stored.
+    """
+
+    events_enabled: bool = True
+    # How long the watched-entity set (from active triggers) is cached.
+    watch_refresh_seconds: float = 15.0
+
+
 class NightModeConfig(BaseModel):
     """Display night mode settings."""
 
@@ -740,8 +753,15 @@ class PrefetchConfig(BaseModel):
     # Hard cap on the assembled bundle. The whole point is to REDUCE
     # bloat, so the bundle is truncated to this budget by priority.
     token_budget: int = 1500
-    # Wall-clock ceiling for one prefetch run (mini-agent loop).
-    timeout_seconds: float = 8.0
+    # Wall-clock ceiling for one prefetch run (mini-agent loop). Applies
+    # to text channels, where the prefetch blocks the reply path — keep
+    # it bounded, but generous enough that a 2-3 iteration run (each a
+    # Haiku round trip + tool call) can actually finish.
+    timeout_seconds: float = 20.0
+    # Ceiling for scheduled-trigger precompute. That path runs in the
+    # background at T-minus-lookahead_minutes with nothing waiting on
+    # it, so it gets far more headroom than the inline text path.
+    trigger_timeout_seconds: float = 120.0
     # Max mini-agent iterations before it must return best-effort.
     max_iterations: int = 6
     # Override the model; null falls back to ``models.small`` (Haiku).
@@ -857,6 +877,7 @@ class BoxBotConfig(BaseModel):
     system: SystemConfig = Field(default_factory=SystemConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    home_assistant: HomeAssistantConfig = Field(default_factory=HomeAssistantConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)
     hardware: HardwareConfig = Field(default_factory=HardwareConfig)
     camera: CameraConfig = Field(default_factory=CameraConfig)

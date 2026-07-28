@@ -1,38 +1,46 @@
 ---
 name: skill_authoring
-description: How to create your own skills. A skill is structured prompt data — a markdown SKILL.md you'll read on demand later, optionally bundled with helper scripts. Load this whenever you're about to call bb.skill.create(), or whenever you find yourself solving the same kind of problem twice and want to teach yourself the recipe so the next time is easier.
-when_to_use: You're about to create a new skill, edit an existing one, or you just discovered a recurring workflow that should outlive this conversation.
+description: How to create your own skills. A skill is structured prompt data — a markdown SKILL.md you read on demand, optionally bundled with helper scripts. Load before calling bb.skill.create(), or when you catch yourself solving the same kind of problem twice.
+when_to_use: You're about to create a skill, edit one, or you just found a recurring workflow that should outlive this conversation.
 ---
 
 # Authoring skills
 
-A skill is a folder under `skills/` containing a `SKILL.md` file. The
-markdown body teaches *future you* how to do something — instructions,
-when to use them, gotchas, examples. Optional bundled scripts under
-`scripts/` give you deterministic helpers to call.
+A skill is a folder under `skills/` with a `SKILL.md`. The body teaches
+*future you* how to do something. Optional scripts under `scripts/` give
+you deterministic helpers.
 
-Skills are not callable functions. They have no parameters, no env vars,
-no schedule. If you need any of those, what you actually want is an
-**integration** (a manifest+script bundle under `integrations/<name>/` —
-see `bb.integrations` and [Skill vs. integration](#skill-vs-integration)
-below), not a skill.
+Skills are not callable. No parameters, no env vars, no schedule. Need
+any of those? You want an **integration**
+(`integrations/<name>/`) — see [Skill vs. integration](#skill-vs-integration).
 
-## When to write a skill
+## Write one when
 
-Write one when **all** of these are true:
+All three hold:
 
-- You'd benefit from re-reading the instructions later. (If once is
-  enough, jot it in `bb.workspace` instead.)
-- The instructions are general — they don't depend on this specific
-  conversation's state.
-- Other consumers (the display, the scheduler, a routine briefing) do
-  not need the same logic. (If they do → integration.)
+- You'd benefit from re-reading it later. (Once is enough →
+  `bb.workspace`.)
+- The instructions are general, not tied to this conversation's state.
+- No other consumer (display, scheduler, briefing) needs the same
+  logic. (They do → integration.)
 
-Write a skill **when in doubt** for repeatable agent-side workflows:
-"how I draft a morning briefing", "how I onboard a new household
-member", "how I diagnose a misbehaving photo tag". Skills are cheap to
-add and only enter the system prompt as ~100 tokens of metadata until
-triggered.
+When in doubt, write it. Skills are cheap: ~100 tokens of metadata in
+the system prompt until triggered.
+
+## Write it terse
+
+You are the reader. You do not need hand-holding prose.
+
+- Fragments over sentences. Drop articles, hedges, and pleasantries.
+- Lead with the rule, then the qualifier.
+- Tables and code over paragraphs.
+- Keep code, identifiers, paths, and error strings **byte-for-byte
+  exact** — compress prose, never payload.
+- Keep full clarity for anything destructive, irreversible, or
+  security-relevant. Terse is not ambiguous.
+
+"Use `bb.weather.forecast(days=N)`" beats "You'll probably want to
+reach for the forecast helper, which takes a number of days."
 
 ## SKILL.md format
 
@@ -45,74 +53,62 @@ when_to_use: User mentions weather, temperature, rain, snow, sun, what to wear, 
 
 # Weather
 
-Use `bb.weather.forecast(days=N)` to get an N-day forecast.
-For hourly precipitation, see HOURLY.md.
+`bb.weather.forecast(days=N)` for an N-day forecast.
+Hourly precipitation: HOURLY.md.
 ```
-
-### Frontmatter rules (Anthropic Agent Skills spec)
 
 | Field | Required | Constraint |
 |---|---|---|
-| `name` | yes | ≤64 chars; `^[a-z0-9-]+$`; cannot be `anthropic` or `claude`; no XML |
-| `description` | yes | ≤1024 chars; non-empty; no XML; should answer *what it does* AND *when to use it* |
-| `when_to_use` | no, but recommended | one sentence on the trigger conditions; helps the loader rank skills |
+| `name` | yes | ≤64 chars; `^[a-z0-9-]+$`; not `anthropic` or `claude`; no XML |
+| `description` | yes | ≤1024 chars; non-empty; no XML; must answer *what* AND *when* |
+| `when_to_use` | recommended | One sentence of trigger conditions. Helps the loader rank. |
 
-A bad description: `"Weather skill"`. A good one:
-`"Get NOAA weather forecasts for the configured location. Use when the user asks about weather, temperature, rain, or what to wear."`
+Bad: `"Weather skill"`. Good: `"Get NOAA weather forecasts for the
+configured location. Use when the user asks about weather, temperature,
+rain, or what to wear."`
 
-The description goes into the system prompt at Level 1 (always). It is
-how *you, in some future conversation* decide whether this skill is
-relevant. Be specific.
+The description sits in the system prompt at Level 1, always. It is how
+future-you decides relevance. Be specific.
 
-## Body length and progressive disclosure
+## Length and progressive disclosure
 
-The body is **Level 2** — loaded when the skill is triggered. Keep it
-**under 5 KB**. If your guidance grows past that, split into Level 3
-sub-docs:
+The body is **Level 2**, loaded on trigger. Keep it **under 5 KB**.
+Overflow goes to Level 3:
 
 ```
 skills/<name>/
-  SKILL.md        # Level 2 — overview, when to use, top of the funnel
-  REFERENCE.md    # Level 3 — full API table, only loaded if needed
+  SKILL.md        # Level 2 — overview, when to use
+  REFERENCE.md    # Level 3 — full API table
   EXAMPLES.md     # Level 3 — worked examples
   scripts/
-    helper.py     # bundled helper, importable in execute_script
+    helper.py     # importable in execute_script
 ```
 
-In SKILL.md, *link* to the Level 3 docs by filename (`see REFERENCE.md`)
-so future-you knows they exist without paying for them upfront.
+Link Level 3 docs by filename (`see REFERENCE.md`) so future-you knows
+they exist without paying for them.
 
 ## Bundled scripts
 
-A bundled script is a Python file under `scripts/` you ship alongside
-the SKILL.md. Two ways to use it inside `execute_script`:
+`skills/` is on the sandbox `sys.path`:
 
 ```python
-# Import and call (works because skills/ is on the sandbox sys.path)
 from skills.weather.scripts import nws_raw
 data = nws_raw.fetch(lat=45.5, lon=-122.7, days=5)
-```
 
-```python
-# Reuse the script's logic from another bundled script in another skill
 from skills.weather.scripts.nws_raw import format_for_voice
 ```
 
-Subprocess execution (`subprocess.run(["python3", "..."])`) does **not**
-work — seccomp blocks `execve`/`fork` in the sandbox. Always import.
+Import only. `subprocess.run(["python3", ...])` never works — seccomp
+blocks `execve`/`fork`.
 
-When you call `bb.skill.add_script(filename, content)`, the writer also
-stamps a `scripts/__init__.py` so the import path resolves. You don't
-have to write it yourself.
+`bb.skill.add_script(filename, content)` stamps `scripts/__init__.py`
+for you.
 
-Bundle a script when:
-- Its logic is too long or fiddly to inline in every conversation.
-- You want a stable interface other skills can reuse.
-- Determinism matters — you'd rather call tested code than re-derive it.
+Bundle when the logic is too long to inline every time, when you want a
+stable interface other skills reuse, or when determinism matters.
+Otherwise just describe the steps.
 
-Otherwise, just describe the steps in the SKILL.md body.
-
-## Creating a skill
+## Creating
 
 ```python
 import boxbot_sdk as bb
@@ -125,43 +121,34 @@ s.description = (
 s.body = """
 # Weather
 
-Use `bb.weather.forecast(days=N)` for the forecast. For hourly
-precipitation, see HOURLY.md.
+`bb.weather.forecast(days=N)` for the forecast.
+Hourly precipitation: HOURLY.md.
 """
 s.add_resource("HOURLY.md", "# Hourly forecast\n\n…")
 s.add_script("nws_raw.py", "import requests\n\ndef fetch(...):\n    …")
 s.save()
 ```
 
-`save()` returns immediately. The loader picks the skill up on the next
-discovery scan (typically next conversation). If a skill named `weather`
-already exists, save fails with `status: "exists"` — call
-`bb.skill.delete("weather")` first (or pick a different name) instead of
-overwriting.
+`save()` returns immediately. The loader picks it up on the next
+discovery scan, typically next conversation. An existing name fails with
+`status: "exists"` — delete first or pick another name. No overwrite.
 
-## Iterating on a skill you wrote
+## Iterating on your own skill
 
-You'll occasionally discover a bug in a skill you authored — usually a
-bundled script that throws when it runs. Two things you need to know:
+**Read your script.** Skills live at `<repo>/skills/<name>/`, which the
+sandbox cannot browse. Pull a file in with `load_skill` — a tool call,
+not `execute_script`:
 
-**Read your own script.** Skills live under `<repo>/skills/<name>/`,
-which the sandbox can't browse directly. Use `load_skill` with `subpath`
-to pull a specific file into the conversation:
-
-```python
-# In a tool call, not execute_script
+```
 load_skill(name="refresh_weekly_glance_agenda", subpath="scripts/refresh.py")
 ```
 
-The body comes back as text you can read, diagnose, and rewrite.
-
-**Replace it via delete + create.** `bb.skill.save()` will not overwrite
-an existing skill. The flow is:
+**Replace via delete + create:**
 
 ```python
 import boxbot_sdk as bb
 
-bb.skill.delete("refresh_weekly_glance_agenda")  # only agent-authored skills
+bb.skill.delete("refresh_weekly_glance_agenda")
 s = bb.skill.create("refresh_weekly_glance_agenda")
 s.description = "..."
 s.body = "..."
@@ -169,32 +156,31 @@ s.add_script("refresh.py", fixed_source)
 s.save()
 ```
 
-`delete` refuses to remove built-in skills (`bb`, `skill_authoring`,
-`onboarding`, `hal-sandbox-ref`, anything shipped under `<repo>/skills/`
-in git) — it requires the `.agent-authored` marker that `save` stamps.
-If you get `status: "forbidden"`, you're trying to delete a built-in;
-pick a different name instead.
+`delete` refuses built-ins (`bb`, `skill_authoring`, `onboarding`,
+`hal-sandbox-ref`, anything shipped in git) — it needs the
+`.agent-authored` marker that `save` stamps. `status: "forbidden"` means
+you hit a built-in; pick a different name.
 
 ## Skill vs. integration
 
 | | Skill | Integration |
 |---|---|---|
-| Form | SKILL.md + optional bundled scripts | `integrations/<name>/{manifest.yaml, script.py}` (sandbox-runnable bundle) |
-| Stateful? | No | Yes (creds, cached values, refresh tokens) |
-| Runs on its own? | No, inert until triggered | Yes, on a schedule or events |
-| Consumers | The agent, in one conversation | Many: displays, scheduler, agent SDK, briefings |
-| Lifecycle | Lives until manually removed | Owns refresh cadence + error handling |
+| Form | SKILL.md + optional scripts | `integrations/<name>/{manifest.yaml, script.py}` |
+| Stateful | No | Yes — creds, caches, refresh tokens |
+| Runs on its own | No, inert until triggered | Yes, on schedule or events |
+| Consumers | You, in one conversation | Displays, scheduler, SDK, briefings |
+| Lifecycle | Lives until removed | Owns refresh cadence + error handling |
 
-If you find yourself wanting `s.add_parameter(...)`, `s.add_env_var(...)`,
-or "fetch this on a schedule", what you want is an integration. Skills
-are nouns the agent reads; integrations are verbs that run whether the
-agent is awake or not.
+Wanting `s.add_parameter(...)`, `s.add_env_var(...)`, or "fetch this on
+a schedule" means you want an integration. **Skills are nouns you read.
+Integrations are verbs that run whether you're awake or not.**
 
-## Self-check before saving
+## Self-check
 
-- [ ] `name` is ≤64 chars, lowercase + hyphens, not "anthropic" or "claude"
-- [ ] `description` is specific about *what* and *when*, not just *what*
-- [ ] Body is under ~5 KB or split into Level 3 sub-docs
-- [ ] No invocation parameters, no env vars, no scheduling — those are integration concerns
-- [ ] Bundled scripts (if any) are importable, not subprocess-invoked
-- [ ] You'd be glad to find this skill in a future conversation
+- [ ] `name` ≤64 chars, lowercase + hyphens, not "anthropic"/"claude"
+- [ ] `description` says *what* AND *when*
+- [ ] Body under ~5 KB, or split to Level 3
+- [ ] Terse — fragments, tables, code; no filler prose
+- [ ] No parameters, env vars, or scheduling (those are integrations)
+- [ ] Scripts are importable, not subprocess-invoked
+- [ ] You'd be glad to find this in a future conversation

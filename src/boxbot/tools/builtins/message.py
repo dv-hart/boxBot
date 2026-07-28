@@ -40,19 +40,18 @@ class MessageTool(Tool):
 
     name = "message"
     description = (
-        "The ONLY way to reach a human; your text output is private "
-        "notes, not speech. Call as many times per turn as needed (e.g. "
-        "an interim acknowledgement before a tool call, then the final "
-        "answer; multiple recipients = multiple calls).\n"
-        "`to`: \"current_speaker\" (whoever just addressed you), \"room\" "
-        "(broadcast spoken audio, speak channel only), or a registered "
+        "The ONLY way to reach a human. Your text output is private "
+        "notes — nobody hears it. No message call = silence.\n"
+        "Call as many times per turn as needed: interim ack alongside a "
+        "tool call, then the answer next turn. Multiple recipients = "
+        "multiple calls.\n"
+        "`to`: \"current_speaker\" (whoever just addressed you) | "
+        "\"room\" (spoken broadcast, speak channel only) | a registered "
         "user's exact name.\n"
-        "`channel`: \"speak\" (box speaker, everyone in the room hears) or "
-        "\"text\" (text a registered user by name — cannot text \"room\" "
-        "or unknown people).\n"
-        "Default to the channel you were contacted through. Be concise, "
-        "and stay silent (don't call this) when people are talking to "
-        "each other, not to you."
+        "`channel`: \"speak\" (box speaker, whole room hears) | \"text\" "
+        "(registered user by name; cannot text \"room\" or strangers).\n"
+        "Default to the channel you were contacted on. Be concise. Stay "
+        "silent when people are talking to each other, not to you."
     )
     parameters = {
         "type": "object",
@@ -60,18 +59,14 @@ class MessageTool(Tool):
             "to": {
                 "type": "string",
                 "description": (
-                    "\"current_speaker\" (whoever just addressed you), "
-                    "\"room\" (spoken broadcast), or a registered user's "
+                    "\"current_speaker\" | \"room\" | a registered user's "
                     "exact name."
                 ),
             },
             "channel": {
                 "type": "string",
                 "enum": ["speak", "text"],
-                "description": (
-                    "\"speak\" (box speaker) or \"text\" (text a "
-                    "registered user)."
-                ),
+                "description": "\"speak\" = box speaker. \"text\" = their phone.",
             },
             "content": {
                 "type": "string",

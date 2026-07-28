@@ -197,6 +197,29 @@ class UserRegistered(Event):
 
 
 @dataclass(frozen=True)
+class EntityStateChanged(Event):
+    """An external entity (Home Assistant) changed state.
+
+    Published by the HA events client for entities that active triggers
+    watch. ``snapshot=True`` marks a state read on (re)connect rather
+    than a live transition — snapshots update the scheduler's state map
+    but never fire triggers, so a reconnect can't re-fire on a
+    long-lived state. ``new_state="unknown"`` is published on
+    disconnect so stale states can't satisfy compound conditions.
+
+    Source: Integrations (ha_events)
+    Consumers: Scheduler
+    """
+
+    entity_id: str = ""
+    new_state: str = ""
+    old_state: str = ""
+    friendly_name: str = ""
+    snapshot: bool = False
+    source: str = "home_assistant"
+
+
+@dataclass(frozen=True)
 class TriggerFired(Event):
     """A scheduler trigger's conditions have all been met.
 
@@ -211,6 +234,7 @@ class TriggerFired(Event):
     for_person: str | None = None
     todo_id: str | None = None
     is_recurring: bool = False
+    entity: str | None = None
 
 
 @dataclass(frozen=True)

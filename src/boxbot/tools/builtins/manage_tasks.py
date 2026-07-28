@@ -21,10 +21,10 @@ class ManageTasksTool(Tool):
 
     name = "manage_tasks"
     description = (
-        "Manage your triggers (wake conditions) and to-do list — your "
-        "internal planning, not the family calendar. Actions: "
-        "create_trigger (AND-combined conditions: fire_at, fire_after, "
-        "cron, person), create_todo, list, get, update, complete, cancel."
+        "Your triggers (wake conditions) and to-do list. Internal "
+        "planning, not the household calendar. Actions: create_trigger "
+        "(conditions AND together: fire_at, fire_after, cron, person, "
+        "entity), create_todo, list, get, update, complete, cancel."
     )
     parameters = {
         "type": "object",
@@ -45,73 +45,85 @@ class ManageTasksTool(Tool):
             # create_trigger fields
             "description": {
                 "type": "string",
-                "description": "Human-readable summary (create_trigger, create_todo).",
+                "description": "Short summary. create_trigger, create_todo.",
             },
             "instructions": {
                 "type": "string",
-                "description": "What to do when the trigger fires (create_trigger).",
+                "description": "What to do when the trigger fires.",
             },
             "fire_at": {
                 "type": "string",
-                "description": "ISO datetime for point-in-time trigger.",
+                "description": "ISO datetime. Point-in-time condition.",
             },
             "fire_after": {
                 "type": "string",
                 "description": (
-                    "Relative duration (e.g., '30m', '2h'). Max 24h. "
-                    "Converted to fire_at on creation."
+                    "Relative duration: '30m', '2h'. Max 24h. Converted to "
+                    "fire_at at creation."
                 ),
             },
             "cron": {
                 "type": "string",
                 "description": (
-                    "Cron expression for recurring triggers. "
-                    "Mutually exclusive with fire_at/fire_after."
+                    "Cron expression, recurring. Mutually exclusive with "
+                    "fire_at/fire_after."
                 ),
             },
             "person": {
                 "type": "string",
                 "description": (
-                    "Person-presence condition: a name (e.g. 'Jacob') "
-                    "fires when that person is seen; '*' fires on the "
-                    "first person seen (no identification). Combine with "
-                    "time fields for compound (AND) triggers."
+                    "Presence condition. A name ('Jacob') fires when that "
+                    "person is seen. '*' fires on any person, no "
+                    "identification needed."
                 ),
+            },
+            "entity": {
+                "type": "string",
+                "description": (
+                    "Home Assistant entity_id, e.g. "
+                    "'binary_sensor.front_door_person'. Fires when the "
+                    "entity enters entity_state. Covers camera "
+                    "person/vehicle/animal/package, doors, motion. Needs "
+                    "the HA events bridge."
+                ),
+            },
+            "entity_state": {
+                "type": "string",
+                "description": "State that satisfies `entity`. Default 'on'.",
             },
             "for_person": {
                 "type": "string",
-                "description": "Who this relates to (context).",
+                "description": "Who this is about. Context, not a condition.",
             },
             "expires": {
                 "type": "string",
-                "description": "ISO datetime expiry override.",
+                "description": "ISO datetime. Expiry override.",
             },
             "todo_id": {
                 "type": "string",
-                "description": "Link trigger to an existing to-do item.",
+                "description": "Link to an existing to-do. Does not auto-complete it.",
             },
             # create_todo fields
             "notes": {
                 "type": "string",
                 "description": (
-                    "Detailed context and instructions for a to-do item. "
-                    "Loaded on demand via 'get', not shown in lists."
+                    "Detail for a to-do. Loaded by 'get', hidden from lists."
                 ),
             },
             "due_date": {
                 "type": "string",
-                "description": "ISO date soft deadline for a to-do item.",
+                "description": "ISO date. Soft deadline for a to-do.",
             },
             # list fields
             "type": {
                 "type": "string",
                 "enum": ["triggers", "todos", "all"],
-                "description": "What to list (default: 'all').",
+                "description": "Default 'all'.",
             },
             "status": {
                 "type": "string",
                 "enum": ["active", "completed", "expired", "all"],
-                "description": "Filter by status (default: 'active').",
+                "description": "Default 'active'.",
             },
             # get/update/complete/cancel fields
             "id": {
@@ -164,6 +176,8 @@ class ManageTasksTool(Tool):
             fire_after=kwargs.get("fire_after"),
             cron=kwargs.get("cron"),
             person=kwargs.get("person"),
+            entity=kwargs.get("entity"),
+            entity_state=kwargs.get("entity_state"),
             for_person=kwargs.get("for_person"),
             expires=kwargs.get("expires"),
             todo_id=kwargs.get("todo_id"),
@@ -225,6 +239,8 @@ class ManageTasksTool(Tool):
                     "fire_at": t.get("fire_at"),
                     "cron": t.get("cron"),
                     "person": t.get("person"),
+                    "entity": t.get("entity"),
+                    "entity_state": t.get("entity_state"),
                     "for_person": t.get("for_person"),
                     "status": t["status"],
                 }
@@ -268,6 +284,8 @@ class ManageTasksTool(Tool):
                 "fire_at": trigger.get("fire_at"),
                 "cron": trigger.get("cron"),
                 "person": trigger.get("person"),
+                "entity": trigger.get("entity"),
+                "entity_state": trigger.get("entity_state"),
                 "for_person": trigger.get("for_person"),
                 "todo_id": trigger.get("todo_id"),
                 "status": trigger["status"],

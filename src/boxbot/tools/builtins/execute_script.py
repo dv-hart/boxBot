@@ -124,43 +124,36 @@ class ExecuteScriptTool(Tool):
 
     name = "execute_script"
     description = (
-        "Run a Python script in the sandboxed environment. The script can "
-        "import from boxbot_sdk (aliased as bb) to manage photos, displays, "
-        "memories, skills, the agent workspace (notes, CSVs), secrets, "
-        "tasks, the calendar, and packages. Use this for anything not "
-        "covered by a dedicated tool — composing multiple operations in a "
-        "single turn, taking notes, capturing/viewing images, or general "
-        "computation."
+        "Run Python in the sandbox. `import bb` (alias: boxbot_sdk) for "
+        "workspace, camera, photos, audio, display, memory, tasks, skill, "
+        "integrations, secrets, packages. Use for anything without a "
+        "dedicated tool, and to compose many operations in one turn."
     )
     parameters = {
         "type": "object",
         "properties": {
             "script": {
                 "type": "string",
-                "description": "Python source code to execute in the sandbox.",
+                "description": "Python source.",
             },
             "description": {
                 "type": "string",
-                "description": "Brief description of what the script does (for logging).",
+                "description": "One-line summary. Logging only.",
             },
             "env_vars": {
                 "type": "object",
                 "description": (
-                    "Optional environment variables to inject into the script's "
-                    "environment. Use this for non-secret values; for stored "
-                    "credentials, prefer the 'secrets' parameter so the value "
-                    "is resolved server-side and never crosses the agent's view."
+                    "Non-secret env vars. For credentials use `secrets` "
+                    "instead — resolved server-side, never in your context."
                 ),
                 "additionalProperties": {"type": "string"},
             },
             "secrets": {
                 "type": "array",
                 "description": (
-                    "Names of stored secrets to inject as BOXBOT_SECRET_<NAME> "
-                    "env vars. The tool resolves names against the secret store; "
-                    "the agent never sees values. Names not in the store are "
-                    "silently skipped — the script can detect None and surface "
-                    "a helpful error."
+                    "Stored secret names, injected as BOXBOT_SECRET_<NAME>. "
+                    "You never see values. Unknown names are skipped "
+                    "silently; the script sees None."
                 ),
                 "items": {"type": "string"},
             },

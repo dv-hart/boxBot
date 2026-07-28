@@ -77,6 +77,14 @@ class TriggerRecord:
         return self._data.get("person")
 
     @property
+    def entity(self) -> str | None:
+        return self._data.get("entity")
+
+    @property
+    def entity_state(self) -> str | None:
+        return self._data.get("entity_state")
+
+    @property
     def for_person(self) -> str | None:
         return self._data.get("for_person")
 
@@ -148,12 +156,15 @@ def create_trigger(description: str, instructions: str, *,
                    fire_after: str | None = None,
                    cron: str | None = None,
                    person: str | None = None,
+                   entity: str | None = None,
+                   entity_state: str | None = None,
                    for_person: str | None = None,
                    todo_id: str | None = None) -> str:
     """Create a trigger (wake condition); return the new trigger's ID.
 
     Triggers use AND logic — all specified conditions must be met.
-    At least one condition (fire_at, fire_after, cron, or person) is required.
+    At least one condition (fire_at, fire_after, cron, person, or entity)
+    is required.
 
     Args:
         description: Human-readable trigger description.
@@ -164,6 +175,12 @@ def create_trigger(description: str, instructions: str, *,
         person: Person-presence condition. A name (e.g. "Jacob") fires when
             that person is visually identified; "*" fires on ANY person seen,
             no identification required.
+        entity: Home Assistant entity condition — a full entity_id
+            (e.g. "binary_sensor.front_door_person"). Fires when the
+            entity enters ``entity_state``. Requires the HA events bridge
+            (HOME_ASSISTANT_URL/TOKEN secrets stored).
+        entity_state: State satisfying the entity condition (default "on").
+            Only valid with ``entity``.
         for_person: Person this trigger is about (for context).
         todo_id: Link to a to-do item.
 
@@ -173,11 +190,11 @@ def create_trigger(description: str, instructions: str, *,
     v.require_str(description, "description")
     v.require_str(instructions, "instructions")
 
-    has_condition = any([fire_at, fire_after, cron, person])
+    has_condition = any([fire_at, fire_after, cron, person, entity])
     if not has_condition:
         raise ValueError(
             "At least one trigger condition is required: "
-            "fire_at, fire_after, cron, or person"
+            "fire_at, fire_after, cron, person, or entity"
         )
 
     payload: dict[str, Any] = {
@@ -192,6 +209,10 @@ def create_trigger(description: str, instructions: str, *,
         payload["cron"] = v.require_str(cron, "cron")
     if person is not None:
         payload["person"] = v.require_str(person, "person")
+    if entity is not None:
+        payload["entity"] = v.require_str(entity, "entity")
+    if entity_state is not None:
+        payload["entity_state"] = v.require_str(entity_state, "entity_state")
     if for_person is not None:
         payload["for_person"] = v.require_str(for_person, "for_person")
     if todo_id is not None:

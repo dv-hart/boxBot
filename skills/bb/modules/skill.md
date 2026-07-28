@@ -1,31 +1,20 @@
-# bb.skill — create new skills at runtime
+# bb.skill — create skills at runtime
 
-Skills are **structured prompt data** — markdown instructions you read
-later, optionally bundled with helper scripts. Use this module to teach
-yourself a new recurring workflow so the next time you face the same
-problem, the recipe is already on disk.
+Skills are **structured prompt data**: markdown you read later,
+optionally bundled with helper scripts. Use this to keep a recipe so
+the next time costs nothing.
 
-For the full authoring guide (when to write a skill, frontmatter rules,
-length guidance, skill-vs-integration), load
-`skills/skill_authoring/SKILL.md`. This page is just the API reference.
+Full authoring guide (when to write one, frontmatter, length,
+skill-vs-integration): `skills/skill_authoring/SKILL.md`. This is the
+API reference.
 
-## When to use it
+**Use when:** you just worked out something reusable ("how I draft a
+morning brief"); the user asks you to remember a workflow ("when I say
+'plan dinner', do X then Y"); you hit the same problem twice.
 
-- You just figured out how to do something useful and want to keep the
-  recipe (e.g. "how I draft a morning brief", "how I diagnose a
-  misbehaving photo tag").
-- The user asks you to remember a workflow ("when I say 'plan dinner',
-  do X then Y").
-- You hit the same problem twice in a row and want the third time to
-  be cheap.
-
-## When NOT to use it
-
-- For data pipelines, scheduled fetchers, or service connectors with
-  credentials. Those belong in **integrations**
-  (`src/boxbot/integrations/`), not skills.
-- For one-off scratch work. Use `bb.workspace` instead.
-- For secrets. Use `bb.secrets`.
+**Not for:** data pipelines, scheduled fetchers, credentialed service
+connectors → **integrations**. One-off scratch work → `bb.workspace`.
+Credentials → `bb.secrets`.
 
 ## API
 
@@ -40,65 +29,54 @@ s.description = (
 s.body = """
 # Weather
 
-Use `bb.weather.forecast(days=N)` to get an N-day forecast.
-For hourly precipitation detail, see HOURLY.md.
+Use `bb.weather.forecast(days=N)` for an N-day forecast.
+Hourly precipitation detail: HOURLY.md.
 """
 s.add_resource("HOURLY.md", "# Hourly forecast\n\n…")
 s.add_script("nws_raw.py", "import requests\n…")
 s.save()
 ```
 
-### Method reference
-
 | Call | Required | Notes |
 |---|---|---|
-| `bb.skill.create(name)` | yes | Returns a builder. `name` ≤64 chars, lowercase, `[a-z0-9_-]+`, not `anthropic`/`claude`. |
-| `s.description = "…"` | yes | ≤1024 chars, non-empty, no XML brackets. Should answer *what* and *when*. |
-| `s.body = "…"` | yes | SKILL.md markdown body. Keep ≤5KB; split overflow into Level 3 sub-docs via `add_resource`. |
-| `s.add_script(filename, content)` | optional, repeatable | `filename` must be a bare basename ending in `.py`. Bundled under `scripts/<filename>`. The writer also stamps a `scripts/__init__.py` so you can `from skills.<name>.scripts import <module>` later. |
-| `s.add_resource(filename, content)` | optional, repeatable | Bare basename. Lives at the skill root. Conventionally `.md`. Cannot be named `SKILL.md`. |
-| `s.save()` | terminal | Emits `skill.save`. Refuses with `status: "exists"` if `skills/<name>/` already exists. |
+| `bb.skill.create(name)` | yes | Returns a builder. `name` ≤64 chars, lowercase `[a-z0-9_-]+`, not `anthropic`/`claude`. |
+| `s.description = "…"` | yes | ≤1024 chars, non-empty, no XML brackets. Answer *what* and *when*. |
+| `s.body = "…"` | yes | SKILL.md markdown. ≤5 KB; overflow goes to Level 3 sub-docs via `add_resource`. |
+| `s.add_script(f, content)` | optional, repeatable | Bare basename ending `.py`. Lands at `scripts/<f>`. A `scripts/__init__.py` is stamped for you. |
+| `s.add_resource(f, content)` | optional, repeatable | Bare basename, skill root, conventionally `.md`. Cannot be `SKILL.md`. |
+| `s.save()` | terminal | Emits `skill.save`. Fails `status: "exists"` if `skills/<name>/` is taken. |
 
-### What lands on disk
-
-For the example above:
+## On disk
 
 ```
 skills/weather/
   SKILL.md          # frontmatter (name, description) + body
-  HOURLY.md         # the resource you added
+  HOURLY.md
   scripts/
     __init__.py     # auto-written
-    nws_raw.py      # your script
+    nws_raw.py
 ```
 
-Files are owned `boxbot:boxbot` mode `0644`. The sandbox can read but
-not modify them after save — your future self won't be able to
-overwrite this skill from a sandbox script. Use `skill.delete` (when
-implemented) and re-create instead.
+Owned `boxbot:boxbot`, mode `0644`. The sandbox reads but cannot modify
+after save — you cannot overwrite a skill from a sandbox script.
 
-### Conflict policy
+**No overwrite.** An existing `<name>` makes `save()` fail fast with
+`status: "exists"` and write nothing. This protects community skills.
 
-If a skill named `<name>` already exists, `save()` fails fast with
-`status: "exists"` and writes nothing. There is no overwrite. This
-prevents accidental clobbers of community skills.
+## Activation
 
-### Activation
+The loader picks new skills up on its next discovery scan, typically
+the next conversation. No live registration — and you do not need it:
+the markdown body already exists in the conversation that wrote it.
 
-The loader picks new skills up on its next discovery scan — typically
-the next conversation. There is no live in-conversation registration.
-If you need the skill *right now*, you do not — the markdown body
-already exists in the conversation that just wrote it.
+## Importing bundled scripts
 
-### Importing bundled scripts
-
-Inside `execute_script`, the project's `skills/` directory is on
-`sys.path`. Bundled scripts are importable directly:
+`skills/` is on `sys.path` inside `execute_script`:
 
 ```python
 from skills.weather.scripts import nws_raw
 data = nws_raw.fetch(lat=45.5, lon=-122.7, days=5)
 ```
 
-Subprocess invocation does not work — seccomp blocks `execve`/`fork`
-in the sandbox. Always import.
+Import only. Seccomp blocks `execve`/`fork`, so subprocess invocation
+never works.

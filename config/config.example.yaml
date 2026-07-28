@@ -62,6 +62,19 @@ schedule:
   # if the person is never detected.
   person_trigger_expiry_days: 7
 
+# ── Home Assistant events bridge ──────────────────────────────────────
+# Feeds entity trigger conditions (e.g. "fire when
+# binary_sensor.front_door_person turns on") with real-time state
+# changes over an outbound WebSocket to the household HA instance.
+# Only activates when the HOME_ASSISTANT_URL / HOME_ASSISTANT_TOKEN
+# secrets are stored (same credentials as the home_assistant
+# integration). No inbound listener is opened.
+home_assistant:
+  events_enabled: true
+  # How long the watched-entity set (derived from active entity
+  # triggers) is cached before re-reading from the scheduler DB.
+  watch_refresh_seconds: 15.0
+
 # ── Display ───────────────────────────────────────────────────────────
 display:
   # Display rotation interval during idle (seconds)
@@ -326,7 +339,11 @@ prefetch:
   lookahead_minutes: 5
   # Hard cap on the assembled bundle — the point is to REDUCE bloat.
   token_budget: 1500
-  timeout_seconds: 8.0
+  # Wall-clock ceiling per prefetch run. Text channels block the reply
+  # path, so their ceiling stays tight-ish; scheduled triggers precompute
+  # in the background at T-minus-lookahead and get far more headroom.
+  timeout_seconds: 20.0
+  trigger_timeout_seconds: 120.0
   max_iterations: 6
   # Override the mini-agent model; null falls back to models.small (Haiku).
   model: null

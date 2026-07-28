@@ -1,137 +1,107 @@
 # bb.display — the 7" screen
 
-A display is a JSON document. You read it, edit the dict, write it
-back. There is no builder, no fluent API — just spec dicts and the
-seven SDK calls that load, preview, save, and list them.
+A display is a JSON document. Read it, edit the dict, write it back. No
+builder, no fluent API — spec dicts plus the SDK calls that load,
+preview, save, and list them.
 
-## When to use it
+**Use for:** showing something the user asked for (`switch_display` if
+it already exists); authoring a layout that doesn't exist yet (build a
+dict, `preview()`, fix warnings, `save()`); editing an existing one
+(`load()` returns a dict you mutate).
 
-- User asks to see something ("put the weather up", "show the next
-  meeting"). Use ``switch_display`` for an existing display.
-- User asks for a layout that doesn't exist. Author it: build a dict,
-  ``preview()`` it, fix anything the warnings flag, ``save()``.
-- Editing an existing display ("a bit more contrast on morning_brief").
-  ``load()`` returns a dict you mutate freely.
+**Not for:** output *you* need to see → `bb.workspace.view`,
+`bb.camera.capture`, `bb.photos.view`. Rapid cycling — switches tear
+down and set up data sources; stay under ~1/sec.
 
-## When NOT to use it
+## Built-ins
 
-- Output the *agent* needs to see — that's ``bb.workspace.view``,
-  ``bb.camera.capture``, or ``bb.photos.view``.
-- Rapid-fire changes — display switches involve teardown/setup of
-  data sources; don't cycle them faster than ~1/sec.
+- `clock` — full-screen time + date.
+- `weather_simple` — current conditions.
+- `picture` — photo viewer. One id = static, several = slideshow.
+  `args.image_ids: [str, ...]` (required), `args.interval: int`
+  (seconds, default 8, used with 2+ ids).
+- `notice` — short centered card (`args.title` + `args.lines`).
+- Plus everything in `displays/` and `data/displays/`.
 
-## Built-in displays
-
-- ``clock`` — full-screen time + date.
-- ``weather_simple`` — current conditions.
-- ``picture`` — photo viewer. Single id → static; multiple ids → slideshow.
-  ``args.image_ids: [str, ...]`` (required), ``args.interval: int``
-  (seconds, default 8, only used when there are 2+ ids).
-- ``notice`` — short centered card (``args.title`` + ``args.lines``).
-- Plus anything in ``displays/`` and any agent-saved displays in
-  ``data/displays/``.
-
-Call ``bb.display.list()`` to enumerate everything.
+`bb.display.list()` enumerates all of them.
 
 ## SDK surface
 
 | Call | Returns | Purpose |
 | --- | --- | --- |
-| ``bb.display.list()`` | ``[{name, source}, …]`` | enumerate displays |
-| ``bb.display.get_active()`` | ``{name, args, theme, pinned, rotation}`` | what's on screen + pin/rotation state |
-| ``bb.display.unpin()`` | ``{pinned, rotation}`` | release the pin, resume rotation |
-| ``bb.display.set_rotation(displays=, interval=)`` | ``{pinned, rotation}`` | configure idle rotation (clears pin) |
-| ``bb.display.screenshot()`` | ``{path, attached, name}`` | live screen → PNG (attached to tool result) |
-| ``bb.display.load(name)`` | ``dict`` | read a spec for editing |
-| ``bb.display.save(spec)`` | ``{path, registered, warnings}`` | validate + write + register live |
-| ``bb.display.preview(spec, data=None)`` | ``{path, attached, warnings}`` | render PNG with placeholder data |
-| ``bb.display.delete(name)`` | — | remove an agent-saved display |
-| ``bb.display.describe_source(name)`` | ``{fields, example}`` | data source field schema |
-| ``bb.display.schema()`` | ``{blocks, themes, …}`` | full block reference |
-| ``bb.display.update_data(display, source, value=)`` | ``{}`` | push live values into a ``static`` source |
+| `bb.display.list()` | `[{name, source}, …]` | enumerate |
+| `bb.display.get_active()` | `{name, args, theme, pinned, rotation}` | what's on screen + pin/rotation state |
+| `bb.display.unpin()` | `{pinned, rotation}` | release pin, resume rotation |
+| `bb.display.set_rotation(displays=, interval=)` | `{pinned, rotation}` | configure idle rotation (clears pin) |
+| `bb.display.screenshot()` | `{path, attached, name}` | live screen → PNG, attached |
+| `bb.display.load(name)` | `dict` | read a spec for editing |
+| `bb.display.save(spec)` | `{path, registered, warnings}` | validate + write + register live |
+| `bb.display.preview(spec, data=None)` | `{path, attached, warnings}` | render PNG with placeholder data |
+| `bb.display.delete(name)` | — | remove an agent-saved display |
+| `bb.display.describe_source(name)` | `{fields, example}` | data source field schema |
+| `bb.display.schema()` | `{blocks, themes, …}` | full block reference |
+| `bb.display.update_data(display, source, value=)` | `{}` | push values into a `static` source |
 
-``save`` and ``preview`` validate the spec before doing anything. On
-error they raise ``RuntimeError`` with every problem listed. On success
-they return ``warnings`` — typed lint hints:
+`save` and `preview` validate first. On error they raise `RuntimeError`
+listing every problem. On success they return `warnings`:
 
-- A binding (``{source.field}``) that didn't resolve against the
-  data the renderer would use at preview/save time. Usually a typo;
-  sometimes legitimate (an ``http_json`` source whose first fetch
-  hasn't happened yet — those clear once live data lands).
-- An icon ``name`` that isn't in the bundled Lucide subset (renders
-  as a circled-letter placeholder otherwise). Use
-  ``bb.display.schema()["icons"]`` to enumerate what's available.
+- A binding (`{source.field}`) that didn't resolve. Usually a typo;
+  sometimes legitimate (an `http_json` source whose first fetch hasn't
+  happened — clears once live data lands).
+- An icon `name` outside the bundled Lucide subset (renders as a
+  circled-letter placeholder). Enumerate with
+  `bb.display.schema()["icons"]`.
 
-**Limits of the warning system.** Warnings fire against the data the
-*preview* sees: live cache + each ``static`` source's declared
-``value=`` + placeholders for built-ins. If a binding resolves cleanly
-against placeholder data but a real fetch returns a sparser shape
-(e.g. a calendar event without a ``location`` field), no warning will
-fire and the affected text will render empty. Sanity-check live
-renders after switch_display, especially for fields placeholders
-populate that real data may not.
+**Warnings check placeholder data, not real data.** A binding that
+resolves against a placeholder may render empty when a real fetch
+returns a sparser shape (a calendar event with no `location`). Sanity-
+check live renders after `switch_display`.
 
-## Switching to an existing display
+## Switching
 
-The always-loaded ``switch_display`` tool — no script needed:
+The always-loaded tool — no script needed:
 
 ```
 switch_display("morning_brief")
 switch_display("picture", args={"image_ids": ["abc123..."]})
 ```
 
-The ``args`` dict shows up in bindings as ``{args.<field>}``.
+`args` binds as `{args.<field>}`.
 
-### Pinning, rotation, and going back to idle
+### Pin and rotation
 
-``switch_display`` **pins by default**. The chosen display stays on
-screen, and idle rotation is paused, until you replace it with another
-``switch_display`` call or release the pin. There is no auto-revert.
+`switch_display` **pins by default**. The display holds and idle
+rotation pauses until you replace it or unpin. No auto-revert.
 
 ```python
-# What's happening right now?
 state = bb.display.get_active()
 # {"name": "picture", "args": {"image_ids": [...]},
 #  "theme": "boxbot", "pinned": True,
 #  "rotation": {"active": False, "displays": [...],
 #               "interval": 30, "next_in_sec": None}}
 
-# Release pin, resume the configured rotation list
-bb.display.unpin()
-
-# Reshape rotation for the evening (slideshow only)
+bb.display.unpin()                                        # resume rotation
 bb.display.set_rotation(displays=["picture"], interval=120)
-
-# Pass pin=False if you want to "preview" a display without taking
-# control — the next rotation tick will move past it.
-switch_display("weather_simple", pin=False)
+switch_display("weather_simple", pin=False)               # preview without taking control
 ```
 
-A typical daily rhythm — one trigger per phase, each one calls the
-right method:
+A daily rhythm, one trigger per phase:
 
-| Time | Trigger fires → agent calls | Effect |
+| Time | Agent calls | Effect |
 | --- | --- | --- |
-| 07:00 | ``switch_display("morning_brief")`` | pinned digest |
-| 09:00 | ``bb.display.unpin()`` | rotation resumes |
-| 22:00 | ``switch_display("picture", args={"image_ids": [...], "interval": 10})`` | pinned slideshow |
+| 07:00 | `switch_display("morning_brief")` | pinned digest |
+| 09:00 | `bb.display.unpin()` | rotation resumes |
+| 22:00 | `switch_display("picture", args={"image_ids": [...], "interval": 10})` | pinned slideshow |
 
-For a slideshow, pass two or more ids in ``image_ids``; the display
-manager rotates through them every ``interval`` seconds (default 8).
-A single id renders static. To cycle "all photos tagged for the
-slideshow," gather the ids first with ``bb.photos.search(...)``,
-then pass the list.
+Slideshow: pass 2+ ids in `image_ids`; the manager rotates every
+`interval` seconds (default 8). One id renders static. For "all
+slideshow-tagged photos," gather ids with `bb.photos.search(...)` first.
 
-Do **not** try to build a slideshow with the ``rotate`` block — that
-block isn't currently driven by the renderer (it renders only its
-first child). The picture display's built-in cycle is the supported
-path.
+Do **not** build a slideshow with the `rotate` block — the renderer
+only draws its first child. The picture display's built-in cycle is the
+supported path.
 
-You don't have to schedule the unpin step — when you decide to put
-something else up, ``switch_display`` already replaces the pin.
-``unpin()`` is just the explicit "go back to rotation now" lever.
-
-## The spec shape
+## Spec shape
 
 ```json
 {
@@ -179,78 +149,73 @@ something else up, ``switch_display`` already replaces the pin.
 }
 ```
 
-Five top-level keys:
-
 | Key | Type | Notes |
 | --- | --- | --- |
-| ``name`` | str | unique, alphanumeric + ``_-`` |
-| ``theme`` | str | ``boxbot`` (default) / ``midnight`` / ``daylight`` / ``classic`` |
-| ``transition`` | str | optional. ``crossfade`` (default), ``slide_left``, ``slide_right``, ``none`` |
-| ``data_sources`` | list[dict] | declared data feeds — see below |
-| ``layout`` | dict | the block tree — a single block, optionally with ``children`` |
+| `name` | str | unique, alphanumeric + `_-` |
+| `theme` | str | `boxbot` (default) / `midnight` / `daylight` / `classic` |
+| `transition` | str | optional. `crossfade` (default), `slide_left`, `slide_right`, `none` |
+| `data_sources` | list[dict] | declared feeds, below |
+| `layout` | dict | the block tree |
 
-The layout is **one block** at the top level. Use a ``column`` or
-``row`` to host multiple top-level children.
+`layout` is **one** block. Use `column` or `row` to host several
+children.
 
-## Block reference
+## Blocks
 
-Every block has ``"type"`` and a flat bag of config fields. Containers
-also have ``"children"`` (a list of blocks).
+Every block has `"type"` plus a flat bag of config fields. Containers
+also take `"children"`.
 
-Get the full machine-readable reference any time with
-``bb.display.schema()`` — it returns every field, default, and
-valid-values list for every block. Use it instead of guessing.
+`bb.display.schema()` returns every field, default, and valid-values
+list for every block. Use it instead of guessing.
 
-### Layout containers
+### Containers
 
-| ``type`` | Fields | Notes |
+| `type` | Fields | Notes |
 | --- | --- | --- |
-| ``row`` | ``gap``, ``align``, ``padding`` | horizontal flow. ``align``: start/center/end/spread |
-| ``column`` / ``stack`` | ``gap``, ``align``, ``padding`` | vertical flow |
-| ``columns`` | ``ratios`` (list[int]), ``gap``, ``padding`` | weighted multi-column. ``ratios=[2,1]`` = 2/3 + 1/3 |
-| ``card`` | ``color``, ``radius``, ``padding`` | **invisible without ``color=``**. Pass ``"muted"`` for a subtle surface |
-| ``spacer`` | ``size`` (int or omit for flexible) | fixed or stretchy gap |
-| ``divider`` | ``color``, ``thickness``, ``orientation`` | line. ``orientation``: horizontal/vertical |
-| ``repeat`` | ``source`` (binding), ``max``, ``highlight_active`` | iterate over an array. Single child = template; bind item fields with ``{.field}`` |
+| `row` | `gap`, `align`, `padding` | horizontal. `align`: start/center/end/spread |
+| `column` / `stack` | `gap`, `align`, `padding` | vertical |
+| `columns` | `ratios` (list[int]), `gap`, `padding` | weighted. `ratios=[2,1]` = 2/3 + 1/3 |
+| `card` | `color`, `radius`, `padding` | **invisible without `color=`**. `"muted"` = subtle surface |
+| `spacer` | `size` (int, or omit for flexible) | fixed or stretchy gap |
+| `divider` | `color`, `thickness`, `orientation` | `orientation`: horizontal/vertical |
+| `repeat` | `source` (binding), `max`, `highlight_active` | iterate an array. Single child = template; bind item fields with `{.field}` |
 
-### Content blocks
+### Content
 
-| ``type`` | Required | Optional | Notes |
+| `type` | Required | Optional | Notes |
 | --- | --- | --- | --- |
-| ``text`` | ``content`` | ``size``, ``color``, ``weight``, ``align``, ``max_lines``, ``animation``, ``min_width`` | ``size``: title/heading/subtitle/body/caption/small. ``color``: default/muted/dim/accent/success/warning/error. ``weight``: normal/medium/semibold/bold. ``align``: left/center/right |
-| ``metric`` | ``value`` | ``label``, ``icon``, ``change``, ``change_color``, ``animation`` | intrinsically big — **no ``size=``**. Value uses theme ``text``; only ``change_color`` is configurable |
-| ``badge`` | ``text`` | ``color`` | small colored label |
-| ``list`` | ``items`` (list or binding) | ``style``, ``icon``, ``max_items`` | ``style``: bullet/number/check/none |
-| ``table`` | ``headers``, ``rows`` | ``striped``, ``max_rows`` | both can be bindings |
-| ``key_value`` | ``data`` (dict or binding) | — | label/value pairs |
-| ``icon`` | ``name`` | ``size``, ``color`` | Lucide icon names. ``size``: sm/md/lg/xl |
-| ``emoji`` | ``name`` | ``size`` | Twemoji. ``size``: md/lg/xl |
-| ``image`` | ``source`` | ``fit``, ``radius`` | ``source``: ``"photo:<id>"`` / ``"url:..."`` / ``"asset:..."`` |
-| ``chart`` | ``data`` *or* ``series`` | ``type``, ``color``, ``height``, ``x_labels``, ``show_grid``, ``show_legend``, ``fill_opacity``, ``show_dots``, ``padding`` | ``type``: line/bar/area |
-| ``progress`` | ``value`` (0..1 or binding) | ``label``, ``color`` | ``color="auto"`` shifts green→yellow→red |
-| ``clock`` | — | ``format``, ``show_date``, ``show_seconds``, ``size`` | live block. ``size``: md/lg/xl |
-| ``countdown`` | ``target`` | ``label`` | live, counts down to a datetime string |
+| `text` | `content` | `size`, `color`, `weight`, `align`, `max_lines`, `animation`, `min_width` | `size`: title/heading/subtitle/body/caption/small. `color`: default/muted/dim/accent/success/warning/error. `weight`: normal/medium/semibold/bold. `align`: left/center/right |
+| `metric` | `value` | `label`, `icon`, `change`, `change_color`, `animation` | intrinsically big — **no `size=`**. Value uses theme `text`; only `change_color` is configurable |
+| `badge` | `text` | `color` | small colored label |
+| `list` | `items` (list or binding) | `style`, `icon`, `max_items` | `style`: bullet/number/check/none |
+| `table` | `headers`, `rows` | `striped`, `max_rows` | both can be bindings |
+| `key_value` | `data` (dict or binding) | — | label/value pairs |
+| `icon` | `name` | `size`, `color` | Lucide names. `size`: sm/md/lg/xl |
+| `emoji` | `name` | `size` | Twemoji. `size`: md/lg/xl |
+| `image` | `source` | `fit`, `radius` | `source`: `"photo:<id>"` / `"url:..."` / `"asset:..."` |
+| `chart` | `data` *or* `series` | `type`, `color`, `height`, `x_labels`, `show_grid`, `show_legend`, `fill_opacity`, `show_dots`, `padding` | `type`: line/bar/area |
+| `progress` | `value` (0..1 or binding) | `label`, `color` | `color="auto"` shifts green→yellow→red |
+| `clock` | — | `format`, `show_date`, `show_seconds`, `size` | live. `size`: md/lg/xl |
+| `countdown` | `target` | `label` | live, counts down to a datetime string |
 
-### Three different ``size`` taxonomies — don't mix them
+### Three `size` taxonomies — do not mix
 
-| Block | ``size`` values |
+| Block | `size` values |
 | --- | --- |
-| ``text`` | semantic: title, heading, subtitle, body, caption, small |
-| ``icon`` | t-shirt: sm, md, lg, xl |
-| ``emoji`` | t-shirt: md, lg, xl |
-| ``clock`` | t-shirt: md, lg, xl |
-| ``metric`` | (no ``size`` — already large) |
+| `text` | semantic: title, heading, subtitle, body, caption, small |
+| `icon` | t-shirt: sm, md, lg, xl |
+| `emoji` | t-shirt: md, lg, xl |
+| `clock` | t-shirt: md, lg, xl |
+| `metric` | none — already large |
 
-``text(size="title")`` is **bigger** than ``clock(size="xl")``. The
-scales aren't comparable; pick visually, not by name.
+`text(size="title")` is **bigger** than `clock(size="xl")`. The scales
+are not comparable. Pick visually.
 
 ## Data sources
 
-Every binding in your layout pulls from a declared data source.
-Declare them once at the top level, bind anywhere with
-``{source.field}``.
+Declare once at the top level, bind anywhere with `{source.field}`.
 
-### Built-ins (zero config)
+### Built-ins, zero config
 
 ```json
 {"name": "tasks"}
@@ -259,19 +224,16 @@ Declare them once at the top level, bind anywhere with
 {"name": "clock"}
 ```
 
-Built-ins read live in-process state — the scheduler's to-do list,
-present people from the perception pipeline, agent state, the clock.
-They can't be expressed as integrations because the data never leaves
-the main process.
+These read live in-process state — the scheduler's to-do list, present
+people from perception, agent state, the clock. They cannot be
+integrations; the data never leaves the main process.
 
-Use ``bb.display.describe_source("tasks")`` to see fields each
-exposes (``items[].description``, ``count``, etc.). The doc rots; the
-schema doesn't.
+`bb.display.describe_source("tasks")` lists the fields
+(`items[].description`, `count`, …). The doc rots; the schema doesn't.
 
-### External data: ``integration``
+### External: `integration`
 
-Anything that talks to the outside world — weather, calendar, the
-solar integration you just authored — flows through one source type:
+Everything that talks to the outside world flows through one type:
 
 ```json
 {"name": "weather", "type": "integration", "refresh": 3600}
@@ -282,33 +244,23 @@ solar integration you just authored — flows through one source type:
  "inputs": {"date": "2026-05-15"}, "refresh": 3600}
 ```
 
-The data-source manager calls
-``bb.integrations.get(<name>, **inputs)`` on the refresh cadence and
-binds the integration's output dict to the source name (so
-``{weather.temp}``, ``{calendar.events[0].title}``,
-``{solar.kwh}`` work as expected).
+The manager calls `bb.integrations.get(<name>, **inputs)` on cadence
+and binds the output dict to the source name, so `{weather.temp}`,
+`{calendar.events[0].title}`, `{solar.kwh}` work.
 
-Optional fields:
+- `integration` — override which integration to call (defaults to
+  `name`). Lets one integration appear under several bindings.
+- `inputs` — passed verbatim. Manifests declare defaults and
+  `default_env` fallbacks for device config like `lat`/`lon`
+  (`BOXBOT_WEATHER_LAT` / `BOXBOT_WEATHER_LON`), so you rarely repeat
+  them per display.
+- `refresh` — seconds between fetches. Default 300.
 
-- ``integration``: override which integration to call (defaults to
-  ``name``). Lets the same integration appear under multiple bindings.
-- ``inputs``: passed verbatim. The integration manifest declares
-  defaults and ``default_env`` fallbacks for device-level config like
-  ``lat``/``lon`` (``BOXBOT_WEATHER_LAT`` / ``BOXBOT_WEATHER_LON``) so
-  you usually don't repeat them per display.
-- ``refresh``: seconds between fetches. Defaults to 300.
+Pre-seeded integrations and ones you author share this path. No
+privileged track. `bb.integrations.list()` shows what exists;
+`bb.display.describe_source(name)` reads the manifest `outputs` for you.
 
-Pre-seeded integrations (``weather``, ``calendar``) and ones you
-author with ``bb.integrations.create(...)`` use this same path —
-there is no privileged track. ``bb.integrations.list()`` enumerates
-what's available, and ``bb.display.describe_source(name)`` reads the
-integration manifest's ``outputs`` so you don't have to.
-
-### Custom: ``http_json``
-
-Fetch JSON from any URL on a refresh interval. Use ``fields`` to pull
-nested values out and (optionally) map them to icon names or color
-tokens.
+### `http_json`
 
 ```json
 {
@@ -325,68 +277,57 @@ tokens.
 }
 ```
 
-The ``secret`` field is the **name** of a secret in the boxBot secret
-store, not the value. The data-source manager looks it up via
-``bb.secrets`` at fetch time and sends it as a Bearer token. Store
-the actual key once with ``bb.secrets.store("STOCKS_API_KEY", "…")``;
-the spec only ever references the name.
+`secret` is the **name** of a secret, never the value. The manager
+looks it up via `bb.secrets` at fetch time and sends it as a Bearer
+token. Store the key once with
+`bb.secrets.store("STOCKS_API_KEY", "…")`.
 
-Then bind ``{stocks.price}`` and ``{stocks.trend}`` (the latter as an
-icon ``name``).
+Bind `{stocks.price}` and `{stocks.trend}` (the latter as an icon
+`name`).
 
-To verify the ``fields`` shape without waiting for a real fetch, pass
-the JSON the API would return as a ``data=`` override on preview:
+To verify `fields` without a real fetch, pass a fixture:
 
 ```python
-spec = {...}
 bb.display.preview(spec, data={
     "stocks": {"data": {"current": {"price": "184.20"}, "change": "+"}}
 })
 ```
 
-The override layers on top of the manager's normal data assembly, so
-``fields`` runs against your fixture and the warnings list reflects
-what would happen with real data.
+The override layers onto normal data assembly, so `fields` runs against
+your fixture and warnings reflect real behavior.
 
-### Custom: ``http_text``
+### `http_text`
 
 ```json
 {"name": "page", "type": "http_text", "url": "https://example.com"}
 ```
 
-Bind as ``{page.text}`` — the whole response body.
+Bind `{page.text}` — the whole body.
 
-### Custom: ``static``
+### `static`
 
-Hardcoded values the agent can later change with
-``bb.display.update_data(...)``:
+Hardcoded values you can change later via `bb.display.update_data(...)`:
 
 ```json
 {"name": "session", "type": "static",
  "value": {"task": "writing", "minutes": 0, "progress": 0.0}}
 ```
 
-### Custom: ``memory_query``
+### `memory_query`
 
-Re-runs a memory search on every refresh — e.g. a standing "household
-reminders" board. Hybrid vector + keyword scoring only (no model
-reranking, no conversation summaries), so it is free to refresh:
+Re-runs a memory search on every refresh — a standing "household
+reminders" board. Hybrid vector + keyword only (no model reranking, no
+conversation summaries), so refreshing is free:
 
 ```json
 {"name": "recent", "type": "memory_query",
  "query": "kitchen renovation", "refresh": 600, "limit": 5}
 ```
 
-``limit`` caps the result count (default 5 — screen space is small).
-Output fields:
-
-- ``results`` — array of ``{text, type, age}``. ``text`` is the memory
-  summary, ``type`` its memory type (person / household / methodology),
-  ``age`` a short age string like ``"3d"`` or ``"2w"``.
-- ``count`` — number of results returned.
-- ``query`` — the query that produced them.
-
-Bind with a ``repeat`` block:
+`limit` default 5 — screen space is small. Output: `results` (array of
+`{text, type, age}`; `text` is the summary, `type` is
+person/household/methodology, `age` is `"3d"` / `"2w"`), `count`,
+`query`.
 
 ```json
 {"type": "repeat", "source": "{recent.results}",
@@ -398,39 +339,37 @@ Bind with a ``repeat`` block:
 
 ## Bindings
 
-Any string in any block can include ``{source.field}``. Resolved at
+Any string in any block can contain `{source.field}`, resolved at
 render time:
 
-- ``args.<field>`` — the ``args={}`` passed to ``switch_display``.
-- ``<source>.<field>`` — declared data source. Array indexing works:
-  ``{calendar.events[0].title}``, ``{weather.forecast[2].high}``.
-- ``{.field}`` — current item *inside* a ``repeat`` block.
-- ``{current.field}`` — active item *inside* a ``rotate`` block.
+- `args.<field>` — the `args={}` from `switch_display`.
+- `<source>.<field>` — a declared source. Indexing works:
+  `{calendar.events[0].title}`, `{weather.forecast[2].high}`.
+- `{.field}` — current item inside a `repeat`.
+- `{current.field}` — active item inside a `rotate`.
 
-If the entire string is one binding, the raw value is passed through
-(useful for arrays into ``list`` / ``table``). If the string is mixed
-(``"{weather.temp}°F"``), the value is stringified.
+A string that is *entirely* one binding passes the raw value through
+(so arrays reach `list` / `table` intact). A mixed string
+(`"{weather.temp}°F"`) stringifies.
 
 ## Themes
 
 | Theme | Mood | Background |
 | --- | --- | --- |
-| ``boxbot`` | warm amber-coral, wooden enclosure | dark warm |
-| ``midnight`` | cool indigo, low ambient light | dark cool |
-| ``daylight`` | bright daytime contrast | light |
-| ``classic`` | high-contrast neutral | light |
+| `boxbot` | warm amber-coral, wooden enclosure | dark warm |
+| `midnight` | cool indigo, low ambient light | dark cool |
+| `daylight` | bright daytime contrast | light |
+| `classic` | high-contrast neutral | light |
 
-``boxbot`` and ``midnight`` both look dark — verify by previewing
-after a theme change, not by trusting the JSON alone. **Don't put
-``color="muted"`` text inside a ``card(color="muted")``** — they're
-the same surface tone, the text disappears.
+`boxbot` and `midnight` both read dark — preview after a theme change,
+don't trust the JSON. **Never put `color="muted"` text inside a
+`card(color="muted")`** — same surface tone, the text vanishes.
 
-## Authoring workflow
+## Authoring
 
 ```python
 import boxbot_sdk as bb
 
-# Build the dict however feels natural — literal, programmatic, mixed.
 spec = {
     "name": "morning_glance",
     "theme": "boxbot",
@@ -440,9 +379,7 @@ spec = {
         {"name": "weather", "type": "integration"},
     ],
     "layout": {
-        "type": "column",
-        "padding": 24,
-        "gap": 16,
+        "type": "column", "padding": 24, "gap": 16,
         "children": [
             {"type": "row", "align": "spread", "children": [
                 {"type": "clock", "format": "12h", "show_date": False,
@@ -463,20 +400,17 @@ spec = {
     },
 }
 
-result = bb.display.preview(spec)
-# inspect result["warnings"], view result["path"] (auto-attached)
-
-bb.display.save(spec)        # validates + writes + registers live
+result = bb.display.preview(spec)   # check result["warnings"], PNG auto-attaches
+bb.display.save(spec)               # validate + write + register live
 ```
 
-## Editing an existing display
+## Editing
 
 ```python
-spec = bb.display.load("morning_glance")  # → dict
+spec = bb.display.load("morning_glance")   # → dict
 spec["theme"] = "midnight"
 
-# Swap the second card's children for a single "UP NEXT" line
-new_card = {
+spec["layout"]["children"][2] = {
     "type": "card", "color": "muted", "padding": 18, "children": [
         {"type": "column", "gap": 4, "children": [
             {"type": "text", "content": "UP NEXT", "size": "small",
@@ -489,19 +423,15 @@ new_card = {
         ]},
     ],
 }
-spec["layout"]["children"][2] = new_card
 
 bb.display.preview(spec)
 bb.display.save(spec)
 ```
 
-Plain dict mutation — ``children`` is a list, ``replace``, ``pop``,
-``insert``, ``append`` all work.
+Plain dict mutation. `children` is a list — `replace`, `pop`, `insert`,
+`append` all work.
 
-## Live data: ``static`` source + ``update_data``
-
-For agent-controlled values (sport scores, focus timer, anything
-computed):
+## Live values: `static` + `update_data`
 
 ```python
 spec = {
@@ -525,44 +455,26 @@ bb.display.update_data("focus", "session",
                               "progress": 0.48})
 ```
 
-``update_data`` only works while the display is active and only on
-``static`` sources.
+`update_data` works only while the display is active, and only on
+`static` sources.
 
-## See what's on screen right now
+## Seeing the screen
 
-The system prompt tells you which display is active in the
-``Current Context`` block, but for the actual pixels and live data
-state you have two calls:
+- `bb.display.get_active()` — structural read, cheap, no render.
+  Confirms a `switch_display` took effect; tells you what you'd replace.
+- `bb.display.screenshot()` — pixel read of the live 1024x600 surface,
+  attached as an image. The only way to verify a layout against **real**
+  data; `preview()` sees placeholders.
 
-- ``bb.display.get_active()`` — structural read: ``{name, args, theme}``.
-  Cheap, no rendering. Use this to confirm a ``switch_display`` took
-  effect, or to know what you'd be replacing before authoring.
-- ``bb.display.screenshot()`` — pixel read: captures the live 1024x600
-  surface and attaches it as an image. Use this to verify a layout
-  looks right with **real** data flowing — ``preview()`` only sees
-  placeholders.
+## Attachment cap
 
-```python
-state = bb.display.get_active()
-# {"name": "morning_brief", "args": {}, "theme": "boxbot"}
-
-bb.display.screenshot()
-# attaches the live frame so you literally see what the household sees
-```
-
-## Preview attachment cap
-
-Each ``execute_script`` call attaches at most **8 images** to its
-result (``MAX_IMAGES_PER_CALL``). ``preview()`` counts as one
-attachment, alongside ``bb.workspace.view`` / ``bb.camera.capture``.
-If you blow through the cap, ``preview()`` still returns the PNG
-path (you can ``bb.workspace.view`` it later) but ``attached`` will
-come back ``False``. Two or three previews per script is fine; ten
-is not.
+Each `execute_script` call attaches at most **8 images**
+(`MAX_IMAGES_PER_CALL`). `preview()` counts as one, alongside
+`bb.workspace.view` / `bb.camera.capture`. Past the cap `preview()`
+still returns the PNG path (view it later) but `attached` comes back
+`False`. Two or three previews per script is fine. Ten is not.
 
 ## Patterns
-
-### Put a specific photo on screen
 
 ```python
 results = bb.photos.search(query="Emily birthday")
@@ -570,27 +482,11 @@ if results:
     bb.photos.show_on_screen([results[0].id])
 ```
 
-### Discover what fields a data source has
-
 ```python
 schema = bb.display.describe_source("weather")
-print(schema["fields"])   # {"temp": "...", "icon": "...", "forecast": "..."}
-print(schema["example"])  # plausible sample, exactly the live shape
-```
+print(schema["fields"])    # {"temp": "...", "icon": "...", "forecast": "..."}
+print(schema["example"])   # plausible sample, exactly the live shape
 
-### Inspect every block type
-
-```python
 ref = bb.display.schema()
 print(ref["blocks"]["chart"]["fields"])
-# {"data": {"type": "...", "default": null},
-#  "type": {"type": "str", "default": "line",
-#           "valid_values": ["area", "bar", "line"]}, ...}
 ```
-
-### Back to idle
-
-Call ``bb.display.unpin()``. The rotation loop resumes from its
-configured list (see ``bb.display.set_rotation`` to reshape it).
-``switch_display`` does **not** auto-revert — a pinned display stays
-until you unpin it or replace it.

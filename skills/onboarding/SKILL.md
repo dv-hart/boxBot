@@ -1,110 +1,88 @@
 ---
 name: onboarding
-description: How to onboard new people to boxBot — voice first-meeting (Person), first-admin bootstrap, admin-initiated user registration (User), and welcoming a freshly-registered user.
+description: How to onboard people to boxBot — voice first-meeting (Person), first-admin bootstrap, admin-initiated user registration (User), welcoming a freshly-registered user.
 when_to_use: |
-  Load this when ANY of:
-    - The "People in this session" block shows a speaker with voice_tier
-      "unknown" (or a low-confidence match you don't want to guess on)
-      AND that speaker is addressing you directly.
-    - There are pending `setup:` todos (a fresh device with no admin yet).
-    - A registered admin (voice or WhatsApp) asks to add a new user.
-    - You receive a `[REGISTRATION] <code>` message — that's a freshly
-      registered user's first turn and they need a welcome.
+  Load when ANY of:
+    - "People in this session" shows a speaker with voice_tier "unknown" (or a
+      low-confidence match you won't guess on) AND that speaker is addressing
+      you directly.
+    - Pending `setup:` todos — a fresh device with no admin.
+    - A registered admin asks to add a new user.
+    - A `[REGISTRATION] <code>` message arrives — a freshly registered user's
+      first turn; they need a welcome.
 ---
 
 # Onboarding
 
-There are two distinct things called "onboarding" in boxBot — keep them
-straight before you act:
+Two different things share the name. Keep them straight:
 
-| Concept | What it represents | How to onboard |
-|---------|--------------------|----------------|
-| **Person** | A voice/visual identity (perception layer). Lets BB recognize someone walking by, address them by name. | Voice first-meeting procedure (§1) — uses `identify_person`. |
-| **User** | A WhatsApp account that can message BB and receive messages back (auth layer). | Registration code procedure (§2 / §3) — uses `bb.auth`. |
+| Concept | Is | Onboard via |
+|---------|-----|-------------|
+| **Person** | A voice/visual identity (perception layer). Lets BB recognize someone and use their name. | Voice first-meeting, §1 — `identify_person`. |
+| **User** | A messaging account that can text BB and be texted back (auth layer). | Registration code, §2/§3 — `bb.auth`. |
 
-A Person and a User can refer to the same human, but they're tracked
-separately. Adding one does not add the other. The "voice fingerprint"
-step in setup is what links them for the admin.
+One human can be both, but they are tracked separately. Adding one does
+not add the other. The voice-fingerprint step (§5) links them for the
+admin.
 
 ---
 
-## §1 — Voice first-meeting (Person creation)
+## §1 — Voice first-meeting (Person)
 
-### When this procedure applies
+**Applies when:** a speaker is addressing you in voice, their
+`voice_tier` is `unknown` (or `low` and you won't guess), and you have
+no registered name for them.
 
-- A speaker is addressing you in a voice conversation.
-- Their `voice_tier` in the identity block is `unknown` (or `low` and
-  you don't want to guess).
-- You do not yet have a registered name for them.
+**Does not apply to:** high-confidence matches (use their name);
+speakers talking to each other; anyone already introduced this session
+(`source: agent_identify` in the identity block).
 
-**Do NOT run this procedure for:**
-
-- High-confidence matches — address those people by name directly.
-- Speakers who are talking to *each other* and not to you.
-- Someone who's already been introduced this session (check the
-  identity block — if `source` is `agent_identify` you've already pinned
-  them).
-
-### The procedure
-
-1. **Warmly acknowledge and ask their name.** Single voice output
-   directed at `"current_speaker"`. Keep it short and natural — don't
-   launch into an explanation of what you are. Pick phrasing that fits
-   the moment:
+1. **Ask their name.** One voice output to `"current_speaker"`. Short
+   and natural. Do not explain what you are.
 
    - "Hi — I don't think we've met. I'm Jarvis. What's your name?"
    - "Hey there — I don't recognize your voice yet. Who am I talking to?"
    - "Hi! I haven't caught your name before. What should I call you?"
 
-   End your turn there. Wait for the reply.
+   End the turn. Wait.
 
-2. **Extract the name from the reply** ("[Speaker A]: I'm Brian", "My
-   name is Brian", "Brian"). If they decline gracefully, drop it — do
-   NOT demand a name.
+2. **Extract the name** ("[Speaker A]: I'm Brian", "My name is Brian",
+   "Brian"). If they decline, drop it. Never demand a name.
 
-3. **Pin the identity with `identify_person`.**
+3. **Pin it** with `identify_person`: `name` = what they gave, trimmed
+   and naturally capitalized; `ref` = the session speaker ref (e.g.
+   `"Speaker A"`).
 
-   - `name`: the name they gave, trimmed and capitalised naturally.
-   - `ref`: the session speaker ref (display name like `"Speaker A"`).
+   | Outcome | Say |
+   |---------|-----|
+   | `create` | "Nice to meet you, Brian. I'll remember you." |
+   | `confirm` | "Got it, Brian. I've got you down now." |
+   | `correct` | "Sorry about the mix-up, Brian. Got it now." |
+   | `rename` / `no_op` | Acknowledge naturally. |
 
-   Tool outcomes:
+   Renaming an *existing* record ("call me Bri") is
+   `identify_person(action="rename", name="Brian", new_name="Bri")` —
+   not a new identify.
 
-   - `create`: first meeting, new person record.
-     "Nice to meet you, Brian. I'll remember you."
-   - `confirm`: a person with that name already existed; linked.
-     "Got it, Brian. I've got you down now."
-   - `correct`: you had a different belief; updated.
-     "Sorry about the mix-up, Brian. Got it now."
-   - `rename` / `no_op`: rare; just acknowledge naturally. (If
-     someone wants their EXISTING record called something else — "call
-     me Bri" — that's `identify_person(action="rename", name="Brian",
-     new_name="Bri")`, not a new identify.)
-
-4. **Continue the conversation normally.** They reached out for some
-   reason — ask what you can help with.
+4. **Continue.** They spoke up for a reason — ask what you can do.
 
 ---
 
-## §2 — First-admin bootstrap (initial setup)
+## §2 — First-admin bootstrap
 
-### When this applies
+**Applies when:** no admins registered. A todo starting
+`setup:bootstrap` is in the backlog, and the Registered users block
+says "No users are registered yet."
 
-There are no admins registered yet. The seeded backlog will surface a
-todo whose description starts with `setup:bootstrap`. You'll also see
-"No users are registered yet" in the **Registered users** block.
+1. `bb.auth.generate_bootstrap_code()` — 6 digits, single use, 10 min.
 
-### The procedure
-
-1. **Mint the bootstrap code** via `bb.auth.generate_bootstrap_code()`.
-   It returns a 6-digit numeric code. Single-use, expires in 10 minutes.
-
-2. **Surface the code on the HDMI screen** with `switch_display`:
+2. Put it **on the HDMI screen**:
 
    ```python
    switch_display("notice", args={
        "title": "Welcome to boxBot!",
        "lines": [
-           "Text this code to BB's WhatsApp number:",
+           "Text this code to BB's number:",
            f"Code: {code}",
            "Expires in 10 minutes",
        ],
@@ -112,135 +90,110 @@ todo whose description starts with `setup:bootstrap`. You'll also see
    ```
 
    The security property is **physical presence** — only someone at the
-   box can read the screen. Do NOT relay the code via voice or any
-   messaging channel.
+   box reads the screen. Never speak the code or send it over any
+   channel.
 
-3. **Wait.** The user texts the code from their phone. The router
-   validates it and emits a `UserRegistered` event with `role="admin"`
-   and a `WhatsAppMessage` tagged `[REGISTRATION] <code>`.
+3. Wait. They text it; the router validates and emits `UserRegistered`
+   with `role="admin"` plus a message tagged `[REGISTRATION] <code>`.
 
-4. **When the registration lands**, mark `setup:bootstrap` complete and
-   move to §4 (welcome the new user).
+4. On arrival: mark `setup:bootstrap` complete, go to §4.
 
-5. **If 10 minutes pass with no registration**, the code expires
-   silently. Generate a new one and re-display it. Don't error out —
-   the human may simply have walked away briefly.
+5. Ten minutes with no registration → the code expires silently.
+   Generate and re-display. Not an error; they probably walked away.
 
 ---
 
-## §3 — Admin-initiated user registration (adding more users)
+## §3 — Admin-initiated registration
 
-### When this applies
+**Applies when:** a registered admin says "add a new user", "register
+Carina", "give my wife access".
 
-A registered admin says (via WhatsApp or voice) something like "add a
-new user", "register Carina", "give my wife access".
+1. **Confirm who.** A name is enough — the admin shares the code
+   out-of-band, so you never need the new user's number.
 
-### The procedure
+2. `bb.auth.generate_registration_code()`. The main process resolves
+   the inviting admin from conversation context; you pass no
+   `created_by`. If the speaker isn't an admin the call fails — say so
+   plainly.
 
-1. **Confirm who they want to add.** A name is enough — you don't need
-   the new user's phone number, the admin shares the code out-of-band.
-
-2. **Generate a code** via `bb.auth.generate_registration_code()`.
-   The main process resolves the inviting admin from the conversation
-   context — you don't pass `created_by`. If the call fails because the
-   speaker isn't an admin, tell them so plainly.
-
-3. **Send the code back to the admin.** WhatsApp text reply (or a voice
-   line if they asked at the box). Format:
+3. **Send the code to the admin**, on whichever channel they asked:
 
    > "Code for Carina: 529174. Share it with her — she should text it
    > to me. Expires in 10 minutes."
 
-4. **Wait.** When the new user texts the code, you'll see a
-   `UserRegistered` event with `role="user"` and `invited_by_phone`
-   set to the admin's phone.
+4. Wait. On success you see `UserRegistered` with `role="user"` and
+   `invited_by_phone` set.
 
-5. **Welcome the new user (§4) and notify the inviting admin** via
-   `bb.auth.notify_admins(...)` or a direct reply to that admin:
+5. Welcome them (§4) and tell the inviting admin, via
+   `bb.auth.notify_admins(...)` or a direct reply:
 
    > "Carina just registered. ✓"
 
-### Rate limit
-
-Admins can mint 1 code per hour. If they ask for a second code within
-that window, the call raises — explain to them and offer to share the
-existing code again (which is still valid until used or expired).
+**Rate limit:** 1 code per admin per hour. A second request inside the
+window raises. Explain, and offer to re-share the existing code — still
+valid until used or expired.
 
 ---
 
-## §4 — Welcoming a freshly registered user
+## §4 — Welcoming a new user
 
-### Triggered by
+Triggered by a `UserRegistered` event or a `[REGISTRATION] <code>`
+message.
 
-- A `UserRegistered` event, OR
-- A `[REGISTRATION] <code>` message in the conversation thread.
+**Admin (bootstrap path):** warm welcome by text, ask what they'd like
+you to call them, save their preferred name to system memory. Then §5
+and §6.
 
-### What to do
-
-1. **For an admin (bootstrap path):** warm welcome via WhatsApp, ask
-   what they'd like you to be called by them. When they answer, save
-   their preferred name to system memory. Then move to
-   `setup:voice_fingerprint` (§5) and `setup:household` (§6).
-
-2. **For a regular user (admin-invited):** warm welcome via WhatsApp,
-   brief one-line description of what you can do, ask their name if it
-   wasn't passed through (most WhatsApp profiles include it). Notify
-   the inviting admin. Don't run the setup todos — those only fire on
-   first-admin bootstrap.
+**Regular user (admin-invited):** warm welcome by text, one line on
+what you can do, ask their name if the profile didn't carry it. Notify
+the inviting admin. Skip the setup todos — those fire only on first
+bootstrap.
 
 ---
 
-## §5 — Voice fingerprint linking (admin-only, after bootstrap)
+## §5 — Voice fingerprint (admin, after bootstrap)
 
-After the first admin registers via WhatsApp, `setup:voice_fingerprint`
-becomes the next todo. They have a User record but no Person record yet.
+The first admin has a User record but no Person record.
+`setup:voice_fingerprint` is next.
 
-1. **Send a WhatsApp message** inviting them to come say hi at the box:
+1. Text them:
 
    > "Whenever you have a sec, come say hi at the box and I'll learn
    > your voice. Just say hello once you're nearby."
 
-2. **The next time they address you in a voice conversation**, run §1
-   (the voice first-meeting procedure) using the name they gave during
-   `setup:greet_admin`. The `identify_person` outcome will be `create`
-   (new Person) or `confirm` (Person already existed).
+2. Next time they address you by voice, run §1 with the name from
+   `setup:greet_admin`. Outcome will be `create` or `confirm`.
 
-3. **Mark `setup:voice_fingerprint` complete** on a successful
-   `create`/`confirm`/`rename` outcome.
+3. Mark `setup:voice_fingerprint` complete on
+   `create`/`confirm`/`rename`.
 
 ---
 
 ## §6 — Household basics (optional)
 
-`setup:household` is the catch-all. Ask the admin (whichever channel
-they prefer) about other household members worth knowing, the city to
-use for weather, and any house preferences. Save anything durable to
-system memory via the existing memory tool. If they don't want to
-answer, mark complete or cancel — this todo is optional.
+`setup:household` is the catch-all. Ask the admin about other household
+members worth knowing, the city for weather, house preferences. Save
+durable answers to system memory. They don't want to answer? Mark
+complete or cancel — this one is optional.
 
 ---
 
-## Quick edge-case reference
+## Edge cases
 
-- **Multiple unknowns at once (voice):** handle one at a time. Onboard
-  the most recent speaker; tell the other you'll get to them next.
-- **"Actually, call me Bri" after Brian was pinned:** same human,
-  new name — call `identify_person(action="rename", name="Brian",
-  new_name="Bri")`. This renames the existing record (embeddings,
-  photos, and triggers follow). Acknowledge: "Got it, Bri."
-- **Two records turn out to be the same person (e.g. "Eric" and
-  "Erik"):** confirm with them first ("Are Eric and Erik the same
-  person?"), then `identify_person(action="merge", name="Eric",
-  duplicate_name="Erik")`. Merge is destructive — never call it
-  without confirmation.
-- **Admin asks to add a user but isn't actually admin:** the
-  `bb.auth.generate_registration_code()` call fails with "only admins
-  can generate registration codes". Don't pretend it worked — tell
-  them plainly they're not an admin.
-- **WhatsApp not configured (no phone number ID / token):** §2-§4 are
-  unavailable. The "No users are registered yet" line in the
-  **Registered users** block hints at this. Don't try to mint codes
-  you can't deliver.
-- **Visual recognition fills in over time:** §1 only anchors voice.
-  Visual ID gets seeded once the camera catches a voice-confirmed
-  speaker. Nothing for you to do — happens automatically.
+- **Several unknowns at once:** one at a time. Onboard the most recent
+  speaker; tell the other you'll get to them.
+- **"Actually, call me Bri" after Brian was pinned:**
+  `identify_person(action="rename", name="Brian", new_name="Bri")`.
+  Embeddings, photos, and triggers follow. "Got it, Bri."
+- **Two records, one human ("Eric" and "Erik"):** confirm first ("Are
+  Eric and Erik the same person?"), then
+  `identify_person(action="merge", name="Eric", duplicate_name="Erik")`.
+  Merge is destructive. Never call it without confirmation.
+- **Non-admin asks to add a user:**
+  `bb.auth.generate_registration_code()` fails with "only admins can
+  generate registration codes". Don't pretend it worked.
+- **Messaging not configured:** §2–§4 are unavailable. The "No users
+  are registered yet" line hints at it. Don't mint codes you can't
+  deliver.
+- **Visual recognition:** §1 anchors voice only. Visual ID seeds itself
+  once the camera catches a voice-confirmed speaker. Automatic.

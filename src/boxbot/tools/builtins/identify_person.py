@@ -56,22 +56,20 @@ class IdentifyPersonTool(Tool):
 
     name = "identify_person"
     description = (
-        "Gateway for person identity. Actions:\n"
-        "- identify (default): record a session speaker as a person — "
-        "first meetings (\"I'm Erik\") or corrections (\"I'm actually "
-        "Sarah\"). Needs `name` + `ref`; buffered embeddings commit at "
-        "voice-session end.\n"
-        "- rename: change an existing person's name (\"call me Jake\"). "
-        "Needs `name` (current) + `new_name`. Metadata only; errors if "
+        "Person-identity gateway. Not for who is present — that arrives "
+        "in the [Present: ...] header.\n"
+        "- identify (default): bind a session speaker to a person. First "
+        "meeting (\"I'm Erik\") or correction (\"I'm actually Sarah\"). "
+        "Needs `name` + `ref`. Embeddings commit at voice-session end.\n"
+        "- rename: change a person's name (\"call me Jake\"). Needs "
+        "`name` (current) + `new_name`. Metadata only. Errors if "
         "`new_name` already belongs to someone else.\n"
-        "- merge: combine two records for the SAME human. Needs `name` "
-        "(the record to KEEP) + `duplicate_name` (merged away). "
-        "DESTRUCTIVE and not undoable — confirm with the humans first "
-        "(\"Are Eric and Erik the same person?\").\n"
-        "- list_flags: read the nightly duplicate-audit findings (use on "
-        "an [id-reconcile] to-do).\n"
-        "Not for looking up who is present — that's injected via the "
-        "[Present: ...] header."
+        "- merge: fold two records for the SAME human into one. Needs "
+        "`name` (record to KEEP) + `duplicate_name`. DESTRUCTIVE and NOT "
+        "UNDOABLE — ask the humans first (\"Are Eric and Erik the same "
+        "person?\").\n"
+        "- list_flags: read the nightly duplicate-audit findings. Use on "
+        "an [id-reconcile] to-do."
     )
     parameters = {
         "type": "object",
@@ -79,39 +77,32 @@ class IdentifyPersonTool(Tool):
             "action": {
                 "type": "string",
                 "enum": ["identify", "rename", "merge", "list_flags"],
-                "description": (
-                    "What to do. Defaults to \"identify\" (session "
-                    "speaker → person). See the tool description for "
-                    "when to use each action."
-                ),
+                "description": "Default \"identify\".",
             },
             "name": {
                 "type": "string",
                 "description": (
-                    "identify: the person's name as you should address "
-                    "them. rename: the person's CURRENT name. merge: the "
-                    "name of the record to KEEP."
+                    "identify: name to address them by. rename: CURRENT "
+                    "name. merge: the record to KEEP."
                 ),
             },
             "ref": {
                 "type": "string",
                 "description": (
-                    "identify only: the speaker's stable pyannote label, "
-                    "from the speaker_identities block in the conversation "
-                    "context. If unsure, use the bracketed display label "
-                    "in the transcript (e.g. 'Speaker A')."
+                    "identify only. Stable pyannote label from the "
+                    "speaker_identities block. Unsure: use the bracketed "
+                    "transcript label (e.g. 'Speaker A')."
                 ),
             },
             "new_name": {
                 "type": "string",
-                "description": "rename only: the new name for the person.",
+                "description": "rename only. The new name.",
             },
             "duplicate_name": {
                 "type": "string",
                 "description": (
-                    "merge only: the duplicate record to merge away. Its "
-                    "embeddings move into `name`'s record. Confirm with "
-                    "the humans involved before merging."
+                    "merge only. Record merged away; its embeddings move "
+                    "into `name`. Confirm with the humans first."
                 ),
             },
         },

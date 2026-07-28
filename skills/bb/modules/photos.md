@@ -1,127 +1,87 @@
 # bb.photos — the photo library
 
-The photo library is the durable store of images the agent should
-remember: WhatsApp sends, camera captures the agent explicitly saved,
-user uploads. It's separate from the workspace (the agent's notebook)
-and from the perception pipeline's crops (ephemeral).
+Durable store of images worth remembering: WhatsApp sends, camera
+captures you saved, user uploads. Separate from the workspace (your
+notebook) and from perception crops (ephemeral).
 
-## When to use it
+**Use for:** finding a photo the user asked for; pulling photos tagged
+with a person; curating the slideshow; `view()` before describing a
+photo so you speak from pixels, not metadata.
 
-- User asks for a photo ("show me the beach photos from last summer").
-- You want to pull up something tagged with a person ("any recent
-  photos with Emily?").
-- Curating the slideshow rotation.
-- Attaching a specific photo to a reply — call `view()` so you can
-  look at it and describe it accurately.
-
-## When NOT to use it
-
-- For ephemeral scratch images (agent-authored visualizations, debug
-  snapshots). Those belong in `bb.workspace`.
-- For raw perception state. Those live in perception/crops and never
-  surface as library photos.
+**Not for:** scratch images, visualizations, debug snapshots →
+`bb.workspace`. Raw perception state — never surfaces as a library
+photo.
 
 ## API
 
-### Search
+### Search and get
 
 ```python
 photos = bb.photos.search(
-    query="snorlax plushie on kitchen table",   # free-text
-    tags=["indoor", "kitchen"],                  # AND-filter
-    people=["Erik"],                             # AND-filter
+    query="snorlax plushie on kitchen table",
+    tags=["indoor", "kitchen"],     # AND
+    people=["Erik"],                # AND
     limit=10,
 )
 for p in photos:
     print(p.id, p.description, p.tags)
+
+p = bb.photos.get("abc123def456")   # full record; PhotosError if missing
 ```
 
-Returns a list of `PhotoRecord` objects ordered by hybrid-retrieval
-score (vector similarity + BM25). Filters are AND-combined. If no
-query is given, results come back newest-first.
-
-### Get one by id
-
-```python
-p = bb.photos.get("abc123def456")
-print(p.description, p.tags, p.people)
-```
-
-Returns the full record: id, description, tags, people, dimensions,
-source, created_at, etc. Raises `bb.photos.PhotosError` if missing.
+`search` returns `PhotoRecord`s ranked by hybrid retrieval (vector +
+BM25). Filters AND together. No query = newest first.
 
 ### View — see the pixels
 
 ```python
 bb.photos.view("abc123def456")
-```
-
-Attaches the photo's JPEG to the tool result as an image content block.
-Same mechanism as `bb.workspace.view()` and `bb.camera.capture()` —
-the agent sees the image this turn. Returns `{id, filename, kind:
-"image", attached: True}`.
-
-Use this before responding to "what's in that photo?" or when you need
-the actual content, not just the description.
-
-### View an unsaved file by path
-
-```python
 bb.photos.view_path("/var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg")
 ```
 
-Same idea as `view()`, but for image files that aren't in the photo
-library yet. The most common case: an inbound WhatsApp image. The
-user's message will start with `[image attached at <path>]` — pass
-that exact path. The path must live under one of the allowlisted
-roots (sandbox tmp, workspace, photos, perception crops); anything
-else is refused.
+`view()` attaches the JPEG to the tool result as an image block — same
+mechanism as `bb.workspace.view()` and `bb.camera.capture()`. Returns
+`{id, filename, kind: "image", attached: True}`. Use it before
+answering "what's in that photo?".
 
-### Ingest — save an image into the library
+`view_path()` does the same for files not yet in the library — usually
+an inbound image. The user's message starts with
+`[image attached at <path>]`; pass that exact path. Only allowlisted
+roots work (sandbox tmp, workspace, photos, perception crops).
+
+### Ingest
 
 ```python
 photo_id = bb.photos.ingest(
     "/var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg",
-    source="whatsapp",
-    sender="Erik",
-    caption="my new pokémon",
+    source="whatsapp",          # mandatory; used for filtering later
+    sender="Erik",              # optional
+    caption="my new pokémon",   # optional; seeds the description
 )
 ```
 
-Hands a local image file to the intake pipeline. The pipeline copies
-the bytes into `data/photos/`, runs detection + tagging, and indexes
-for search. The original file is deleted on success.
+Copies bytes into `data/photos/`, runs detection + tagging, indexes for
+search, deletes the original on success.
 
-Use this when an inbound photo is worth keeping — family moments,
-things the user asked you to remember, anything you'd want to surface
-later. Don't ingest memes, throwaway shares, or anything ephemeral.
-View it, respond, and let the inbound janitor reap it (7-day TTL).
-
-`source` is mandatory and goes on the photo for filtering later;
-`sender` and `caption` are optional but help. The caption seeds the
-photo's description so search works even before the small-model
-tagger fills it in.
+Ingest what is worth keeping: family moments, things the user asked you
+to remember. Skip memes and throwaway shares — view, respond, and let
+the inbound janitor reap them (7-day TTL).
 
 ### Show on the 7" screen
 
 ```python
-# A single photo
 bb.photos.show_on_screen(["abc123def456"])
 
-# A rotating pick
 results = bb.photos.search(query="Emily birthday")
 bb.photos.show_on_screen([p.id for p in results[:5]])
 ```
 
-Dispatches to the `picture` display on the physical screen. This is
-for humans in the room — it does NOT attach to the tool result. Pair
-with `view()` if you want to see what you're showing.
+Dispatches to the `picture` display. For humans in the room — it does
+NOT attach to the tool result. Pair with `view()` to see what you are
+showing. Returns `{dispatched: False, reason: "display manager not
+running"}` when headless.
 
-Currently stubs through when the display manager isn't wired up yet
-(the call returns `{dispatched: False, reason: "display manager not
-running"}`).
-
-### Metadata updates
+### Metadata
 
 ```python
 bb.photos.update(photo_id, description="Dad's 60th, Apr 2026")
@@ -129,95 +89,68 @@ bb.photos.set_tags(photo_id, tags=["family", "party"])
 bb.photos.set_person(photo_id, person_index=0, name="Erik")
 ```
 
-`update()` rewrites the description and re-embeds it, so hybrid search
-stays consistent with the new text. `set_tags()` **replaces** the
-photo's whole tag list — to add or remove a single tag, read the
-current set first and write back the union/difference:
+`update()` re-embeds the description so hybrid search stays consistent.
+
+`set_tags()` **replaces** the whole tag list. To add one tag, read
+first:
 
 ```python
 p = bb.photos.get(photo_id)
 bb.photos.set_tags(photo_id, tags=sorted(set(p.tags) | {"birthday"}))
 ```
 
-`set_person(person_index=…)` labels an already-detected face slot; if
-intake found no faces there are no slots to label (it returns an
-error), so fall back to a `people`/name tag or note it in the
-description.
+`set_person(person_index=…)` labels an already-detected face slot. If
+intake found no faces there are no slots — it errors. Fall back to a
+name tag or the description.
 
-### Tag library (vocabulary curation)
+### Tag vocabulary
 
-Tags are a shared, flat vocabulary across all photos. Keep it tidy:
+Flat and shared across all photos. Keep it tidy:
 
 ```python
-bb.photos.merge_tags("kids", into="children")  # fold a synonym in
-bb.photos.rename_tag("xmas", to="christmas")   # rename everywhere
-bb.photos.delete_tag("blurry")                 # drop from the library
+bb.photos.merge_tags("kids", into="children")
+bb.photos.rename_tag("xmas", to="christmas")
+bb.photos.delete_tag("blurry")
 ```
 
-These return nothing; the number of photos affected shows up in the
-tool result's `sdk_actions` entry for the call.
+These return nothing. Affected-photo counts land in the tool result's
+`sdk_actions` entry.
 
-### Slideshow
+### Slideshow and lifecycle
 
 ```python
 bb.photos.add_to_slideshow(photo_id)
 bb.photos.remove_from_slideshow(photo_id)
-```
-
-### Lifecycle
-
-```python
-bb.photos.delete(photo_id)   # soft delete, 30-day retention
+bb.photos.delete(photo_id)    # soft delete, 30-day retention
 bb.photos.restore(photo_id)
 ```
 
 ## Patterns
 
-### "Show me that photo Emily sent last week"
+"Show me that photo Emily sent last week":
 
 ```python
-results = bb.photos.search(
-    query="recent photos from Emily",
-    people=["Emily"],
-    limit=1,
-)
+results = bb.photos.search(query="recent photos from Emily",
+                           people=["Emily"], limit=1)
 if results:
-    bb.photos.view(results[0].id)          # see it
-    bb.photos.show_on_screen([results[0].id])  # and put it on the screen
+    bb.photos.view(results[0].id)               # see it
+    bb.photos.show_on_screen([results[0].id])   # and put it on screen
 else:
     print("no matching photo")
 ```
 
-### Describing a photo the user is asking about
+Inbound image — view, then decide:
 
 ```python
-p = bb.photos.get(photo_id)         # metadata
-bb.photos.view(photo_id)            # pixels (attaches to tool result)
-# Now you have the description + can cross-reference visual details.
-```
-
-### Inbound WhatsApp image — view and decide
-
-```python
-# The user's WhatsApp message arrived as:
-#   "[image attached at /var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg] check this out"
 path = "/var/lib/boxbot-sandbox/tmp/inbound/whatsapp/wamid.HBg.jpg"
-
-bb.photos.view_path(path)         # see it this turn
-
-# Decide based on what you see + who sent it + the caption:
-photo_id = bb.photos.ingest(
-    path,
-    source="whatsapp",
-    sender="Erik",
-    caption="check this out",
-)
+bb.photos.view_path(path)          # see it this turn
+bb.photos.ingest(path, source="whatsapp", sender="Erik",
+                 caption="check this out")
 ```
 
-If you decide *not* to keep it, just don't call `ingest()` — the
-janitor deletes staged inbound files older than 7 days.
+Not keeping it? Don't call `ingest()`. The janitor handles it.
 
-### Curate the idle slideshow
+Curate the idle slideshow:
 
 ```python
 for tag in ("family", "vacation"):
@@ -225,12 +158,8 @@ for tag in ("family", "vacation"):
         bb.photos.add_to_slideshow(p.id)
 ```
 
-## Known gaps
+## Display behavior
 
-- `show_on_screen(ids)` renders the given photos full-screen on the
-  `picture` display. Switching to `picture` with no ids runs slideshow
-  mode: it pulls the slideshow-enabled set (`add_to_slideshow`) and
-  rotates through it. With an empty slideshow set it shows a "No photos
-  yet" notice. `view()` (pixels to tool result) also works. The call
-  returns `dispatched: False` only when the display manager isn't
-  running (e.g. headless).
+`show_on_screen(ids)` renders those photos full-screen on `picture`.
+Switching to `picture` with no ids runs slideshow mode over the
+`add_to_slideshow` set; an empty set shows "No photos yet."

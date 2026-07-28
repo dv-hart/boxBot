@@ -416,6 +416,24 @@ async def _init_scheduler() -> Any:
     return scheduler
 
 
+async def _init_ha_events(config: Any) -> Any | None:
+    """Initialise the Home Assistant events bridge (entity triggers).
+
+    Returns None when disabled in config; the bridge itself is a no-op
+    when the HOME_ASSISTANT_URL/TOKEN secrets aren't stored.
+    """
+    if not config.home_assistant.events_enabled:
+        logger.info("HA events bridge disabled in config")
+        return None
+    from boxbot.integrations.ha_events import HAEventsBridge
+
+    bridge = HAEventsBridge(
+        watch_ttl_s=config.home_assistant.watch_refresh_seconds,
+    )
+    await bridge.start()
+    return bridge
+
+
 async def _init_display_manager() -> Any:
     """Initialise and start the DisplayManager."""
     from boxbot.displays.manager import DisplayManager, set_display_manager
@@ -795,6 +813,7 @@ async def _shutdown(
         "photo_intake",
         "perception",
         "display_manager",
+        "ha_events",
         "scheduler",
         "photo_store",
         "conversation_store",
@@ -836,6 +855,8 @@ async def _shutdown(
             elif name == "perception":
                 await instance.stop()
             elif name == "display_manager":
+                await instance.stop()
+            elif name == "ha_events":
                 await instance.stop()
             elif name == "scheduler":
                 await instance.stop()
@@ -952,6 +973,12 @@ async def _async_main() -> None:
         # Scheduler — manages triggers and to-do items, background loop
         scheduler = await _init_scheduler()
         subsystems["scheduler"] = scheduler
+
+        # HA events bridge — feeds entity trigger conditions from Home
+        # Assistant (outbound WebSocket; no-op without stored secrets)
+        ha_events = await _init_ha_events(config)
+        if ha_events is not None:
+            subsystems["ha_events"] = ha_events
 
         # Display manager — manages screen output
         display_manager = await _init_display_manager()

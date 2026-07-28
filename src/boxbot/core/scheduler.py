@@ -37,6 +37,7 @@ import aiosqlite
 
 from boxbot.core.config import BoxBotConfig, get_config
 from boxbot.core.events import (
+    EntityStateChanged,
     PersonDetected,
     PersonIdentified,
     TriggerFired,
@@ -68,6 +69,8 @@ CREATE TABLE IF NOT EXISTS triggers (
     fire_at TEXT,
     cron TEXT,
     person TEXT,
+    entity TEXT,
+    entity_state TEXT,
     for_person TEXT,
     todo_id TEXT,
     status TEXT NOT NULL DEFAULT 'active',
@@ -78,6 +81,17 @@ CREATE TABLE IF NOT EXISTS triggers (
     fire_count INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (todo_id) REFERENCES todos(id)
 )"""
+
+# Columns added after first release — applied via ALTER TABLE for databases
+# created before the column existed (CREATE TABLE IF NOT EXISTS won't touch
+# an existing table). Each entry: (table, column, column DDL).
+_MIGRATION_COLUMNS: list[tuple[str, str, str]] = [
+    ("triggers", "entity", "entity TEXT"),
+    ("triggers", "entity_state", "entity_state TEXT"),
+]
+
+# Entity condition: entity ids look like "binary_sensor.front_door_person".
+_ENTITY_ID_RE = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
 
 _TODOS_DDL = """\
 CREATE TABLE IF NOT EXISTS todos (
@@ -258,6 +272,12 @@ async def _get_db() -> aiosqlite.Connection:
     await db.execute("PRAGMA foreign_keys=ON")
     await db.execute(_TRIGGERS_DDL)
     await db.execute(_TODOS_DDL)
+    for table, column, ddl in _MIGRATION_COLUMNS:
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cursor.fetchall()}
+        if column not in existing:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+            logger.info("Migrated %s: added column %s", table, column)
     await db.commit()
     return db
 
@@ -282,6 +302,8 @@ async def create_trigger(
     fire_after: str | None = None,
     cron: str | None = None,
     person: str | None = None,
+    entity: str | None = None,
+    entity_state: str | None = None,
     for_person: str | None = None,
     expires: str | None = None,
     todo_id: str | None = None,
@@ -296,6 +318,12 @@ async def create_trigger(
         fire_after: Relative duration (e.g. "30m"). Converted to ``fire_at``.
         cron: Cron expression (recurring). Mutually exclusive with fire_at/fire_after.
         person: Person-presence condition.
+        entity: External entity condition — a Home Assistant entity_id
+            (e.g. "binary_sensor.front_door_person"). The condition is met
+            while the entity is in ``entity_state``. Requires the HA events
+            bridge (home_assistant secrets stored).
+        entity_state: State that satisfies the entity condition
+            (default "on"). Only valid with ``entity``.
         for_person: Who this task relates to (context).
         expires: Explicit expiry datetime (ISO).
         todo_id: Optional link to a to-do item.
@@ -306,6 +334,17 @@ async def create_trigger(
     """
     trigger_id = f"t_{uuid4().hex[:12]}"
     now = _now_iso()
+
+    # Validate entity condition
+    if entity is not None and not _ENTITY_ID_RE.match(entity):
+        raise ValueError(
+            f"entity must be a Home Assistant entity_id like "
+            f"'binary_sensor.front_door_person', got {entity!r}"
+        )
+    if entity_state is not None and entity is None:
+        raise ValueError("entity_state requires entity")
+    if entity is not None and entity_state is None:
+        entity_state = "on"
 
     # Resolve fire_after → fire_at
     resolved_fire_at = fire_at
@@ -344,8 +383,9 @@ async def create_trigger(
             ft = _parse_iso(resolved_fire_at)
             if ft is not None:
                 expires = (ft + timedelta(days=person_expiry_days)).isoformat()
-        elif person is not None:
-            # Person-only: default window from now
+        elif person is not None or entity is not None:
+            # Person- or entity-only: transient conditions get a default
+            # expiry window so forgotten watches don't linger forever.
             expires = (
                 _now_utc() + timedelta(days=person_expiry_days)
             ).isoformat()
@@ -356,9 +396,9 @@ async def create_trigger(
         await db.execute(
             """INSERT INTO triggers
                (id, description, instructions, fire_at, cron, person,
-                for_person, todo_id, status, source, created_at, expires,
-                last_fired, fire_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, NULL, 0)""",
+                entity, entity_state, for_person, todo_id, status, source,
+                created_at, expires, last_fired, fire_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, NULL, 0)""",
             (
                 trigger_id,
                 description,
@@ -366,6 +406,8 @@ async def create_trigger(
                 resolved_fire_at,
                 cron,
                 person,
+                entity,
+                entity_state,
                 for_person,
                 todo_id,
                 source,
@@ -434,6 +476,8 @@ async def update_trigger(trigger_id: str, **fields: Any) -> bool:
         "fire_at",
         "cron",
         "person",
+        "entity",
+        "entity_state",
         "for_person",
         "todo_id",
         "status",
@@ -462,6 +506,24 @@ async def update_trigger(trigger_id: str, **fields: Any) -> bool:
 async def cancel_trigger(trigger_id: str) -> bool:
     """Cancel an active trigger."""
     return await update_trigger(trigger_id, status="cancelled")
+
+
+async def watched_entities() -> set[str]:
+    """Distinct entity_ids referenced by active entity-condition triggers.
+
+    The HA events bridge polls this to know which Home Assistant entities
+    to watch (and to skip publishing events nothing is waiting on).
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT DISTINCT entity FROM triggers "
+            "WHERE entity IS NOT NULL AND status = 'active'"
+        )
+        rows = await cursor.fetchall()
+        return {row[0] for row in rows}
+    finally:
+        await db.close()
 
 
 async def repoint_person_triggers(old_name: str, new_name: str) -> int:
@@ -808,9 +870,32 @@ def evaluate_person_condition(
     return person in present_people
 
 
+def evaluate_entity_condition(
+    trigger: dict[str, Any],
+    entity_states: dict[str, str],
+) -> bool:
+    """Check whether a trigger's entity condition is met.
+
+    Entity conditions are transient — the entity must currently be in the
+    wanted state. ``entity_states`` is the scheduler's live mirror of
+    watched Home Assistant entities (fed by ``EntityStateChanged`` events);
+    an entity missing from the map (never seen, or reset to "unknown" on
+    bridge disconnect) does not satisfy the condition.
+
+    Returns True if there is no entity condition (vacuously true) or if
+    the entity's current state matches ``entity_state``.
+    """
+    entity = trigger.get("entity")
+    if not entity:
+        return True
+    wanted = trigger.get("entity_state") or "on"
+    return entity_states.get(entity) == wanted
+
+
 def evaluate_trigger(
     trigger: dict[str, Any],
     present_people: set[str] | None = None,
+    entity_states: dict[str, str] | None = None,
 ) -> bool:
     """Evaluate all conditions on a trigger (AND logic).
 
@@ -821,8 +906,12 @@ def evaluate_trigger(
         return False
     if present_people is None:
         present_people = set()
-    return evaluate_time_condition(trigger) and evaluate_person_condition(
-        trigger, present_people
+    if entity_states is None:
+        entity_states = {}
+    return (
+        evaluate_time_condition(trigger)
+        and evaluate_person_condition(trigger, present_people)
+        and evaluate_entity_condition(trigger, entity_states)
     )
 
 
@@ -859,6 +948,8 @@ class Scheduler:
     - Check time-based triggers every 60 seconds
     - Subscribe to ``PersonIdentified`` events (named person conditions) and
       ``PersonDetected`` events (the ``ANY_PERSON`` wildcard condition)
+    - Subscribe to ``EntityStateChanged`` events (entity conditions, fed by
+      the Home Assistant events bridge)
     - Emit ``TriggerFired`` events when all conditions are met
     - Handle recurring trigger reset and expiry sweeps
     """
@@ -867,6 +958,10 @@ class Scheduler:
         self._task: asyncio.Task[None] | None = None
         self._running = False
         self._present_people: set[str] = set()
+        # Live mirror of watched HA entity states, keyed by entity_id.
+        # Entries are removed when the bridge reports "unknown" (disconnect)
+        # so stale states can't satisfy compound conditions.
+        self._entity_states: dict[str, str] = {}
         self._person_last_seen: dict[str, datetime] = {}
         # How long a person remains "present" after last detection
         self._person_presence_window = timedelta(minutes=5)
@@ -896,6 +991,7 @@ class Scheduler:
         bus = get_event_bus()
         bus.subscribe(PersonIdentified, self._on_person_identified)
         bus.subscribe(PersonDetected, self._on_person_detected)
+        bus.subscribe(EntityStateChanged, self._on_entity_state)
 
         self._running = True
         self._task = asyncio.create_task(self._run_loop(), name="scheduler")
@@ -910,6 +1006,7 @@ class Scheduler:
         bus = get_event_bus()
         bus.unsubscribe(PersonIdentified, self._on_person_identified)
         bus.unsubscribe(PersonDetected, self._on_person_detected)
+        bus.unsubscribe(EntityStateChanged, self._on_entity_state)
 
         if self._task is not None:
             self._task.cancel()
@@ -985,6 +1082,38 @@ class Scheduler:
         self._last_any_person_check = now
         await self._check_person_triggers(ANY_PERSON)
 
+    async def _on_entity_state(self, event: EntityStateChanged) -> None:
+        """Handle an entity state change from the HA events bridge.
+
+        Updates the live entity-state mirror. Live transitions (not
+        snapshots) also scan triggers watching this entity — mirroring the
+        person flow, the event edge is what fires momentary conditions
+        like a camera's person-detected sensor.
+        """
+        if not event.entity_id:
+            return
+        if event.new_state == "unknown":
+            # Bridge lost its connection (or HA reports the entity gone) —
+            # drop the entry so compound conditions can't hold stale-true.
+            self._entity_states.pop(event.entity_id, None)
+            return
+        self._entity_states[event.entity_id] = event.new_state
+        if event.snapshot:
+            return  # reconnect state read — never fire on these
+        await self._check_entity_triggers(event.entity_id)
+
+    async def _check_entity_triggers(self, entity_id: str) -> None:
+        """Check active triggers whose entity condition watches ``entity_id``."""
+        triggers = await list_triggers(status="active")
+        for trigger in triggers:
+            if trigger.get("entity") != entity_id:
+                continue
+            if _is_expired(trigger):
+                await update_trigger(trigger["id"], status="expired")
+                continue
+            if evaluate_trigger(trigger, self._present_people, self._entity_states):
+                await self._fire_trigger(trigger)
+
     def _refresh_present_people(self) -> None:
         """Remove people who haven't been seen within the presence window."""
         now = _now_utc()
@@ -1010,7 +1139,7 @@ class Scheduler:
                 )
                 continue
 
-            if evaluate_trigger(trigger, self._present_people):
+            if evaluate_trigger(trigger, self._present_people, self._entity_states):
                 await self._fire_trigger(trigger)
 
     async def _check_upcoming_triggers(self) -> None:
@@ -1080,7 +1209,7 @@ class Scheduler:
             if _is_expired(trigger):
                 await update_trigger(trigger["id"], status="expired")
                 continue
-            if evaluate_trigger(trigger, self._present_people):
+            if evaluate_trigger(trigger, self._present_people, self._entity_states):
                 await self._fire_trigger(trigger)
 
     async def _fire_trigger(self, trigger: dict[str, Any]) -> None:
@@ -1124,6 +1253,7 @@ class Scheduler:
             for_person=trigger.get("for_person"),
             todo_id=trigger.get("todo_id"),
             is_recurring=is_recurring,
+            entity=trigger.get("entity"),
         )
         bus = get_event_bus()
         await bus.publish(event)

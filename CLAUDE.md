@@ -206,9 +206,11 @@ The agent has a trigger-driven wake/sleep lifecycle and a persistent
 to-do list:
 - **Triggers** — event-driven wake conditions with AND logic. Types:
   point-in-time (`fire_at`), timer (`fire_after`, max 24h), recurring
-  (`cron`), and person detection (`person`). Compound triggers combine
-  conditions: "after 30 minutes, remind Jacob when you see him" =
-  `fire_after` + `person`, both must be met
+  (`cron`), person detection (`person`), and Home Assistant entity
+  state (`entity` + `entity_state`, fed by the outbound HA events
+  bridge — e.g. an Alarm.com camera's person-detected sensor).
+  Compound triggers combine conditions: "after 30 minutes, remind
+  Jacob when you see him" = `fire_after` + `person`, both must be met
 - **To-do list** — persistent action items the agent tracks. Lightweight
   list (descriptions only) with detailed notes loaded on demand. Reviewed
   during wake cycles and available during conversations
@@ -331,6 +333,25 @@ processes conversations independent of transport.
 - Hardware access goes through the HAL, never direct GPIO/I2C in business logic
 - All configuration via YAML files, never hardcoded
 - Secrets (API keys, WhatsApp tokens) go in `.env`, never committed
+
+### Agent-facing prose (tool descriptions, skills, system prompt)
+Everything the model reads on every turn is a recurring token cost, and
+the model does not need hand-holding. Write for a competent reader.
+
+- Fragments over sentences. Drop articles, hedges, filler, and
+  explanatory preamble.
+- Lead with the rule, then the qualifier. Tables and code over prose.
+- Keep code, identifiers, paths, enums, and error strings
+  **byte-for-byte exact**. Compress prose, never payload.
+- Keep full clarity for anything destructive, irreversible, or
+  security-relevant (merge, delete, alarm/lock, secrets, approval
+  gates). Terse must never mean ambiguous.
+- Don't duplicate a schema that already lives in code. Point at it.
+- `skills/bb/` is the agent-facing SDK reference; `src/**/README.md` is
+  developer-facing architecture. Neither should restate the other.
+
+Applies to `src/boxbot/tools/builtins/*.py` descriptions, `skills/**`,
+the SDK docs, and `_prompt_*` in `core/agent.py`.
 
 ### Testing
 - Unit tests mock hardware; integration tests run on-device

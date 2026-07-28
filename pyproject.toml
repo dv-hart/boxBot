@@ -43,6 +43,7 @@ dependencies = [
     # Communication
     "pyaudio",
     "httpx",
+    "aiohttp>=3.9",
     "aioboto3>=13.0",
     "miniaudio",
 

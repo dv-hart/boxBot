@@ -21,35 +21,33 @@ class SwitchDisplayTool(Tool):
 
     name = "switch_display"
     description = (
-        "Change what's shown on the 7-inch screen. By default the display "
-        "is pinned — it stays until you call switch_display again or "
-        "release the pin via bb.display.unpin(). Idle rotation is paused "
-        "while pinned. Examples: "
-        "switch_display('picture', args={}) for slideshow mode, "
-        "switch_display('picture', args={'image_ids': ['abc', 'def']}) for "
-        "specific photos, switch_display('weather') for weather display."
+        "Change the 7-inch screen. Pinned by default — holds until the "
+        "next switch_display or bb.display.unpin(). Idle rotation pauses "
+        "while pinned.\n"
+        "switch_display('picture', args={}) — slideshow\n"
+        "switch_display('picture', args={'image_ids': ['abc', 'def']}) — "
+        "specific photos\n"
+        "switch_display('weather')"
     )
     parameters = {
         "type": "object",
         "properties": {
             "display_name": {
                 "type": "string",
-                "description": "Name of the display to activate.",
+                "description": "Display to activate.",
             },
             "args": {
                 "type": "object",
                 "description": (
-                    "Optional display-specific arguments passed through to "
-                    "the display's render context. Each display defines what "
-                    "args it accepts."
+                    "Passed to the display's render context. Each display "
+                    "defines its own args."
                 ),
             },
             "pin": {
                 "type": "boolean",
                 "description": (
-                    "Pin this display so idle rotation does not switch "
-                    "away. Default true. Use bb.display.unpin() to "
-                    "release."
+                    "Block idle rotation. Default true. Release with "
+                    "bb.display.unpin()."
                 ),
             },
         },

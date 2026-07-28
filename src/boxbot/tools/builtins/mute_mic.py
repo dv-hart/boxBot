@@ -33,15 +33,15 @@ class MuteMicTool(Tool):
 
     name = "mute_mic"
     description = (
-        "Stop mic input on the current voice conversation (no effect on "
-        "text or trigger conversations). The wake word stays armed, so the "
-        "room can re-engage you by saying it; the mute auto-clears on your "
-        "next message(channel=\"speak\") or when the conversation ends. It "
-        "also drops utterances queued while you were thinking.\n"
-        "If you are interrupted by background noise or unrelated speech "
-        "from the mic, call mute_mic immediately.\n"
-        "Do not pair mute_mic with message(channel=\"speak\") in the same "
-        "turn — speaking re-opens the mic and cancels the mute."
+        "Drop mic input on the current voice conversation. No effect on "
+        "text or trigger conversations.\n"
+        "Wake word stays armed — the room re-engages you by saying it. "
+        "Auto-clears on your next message(channel=\"speak\") or at "
+        "conversation end. Also drops utterances queued while you thought.\n"
+        "Background noise or unrelated speech mid-task: mute immediately, "
+        "same turn.\n"
+        "Never pair with message(channel=\"speak\") in one turn — speech "
+        "reopens the mic and cancels the mute."
     )
     parameters = {
         "type": "object",
@@ -49,10 +49,8 @@ class MuteMicTool(Tool):
             "reason": {
                 "type": "string",
                 "description": (
-                    "Short free-form note on why you're muting. Recorded "
-                    "for memory extraction and debugging. Examples: "
-                    "\"ambient chatter\", \"focusing on calendar lookup\", "
-                    "\"unrelated interruption\"."
+                    "Why. Recorded for extraction and debugging. e.g. "
+                    "\"ambient chatter\", \"unrelated interruption\"."
                 ),
             },
         },

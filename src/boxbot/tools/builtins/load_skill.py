@@ -34,23 +34,19 @@ class LoadSkillTool(Tool):
 
     name = "load_skill"
     description = (
-        "Load a specific skill's full body or a sub-file for on-demand "
-        "guidance. Call when a skill's index description matches the "
-        "current task."
+        "Load a skill's body, or one sub-file. Call when a skill's index "
+        "description matches the task."
     )
     parameters = {
         "type": "object",
         "properties": {
             "name": {
                 "type": "string",
-                "description": "Skill name from the skills index.",
+                "description": "Skill name from the index.",
             },
             "subpath": {
                 "type": "string",
-                "description": (
-                    "Optional relative path to a sub-file within the "
-                    "skill directory."
-                ),
+                "description": "Relative path to a sub-file in the skill dir.",
             },
         },
         "required": ["name"],

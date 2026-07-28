@@ -1,14 +1,14 @@
-# Mutation policy — what's blocked in V1 and why
+# Mutation policy — blocked in V1
 
-The `home_assistant` integration refuses `call_service` for three
+The `home_assistant` integration refuses `call_service` in three
 domains:
 
-- `alarm_control_panel.*` — arming and disarming
-- `lock.*` — locking and unlocking
+- `alarm_control_panel.*` — arm/disarm
+- `lock.*` — lock/unlock
 - `cover.*` — garage doors, gates, motorized blinds
 
-Refusal happens in the integration's script before the HTTP call —
-HA never sees the request. The error returned looks like:
+Refusal happens in the script before the HTTP call. HA never sees the
+request.
 
 ```
 {"status": "error", "error": "service calls in domain 'lock' are blocked
@@ -16,54 +16,42 @@ HA never sees the request. The error returned looks like:
  implemented). State reads (get_state) on these entities still work."}
 ```
 
-## What still works
+## Still works
 
-State reads (`get_state`) on blocked-domain entities are **always**
-allowed. BB can answer:
-
-- "Is the alarm armed?"
-- "Are the front doors locked?"
-- "Is the garage open?"
-
-It just can't change any of those answers yet.
+`get_state` on blocked-domain entities is **always** allowed. BB can
+answer "is the alarm armed?", "are the front doors locked?", "is the
+garage open?" It just can't change the answer.
 
 ## Why these three
 
-These are the domains where an agent acting on a hallucinated request
-— or following a successfully prompt-injected one — could create real
-physical or security harm:
+These are where acting on a hallucinated — or successfully
+prompt-injected — request causes real physical or security harm:
 
-- **Disarming the alarm** while no one is home, then doing nothing
-  visible to the user.
-- **Unlocking a door** at 3 a.m. on a misheard wake word.
-- **Closing a garage** on a child, a pet, or a person — covers in
-  general are too broad to evaluate by domain alone, so V1 takes the
-  conservative path and blocks them all (even blinds, which are
-  benign).
+- Disarming the alarm while nobody is home, invisibly.
+- Unlocking a door at 3 a.m. on a misheard wake word.
+- Closing a garage on a child, a pet, or a person. Covers are too
+  broad to evaluate by domain, so V1 blocks all of them, benign blinds
+  included.
 
-The cost of refusing is small ("tell the user BB can see but not yet
-change"); the cost of mis-acting is large.
+Refusing costs little. Mis-acting costs a lot.
 
-## What ISN'T blocked
+## Not blocked
 
 - `light.*`, `switch.*`, `scene.*`, `script.*`, `climate.*`,
-  `media_player.*`, `fan.*`, and the long tail of "boring" domains.
-- Reads (`get_state`, `get_states`) on **any** entity, including
-  alarm/lock/cover.
-- `list_services` returns gated services in its listing — discovery
-  is not the threat.
+  `media_player.*`, `fan.*`, and the boring long tail.
+- Reads on **any** entity, alarm/lock/cover included.
+- `list_services` still lists gated services. Discovery is not the
+  threat.
 
-If something boring is wired to a dangerous physical effect (a smart
-plug controlling a space heater wired into a child's room), the V1
-denylist won't catch it. Document those edge cases in memory so BB
-treats them carefully.
+A boring domain wired to a dangerous effect — a smart plug driving a
+space heater in a child's room — slips past the denylist. Note those
+in memory so BB handles them carefully.
 
 ## V2 — confirmation gate
 
-The eventual design mirrors the package-install approval pattern that
-already exists for `bb.packages.install`:
+Mirrors the existing package-install approval flow:
 
-1. The integration manifest declares which actions need confirmation:
+1. The manifest declares gated actions:
    ```yaml
    confirmations:
      - alarm_arm_home
@@ -73,29 +61,21 @@ already exists for `bb.packages.install`:
      - open_cover
      - close_cover
    ```
-2. When `call_service` is invoked for a confirmation-gated action,
-   the runner pauses the call, emits an approval request (admin
-   WhatsApp YES or screen-tap), and only proceeds on explicit
-   approval.
-3. Denial closes the call with a clean error; timeout (e.g. 30s)
-   also closes it.
+2. `call_service` on a gated action pauses, emits an approval request
+   (admin text YES, or screen tap), proceeds only on explicit approval.
+3. Denial closes the call with a clean error. Timeout (~30s) does too.
 
-V2 unblocks the domain denylist by replacing it with per-action gates
-+ a clear confirmation UX. Until then: reads on, writes off.
+That replaces the domain denylist with per-action gates. Until then:
+reads on, writes off.
 
-## Talking to the user about it
-
-When the user asks BB to disarm the alarm or unlock a door, the right
-response is something like:
+## Talking about it
 
 > "I can see the alarm is armed-home and the front door is locked. I
 > can't change those from BB yet — that needs the confirmation step
-> I'm working on. You can do it from the Alarm.com app or the HA UI
-> in the meantime."
+> I'm working on. You can do it from the Alarm.com app or the HA UI in
+> the meantime."
 
-Don't pretend the limit isn't there. Don't try to work around it by,
-e.g., calling `script.*` if the script wraps a `lock.unlock` call —
-the script will succeed (HA processes it server-side) and the gate
-won't catch it. That's an edge case to document in memory for the
-specific scripts users set up; the integration can't see through
-HA's automation layer.
+Don't pretend the limit isn't there. Don't route around it via
+`script.*` — a script wrapping `lock.unlock` succeeds server-side and
+the gate never sees it. The integration cannot see through HA's
+automation layer. Note specific user scripts in memory.

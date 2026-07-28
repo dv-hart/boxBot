@@ -1624,6 +1624,8 @@ async def _handle_tasks_action(
                     fire_after=payload.get("fire_after"),
                     cron=payload.get("cron"),
                     person=payload.get("person"),
+                    entity=payload.get("entity"),
+                    entity_state=payload.get("entity_state"),
                     for_person=payload.get("for_person"),
                     todo_id=payload.get("todo_id"),
                     source="agent",

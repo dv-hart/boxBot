@@ -21,12 +21,10 @@ class SearchPhotosTool(Tool):
 
     name = "search_photos"
     description = (
-        "Search and retrieve photos from the photo library. Two modes: "
-        "'search' returns ranked results matching a text query and optional "
-        "filters (tags, people, date range, source). 'get' returns full "
-        "details for a single photo by ID. Use this to find photos during "
-        "conversation, then switch_display('picture', args={'image_ids': [...]}) "
-        "to display them."
+        "Photo library. Modes: 'search' (ranked text match, filterable by "
+        "tags, people, date range, source), 'get' (full detail by "
+        "photo_id). To put results on screen: "
+        "switch_display('picture', args={'image_ids': [...]})."
     )
     parameters = {
         "type": "object",
@@ -34,43 +32,40 @@ class SearchPhotosTool(Tool):
             "mode": {
                 "type": "string",
                 "enum": ["search", "get"],
-                "description": (
-                    "Search mode: 'search' for ranked results, "
-                    "'get' for full details by ID."
-                ),
+                "description": "'search' = ranked results. 'get' = one photo.",
             },
             "query": {
                 "type": "string",
                 "description": (
-                    "Text search against photo descriptions. "
-                    "Required for 'search' mode."
+                    "Text match against photo descriptions. Required for "
+                    "'search'."
                 ),
             },
             "photo_id": {
                 "type": "string",
-                "description": "Photo ID. Required for 'get' mode.",
+                "description": "Required for 'get'.",
             },
             "tags": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Filter by tags (AND logic).",
+                "description": "Filter by tags. AND.",
             },
             "people": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Filter by person names (AND logic).",
+                "description": "Filter by person names. AND.",
             },
             "date_from": {
                 "type": "string",
-                "description": "ISO date — results from this date onward.",
+                "description": "ISO date. From here onward.",
             },
             "date_to": {
                 "type": "string",
-                "description": "ISO date — results up to this date.",
+                "description": "ISO date. Up to here.",
             },
             "source": {
                 "type": "string",
-                "description": "Filter by source ('whatsapp', 'camera', etc.).",
+                "description": "'whatsapp', 'camera', etc.",
             },
             "in_slideshow": {
                 "type": "boolean",
@@ -78,11 +73,11 @@ class SearchPhotosTool(Tool):
             },
             "include_deleted": {
                 "type": "boolean",
-                "description": "Include soft-deleted photos. Default: false.",
+                "description": "Include soft-deleted. Default false.",
             },
             "limit": {
                 "type": "integer",
-                "description": "Max results for search mode. Default: 20.",
+                "description": "Max results for 'search'. Default 20.",
             },
         },
         "required": ["mode"],

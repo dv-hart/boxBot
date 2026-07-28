@@ -21,14 +21,13 @@ class SearchMemoryTool(Tool):
 
     name = "search_memory"
     description = (
-        "Search, summarize, or retrieve stored memories. Modes: "
-        "'lookup' returns ranked fact memories and conversation matches, "
-        "'summary' synthesizes an answer from relevant memories, "
-        "'get' retrieves a full memory record by ID, "
-        "'transcript' recovers raw conversation text — pass conversation_id "
-        "for a single conversation, or query to substring-search recent "
-        "transcripts (last 14 days). Use 'transcript' when memory is "
-        "thin and you need to reconstruct what was actually said."
+        "Search, summarize, or retrieve memories. Modes:\n"
+        "- lookup: ranked fact memories + conversation matches\n"
+        "- summary: one synthesized answer from relevant memories\n"
+        "- get: one full record by memory_id\n"
+        "- transcript: raw conversation text. Pass conversation_id for "
+        "one thread, or query to substring-search the last 14 days. Use "
+        "when memory is thin and you need what was actually said."
     )
     parameters = {
         "type": "object",
@@ -36,26 +35,23 @@ class SearchMemoryTool(Tool):
             "mode": {
                 "type": "string",
                 "enum": ["lookup", "summary", "get", "transcript"],
-                "description": "Operation to run (see tool description).",
+                "description": "See tool description.",
             },
             "query": {
                 "type": "string",
                 "description": (
-                    "Search query text. Required for 'lookup' and 'summary' "
-                    "modes; in 'transcript' mode used to substring-search "
-                    "recent transcripts when conversation_id is not given."
+                    "Required for 'lookup' and 'summary'. In 'transcript', "
+                    "substring-searches recent transcripts when "
+                    "conversation_id is absent."
                 ),
             },
             "memory_id": {
                 "type": "string",
-                "description": "Memory ID. Required for 'get' mode.",
+                "description": "Required for 'get'.",
             },
             "conversation_id": {
                 "type": "string",
-                "description": (
-                    "Conversation ID for 'transcript' mode. If provided, "
-                    "returns the full transcript for that conversation."
-                ),
+                "description": "'transcript' only. Returns that full transcript.",
             },
             "types": {
                 "type": "array",
@@ -63,23 +59,19 @@ class SearchMemoryTool(Tool):
                     "type": "string",
                     "enum": ["person", "household", "methodology"],
                 },
-                "description": "Optional: filter by memory types.",
+                "description": "Filter by memory type.",
             },
             "person": {
                 "type": "string",
-                "description": "Optional: filter by person name.",
+                "description": "Filter by person name.",
             },
             "include_conversations": {
                 "type": "boolean",
-                "description": (
-                    "Include conversation log in results. Default: true."
-                ),
+                "description": "Include the conversation log. Default true.",
             },
             "include_archived": {
                 "type": "boolean",
-                "description": (
-                    "Include archived memories. Default: false."
-                ),
+                "description": "Include archived memories. Default false.",
             },
         },
         "required": ["mode"],

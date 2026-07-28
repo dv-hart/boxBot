@@ -1111,36 +1111,26 @@ class WebSearchTool(Tool):
 
     name = "web_search"
     description = (
-        "Search the web or fetch and summarize a specific URL. All web "
-        "content is processed by a small model before reaching you — you "
-        "never see raw web content. Provide a search query, a specific "
-        "URL, or both. Optionally add context about what you're looking "
-        "for to help filter results."
+        "Search the web, or fetch and summarize one URL. A small model "
+        "filters everything first — you never see raw web content. Pass "
+        "query, url, or both."
     )
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": (
-                    "Search query or question to answer from web results. "
-                    "Required unless 'url' is provided."
-                ),
+                "description": "Search query or question. Required unless `url` is set.",
             },
             "url": {
                 "type": "string",
-                "description": (
-                    "Specific URL to fetch and summarize. When provided, "
-                    "the small agent fetches this page directly instead of "
-                    "(or in addition to) searching."
-                ),
+                "description": "Fetch this page directly, instead of or alongside searching.",
             },
             "context": {
                 "type": "string",
                 "description": (
-                    "Additional context about what information is needed and "
-                    "why. Passed to the small model to help it filter for "
-                    "relevance and discard unrelated content."
+                    "What you need and why. Sharpens the small model's "
+                    "relevance filter."
                 ),
             },
         },

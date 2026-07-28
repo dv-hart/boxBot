@@ -68,7 +68,10 @@ def agent_with_mock_client(monkeypatch, mock_config):
     # Stub _process_tool_calls: the message tool's real implementation
     # would call dispatch_outputs; we don't want to exercise that here.
     # The dispatcher itself is patched separately in tests that care.
-    async def _fake_process(response, tools, *, conversation_id=None):
+    async def _fake_process(
+        response, tools, *, conversation_id=None, turn_number=None,
+        channel=None,
+    ):
         results = []
         for block in response.content:
             if getattr(block, "type", None) != "tool_use":

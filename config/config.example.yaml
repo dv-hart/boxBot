@@ -114,6 +114,15 @@ hardware:
     # on a NoIR sensor with no IR-cut filter — produces honest greyscale
     # rather than IR-shifted colour. Restore once a filter is installed.
     saturation: 1.0
+    # Capture timeouts + stall watchdog. libcamera can silently stop
+    # completing requests; captures then block forever. Timeouts fail the
+    # call instead of hanging it; the watchdog probes after
+    # watchdog_stale_s without a frame and restarts the pipeline if the
+    # probe hangs.
+    capture_timeout_s: 5.0
+    photo_timeout_s: 15.0        # still capture includes a mode switch
+    watchdog_interval_s: 30.0
+    watchdog_stale_s: 60.0
   hailo:
     # Model paths for Hailo-8L inference
     models:

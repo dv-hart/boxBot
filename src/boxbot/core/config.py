@@ -272,6 +272,15 @@ class HardwareCameraConfig(BaseModel):
     # filter is installed.
     saturation: float = 1.0
 
+    # Capture timeouts and stall watchdog. libcamera can silently stop
+    # completing requests (observed 2026-07-26); the watchdog probes when
+    # no frame has been captured for watchdog_stale_s and restarts the
+    # picamera2 pipeline if the probe hangs.
+    capture_timeout_s: float = 5.0
+    photo_timeout_s: float = 15.0  # still capture includes a mode switch
+    watchdog_interval_s: float = 30.0
+    watchdog_stale_s: float = 60.0
+
 
 class HardwareHailoConfig(BaseModel):
     """Hailo NPU configuration (model paths, preloading)."""

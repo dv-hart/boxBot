@@ -260,6 +260,10 @@ async def _init_hal(
                 else None
             ),
             saturation=cam_cfg.saturation,
+            capture_timeout=cam_cfg.capture_timeout_s,
+            photo_timeout=cam_cfg.photo_timeout_s,
+            watchdog_interval=cam_cfg.watchdog_interval_s,
+            watchdog_stale=cam_cfg.watchdog_stale_s,
         )
         await camera.start()
         system.register_module(camera)

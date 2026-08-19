@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import numpy as np
@@ -62,6 +63,10 @@ class Camera(HardwareModule):
         colour_gains: tuple[float, float] | None = None,
         colour_correction_matrix: tuple[float, ...] | None = None,
         saturation: float = 1.0,
+        capture_timeout: float = 5.0,
+        photo_timeout: float = 15.0,
+        watchdog_interval: float = 30.0,
+        watchdog_stale: float = 60.0,
     ) -> None:
         super().__init__()
         self._rotation = rotation
@@ -71,11 +76,25 @@ class Camera(HardwareModule):
         self._colour_gains = colour_gains
         self._colour_correction_matrix = colour_correction_matrix
         self._saturation = saturation
+        self._capture_timeout = capture_timeout
+        self._photo_timeout = photo_timeout
+        self._watchdog_interval = watchdog_interval
+        self._watchdog_stale = watchdog_stale
 
         # Set by start(), typed as Any to avoid import at module level
         self._picam2: Any = None
         self._still_config: Any = None
         self._preview_config: Any = None
+
+        # Stall watchdog state. libcamera can stop completing requests
+        # without any exception or kernel error (observed 2026-07-26:
+        # frames froze mid-stream after ~6 days uptime; every capture
+        # blocked forever and perception went silently blind). The
+        # watchdog probes when frames go stale and restarts the
+        # picamera2 pipeline in-process.
+        self._last_frame_time: float | None = None
+        self._watchdog_task: asyncio.Task[None] | None = None
+        self._restart_lock = asyncio.Lock()
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -85,6 +104,11 @@ class Camera(HardwareModule):
         try:
             await loop.run_in_executor(None, self._start_sync)
             self._started = True
+            self._last_frame_time = time.monotonic()
+            if self._watchdog_task is None:
+                self._watchdog_task = asyncio.create_task(
+                    self._watchdog_loop(), name="camera-watchdog"
+                )
             await self._emit_health(HealthStatus.OK)
             logger.info(
                 "Camera started: main=%s lores=%s rotation=%d",
@@ -145,6 +169,13 @@ class Camera(HardwareModule):
 
     async def stop(self) -> None:
         """Stop camera and release resources."""
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._watchdog_task = None
         if self._picam2 is not None:
             loop = asyncio.get_event_loop()
             try:
@@ -159,6 +190,31 @@ class Camera(HardwareModule):
 
     # ── Frame capture ──────────────────────────────────────────────
 
+    async def _run_capture(
+        self, fn: Any, *args: Any, timeout: float
+    ) -> np.ndarray:
+        """Run a blocking capture in the executor with a hard timeout.
+
+        A timed-out capture strands its executor thread (picamera2 has
+        no cancellable wait); the watchdog's pipeline restart is what
+        unwedges those. Raising here keeps callers' error paths live
+        instead of hanging them for the sandbox's full 30s budget.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            result: np.ndarray = await asyncio.wait_for(
+                loop.run_in_executor(None, fn, *args), timeout
+            )
+        except asyncio.TimeoutError:
+            await self._emit_health(
+                HealthStatus.DEGRADED, f"capture timed out after {timeout:.0f}s"
+            )
+            raise HardwareUnavailableError(
+                f"camera capture timed out after {timeout:.0f}s"
+            ) from None
+        self._last_frame_time = time.monotonic()
+        return result
+
     async def get_lores_frame(self) -> np.ndarray:
         """Get the latest low-resolution frame for motion detection.
 
@@ -169,9 +225,9 @@ class Camera(HardwareModule):
         Returns:
             (H, W) uint8 grayscale numpy array.
         """
-        loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(
-            None, self._picam2.capture_array, "lores"
+        raw = await self._run_capture(
+            self._picam2.capture_array, "lores",
+            timeout=self._capture_timeout,
         )
         # YUV420 layout: Y plane is the first (H * W) bytes, but
         # picamera2 returns the full padded buffer.  We need the
@@ -188,11 +244,10 @@ class Camera(HardwareModule):
         Returns:
             (H, W, 3) RGB uint8 numpy array at main_resolution.
         """
-        loop = asyncio.get_event_loop()
-        frame: np.ndarray = await loop.run_in_executor(
-            None, self._picam2.capture_array, "main"
+        return await self._run_capture(
+            self._picam2.capture_array, "main",
+            timeout=self._capture_timeout,
         )
-        return frame
 
     async def capture_photo(self) -> np.ndarray:
         """Capture a full-resolution still image.
@@ -204,11 +259,10 @@ class Camera(HardwareModule):
         Returns:
             (H, W, 3) RGB uint8 numpy array at full sensor resolution.
         """
-        loop = asyncio.get_event_loop()
-        photo: np.ndarray = await loop.run_in_executor(
-            None, self._capture_photo_sync
+        return await self._run_capture(
+            self._capture_photo_sync,
+            timeout=self._photo_timeout,
         )
-        return photo
 
     def _capture_photo_sync(self) -> np.ndarray:
         """Blocking still capture with mode switch (runs in executor)."""
@@ -216,6 +270,81 @@ class Camera(HardwareModule):
             self._still_config, "main"
         )
         return frame
+
+    # ── Stall watchdog ─────────────────────────────────────────────
+
+    @property
+    def frame_age(self) -> float | None:
+        """Seconds since the last successful capture, or None pre-start."""
+        if self._last_frame_time is None:
+            return None
+        return time.monotonic() - self._last_frame_time
+
+    async def _watchdog_loop(self) -> None:
+        """Probe when frames go stale; restart the pipeline on a wedge.
+
+        Perception stops grabbing frames during CONVERSATION state, so
+        staleness alone is not a fault — the probe capture is what
+        distinguishes "idle" from "wedged". A successful probe refreshes
+        ``_last_frame_time``, so probes fire at most once per interval
+        and only when nothing else has captured recently.
+        """
+        while True:
+            await asyncio.sleep(self._watchdog_interval)
+            try:
+                if not self._started or self._picam2 is None:
+                    continue
+                age = self.frame_age
+                if age is None or age < self._watchdog_stale:
+                    continue
+                try:
+                    await self.get_lores_frame()
+                    continue  # probe ok — camera alive, just idle
+                except Exception:
+                    logger.error(
+                        "Camera watchdog: frames stale for %.0fs and probe "
+                        "failed — restarting camera pipeline",
+                        age,
+                    )
+                await self._restart()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Camera watchdog iteration failed")
+
+    async def _restart(self) -> None:
+        """Tear down and re-init picamera2 in-process.
+
+        Best effort: teardown of a wedged pipeline can itself block, so
+        it runs under the same hard timeout and a stuck close is
+        abandoned. If the old handle never released the device, re-init
+        fails and the watchdog retries next interval.
+        """
+        async with self._restart_lock:
+            loop = asyncio.get_event_loop()
+            old = self._picam2
+            self._picam2 = None
+            if old is not None:
+                for op in (old.stop, old.close):
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, op),
+                            self._capture_timeout,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Camera restart: %s() failed or timed out; "
+                            "abandoning old pipeline handle", op.__name__,
+                        )
+            try:
+                await loop.run_in_executor(None, self._start_sync)
+            except Exception as exc:
+                await self._emit_health(HealthStatus.ERROR, str(exc))
+                logger.exception("Camera restart failed; will retry")
+                return
+            self._last_frame_time = time.monotonic()
+            await self._emit_health(HealthStatus.OK, "recovered by watchdog")
+            logger.info("Camera watchdog: pipeline restarted successfully")
 
     # ── Properties ─────────────────────────────────────────────────
 
@@ -257,9 +386,18 @@ class Camera(HardwareModule):
         return True
 
     async def health_check(self) -> HealthStatus:
-        """Check camera health by verifying the stream is active."""
+        """Check camera health by verifying frames are actually flowing."""
         if not self._started:
             return HealthStatus.STOPPED
         if self._picam2 is None:
+            return HealthStatus.ERROR
+        # The watchdog probes whenever frames go stale, so a healthy
+        # camera never exceeds stale + interval (+ probe timeout) even
+        # when perception is idle. Older than that = wedged and not yet
+        # recovered.
+        age = self.frame_age
+        if age is not None and age > (
+            self._watchdog_stale + 2 * self._watchdog_interval
+        ):
             return HealthStatus.ERROR
         return HealthStatus.OK

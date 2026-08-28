@@ -63,6 +63,7 @@ class Camera(HardwareModule):
         colour_gains: tuple[float, float] | None = None,
         colour_correction_matrix: tuple[float, ...] | None = None,
         saturation: float = 1.0,
+        tuning_file: str | None = None,
         capture_timeout: float = 5.0,
         photo_timeout: float = 15.0,
         watchdog_interval: float = 30.0,
@@ -76,6 +77,7 @@ class Camera(HardwareModule):
         self._colour_gains = colour_gains
         self._colour_correction_matrix = colour_correction_matrix
         self._saturation = saturation
+        self._tuning_file = tuning_file
         self._capture_timeout = capture_timeout
         self._photo_timeout = photo_timeout
         self._watchdog_interval = watchdog_interval
@@ -127,7 +129,16 @@ class Camera(HardwareModule):
         from libcamera import Transform  # type: ignore[import-untyped]
         from picamera2 import Picamera2  # type: ignore[import-untyped]
 
-        self._picam2 = Picamera2()
+        # Tuning-file override. libcamera auto-selects by sensor name —
+        # for a NoIR sensor that means the *_noir tuning, whose colour
+        # tables assume no IR-cut filter. With a filter retrofitted, the
+        # standard tuning (e.g. "imx708_wide.json") is the correct one;
+        # load_tuning_file resolves the platform dir (pisp/vc4) itself.
+        tuning = None
+        if self._tuning_file:
+            tuning = Picamera2.load_tuning_file(self._tuning_file)
+
+        self._picam2 = Picamera2(tuning=tuning)
 
         # Build transform for rotation
         transform = Transform()

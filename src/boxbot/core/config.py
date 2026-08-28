@@ -272,6 +272,14 @@ class HardwareCameraConfig(BaseModel):
     # filter is installed.
     saturation: float = 1.0
 
+    # libcamera tuning-file override (name only, e.g. "imx708_wide.json";
+    # picamera2 resolves the platform directory). libcamera auto-selects
+    # the *_noir tuning for NoIR sensors — wrong once an IR-cut filter is
+    # retrofitted: its lens-shading tables produce magenta/teal colour
+    # casts. Set to the standard variant to match the filtered sensor.
+    # null = libcamera default selection.
+    tuning_file: str | None = None
+
     # Capture timeouts and stall watchdog. libcamera can silently stop
     # completing requests (observed 2026-07-26); the watchdog probes when
     # no frame has been captured for watchdog_stale_s and restarts the

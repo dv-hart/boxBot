@@ -260,6 +260,7 @@ async def _init_hal(
                 else None
             ),
             saturation=cam_cfg.saturation,
+            tuning_file=cam_cfg.tuning_file,
             capture_timeout=cam_cfg.capture_timeout_s,
             photo_timeout=cam_cfg.photo_timeout_s,
             watchdog_interval=cam_cfg.watchdog_interval_s,

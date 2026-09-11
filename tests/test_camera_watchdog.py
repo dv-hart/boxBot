@@ -170,3 +170,106 @@ async def test_health_check_errors_on_stale_frames():
 async def test_health_check_stopped_when_not_started():
     cam = Camera(rotation=0)
     assert await cam.health_check() == HealthStatus.STOPPED
+
+
+# ── Private executor: a wedge must not poison the shared pool ─────────
+
+
+@pytest.mark.asyncio
+async def test_wedged_capture_strands_only_camera_thread():
+    """A timed-out capture leaves the loop's default executor untouched.
+
+    The 2026-09-03 failure: picamera2 stalls ran on the default pool and
+    stranded every worker, so unrelated run_in_executor(None, ...) calls
+    (Hailo, voice embedding, shutdown) queued forever.
+    """
+    cam, fake = make_camera()
+    fake.wedged = True
+    with pytest.raises(HardwareUnavailableError):
+        await cam.capture_frame()
+    try:
+        names = {t.name for t in threading.enumerate()}
+        assert any(n.startswith("camera") for n in names)
+        loop = asyncio.get_running_loop()
+        # Default executor still answers promptly.
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: "alive"), 1.0
+        )
+        assert result == "alive"
+    finally:
+        fake._unwedge.set()
+
+
+@pytest.mark.asyncio
+async def test_queued_captures_behind_wedge_do_not_spawn_threads():
+    cam, fake = make_camera()
+    fake.wedged = True
+    before = sum(1 for t in threading.enumerate() if t.name.startswith("camera"))
+    for _ in range(3):
+        with pytest.raises(HardwareUnavailableError):
+            await cam.capture_frame()
+    after = sum(1 for t in threading.enumerate() if t.name.startswith("camera"))
+    try:
+        # Single worker: the first capture strands it, the rest queue and
+        # time out without adding threads.
+        assert after - before <= 1
+    finally:
+        fake._unwedge.set()
+
+
+@pytest.mark.asyncio
+async def test_restart_recycles_executor(monkeypatch):
+    cam, fake = make_camera()
+    new_fake = FakePicam2()
+    monkeypatch.setattr(cam, "_start_sync", lambda: setattr(cam, "_picam2", new_fake))
+
+    fake.wedged = True
+    with pytest.raises(HardwareUnavailableError):
+        await cam.capture_frame()  # strands the sole worker
+    old_executor = cam._executor
+
+    await cam._restart()
+    try:
+        assert cam._executor is not old_executor
+        assert cam._picam2 is new_fake
+        # Old handle was torn down on a live worker despite the wedge.
+        assert fake.stopped
+        frame = await asyncio.wait_for(cam.capture_frame(), 1.0)
+        assert frame.shape == (720, 1280, 3)
+    finally:
+        fake._unwedge.set()
+
+
+@pytest.mark.asyncio
+async def test_restart_bounded_when_init_hangs(monkeypatch):
+    cam, fake = make_camera(restart_timeout=0.2)
+    release = threading.Event()
+    monkeypatch.setattr(cam, "_start_sync", lambda: release.wait(timeout=30))
+    cam._picam2 = None
+
+    start = time.monotonic()
+    await cam._restart()  # must return, not hold _restart_lock forever
+    try:
+        assert time.monotonic() - start < 2.0
+        assert not cam._restart_lock.locked()
+        assert cam._picam2 is None
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_stop_bounded_when_pipeline_wedged():
+    cam, fake = make_camera()
+    fake.wedged = True
+    with pytest.raises(HardwareUnavailableError):
+        await cam.capture_frame()
+    # Make teardown itself hang too.
+    fake.stop = lambda: fake._unwedge.wait(timeout=30)  # type: ignore[method-assign]
+    start = time.monotonic()
+    await cam.stop()
+    try:
+        assert time.monotonic() - start < 2.0
+        assert cam._picam2 is None
+        assert not cam._started
+    finally:
+        fake._unwedge.set()

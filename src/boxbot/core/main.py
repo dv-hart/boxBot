@@ -880,6 +880,57 @@ async def _shutdown(
     logger.info("boxBot shutdown complete")
 
 
+# Upper bound on the whole graceful-shutdown sequence. Past this we stop
+# waiting and hard-exit: a stop() that never returns (a wedged HAL
+# thread, a dead executor) must not turn the process into a zombie that
+# systemd still reports as ``active`` — 2026-07-18 and 2026-09-06 both
+# lost days of service that way.
+_SHUTDOWN_DEADLINE_S = 60.0
+
+# Exit codes. systemd runs us with ``Restart=on-failure``: 0 means "stay
+# down" (operator stop / deploy restart handles it), anything else asks
+# for a fresh process.
+EXIT_OK = 0
+EXIT_INIT_FAILED = 1
+EXIT_RESTART_REQUESTED = 3
+
+
+async def _shutdown_bounded(
+    subsystems: dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
+    deadline: float = _SHUTDOWN_DEADLINE_S,
+) -> bool:
+    """Run ``_shutdown`` under a hard deadline.
+
+    Returns True if it completed, False if it was abandoned. Either way
+    the caller must exit the process — after False there may be tasks
+    or threads that will never finish.
+    """
+    try:
+        await asyncio.wait_for(_shutdown(subsystems, loop), timeout=deadline)
+        return True
+    except asyncio.TimeoutError:
+        logger.critical(
+            "Graceful shutdown did not finish within %.0fs — forcing exit",
+            deadline,
+        )
+        return False
+
+
+def _exit_process(code: int) -> None:
+    """Terminate immediately with ``code``.
+
+    ``os._exit`` on purpose: the normal interpreter exit joins every
+    non-daemon thread, and a thread stranded in a blocking driver call
+    (picamera2, HailoRT) would hang it forever. Everything that needs
+    an orderly stop has already had its chance in ``_shutdown``; all
+    that remains is flushing the log.
+    """
+    logger.info("Exiting with code %d", code)
+    logging.shutdown()
+    os._exit(code)
+
+
 # ---------------------------------------------------------------------------
 # Async main
 # ---------------------------------------------------------------------------
@@ -934,22 +985,31 @@ async def _async_main() -> None:
     # Track subsystems for shutdown
     subsystems: dict[str, Any] = {}
 
-    # Event to signal shutdown
+    # Event to signal shutdown, plus who asked first: a signal means the
+    # operator wants us down (exit 0); an internal request (RSS
+    # guardrail) wants systemd to bring up a fresh process.
     shutdown_event = asyncio.Event()
+    shutdown_reason: dict[str, str] = {}
+
+    def _request_shutdown(reason: str) -> None:
+        shutdown_reason.setdefault("reason", reason)
+        shutdown_event.set()
 
     # 4. Register signal handlers
     loop = asyncio.get_running_loop()
 
     def _signal_handler(sig: signal.Signals) -> None:
         logger.info("Received signal %s, initiating shutdown...", sig.name)
-        shutdown_event.set()
+        _request_shutdown(f"signal:{sig.name}")
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, _signal_handler, sig)
         except NotImplementedError:
             # Windows does not support add_signal_handler
-            signal.signal(sig, lambda s, f: shutdown_event.set())
+            signal.signal(
+                sig, lambda s, f: _request_shutdown(f"signal:{s}")
+            )
 
     # 5. Initialise subsystems in dependency order
     try:
@@ -957,7 +1017,8 @@ async def _async_main() -> None:
         # Hand the shutdown event to system so its RSS guardrail can
         # request a graceful exit before the kernel OOM-kills us.
         hal_modules = await _init_hal(
-            config, shutdown_callback=shutdown_event.set
+            config,
+            shutdown_callback=lambda: _request_shutdown("rss_guardrail"),
         )
         subsystems["hal"] = hal_modules
 
@@ -1047,8 +1108,8 @@ async def _async_main() -> None:
 
     except Exception:
         logger.exception("Fatal error during subsystem initialisation")
-        await _shutdown(subsystems, loop)
-        return
+        await _shutdown_bounded(subsystems, loop)
+        _exit_process(EXIT_INIT_FAILED)
 
     # 6. Run until shutdown signal
     try:
@@ -1056,8 +1117,18 @@ async def _async_main() -> None:
     except asyncio.CancelledError:
         pass
 
-    # 7. Graceful shutdown
-    await _shutdown(subsystems, loop)
+    # 7. Graceful shutdown — bounded, then hard exit. The exit code
+    # tells systemd whether to restart us: a self-requested shutdown
+    # (RSS guardrail) or one that had to be forced wants a fresh
+    # process; an operator signal does not.
+    reason = shutdown_reason.get("reason", "unknown")
+    clean = await _shutdown_bounded(subsystems, loop)
+    if clean and reason.startswith("signal:"):
+        _exit_process(EXIT_OK)
+    logger.warning(
+        "Shutdown reason=%s clean=%s — requesting restart", reason, clean
+    )
+    _exit_process(EXIT_RESTART_REQUESTED)
 
 
 # ---------------------------------------------------------------------------

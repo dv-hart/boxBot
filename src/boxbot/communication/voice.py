@@ -916,7 +916,18 @@ class VoiceSession:
                 )
 
         if not stt_result or not stt_result.text.strip():
-            # No transcript — go back to listening
+            # No transcript — go back to listening. Re-arm the grace
+            # window: the utterance cancelled it above, and nothing
+            # downstream (no TranscriptReady, no agent turn) will arm a
+            # timer for us. Without this a session whose STT keeps
+            # failing (network outage) or that only ever hears ambient
+            # noise stays ACTIVE with a hot mic indefinitely — observed
+            # 2026-09-06: 90 minutes of failed STT, never deactivated.
+            if (
+                self._state is VoiceSessionState.ACTIVE
+                and self._active_timeout_task is None
+            ):
+                self._reset_wake_word_grace_timer()
             if self._microphone:
                 try:
                     await self._microphone.set_led_pattern("listening")

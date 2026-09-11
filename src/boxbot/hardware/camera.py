@@ -2,8 +2,16 @@
 
 Provides dual-stream video (low-res for motion detection, main for
 perception) and full-resolution still capture for the photo library.
-All picamera2 calls are wrapped in ``run_in_executor`` since the library
-is blocking.
+All picamera2 calls run on a **dedicated single-thread executor** owned
+by this module, never the loop's default executor. picamera2 has no
+cancellable wait: a wedged ``capture_array`` blocks its thread forever,
+and ``asyncio.wait_for`` only abandons the await, not the thread. On
+the shared default pool that strands one worker per timed-out capture
+until the pool is dead — observed 2026-09-03: eight stranded workers in
+30 s, after which Hailo inference, voice embedding, TTS decode and the
+graceful-shutdown path all queued forever behind them. With a private
+executor a stall can only ever cost this module its own worker, and
+the watchdog restart recycles it.
 
 Hardware: Pi Camera Module 3 Wide NoIR (IMX708, 120 deg FOV, 12MP)
 Interface: CSI-2 ribbon cable
@@ -14,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -68,6 +77,7 @@ class Camera(HardwareModule):
         photo_timeout: float = 15.0,
         watchdog_interval: float = 30.0,
         watchdog_stale: float = 60.0,
+        restart_timeout: float = 30.0,
     ) -> None:
         super().__init__()
         self._rotation = rotation
@@ -82,6 +92,7 @@ class Camera(HardwareModule):
         self._photo_timeout = photo_timeout
         self._watchdog_interval = watchdog_interval
         self._watchdog_stale = watchdog_stale
+        self._restart_timeout = restart_timeout
 
         # Set by start(), typed as Any to avoid import at module level
         self._picam2: Any = None
@@ -98,13 +109,50 @@ class Camera(HardwareModule):
         self._watchdog_task: asyncio.Task[None] | None = None
         self._restart_lock = asyncio.Lock()
 
+        # Private executor for every blocking picamera2 call. One
+        # worker: the camera is a single serial device, and a single
+        # worker means a wedged capture strands exactly one thread —
+        # later captures queue behind it and time out without spawning
+        # more. ``_recycle_executor`` swaps in a fresh pool whenever a
+        # thread is known to be stuck.
+        self._executor = self._new_executor()
+
+    # ── Executor management ────────────────────────────────────────
+
+    @staticmethod
+    def _new_executor() -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="camera")
+
+    def _recycle_executor(self) -> None:
+        """Abandon the current executor (and any stranded worker in it).
+
+        Pending work items are cancelled; the stuck thread is left to
+        die with the process. ``shutdown(wait=False)`` never blocks.
+        """
+        old = self._executor
+        self._executor = self._new_executor()
+        old.shutdown(wait=False, cancel_futures=True)
+
+    async def _run_bounded(self, fn: Any, *args: Any, timeout: float) -> Any:
+        """Run ``fn`` on the camera executor with a hard timeout.
+
+        Raises ``asyncio.TimeoutError`` if it does not return in time.
+        The worker thread is then presumed stranded; callers decide
+        whether to recycle the executor (restart/stop do, captures
+        leave it for the watchdog).
+        """
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(self._executor, fn, *args), timeout
+        )
+
     # ── Lifecycle ──────────────────────────────────────────────────
 
     async def start(self) -> None:
         """Initialize picamera2 with dual-stream preview configuration."""
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(None, self._start_sync)
+            await loop.run_in_executor(self._executor, self._start_sync)
             self._started = True
             self._last_frame_time = time.monotonic()
             if self._watchdog_task is None:
@@ -188,14 +236,25 @@ class Camera(HardwareModule):
                 pass
             self._watchdog_task = None
         if self._picam2 is not None:
-            loop = asyncio.get_event_loop()
-            try:
-                await loop.run_in_executor(None, self._picam2.stop)
-                await loop.run_in_executor(None, self._picam2.close)
-            except Exception:
-                logger.exception("Error stopping camera")
-            finally:
-                self._picam2 = None
+            # Bounded: a wedged pipeline must not be able to hang the
+            # process's shutdown sequence. Recycle first so teardown
+            # gets a live worker even if a capture is currently stuck.
+            self._recycle_executor()
+            picam2, self._picam2 = self._picam2, None
+            for op in (picam2.stop, picam2.close):
+                try:
+                    await self._run_bounded(op, timeout=self._capture_timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Camera stop: %s() timed out; abandoning handle",
+                        op.__name__,
+                    )
+                    self._recycle_executor()
+                except Exception:
+                    logger.exception("Error stopping camera (%s)", op.__name__)
+        # Drop the executor; a fresh (idle, threadless) one keeps a
+        # later start() valid without special-casing a closed pool.
+        self._recycle_executor()
         self._started = False
         await self._emit_health(HealthStatus.STOPPED)
 
@@ -204,17 +263,18 @@ class Camera(HardwareModule):
     async def _run_capture(
         self, fn: Any, *args: Any, timeout: float
     ) -> np.ndarray:
-        """Run a blocking capture in the executor with a hard timeout.
+        """Run a blocking capture on the camera executor with a hard timeout.
 
-        A timed-out capture strands its executor thread (picamera2 has
-        no cancellable wait); the watchdog's pipeline restart is what
-        unwedges those. Raising here keeps callers' error paths live
-        instead of hanging them for the sandbox's full 30s budget.
+        A timed-out capture strands the executor's single worker
+        (picamera2 has no cancellable wait). Later captures queue
+        behind it and time out too — cheaply, without spawning threads
+        — until the watchdog's pipeline restart recycles the executor.
+        Raising here keeps callers' error paths live instead of hanging
+        them for the sandbox's full 30s budget.
         """
-        loop = asyncio.get_event_loop()
         try:
-            result: np.ndarray = await asyncio.wait_for(
-                loop.run_in_executor(None, fn, *args), timeout
+            result: np.ndarray = await self._run_bounded(
+                fn, *args, timeout=timeout
             )
         except asyncio.TimeoutError:
             await self._emit_health(
@@ -330,25 +390,50 @@ class Camera(HardwareModule):
         it runs under the same hard timeout and a stuck close is
         abandoned. If the old handle never released the device, re-init
         fails and the watchdog retries next interval.
+
+        Every step runs on a freshly recycled executor: the worker that
+        wedged on the stale capture is abandoned up front, and any
+        teardown op that times out strands the new worker, so it is
+        recycled again before re-init. Re-init is bounded too — an
+        unbounded ``_start_sync`` here would hold ``_restart_lock``
+        forever and kill the watchdog (2026-09-03).
         """
         async with self._restart_lock:
-            loop = asyncio.get_event_loop()
             old = self._picam2
             self._picam2 = None
+            self._recycle_executor()
             if old is not None:
                 for op in (old.stop, old.close):
                     try:
-                        await asyncio.wait_for(
-                            loop.run_in_executor(None, op),
-                            self._capture_timeout,
+                        await self._run_bounded(
+                            op, timeout=self._capture_timeout
                         )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Camera restart: %s() timed out; abandoning "
+                            "old pipeline handle", op.__name__,
+                        )
+                        self._recycle_executor()
                     except Exception:
                         logger.warning(
-                            "Camera restart: %s() failed or timed out; "
-                            "abandoning old pipeline handle", op.__name__,
+                            "Camera restart: %s() failed; abandoning old "
+                            "pipeline handle", op.__name__, exc_info=True,
                         )
             try:
-                await loop.run_in_executor(None, self._start_sync)
+                await self._run_bounded(
+                    self._start_sync, timeout=self._restart_timeout
+                )
+            except asyncio.TimeoutError:
+                self._recycle_executor()
+                await self._emit_health(
+                    HealthStatus.ERROR,
+                    f"restart timed out after {self._restart_timeout:.0f}s",
+                )
+                logger.error(
+                    "Camera restart: init timed out after %.0fs; will retry",
+                    self._restart_timeout,
+                )
+                return
             except Exception as exc:
                 await self._emit_health(HealthStatus.ERROR, str(exc))
                 logger.exception("Camera restart failed; will retry")

@@ -73,16 +73,24 @@ class VoiceActivityDetector:
         window_size = 512
         max_prob = 0.0
 
-        for offset in range(0, len(audio_tensor), window_size):
-            window = audio_tensor[offset : offset + window_size]
-            if len(window) < window_size:
-                # Pad the final partial window with zeros
-                window = torch.nn.functional.pad(
-                    window, (0, window_size - len(window))
-                )
-            prob = self._model(window, chunk.sample_rate).item()
-            if prob > max_prob:
-                max_prob = prob
+        # inference_mode is load-bearing, not an optimisation. The model
+        # carries its recurrent state across calls as tensors; with
+        # autograd on, every call's graph chains onto the previous
+        # state's graph and nothing is ever released — ~31 KB per
+        # window, ~40 MB/min of hot mic, all pinned to the model until
+        # reset_states(). That was the 2026-09-06 RSS-guardrail trip
+        # (4 GB in 90 minutes of an ACTIVE session).
+        with torch.inference_mode():
+            for offset in range(0, len(audio_tensor), window_size):
+                window = audio_tensor[offset : offset + window_size]
+                if len(window) < window_size:
+                    # Pad the final partial window with zeros
+                    window = torch.nn.functional.pad(
+                        window, (0, window_size - len(window))
+                    )
+                prob = self._model(window, chunk.sample_rate).item()
+                if prob > max_prob:
+                    max_prob = prob
 
         return max_prob
 

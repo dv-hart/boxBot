@@ -76,3 +76,34 @@ def return_output(value: Any) -> None:
         )
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(value, fh)
+
+
+def escalate(reason: str) -> None:
+    """Wake the agent when this unattended run finishes: ``bb.escalate(...)``.
+
+    Sets the reserved ``escalate`` key on the run's output, merging with
+    any output already set via :func:`return_output` (and preserved by a
+    later ``return_output`` only if that call keeps the key — last call
+    wins, same contract). An unattended script cannot reach a human
+    directly; this is the one lever it has — the agent wakes with the
+    trigger's ``instructions`` plus this reason and decides what to say.
+    """
+    path = os.environ.get(_OUTPUT_PATH_ENV)
+    if not path:
+        raise IntegrationContextError(
+            f"{_OUTPUT_PATH_ENV} not set — escalate() only works inside "
+            "an unattended run (integration or trigger-run script)."
+        )
+    current: Any = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        if text.strip():
+            current = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        current = {}
+    if not isinstance(current, dict):
+        current = {"output": current}
+    current["escalate"] = str(reason)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(current, fh)

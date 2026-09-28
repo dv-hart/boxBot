@@ -238,7 +238,7 @@ def _breakdown(t: TurnLatency) -> str:
         # stage (diarize when enabled, else embed), so they overlap inside
         # the transcript window — shown individually, not summed.
         sub = []
-        for label in ("stt", "diarize", "embed", "resolve"):
+        for label in ("stt", "stt_connect", "diarize", "embed", "resolve"):
             v = t.spans.get(label)
             if v is not None:
                 sub.append(f"{label}={v * 1000:.0f}")

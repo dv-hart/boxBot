@@ -63,10 +63,10 @@ pixel coordinates — containers handle all positioning.
 
 | Block | Parameters | Purpose |
 |-------|-----------|---------|
-| `row` | `gap`, `align`, `padding` | Horizontal flow — children side by side |
-| `column` / `stack` | `gap`, `align`, `padding` | Vertical flow — children stacked |
+| `row` | `gap`, `align`, `valign`, `padding` | Horizontal flow — children side by side |
+| `column` / `stack` | `gap`, `align`, `item_align`, `padding` | Vertical flow — children stacked |
 | `columns` | `ratios`, `gap`, `padding` | Multi-column layout with weight ratios |
-| `card` | `color`, `radius`, `padding` | Surface with background, rounded corners, shadow |
+| `card` | `color`, `radius`, `padding`, `align` | Surface with background, rounded corners, shadow |
 | `spacer` | `size` | Fixed or flexible space between elements |
 | `divider` | `color`, `thickness`, `orientation` | Separator line (horizontal or vertical) |
 | `repeat` | `source`, `max` | Iterate over data array, stamp template per item |
@@ -87,11 +87,25 @@ space minus gaps and padding. The agent never thinks in pixels.
 
 #### Alignment
 
-All containers support `align`:
-- `start` — pack children to the start (left for row, top for column)
+`align` packs children along the container's **main axis** (horizontal
+for `row`, vertical for `column`):
+- `start` — pack to the start (left for row, top for column)
 - `center` — center children
 - `end` — pack to end
-- `spread` — distribute evenly with space between
+- `spread` — distribute evenly with space between (`row` only)
+
+Cross-axis control:
+- `row.valign` — `center` (default) / `top` / `bottom`. Children sit on
+  a shared optical centerline by default.
+- `column.item_align` — `stretch` (default) / `start` / `center` /
+  `end`. Non-stretch shrinks each child to its natural width.
+
+Space distribution in a column:
+- A `spacer` with no `size` is a **flex spacer** — it absorbs leftover
+  height (and leftover width in a row). Use flex spacers to center a
+  hero or anchor a footer.
+- `grow: true` on any child makes it absorb leftover height itself —
+  the way to let a card's interior fill a stretched card.
 
 #### Padding
 
@@ -610,27 +624,27 @@ transition: string              # default display switch animation
 
 #### `boxbot` (Default)
 
-The signature theme. Warm, minimal, designed for a wooden enclosure.
-Inspired by the warmth of a vintage radio, the clean lines of Apple
-products, and Anthropic's warm color palette.
+The signature theme: deep slate + Alarm.com signal orange. See
+[display-style-guide.md](display-style-guide.md) for the design
+rationale and usage rules.
 
 ```yaml
 name: boxbot
-description: "Warm minimal — designed for the wooden enclosure"
+description: "Slate + signal orange — Alarm.com brand, modernized"
 
 colors:
-  background: "#191714"         # deep warm charcoal (not cold, not pure black)
-  surface: "#252018"            # warm dark card backgrounds
-  surface_alt: "#302a20"        # nested depth
-  text: "#ede8e0"               # warm off-white cream
-  muted: "#8a8078"              # warm gray
-  dim: "#5a5550"                # very subtle
-  accent: "#d4845a"             # warm amber-coral (Anthropic-inspired)
-  accent_soft: "#d4845a22"      # accent at low opacity
-  secondary: "#c4a46c"          # soft gold (tube glow warmth)
-  success: "#7a9e6c"            # earthy sage green
-  warning: "#d4a043"            # warm amber
-  error: "#c45c5c"              # muted red
+  background: "#141a21"         # deep slate (Alarm.com ink, deepened)
+  surface: "#1d252d"            # card background — Alarm.com brand dark
+  surface_alt: "#28323c"        # nested depth, chart tracks
+  text: "#f0f2f3"               # Alarm.com light gray
+  muted: "#8a989e"              # Alarm.com slate gray
+  dim: "#505a6a"                # timestamps, grid lines
+  accent: "#f25e0f"             # signal orange — Alarm.com brand
+  accent_soft: "#f25e0f29"      # accent at low opacity
+  secondary: "#ff9965"          # orange tint — charts, quiet emphasis
+  success: "#3fae5f"            # calm green
+  warning: "#e8a33d"            # amber
+  error: "#e2574b"              # alarm red — true alerts only
 
 fonts:
   family: "Inter"
@@ -639,7 +653,7 @@ fonts:
   subtitle: { size: 22, weight: 500 }
   body:     { size: 18, weight: 400 }
   caption:  { size: 15, weight: 400 }
-  small:    { size: 13, weight: 400 }
+  small:    { size: 13, weight: 500, tracking: 0.06 }
 
 spacing:
   xs: 4
@@ -648,7 +662,7 @@ spacing:
   lg: 24
   xl: 32
 
-radius: 14
+radius: 16
 shadow: true
 icon_style: outline
 transition: crossfade
@@ -656,29 +670,29 @@ transition: crossfade
 
 #### `midnight`
 
-Near-black for nighttime. Only essentials visible. Paired with HAL
+Near-black slate for nighttime. Only embers visible. Paired with HAL
 brightness dimming.
 
 ```yaml
 name: midnight
-description: "Near-black for nighttime — only essentials visible"
+description: "Near-black slate for nighttime — only embers visible"
 
 colors:
-  background: "#0c0b0a"
-  surface: "#141210"
-  surface_alt: "#1a1816"
-  text: "#6a6560"
-  muted: "#3a3835"
-  dim: "#2a2825"
-  accent: "#8a6040"
-  accent_soft: "#8a604015"
-  secondary: "#7a6840"
-  success: "#4a6a44"
-  warning: "#8a7030"
-  error: "#7a3a3a"
+  background: "#0a0e12"
+  surface: "#11161c"
+  surface_alt: "#181f26"
+  text: "#77828b"
+  muted: "#46515a"
+  dim: "#2c343c"
+  accent: "#a04413"
+  accent_soft: "#a0441317"
+  secondary: "#8f6a52"
+  success: "#2e6b42"
+  warning: "#8a6420"
+  error: "#7e3b34"
 
 # Same font family, same sizes, same spacing
-radius: 14
+radius: 16
 shadow: false                   # no shadows in near-dark
 icon_style: outline
 transition: crossfade
@@ -686,28 +700,28 @@ transition: crossfade
 
 #### `daylight`
 
-Warm cream backgrounds for well-lit rooms. High contrast for
-readability in bright conditions.
+Light slate for well-lit rooms — the Alarm.com web look. High contrast
+for readability in bright conditions.
 
 ```yaml
 name: daylight
-description: "Warm cream for bright rooms — high contrast readability"
+description: "Light slate for bright rooms — the Alarm.com web look"
 
 colors:
-  background: "#f5f0e6"         # warm linen
+  background: "#f4f4f4"         # Alarm.com light field
   surface: "#ffffff"
-  surface_alt: "#ece7dd"
-  text: "#2a2218"               # dark warm brown
-  muted: "#7a7068"
-  dim: "#a09890"
-  accent: "#c46a3c"             # deeper amber on light backgrounds
-  accent_soft: "#c46a3c18"
-  secondary: "#8a7040"
-  success: "#4a7a40"
-  warning: "#b08020"
-  error: "#b04040"
+  surface_alt: "#e7ebed"
+  text: "#1d252d"               # Alarm.com ink
+  muted: "#505a6a"
+  dim: "#8a989e"
+  accent: "#e35205"             # Alarm.com brand orange (light bg variant)
+  accent_soft: "#e3520514"
+  secondary: "#bf4600"
+  success: "#048631"
+  warning: "#a86a00"
+  error: "#c23b2e"
 
-radius: 14
+radius: 16
 shadow: true
 icon_style: outline
 transition: crossfade

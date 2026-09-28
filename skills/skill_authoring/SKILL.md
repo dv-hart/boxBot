@@ -1,6 +1,6 @@
 ---
 name: skill_authoring
-description: How to create your own skills. A skill is structured prompt data — a markdown SKILL.md you read on demand, optionally bundled with helper scripts. Load before calling bb.skill.create(), or when you catch yourself solving the same kind of problem twice.
+description: How to create your own skills — structured prompt data in a markdown SKILL.md, read on demand, optionally bundled with helper scripts. Read before bb.skill.create().
 when_to_use: You're about to create a skill, edit one, or you just found a recurring workflow that should outlive this conversation.
 ---
 

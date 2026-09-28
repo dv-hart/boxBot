@@ -160,6 +160,31 @@ async def test_runner_start_is_idempotent(sdk_stub_env):
         await runner.stop()
 
 
+async def test_runner_poisoned_when_privilege_drop_fails(
+    sdk_stub_env, monkeypatch
+):
+    """If build_sandbox_launch raises (e.g. setuid + missing sandbox user,
+    or refusing root with no drop), start() must poison the runner and
+    record a failure_reason — never let the exception escape."""
+    def _boom(*a, **k):
+        raise RuntimeError("user 'boxbot-sandbox' not found")
+
+    monkeypatch.setattr(sandbox_runner_module, "build_sandbox_launch", _boom)
+    runner = SandboxRunner(
+        venv_python=Path(sys.executable),
+        sandbox_user="boxbot-sandbox",
+        enforce_sandbox=True,
+        timeout=20,
+        label="test",
+    )
+    await runner.start()
+    assert not runner.is_running
+    assert runner.failure_reason is not None
+    assert "privilege drop unavailable" in runner.failure_reason
+    with pytest.raises(RuntimeError):
+        await runner.run_script("print(1)")
+
+
 async def test_runner_poisoned_when_venv_missing(tmp_path):
     """Startup failure is recorded, not just swallowed: the runner
     poisons itself, exposes a failure_reason, and run_script raises."""

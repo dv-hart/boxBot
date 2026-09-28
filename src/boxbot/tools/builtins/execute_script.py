@@ -43,6 +43,7 @@ from boxbot.tools._sandbox_actions import (
     process_action,
     read_sandbox_line,
 )
+from boxbot.tools._sandbox_launch import build_sandbox_launch
 from boxbot.tools._tool_context import get_current_conversation
 from boxbot.tools.base import Tool
 
@@ -237,6 +238,8 @@ class ExecuteScriptTool(Tool):
             sandbox_user = config.sandbox.user
             scripts_dir = Path(config.sandbox.scripts_dir)
             output_dir = Path(config.sandbox.output_dir)
+            privilege_drop = config.sandbox.privilege_drop
+            extra_groups = list(config.sandbox.extra_groups)
         except RuntimeError:
             runtime_dir = _FALLBACK_RUNTIME_DIR
             venv_python = _FALLBACK_RUNTIME_DIR / "venv" / "bin" / "python3"
@@ -244,6 +247,8 @@ class ExecuteScriptTool(Tool):
             sandbox_user = "boxbot-sandbox"
             scripts_dir = _FALLBACK_RUNTIME_DIR / "scripts"
             output_dir = _FALLBACK_RUNTIME_DIR / "output"
+            privilege_drop = "auto"
+            extra_groups = []
 
         bootstrap_path = _resolve_bootstrap_path(runtime_dir)
 
@@ -304,33 +309,38 @@ class ExecuteScriptTool(Tool):
         env["BOXBOT_SKILLS_ROOT"] = str(_DEFAULT_SKILLS_ROOT)
 
         enforce_sandbox = os.environ.get("BOXBOT_SANDBOX_ENFORCE", "1") != "0"
-        if enforce_sandbox and sandbox_user:
-            preserve = [
-                "BOXBOT_SECCOMP_MODE",
-                "BOXBOT_SECCOMP_DISABLE",
-                "BOXBOT_SKILLS_ROOT",
-            ]
-            # sudo strips env not listed here. Secrets are NOT named —
-            # they ride in the file at BOXBOT_SECRETS_PATH so their values
-            # stay out of sudo's audit log. Only the path is preserved.
+        # sudo strips env not listed here. Secrets are NOT named — they
+        # ride in the file at BOXBOT_SECRETS_PATH so their values stay out
+        # of sudo's audit log; only the path is preserved. (No-op on the
+        # setuid/none paths, where env passes through untouched.)
+        preserve = [
+            "BOXBOT_SECCOMP_MODE",
+            "BOXBOT_SECCOMP_DISABLE",
+            "BOXBOT_SKILLS_ROOT",
+        ]
+        if secrets_path is not None:
+            preserve.append("BOXBOT_SECRETS_PATH")
+        try:
+            cmd, popen_kwargs = build_sandbox_launch(
+                [str(venv_python), str(bootstrap_path), str(script_path)],
+                user=sandbox_user,
+                privilege_drop=privilege_drop,
+                extra_groups=extra_groups,
+                preserve_env_keys=preserve,
+                enforce=enforce_sandbox,
+            )
+        except RuntimeError as e:
+            # Privilege drop can't be built (missing sandbox user, or
+            # refusing to run as root with no drop). Don't crash the tool —
+            # clean up the staged secrets and return an error result.
             if secrets_path is not None:
-                preserve.append("BOXBOT_SECRETS_PATH")
-            cmd = [
-                "sudo", "-n",
-                "--preserve-env=" + ",".join(preserve),
-                "-u", sandbox_user,
-                "--", str(venv_python), str(bootstrap_path),
-                str(script_path),
-            ]
-        else:
-            if sandbox_user:
-                logger.warning(
-                    "Sandbox enforcement disabled (BOXBOT_SANDBOX_ENFORCE=0) "
-                    "— script runs as current user"
-                )
-            cmd = [
-                str(venv_python), str(bootstrap_path), str(script_path),
-            ]
+                secrets_path.unlink(missing_ok=True)
+            logger.warning("execute_script: sandbox privilege drop failed: %s", e)
+            return json.dumps({
+                "status": "error",
+                "error": f"Sandbox privilege drop unavailable: {e}",
+                "script_id": script_id,
+            })
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -341,6 +351,7 @@ class ExecuteScriptTool(Tool):
                 env=env,
                 cwd=str(Path.cwd()),
                 limit=SANDBOX_STREAM_LIMIT,
+                **popen_kwargs,
             )
         except FileNotFoundError:
             # The bootstrap never ran, so nothing unlinked the secrets
@@ -356,7 +367,9 @@ class ExecuteScriptTool(Tool):
                 "script_id": script_id,
             })
 
-        ctx = ActionContext()
+        ctx = ActionContext(
+            conversation_id=conv.conversation_id if conv is not None else None,
+        )
         output_lines: list[str] = []
 
         async def pump_stdout() -> None:
@@ -440,7 +453,19 @@ def _assemble_result(
     No attachments → JSON-encoded string. Any attachments → a list of
     content blocks (one ``text`` with the JSON body, then one ``image``
     per attachable path that passes the allowlist + size checks).
+
+    Script failures are logged here (both runner and per-call paths
+    funnel through) — without this, a failed script is visible only in
+    the tool result and a recurring failure pattern (e.g. the model's
+    first script of a conversation erroring) cannot be diagnosed from
+    the boxbot log.
     """
+    if body.get("status") != "success":
+        stderr_tail = str(body.get("stderr") or "")[-500:]
+        logger.warning(
+            "execute_script FAILED (status=%s script=%s): %s",
+            body.get("status"), body.get("script_id"), stderr_tail or "(no stderr)",
+        )
     if not image_attachments:
         return json.dumps(body)
     blocks: list[dict[str, Any]] = [

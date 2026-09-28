@@ -18,6 +18,7 @@ from boxbot.core.events import (
 )
 from boxbot.displays.data_sources import (
     AgentStatusSource,
+    DataSource,
     IntegrationSource,
     MemoryQuerySource,
     TasksSource,
@@ -651,6 +652,152 @@ class TestIntegrationSourceFailureSurfacing:
         assert src._fetch_error is None
 
 
+class TestSourceAvailabilityAndRetries:
+    """A source that keeps failing must get quieter, not louder.
+
+    The panel logged 15,747 identical "No module named 'cv2'" warnings
+    (55% of the whole file) because every failed fetch warned and the
+    loop retried at a fixed interval forever.
+    """
+
+    @staticmethod
+    def _src():
+        return IntegrationSource("stocks", {"inputs": {}, "refresh": 10})
+
+    async def test_repeat_failure_warns_once(self, caplog):
+        async def boom(name, inputs, **_kwargs):
+            raise ConnectionError("network down")
+
+        src = self._src()
+        with patch("boxbot.integrations.runner.run", new=boom):
+            with caplog.at_level("DEBUG", logger="boxbot.displays.data_sources"):
+                for _ in range(5):
+                    await src.do_fetch()
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "network down" in warnings[0].getMessage()
+        assert len([r for r in caplog.records if r.levelname == "DEBUG"]) == 4
+
+    async def test_new_error_signature_warns_again(self, caplog):
+        async def boom(name, inputs, **_kwargs):
+            raise ConnectionError("network down")
+
+        async def other_boom(name, inputs, **_kwargs):
+            raise ConnectionError("DNS failure")
+
+        src = self._src()
+        with caplog.at_level("WARNING", logger="boxbot.displays.data_sources"):
+            with patch("boxbot.integrations.runner.run", new=boom):
+                await src.do_fetch()
+                await src.do_fetch()
+            with patch("boxbot.integrations.runner.run", new=other_boom):
+                await src.do_fetch()
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 2
+        assert "DNS failure" in messages[1]
+
+    async def test_recovery_warns_once(self, caplog):
+        async def boom(name, inputs, **_kwargs):
+            raise ConnectionError("network down")
+
+        async def ok(name, inputs, **_kwargs):
+            return {"status": "ok", "output": {"price": 1.0}}
+
+        src = self._src()
+        with patch("boxbot.integrations.runner.run", new=boom):
+            await src.do_fetch()
+            await src.do_fetch()
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="boxbot.displays.data_sources"):
+            with patch("boxbot.integrations.runner.run", new=ok):
+                await src.do_fetch()
+                await src.do_fetch()
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages == ["Source 'stocks' recovered after 2 failures"]
+
+    async def test_backoff_grows_then_resets(self):
+        async def boom(name, inputs, **_kwargs):
+            raise ConnectionError("network down")
+
+        async def ok(name, inputs, **_kwargs):
+            return {"status": "ok", "output": {"price": 1.0}}
+
+        src = self._src()
+        assert src.next_fetch_delay == 10
+        with patch("boxbot.integrations.runner.run", new=boom):
+            delays = []
+            for _ in range(7):
+                await src.do_fetch()
+                delays.append(src.next_fetch_delay)
+        assert delays == [20, 40, 80, 160, 300, 300, 300]
+
+        with patch("boxbot.integrations.runner.run", new=ok):
+            await src.do_fetch()
+        assert src.next_fetch_delay == 10
+
+    async def test_unknown_integration_disables_source(self, caplog):
+        from boxbot.displays.data_sources import DataSourceManager
+
+        src = self._src()
+        mgr = DataSourceManager()
+        mgr.register(src)
+        with caplog.at_level("WARNING", logger="boxbot.displays.data_sources"):
+            # No 'stocks' integration is registered, so the runner raises
+            # IntegrationRunError — permanent until someone installs one.
+            await mgr.start_all()
+            await src.do_fetch()
+
+        assert src.unavailable_reason is not None
+        assert "unknown integration" in src.unavailable_reason
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1
+        assert "disabled until restart" in messages[0]
+        # No fetch loop was started for it.
+        assert "stocks" not in mgr._tasks
+        await mgr.stop_all()
+
+    async def test_people_source_survives_missing_perception_deps(self):
+        import sys
+
+        from boxbot.displays.data_sources import PeopleSource
+
+        src = PeopleSource()
+        with patch.dict(sys.modules, {"boxbot.perception.pipeline": None}):
+            data = await src.do_fetch()
+
+        assert data == {"present": [], "count": 0}
+        assert src.unavailable_reason is None
+
+
+class TestIntegrationSourceRouting:
+    """``integration_for_source`` must agree with ``create_source``."""
+
+    def test_builtin_name_is_not_an_integration(self):
+        from boxbot.displays.data_sources import integration_for_source
+
+        assert integration_for_source("people", "builtin") is None
+
+    def test_unknown_builtin_name_promotes_to_integration(self):
+        from boxbot.displays.data_sources import integration_for_source
+
+        assert integration_for_source("weather", "builtin") == "weather"
+
+    def test_integration_override_wins(self):
+        from boxbot.displays.data_sources import integration_for_source
+
+        assert integration_for_source(
+            "solar_now", "integration", "solar",
+        ) == "solar"
+
+    def test_static_source_has_no_integration(self):
+        from boxbot.displays.data_sources import integration_for_source
+
+        assert integration_for_source("climate", "static") is None
+
+
 class TestCalendarIntegrationNormalization:
     """Helpers moved into integrations/calendar/script.py with the migration.
 
@@ -861,3 +1008,71 @@ class TestCalendarIntegrationNormalization:
         day = mod._format_day(evt, today=today)
         # 1 day out from today → "Tomorrow".
         assert day == "Tomorrow"
+
+
+# ---------------------------------------------------------------------------
+# Fetch-loop change notifications — the seam that repaints a data-bound
+# display. Without it a display that never rotates renders once and freezes.
+# ---------------------------------------------------------------------------
+
+
+class _CountingSource(DataSource):
+    """Returns a new value on every fetch unless ``frozen``."""
+
+    def __init__(self, *, frozen: bool = False) -> None:
+        super().__init__("counter", {})
+        self.frozen = frozen
+        self.fetches = 0
+
+    @property
+    def refresh_interval(self) -> int:
+        return 0
+
+    async def fetch(self) -> dict:
+        self.fetches += 1
+        return {"n": 0 if self.frozen else self.fetches}
+
+
+class TestFetchLoopNotifies:
+
+    async def _run(self, source: DataSource) -> list[str]:
+        import asyncio
+
+        from boxbot.displays.data_sources import DataSourceManager
+
+        seen: list[str] = []
+        mgr = DataSourceManager(on_update=seen.append)
+        mgr.register(source)
+        await mgr.start_all()
+        await asyncio.sleep(0.05)
+        await mgr.stop_all()
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_changed_data_notifies(self):
+        seen = await self._run(_CountingSource())
+        assert seen and set(seen) == {"counter"}
+
+    @pytest.mark.asyncio
+    async def test_unchanged_data_stays_quiet(self):
+        source = _CountingSource(frozen=True)
+        seen = await self._run(source)
+        assert source.fetches > 1  # the loop really ran
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_raising_listener_does_not_kill_the_loop(self):
+        def boom(_name: str) -> None:
+            raise RuntimeError("listener exploded")
+
+        import asyncio
+
+        from boxbot.displays.data_sources import DataSourceManager
+
+        source = _CountingSource()
+        mgr = DataSourceManager(on_update=boom)
+        mgr.register(source)
+        await mgr.start_all()
+        await asyncio.sleep(0.05)
+        await mgr.stop_all()
+        assert source.fetches > 2

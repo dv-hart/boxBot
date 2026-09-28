@@ -8,7 +8,14 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from boxbot.memory.embeddings import EMBEDDING_DIM, cosine_similarity, embed, embed_batch
+from boxbot.memory import embeddings
+from boxbot.memory.embeddings import (
+    EMBEDDING_DIM,
+    active_model,
+    cosine_similarity,
+    embed,
+    embed_batch,
+)
 from boxbot.memory.search import (
     SearchCandidate,
     _escape_fts_query,
@@ -31,28 +38,90 @@ from boxbot.memory.store import (
 # ---------------------------------------------------------------------------
 
 
-class TestEmbeddings:
-    """Test the embedding generation functions."""
+class _StubEncoder:
+    """Stand-in for SentenceTransformer: deterministic unit vectors."""
 
-    def test_embed_returns_correct_dimension(self):
+    def encode(self, text, normalize_embeddings=False):
+        if isinstance(text, list):
+            return [self.encode(t) for t in text]
+        rng = np.random.RandomState(len(text))
+        vec = rng.randn(EMBEDDING_DIM).astype(np.float32)
+        return vec / np.linalg.norm(vec)
+
+
+class TestEmbeddings:
+    """Test the embedding generation functions.
+
+    Both modes are forced explicitly so the suite behaves the same with
+    or without sentence-transformers installed.
+    """
+
+    @pytest.fixture
+    def with_model(self, monkeypatch):
+        """Force the loaded-model path with a stub encoder."""
+        monkeypatch.setattr(embeddings, "_model", _StubEncoder())
+        monkeypatch.setattr(embeddings, "_unavailable", False)
+
+    @pytest.fixture
+    def without_model(self, monkeypatch):
+        """Force the degraded path (no sentence-transformers, no API)."""
+        monkeypatch.setattr(embeddings, "_model", None)
+        monkeypatch.setattr(embeddings, "_unavailable", True)
+        monkeypatch.setattr(embeddings, "_api_client", None)
+        monkeypatch.setattr(embeddings, "_api_unavailable", True)
+
+    @pytest.fixture
+    def with_api(self, monkeypatch):
+        """Force the API-fallback path with a stub OpenAI client."""
+
+        class _StubAPI:
+            class embeddings:  # noqa: N801 - mirrors openai client shape
+                @staticmethod
+                def create(model, input, dimensions):
+                    assert dimensions == EMBEDDING_DIM
+
+                    class _Item:
+                        def __init__(self, text):
+                            rng = np.random.RandomState(len(text))
+                            vec = rng.randn(dimensions).astype(np.float32)
+                            self.embedding = (vec / np.linalg.norm(vec)).tolist()
+
+                    class _Response:
+                        data = [_Item(t) for t in input]
+
+                    return _Response()
+
+        monkeypatch.setattr(embeddings, "_model", None)
+        monkeypatch.setattr(embeddings, "_unavailable", True)
+        monkeypatch.setattr(embeddings, "_api_client", _StubAPI())
+        monkeypatch.setattr(embeddings, "_api_model", "text-embedding-3-small")
+        monkeypatch.setattr(embeddings, "_api_unavailable", False)
+
+    @pytest.fixture
+    def with_failing_api(self, monkeypatch, with_api):
+        """API configured but every call errors."""
+
+        class _Broken:
+            class embeddings:  # noqa: N801
+                @staticmethod
+                def create(model, input, dimensions):
+                    raise RuntimeError("deployment not found")
+
+        monkeypatch.setattr(embeddings, "_api_client", _Broken())
+        monkeypatch.setattr(embeddings, "_api_call_failed", False)
+
+    def test_embed_returns_correct_dimension(self, with_model):
         vec = embed("hello world")
         assert vec.shape == (EMBEDDING_DIM,)
         assert vec.dtype == np.float32
 
-    def test_embed_same_text_produces_same_vector(self):
-        """Deterministic fallback: same text should produce same embedding."""
+    def test_embed_same_text_produces_same_vector(self, with_model):
         a = embed("test text")
         b = embed("test text")
         np.testing.assert_array_equal(a, b)
 
-    def test_embed_different_text_produces_different_vector(self):
-        a = embed("cats are great")
-        b = embed("quantum physics theory")
-        # These should differ substantially
-        assert not np.allclose(a, b)
-
-    def test_embed_batch_returns_list_of_correct_size(self):
-        results = embed_batch(["hello", "world", "test"])
+    def test_embed_batch_returns_list_of_correct_size(self, with_model):
+        results = embed_batch(["hello", "world", "testing"])
         assert len(results) == 3
         for vec in results:
             assert vec.shape == (EMBEDDING_DIM,)
@@ -60,8 +129,46 @@ class TestEmbeddings:
     def test_embed_batch_empty_input(self):
         assert embed_batch([]) == []
 
+    def test_embed_returns_none_without_model(self, without_model):
+        """No fabricated vectors: noise would outrank real keyword hits."""
+        assert embed("hello world") is None
+
+    def test_embed_batch_returns_nones_without_model(self, without_model):
+        assert embed_batch(["a", "b"]) == [None, None]
+
+    def test_active_model_reports_availability(self, without_model):
+        assert active_model() is None
+
+    def test_active_model_names_the_model(self, with_model):
+        assert active_model() == embeddings.MODEL_NAME
+
+    def test_api_embed_returns_correct_shape(self, with_api):
+        vec = embed("hello world")
+        assert vec.shape == (EMBEDDING_DIM,)
+        assert vec.dtype == np.float32
+
+    def test_api_embed_batch_preserves_order_and_size(self, with_api):
+        results = embed_batch(["hello", "world", "hello"])
+        assert len(results) == 3
+        np.testing.assert_array_equal(results[0], results[2])
+        assert all(r.shape == (EMBEDDING_DIM,) for r in results)
+
+    def test_api_active_model_names_api_model(self, with_api):
+        assert active_model() == "text-embedding-3-small"
+
+    def test_local_model_wins_over_api(self, with_api, monkeypatch):
+        """Local sentence-transformers is preferred when importable."""
+        monkeypatch.setattr(embeddings, "_model", _StubEncoder())
+        monkeypatch.setattr(embeddings, "_unavailable", False)
+        assert active_model() == embeddings.MODEL_NAME
+
+    def test_api_failure_returns_none_not_noise(self, with_failing_api):
+        """A failed API call stores NULL, never a fabricated vector."""
+        assert embed("hello") is None
+        assert embed_batch(["a", "b"]) == [None, None]
+
     def test_cosine_similarity_identical_vectors(self):
-        vec = embed("identical")
+        vec = np.linspace(0.0, 1.0, EMBEDDING_DIM, dtype=np.float32)
         sim = cosine_similarity(vec, vec)
         assert abs(sim - 1.0) < 0.01
 
@@ -73,7 +180,7 @@ class TestEmbeddings:
 
     def test_cosine_similarity_zero_vector_returns_zero(self):
         a = np.zeros(EMBEDDING_DIM, dtype=np.float32)
-        b = embed("something")
+        b = np.ones(EMBEDDING_DIM, dtype=np.float32)
         assert cosine_similarity(a, b) == 0.0
 
 
@@ -575,6 +682,174 @@ class TestHybridSearch:
         # All results should relate to Jacob
         for c in candidates:
             assert c.person == "Jacob" or "Jacob" in str(c.metadata.get("people", []))
+
+
+class TestDegradedEmbeddings:
+    """No embedding model: NULL vectors on write, keyword-only ranking."""
+
+    @pytest.fixture(autouse=True)
+    def no_model(self, monkeypatch):
+        monkeypatch.setattr(embeddings, "_model", None)
+        monkeypatch.setattr(embeddings, "_unavailable", True)
+
+    @pytest.mark.asyncio
+    async def test_create_memory_stores_null_embedding(self, memory_store):
+        mem_id = await memory_store.create_memory(
+            type="household", content="The fridge is a Samsung", summary="fridge"
+        )
+        cursor = await memory_store.db.execute(
+            "SELECT embedding FROM memories WHERE id = ?", (mem_id,)
+        )
+        row = await cursor.fetchone()
+        assert row["embedding"] is None
+
+    @pytest.mark.asyncio
+    async def test_search_ranks_on_keywords_alone(self, memory_store):
+        await memory_store.create_memory(
+            type="person",
+            content="Jacob is allergic to peanuts and tree nuts",
+            summary="Jacob has nut allergies",
+            person="Jacob",
+        )
+        await memory_store.create_memory(
+            type="household",
+            content="The fridge brand is Samsung",
+            summary="Samsung fridge",
+        )
+
+        candidates = await hybrid_search(
+            memory_store, "allergies", include_conversations=False
+        )
+        assert candidates
+        top = candidates[0]
+        assert "allerg" in top.summary.lower()
+        # BM25 carries the whole score — no vector contribution at all.
+        assert all(c.vector_score == 0.0 for c in candidates)
+        assert top.combined_score == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_search_matches_a_whole_utterance(self, memory_store):
+        """FTS5 ANDs bare terms — an utterance must still find keywords."""
+        mem_id = await memory_store.create_memory(
+            type="person",
+            content="Jacob loves chicken pesto pizza.",
+            summary="Jacob's pizza preference",
+            person="Jacob",
+        )
+        candidates = await hybrid_search(
+            memory_store,
+            "Jacob what should I eat tonight?",
+            person="Jacob",
+            include_conversations=False,
+        )
+        assert [c.id for c in candidates] == [mem_id]
+
+    @pytest.mark.asyncio
+    async def test_exact_phrase_wins_over_loose_matches(self, memory_store):
+        """The relaxed OR pass only runs when the strict pass finds nothing."""
+        exact = await memory_store.create_memory(
+            type="household",
+            content="The fridge brand is Samsung",
+            summary="Samsung fridge",
+        )
+        await memory_store.create_memory(
+            type="household",
+            content="The washing machine brand is Bosch",
+            summary="Bosch washer",
+        )
+        candidates = await hybrid_search(
+            memory_store, "Samsung fridge", include_conversations=False
+        )
+        assert [c.id for c in candidates] == [exact]
+
+    @pytest.mark.asyncio
+    async def test_search_tolerates_stored_vectors(self, memory_store):
+        """Rows embedded by an earlier install must not break search."""
+        mem_id = await memory_store.create_memory(
+            type="household", content="The fridge brand is Samsung", summary="fridge"
+        )
+        await memory_store.db.execute(
+            "UPDATE memories SET embedding = ? WHERE id = ?",
+            (np.ones(EMBEDDING_DIM, dtype=np.float32).tobytes(), mem_id),
+        )
+        candidates = await hybrid_search(
+            memory_store, "fridge", include_conversations=False
+        )
+        assert [c.id for c in candidates] == [mem_id]
+
+
+class TestEmbeddingModelMarker:
+    """The store records which embedder produced its vectors."""
+
+    @pytest.fixture(autouse=True)
+    def stub_model(self, monkeypatch):
+        monkeypatch.setattr(embeddings, "_model", _StubEncoder())
+        monkeypatch.setattr(embeddings, "_unavailable", False)
+
+    @pytest.mark.asyncio
+    async def test_marker_recorded_on_first_init(self, memory_store):
+        cursor = await memory_store.db.execute(
+            "SELECT value FROM store_meta WHERE key = 'embedding_model'"
+        )
+        row = await cursor.fetchone()
+        assert row["value"] == embeddings.MODEL_NAME
+
+    @pytest.mark.asyncio
+    async def test_model_swap_warns(self, memory_store, monkeypatch, caplog):
+        monkeypatch.setattr(embeddings, "MODEL_NAME", "some-other-model")
+        with caplog.at_level("WARNING"):
+            await memory_store._check_embedding_model()
+        assert "Embedding model changed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unmarked_store_with_vectors_warns(
+        self, memory_store, caplog
+    ):
+        """The panel case: rows embedded before the marker existed."""
+        mem_id = await memory_store.create_memory(
+            type="household", content="The fridge is a Samsung", summary="fridge"
+        )
+        await memory_store.db.execute(
+            "UPDATE memories SET embedding = ? WHERE id = ?",
+            (np.ones(EMBEDDING_DIM, dtype=np.float32).tobytes(), mem_id),
+        )
+        await memory_store.db.execute("DELETE FROM store_meta")
+
+        with caplog.at_level("WARNING"):
+            await memory_store._check_embedding_model()
+        assert "unknown provenance" in caplog.text
+
+        # The marker stays absent: claiming those vectors for the active
+        # model would silence the warning on the next boot.
+        cursor = await memory_store.db.execute(
+            "SELECT value FROM store_meta WHERE key = 'embedding_model'"
+        )
+        assert await cursor.fetchone() is None
+
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            await memory_store._check_embedding_model()
+        assert "unknown provenance" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unmarked_empty_store_is_quiet(self, memory_store, caplog):
+        await memory_store.db.execute("DELETE FROM store_meta")
+        with caplog.at_level("WARNING"):
+            await memory_store._check_embedding_model()
+        assert "unknown provenance" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_degraded_mode_leaves_marker_alone(
+        self, memory_store, monkeypatch
+    ):
+        monkeypatch.setattr(embeddings, "_model", None)
+        monkeypatch.setattr(embeddings, "_unavailable", True)
+        await memory_store._check_embedding_model()
+        cursor = await memory_store.db.execute(
+            "SELECT value FROM store_meta WHERE key = 'embedding_model'"
+        )
+        row = await cursor.fetchone()
+        assert row["value"] == embeddings.MODEL_NAME
 
 
 class TestMergeCandidates:

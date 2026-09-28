@@ -20,6 +20,7 @@ from boxbot.cost import (
     from_anthropic_usage,
     from_elevenlabs_stt,
     from_elevenlabs_tts,
+    from_openai_usage,
     record,
     reload_pricing,
 )
@@ -43,6 +44,17 @@ anthropic:
     claude-haiku-4-5:
       input_per_mtok: 1.00
       output_per_mtok: 5.00
+openai:
+  source_url: https://example.test/openai
+  verified_on: 2026-08-25
+  models:
+    gpt-5.6-luna:
+      input_per_mtok: 0.20
+      output_per_mtok: 1.20
+      cached_input_per_mtok: 0.05
+    gpt-nodiscount:
+      input_per_mtok: 0.20
+      output_per_mtok: 1.20
 elevenlabs:
   source_url: https://example.test/elevenlabs
   verified_on: 2026-05-02
@@ -243,6 +255,96 @@ class TestFromAgentSdkResult:
 # ---------------------------------------------------------------------------
 
 
+class TestFromOpenAIUsage:
+    def test_responses_shape(self):
+        usage = SimpleNamespace(
+            input_tokens=1_000_000,
+            output_tokens=500_000,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        event = from_openai_usage(
+            purpose="fast_turn", model="gpt-5.6-luna", usage=usage
+        )
+        # 1M × $0.20 + 0.5M × $1.20 = $0.80
+        assert event.cost_usd == pytest.approx(0.80)
+        assert event.provider == "openai"
+        assert event.model == "gpt-5.6-luna"
+        assert event.input_tokens == 1_000_000
+        assert event.output_tokens == 500_000
+
+    def test_chat_completions_shape(self):
+        usage = {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
+        event = from_openai_usage(
+            purpose="fast_turn", model="gpt-5.6-luna", usage=usage
+        )
+        # 1M × $0.20 + 1M × $1.20 = $1.40
+        assert event.cost_usd == pytest.approx(1.40)
+        assert event.input_tokens == 1_000_000
+        assert event.output_tokens == 1_000_000
+
+    def test_cached_tokens_billed_at_cached_rate(self):
+        usage = {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 900_000},
+        }
+        event = from_openai_usage(
+            purpose="fast_turn", model="gpt-5.6-luna", usage=usage
+        )
+        # Cached input is a subset of prompt_tokens. 100k uncached ×
+        # $0.20 + 900k cached × $0.05 = $0.065.
+        assert event.cost_usd == pytest.approx(0.065)
+        assert event.cache_read_tokens == 900_000
+
+    def test_cached_tokens_clamped_to_input_total(self):
+        """A malformed usage object reporting cached > prompt must not
+        bill phantom tokens."""
+        usage = {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 3_000_000},
+        }
+        event = from_openai_usage(
+            purpose="fast_turn", model="gpt-5.6-luna", usage=usage
+        )
+        # Clamped: all 1M billed at the cached rate ($0.05/M).
+        assert event.cost_usd == pytest.approx(0.05)
+
+    def test_cached_tokens_full_rate_without_declared_discount(self):
+        usage = {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 900_000},
+        }
+        event = from_openai_usage(
+            purpose="fast_turn", model="gpt-nodiscount", usage=usage
+        )
+        # No cached_input_per_mtok in pricing.yaml → full input rate.
+        assert event.cost_usd == pytest.approx(0.20)
+        assert event.cache_read_tokens == 900_000
+
+    def test_unknown_model_zeroes_cost_keeps_units(self):
+        usage = {"input_tokens": 1_000, "output_tokens": 2_000}
+        event = from_openai_usage(purpose="fast_turn", model="gpt-nope", usage=usage)
+        assert event.cost_usd == 0.0
+        assert event.input_tokens == 1_000
+        assert event.output_tokens == 2_000
+
+    def test_passes_through_bookkeeping(self):
+        event = from_openai_usage(
+            purpose="fast_turn",
+            model="gpt-5.6-luna",
+            usage={"input_tokens": 10, "output_tokens": 10},
+            iterations=3,
+            correlation_id="turn-7",
+            metadata={"conversation_id": "voice:room"},
+        )
+        assert event.iterations == 3
+        assert event.correlation_id == "turn-7"
+        assert event.metadata == {"conversation_id": "voice:room"}
+        assert event.is_batch is False
+
+
 class TestElevenLabs:
     def test_tts_uses_billed_chars(self):
         event = from_elevenlabs_tts(model="eleven_turbo_v2_5", billed_chars=4000)
@@ -377,3 +479,63 @@ class TestSchemaAndRecord:
             assert is_batch == 1
         finally:
             await store.close()
+
+
+# ---------------------------------------------------------------------------
+# Shipped pricing.yaml
+# ---------------------------------------------------------------------------
+
+
+def test_shipped_pricing_has_openai_fast_tier(monkeypatch: pytest.MonkeyPatch):
+    """config/pricing.yaml prices the fast tier; drift here zeroes costs."""
+    monkeypatch.delenv("BOXBOT_PRICING_CONFIG", raising=False)
+    shipped = Path(__file__).resolve().parents[1] / "config" / "pricing.yaml"
+    pricing = reload_pricing(shipped)
+    assert pricing.openai_input_per_mtok("gpt-5.6-luna") == 0.20
+    assert pricing.openai_output_per_mtok("gpt-5.6-luna") == 1.20
+    # Verified 2026-09-18 against the model page: cached input is $0.02.
+    assert pricing.openai_cached_input_per_mtok("gpt-5.6-luna") == 0.02
+    # gpt-6-luna (2026-09-22): $0.10 / $0.50, cached input $0.01.
+    assert pricing.openai_input_per_mtok("gpt-6-luna") == 0.10
+    assert pricing.openai_output_per_mtok("gpt-6-luna") == 0.50
+    assert pricing.openai_cached_input_per_mtok("gpt-6-luna") == 0.01
+    # Unquoted YAML dates load as datetime.date.
+    assert str(pricing.openai_verified_on) == "2026-09-22"
+    # Finding #3: the lookup is exact-match, so the snapshot id Chat
+    # Completions echoes back prices at $0. The loop must bill the
+    # requested alias.
+    assert pricing.openai_input_per_mtok("gpt-5.6-luna-2026-07-09") is None
+
+
+class TestPricingPathResolution:
+    def test_default_path_is_cwd_independent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        """boxbot is launched from systemd/cron, not from the repo dir."""
+        from boxbot.cost import pricing as pricing_mod
+
+        monkeypatch.delenv("BOXBOT_PRICING_CONFIG", raising=False)
+        monkeypatch.chdir(tmp_path)
+        resolved = pricing_mod._resolve_path(None)
+        assert resolved.is_absolute()
+        assert resolved.exists()
+        assert resolved.name == "pricing.yaml"
+
+    def test_missing_file_degrades_instead_of_raising(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        from boxbot.cost import pricing as pricing_mod
+
+        monkeypatch.setenv(
+            "BOXBOT_PRICING_CONFIG", str(tmp_path / "absent.yaml")
+        )
+        monkeypatch.setattr(pricing_mod, "_cached", None)
+        try:
+            pricing = pricing_mod.get_pricing()
+            assert pricing.anthropic_input_per_mtok("claude-opus-5") is None
+            # Explicit reloads still report the failure.
+            with pytest.raises(FileNotFoundError, match="BOXBOT_PRICING_CONFIG"):
+                reload_pricing()
+        finally:
+            monkeypatch.delenv("BOXBOT_PRICING_CONFIG", raising=False)
+            reload_pricing()

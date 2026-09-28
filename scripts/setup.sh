@@ -223,7 +223,7 @@ echo "--- Installing Python dependencies ---"
     pyusb \
     sentence-transformers \
     openwakeword \
-    elevenlabs \
+    'elevenlabs>=2.65.0' \
     pyannote.audio
 
 # torchcodec pulls in CUDA libs (libnppicc.so.13 etc.) that don't

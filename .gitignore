@@ -72,6 +72,7 @@ skills/*/
 !skills/hal-sandbox-ref/
 !skills/skill_authoring/
 !skills/home/
+!skills/tier0-support/
 integrations/*/
 !integrations/weather/
 !integrations/calendar/
@@ -85,9 +86,13 @@ displays/*/
 !displays/focus_clock/
 !displays/home_metrics/
 !displays/now_listening/
+!displays/thermostat/
 data/credentials/
 
 # Agent workspace — directory committed, runtime contents ignored
 data/workspace/*
 !data/workspace/.gitkeep
 .pytest-tmp/
+
+# Claude Code personal/local settings
+.claude/settings.local.json

@@ -29,6 +29,13 @@ class TestGating:
         assert prefetch.should_prefetch("signal") is False
         assert prefetch.should_prefetch("voice") is False
 
+    def test_default_channels_include_voice(self):
+        from boxbot.core.config import PrefetchConfig
+
+        assert set(PrefetchConfig().channels) == {
+            "whatsapp", "signal", "trigger", "voice",
+        }
+
     def test_mode_and_is_active(self, monkeypatch):
         _install_cfg(monkeypatch, enabled=True, mode="shadow")
         assert prefetch.prefetch_mode() == "shadow"

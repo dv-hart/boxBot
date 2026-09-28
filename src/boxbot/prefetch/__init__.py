@@ -1,5 +1,11 @@
-"""Prefetch layer — a read-only mini-agent that pre-assembles the context
-the main agent will likely need into its first turn.
+"""Prefetch layer — parallel one-shot selector calls (one per context
+source) that pre-assemble the context the main agent will likely need
+into its first turn.
+
+Two deterministic legs ride alongside the selector fan-out: live-context
+providers (``providers.py``, fresh device state) and the recent-activity
+log (``activity.py``, cross-channel conversation recency). Neither costs
+a model call and neither is ever cached.
 
 Ships gated behind ``config.prefetch`` and runs in ``shadow`` mode first
 (log predictions, inject nothing) until the offline analysis harness
@@ -12,7 +18,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from boxbot.prefetch.activity import gather_recent_activity
 from boxbot.prefetch.bundle import PrefetchBundle
+from boxbot.prefetch.hot import HotTaskCache
 from boxbot.prefetch.request import PrefetchRequest
 from boxbot.prefetch.runner import PrefetchResult, run_prefetch
 from boxbot.prefetch.store import (
@@ -26,6 +34,8 @@ from boxbot.prefetch.store import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "HotTaskCache",
+    "gather_recent_activity",
     "PrefetchBundle",
     "PrefetchRequest",
     "PrefetchResult",
@@ -73,28 +83,80 @@ def is_active() -> bool:
 
 
 def resolve_client() -> Any | None:
-    """Build an Anthropic client for the prefetch mini-agent.
+    """Build the selector-model handle for the prefetch fan-out.
 
-    Peripheral small-model work bills against the API key (same as the
-    web_search firewall and memory rerank), never the OAuth subscription
-    credit. Returns None if no key is configured.
+    The model resolves ``prefetch.model`` → ``models.fast`` (the latency
+    tier, e.g. ``gpt-5.6-luna``) → ``models.small``; the provider follows
+    from the id (``boxbot.core.models``). Peripheral fast/small-model
+    work bills against API keys (same as the web_search firewall and
+    memory rerank), never the OAuth subscription credit. Returns None —
+    prefetch disabled — when the resolved provider's key or SDK is
+    missing.
     """
+    import os
+
+    from boxbot.core.models import provider_for_model
+    from boxbot.prefetch.runner import LLMHandle, _resolve_model
+
+    model = _resolve_model(get_prefetch_config())
+    provider = provider_for_model(model)
+
+    if provider == "openai":
+        try:
+            import openai
+        except ImportError:
+            logger.error("openai SDK not installed; prefetch disabled")
+            return None
+        api_key: str | None = None
+        oa_cfg = None
+        try:
+            from boxbot.core.config import get_config
+
+            api_key = get_config().api_keys.openai
+            oa_cfg = get_config().openai
+        except Exception:
+            api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            logger.warning(
+                "prefetch resolved to %s but OPENAI_API_KEY is not set; "
+                "prefetch disabled", model,
+            )
+            return None
+        if oa_cfg is not None and oa_cfg.is_azure:
+            if not (oa_cfg.api_base and oa_cfg.api_version):
+                logger.warning(
+                    "prefetch resolved to Azure OpenAI but OPENAI_API_BASE/"
+                    "OPENAI_API_VERSION is missing; prefetch disabled",
+                )
+                return None
+            client = openai.AsyncAzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=oa_cfg.api_base,
+                api_version=oa_cfg.api_version,
+            )
+        else:
+            client = openai.AsyncOpenAI(
+                api_key=api_key,
+                base_url=(oa_cfg.api_base or None) if oa_cfg else None,
+            )
+        return LLMHandle(provider="openai", model=model, client=client)
+
     try:
         import anthropic
     except ImportError:
         logger.error("anthropic SDK not installed; prefetch disabled")
         return None
-
-    api_key: str | None = None
+    api_key = None
     try:
         from boxbot.core.config import get_config
 
         api_key = get_config().api_keys.anthropic
     except Exception:
-        import os
-
         api_key = os.environ.get("ANTHROPIC_API_KEY")
-
     if not api_key:
         return None
-    return anthropic.AsyncAnthropic(api_key=api_key)
+    return LLMHandle(
+        provider="anthropic",
+        model=model,
+        client=anthropic.AsyncAnthropic(api_key=api_key),
+    )

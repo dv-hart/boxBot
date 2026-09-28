@@ -16,7 +16,7 @@ data source's `params`. Anything you need to *read* — this is one-way.
 Values over 8 KB, or more than 64 stored; the store is deliberately
 small.
 
-## Lifecycle
+## Call signatures — store / list / has / delete (values never readable)
 
 ```python
 import boxbot_sdk as bb
@@ -41,7 +41,7 @@ bb.secrets.delete("OLD_API_KEY")
 shape, oversized value, store full, name absent). `list`, `has`, `use`
 return the shapes above.
 
-## Naming
+## Naming — SCREAMING_SNAKE_CASE, ≤64 chars, matches manifest declarations
 
 SCREAMING_SNAKE_CASE, `^[A-Z][A-Z0-9_]*$`, ≤64 chars. Same shape
 integrations declare in manifests, so one name works end to end.
@@ -74,14 +74,14 @@ key = os.environ["BOXBOT_SECRET_POLYGON_API_KEY"]
 Do **not** call `bb.secrets.use("…")` and route the result through
 `env_vars`. `use()` returns the env-var *name* only, as a diagnostic.
 
-## What you can see
+## What you can see — names and timestamps, never values
 
 Names, stored-at timestamps, and whether a secret was reachable for a
 given call (observable in your script's own error handling). **Never
 values** — once stored, a value returns through no SDK call, only
 through env vars in the launched subprocess.
 
-## Conversation-start hint
+## Conversation-start hint — the "Secrets: N stored" counter
 
 ```
 [To-do: 3 items | Triggers: 1 active | Secrets: 7 stored]
@@ -90,7 +90,7 @@ through env vars in the launched subprocess.
 `0` means no credentials on file. Non-zero and you need specifics:
 `bb.secrets.list()`.
 
-## Storage
+## Storage — data/credentials/secrets.json, 0600, sandbox cannot read
 
 `data/credentials/secrets.json`, mode `0600`, owned by the main-process
 user. `boxbot-sandbox` has no read. Unencrypted at rest — same

@@ -19,7 +19,7 @@ This module owns:
 
 - ``dispatch_outputs`` — invoked by the ``message`` tool (and
   by trigger-fired turns) to deliver one or more ``{to, channel, content}``
-  entries through voice TTS or WhatsApp.
+  entries through voice TTS or a registered outbound channel.
 
 Routing:
 
@@ -27,12 +27,13 @@ Routing:
   (the box speaker). ``to`` is semantic — the audience is whoever is in
   the room; we log the intended addressee for audit.
 - ``channel == "text"`` → resolve ``to`` (a name, or ``"current_speaker"``)
-  to a registered user's phone number via the AuthManager, then send via
-  the WhatsApp client.
+  to a registered user via the AuthManager, then send via the outbound
+  client for that user's ``channel`` column (WhatsApp or Signal).
 
 Invalid combinations (e.g. ``to: "room"`` with ``channel: "text"``, or
 an unknown name with ``channel: "text"``) are logged and dropped — the
-run does not crash. ``dispatch_outputs`` returns one ``DispatchResult``
+run does not crash. So is content that is nothing but filler or
+self-referential noise (see ``_is_degenerate_content``). ``dispatch_outputs`` returns one ``DispatchResult``
 per entry so the caller (the ``message`` tool) can tell the agent what
 actually happened, including the list of valid recipients when a name
 fails to resolve.
@@ -47,10 +48,96 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# A malformed generation can leak the harness tool-call syntax into a
+# ``message`` content (observed: an agent texting a user a bare
+# ``</antml.parameter>``). Such a fragment is never legitimate outbound
+# text, so we drop it rather than deliver garbage to a human.
+_TOOL_SYNTAX_FRAGMENT_RE = re.compile(
+    r"</?\s*(?:antml|function_calls?|invoke|parameter)\b", re.IGNORECASE
+)
+
+# Degenerate ``message`` content — the agent talking to itself out loud.
+# Observed on-device: literal "placeholder" and "done" delivered to a
+# user, "(no further action needed for now)", then texts apologising for
+# those texts. All three classes below are matched EXACTLY, never by
+# length or vagueness: "Yes." and "Done — the lights are off." are real
+# answers and must survive.
+
+# Closed sets, compared after strip + casefold + trailing ".!" trim.
+# Never legitimate outbound text on any channel.
+_FILLER_CONTENT = frozenset({"placeholder", "test"})
+
+# Filler in a wake cycle nobody asked for, but a real answer when a human
+# asked a yes/no question — "did you lock the door?" / "Done." So these
+# are dropped ONLY on the trigger channel, where there is no question to
+# be answering.
+_TRIGGER_FILLER_CONTENT = frozenset({"done", "ok", "n/a", "none"})
+
+# Content that is entirely a parenthetical aside ("(nothing to do)").
+_PARENTHETICAL_ONLY_RE = re.compile(r"\([^()]*\)", re.DOTALL)
+
+# The agent retracting or apologising for its own noise. Anchored to the
+# WHOLE message: a genuine "Sorry for the noise above — the lights are
+# off now" carries real content and is delivered.
+_NOISE_APOLOGY_RE = re.compile(
+    r"^(?:(?:i'm |i am )?sorry|apologies|my apologies|oops|whoops|please)?"
+    r"[\s,—-]*"
+    r"(?:"
+    r"(?:please\s+)?(?:ignore|disregard)\s+(?:my|the|that)\s+"
+    r"(?:last|previous|preceding|earlier|stray|blank|empty)\s*"
+    r"(?:message|text|note|one)?"
+    r"|(?:sorry|apologies)\s+(?:for|about)\s+(?:the|that)\s+"
+    r"(?:noise|spam|stray|blank|empty|extra|duplicate)"
+    r"(?:\s+(?:messages?|texts?))?"
+    r")"
+    r"[\s.!,]*$",
+    re.IGNORECASE,
+)
+
+# Machine-readable ``reason_code`` markers for drops that RETRYING CANNOT
+# FIX: the same call would be refused the same way. The agent loop's
+# trigger backstop ends a turn on these (see
+# ``agent._message_results_settled``) and grants a retry on every other
+# failure. Anything genuinely recoverable — an unregistered recipient, a
+# send error — must stay untagged.
+DEGENERATE_CONTENT = "degenerate_content"  # filler; more filler follows
+TOOL_SYNTAX = "tool_syntax"                # leaked harness syntax
+BUDGET_SPENT = "budget_spent"              # wake-cycle message budget gone
+UNRETRYABLE_DROPS = frozenset({DEGENERATE_CONTENT, TOOL_SYNTAX, BUDGET_SPENT})
+
+# Handed back to the agent when a delivery is dropped for degeneracy.
+# Points at the flag so it stops instead of retrying with more filler.
+_DEGENERATE_CONTENT_REASON = (
+    "filler and self-referential content is not deliverable. Say "
+    "something the person actually needs, or — if you are finished — "
+    "set final_turn=true in your notes instead of sending a message."
+)
+
+
+def _is_degenerate_content(content: str, channel_context: str = "") -> bool:
+    """True when ``content`` is nothing but filler or self-referential noise.
+
+    ``channel_context`` is the conversation's source channel. On
+    ``"trigger"`` the bare-acknowledgement set is filler too; everywhere
+    else a human may have asked the question it answers.
+    """
+    stripped = content.strip()
+    if not stripped:
+        return True
+    if _PARENTHETICAL_ONLY_RE.fullmatch(stripped):
+        return True
+    normalised = stripped.casefold().rstrip(" .!")
+    if normalised in _FILLER_CONTENT:
+        return True
+    if channel_context == "trigger" and normalised in _TRIGGER_FILLER_CONTENT:
+        return True
+    return _NOISE_APOLOGY_RE.match(normalised) is not None
 
 # Conversation channels that carry a human who can be replied to. Speech
 # dispatched from one of these is a relay — BB was asked to put something
@@ -72,7 +159,10 @@ class DispatchResult:
 
     ``status`` is ``"delivered"`` or ``"dropped"``. On a drop, ``reason``
     is a human-readable explanation safe to hand back to the agent as a
-    tool result. ``valid_recipients`` is populated only when the drop was
+    tool result, and ``reason_code`` is the machine-readable class of
+    drop for callers that must branch on it (currently only
+    ``DEGENERATE_CONTENT``; see ``agent._message_results_settled``).
+    ``valid_recipients`` is populated only when the drop was
     caused by an unresolvable recipient name, so the agent can retry with
     a real name.
     """
@@ -81,6 +171,7 @@ class DispatchResult:
     channel: str
     status: str
     reason: str = ""
+    reason_code: str = ""
     valid_recipients: Optional[list[str]] = field(default=None)
 
 
@@ -90,7 +181,11 @@ class DispatchResult:
 # The schema has NO delivery channel by design. Its sole job is to occupy
 # the model's text-output slot with a private scratchpad shape, removing
 # the trained "respond as plain text to the user" affordance. To reach a
-# human, the agent MUST call the ``message`` tool.
+# human, the agent MUST call the ``message`` tool. ``final_turn`` is the
+# one exception to "private": it is control, not prose — it ends the
+# agent loop (see ``agent._agent_loop``).
+#
+# Mutating this schema invalidates the messages cache once at deploy.
 # ---------------------------------------------------------------------------
 
 INTERNAL_NOTES_SCHEMA: dict[str, Any] = {
@@ -116,8 +211,20 @@ INTERNAL_NOTES_SCHEMA: dict[str, Any] = {
                 "Never reaches anyone."
             ),
         },
+        "final_turn": {
+            "type": "boolean",
+            "description": (
+                "True on the response that finishes the job — typically "
+                "alongside your final message call. False while more tool "
+                "work remains. Never call message just to signal you are "
+                "done; set this instead."
+            ),
+        },
     },
-    "required": ["thought"],
+    # ``final_turn`` is required, not optional: the OpenAI path runs this
+    # schema through strict mode (every property required) and a required
+    # flag forces an explicit continue/stop decision on every response.
+    "required": ["thought", "final_turn"],
     "additionalProperties": False,
 }
 
@@ -130,17 +237,35 @@ INTERNAL_NOTES_SCHEMA: dict[str, Any] = {
 class ParsedNotes:
     """Result of parsing one agent text block as internal notes."""
 
-    __slots__ = ("thought", "observations", "raw")
+    __slots__ = ("thought", "observations", "final_turn", "raw")
 
     def __init__(
         self,
         thought: str,
         observations: list[str],
         raw: str,
+        final_turn: bool = False,
     ) -> None:
         self.thought = thought
         self.observations = observations
+        self.final_turn = final_turn
         self.raw = raw
+
+
+def _notes_from_dict(data: dict[str, Any], raw: str) -> ParsedNotes:
+    """Build ``ParsedNotes`` from an already-decoded notes object."""
+    obs_raw = data.get("observations")
+    observations: list[str] = []
+    if isinstance(obs_raw, list):
+        for entry in obs_raw:
+            if isinstance(entry, str) and entry.strip():
+                observations.append(entry)
+    return ParsedNotes(
+        thought=str(data.get("thought") or ""),
+        observations=observations,
+        raw=raw,
+        final_turn=bool(data.get("final_turn")),
+    )
 
 
 def parse_internal_notes(raw_text: str) -> ParsedNotes | None:
@@ -163,14 +288,7 @@ def parse_internal_notes(raw_text: str) -> ParsedNotes | None:
     if not isinstance(data, dict):
         logger.warning("Parsed agent output is not a dict: %r", type(data).__name__)
         return None
-    thought = str(data.get("thought") or "")
-    obs_raw = data.get("observations")
-    observations: list[str] = []
-    if isinstance(obs_raw, list):
-        for entry in obs_raw:
-            if isinstance(entry, str) and entry.strip():
-                observations.append(entry)
-    return ParsedNotes(thought=thought, observations=observations, raw=raw_text)
+    return _notes_from_dict(data, raw_text)
 
 
 def parse_structured_notes(value: Any) -> ParsedNotes | None:
@@ -197,16 +315,7 @@ def parse_structured_notes(value: Any) -> ParsedNotes | None:
             "structured_output is not a dict: %r", type(value).__name__
         )
         return None
-    thought = str(value.get("thought") or "")
-    obs_raw = value.get("observations")
-    observations: list[str] = []
-    if isinstance(obs_raw, list):
-        for entry in obs_raw:
-            if isinstance(entry, str) and entry.strip():
-                observations.append(entry)
-    return ParsedNotes(
-        thought=thought, observations=observations, raw=json.dumps(value)
-    )
+    return _notes_from_dict(value, json.dumps(value))
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +343,10 @@ async def dispatch_outputs(
     Args:
         outputs: List of ``{to, channel, content}`` dicts.
         conversation_id: For audit logging.
-        channel_context: The conversation's source channel — currently only
-            used in log messages for provenance.
+        channel_context: The conversation's source channel. Logged for
+            provenance, decides whether speech is a relay (see
+            ``_dispatch_voice``), and widens the filler filter on
+            ``"trigger"`` (see ``_is_degenerate_content``).
         current_speaker: The human the agent is addressing by default.
             Used to resolve ``to: "current_speaker"``.
         segment_recorder: If provided, called with a ``SpokenSegment``
@@ -264,6 +375,31 @@ async def dispatch_outputs(
                     "malformed output: to, channel, and content must all "
                     "be non-empty"
                 ),
+            ))
+            continue
+
+        if _TOOL_SYNTAX_FRAGMENT_RE.search(content):
+            logger.warning(
+                "Dropping output entry with leaked tool-call syntax "
+                "(conv=%s idx=%d): %r",
+                conversation_id, i, content,
+            )
+            results.append(DispatchResult(
+                to=to, channel=channel, status="dropped",
+                reason="content contains tool-call syntax; not delivered",
+                reason_code=TOOL_SYNTAX,
+            ))
+            continue
+
+        if _is_degenerate_content(content, channel_context):
+            logger.warning(
+                "Dropping degenerate output entry (conv=%s idx=%d): %r",
+                conversation_id, i, content,
+            )
+            results.append(DispatchResult(
+                to=to, channel=channel, status="dropped",
+                reason=_DEGENERATE_CONTENT_REASON,
+                reason_code=DEGENERATE_CONTENT,
             ))
             continue
 
@@ -450,27 +586,20 @@ async def _dispatch_text(
             reason="text delivery is unavailable (auth not configured)",
         )
 
-    # Resolve name → user. Exact case-insensitive name match on the user list.
+    # Resolve name → user, falling back to a direct phone if the agent
+    # provided one. The name list is only needed to name valid
+    # recipients when nothing matches.
     try:
-        users = await auth.list_users()
+        matched = await auth.get_user_by_name(to) or await auth.get_user(to)
+        names = [] if matched else [u.name for u in await auth.list_users()]
     except Exception:
-        logger.exception("Failed to list users for text dispatch")
+        logger.exception("Failed to resolve '%s' for text dispatch", to)
         return DispatchResult(
             to=to, channel="text", status="dropped",
             reason="could not look up registered users",
         )
 
-    matched = None
-    for user in users:
-        if user.name.strip().lower() == to.strip().lower():
-            matched = user
-            break
-        if user.phone == to:  # allow direct phone if the agent provided one
-            matched = user
-            break
-
     if matched is None:
-        names = [u.name for u in users]
         known = ", ".join(names) or "(no registered users)"
         logger.warning(
             "Cannot resolve '%s' to a registered user; dropping text output "

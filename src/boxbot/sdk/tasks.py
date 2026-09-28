@@ -73,6 +73,18 @@ class TriggerRecord:
         return self._data.get("cron")
 
     @property
+    def run_integration(self) -> str | None:
+        return self._data.get("run_integration")
+
+    @property
+    def rearm_after_s(self) -> int | None:
+        return self._data.get("rearm_after_s")
+
+    @property
+    def run_script(self) -> str | None:
+        return self._data.get("run_script")
+
+    @property
     def person(self) -> str | None:
         return self._data.get("person")
 
@@ -159,7 +171,11 @@ def create_trigger(description: str, instructions: str, *,
                    entity: str | None = None,
                    entity_state: str | None = None,
                    for_person: str | None = None,
-                   todo_id: str | None = None) -> str:
+                   todo_id: str | None = None,
+                   run_integration: str | None = None,
+                   run_script: str | None = None,
+                   run_inputs: dict[str, Any] | None = None,
+                   rearm_after_s: int | None = None) -> str:
     """Create a trigger (wake condition); return the new trigger's ID.
 
     Triggers use AND logic — all specified conditions must be met.
@@ -175,14 +191,36 @@ def create_trigger(description: str, instructions: str, *,
         person: Person-presence condition. A name (e.g. "Jacob") fires when
             that person is visually identified; "*" fires on ANY person seen,
             no identification required.
-        entity: Home Assistant entity condition — a full entity_id
-            (e.g. "binary_sensor.front_door_person"). Fires when the
-            entity enters ``entity_state``. Requires the HA events bridge
-            (HOME_ASSISTANT_URL/TOKEN secrets stored).
+        entity: Sensor condition — a full entity_id published by the
+            running events bridge (e.g. "binary_sensor.front_door_person";
+            camera detections are binary_sensor.<camera-slug>_<class>,
+            class person/vehicle/animal/package, fed by the Home Assistant
+            events bridge). Fires when the entity
+            enters ``entity_state``. Only ids a bridge publishes can fire.
         entity_state: State satisfying the entity condition (default "on").
             Only valid with ``entity``.
         for_person: Person this trigger is about (for context).
         todo_id: Link to a to-do item.
+        run_integration: Run this integration on fire instead of waking
+            the agent — no model call, no tokens. Silent on success;
+            escalates to a conversation seeded with ``instructions`` plus
+            the script output when the run fails or the output carries an
+            ``escalate`` key. Must already exist.
+        run_script: Workspace-relative ``.py`` to run on fire instead of
+            waking the agent — same unattended sandbox + escalate
+            contract as ``run_integration``, no manifest/registry.
+            Write it with ``bb.workspace.write``, test it with
+            ``execute_script``, then schedule it. Validated (path-safe,
+            exists) at creation. Mutually exclusive with
+            ``run_integration``.
+        run_inputs: Inputs for ``run_integration`` (validated against
+            its manifest at creation) or ``run_script`` (passed through;
+            read via ``bb.integration.inputs()``).
+        rearm_after_s: Re-arm instead of completing on first fire —
+            "whenever X", not "next time X". Fires again each time the
+            condition is met after this cooldown (seconds; 0 = minimum
+            floor). Requires ``person`` or ``entity``; invalid with
+            ``cron``. Default expiry extends to 30 days.
 
     Raises:
         ActionError: if the main process rejects the call.
@@ -217,6 +255,20 @@ def create_trigger(description: str, instructions: str, *,
         payload["for_person"] = v.require_str(for_person, "for_person")
     if todo_id is not None:
         payload["todo_id"] = v.require_str(todo_id, "todo_id")
+    if run_integration is not None:
+        payload["run_integration"] = v.require_str(run_integration, "run_integration")
+    if run_script is not None:
+        payload["run_script"] = v.require_str(run_script, "run_script")
+    if run_inputs is not None:
+        if not isinstance(run_inputs, dict):
+            raise ValueError("run_inputs must be a dict")
+        if run_integration is None and run_script is None:
+            raise ValueError("run_inputs requires run_integration or run_script")
+        payload["run_inputs"] = run_inputs
+    if rearm_after_s is not None:
+        if not isinstance(rearm_after_s, int) or isinstance(rearm_after_s, bool):
+            raise ValueError("rearm_after_s must be an integer")
+        payload["rearm_after_s"] = rearm_after_s
 
     response = _transport.request("tasks.create_trigger", payload, timeout=30)
     _raise_on_error(response, "tasks.create_trigger")

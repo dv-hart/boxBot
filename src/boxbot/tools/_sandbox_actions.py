@@ -33,9 +33,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import inspect
 import io
 import logging
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -146,6 +148,25 @@ class ActionContext:
     # Every action processed, mirrored into the final tool result so the
     # agent can observe side effects (e.g. "photos.set_tags: ok").
     action_log: list[dict[str, Any]] = field(default_factory=list)
+    # Who is driving this action stream. "agent" = an execute_script turn,
+    # a human in the loop deciding each call. "integration" = ANY integration
+    # run — unattended, no model in the loop (whether a trigger fired it or an
+    # agent turn called it). Handlers use this to structurally deny the
+    # privileged surfaces — see ``_handle_tasks_action``.
+    origin: str = "agent"
+    # Conversation this run belongs to (the runner's label). None for
+    # one-off runs.
+    conversation_id: str | None = None
+
+
+def _from_integration(ctx: "ActionContext | None") -> bool:
+    """True when this action stream belongs to an integration script.
+
+    Tolerates ``ctx=None`` — in-process callers that skip the context
+    entirely are trusted by construction; only the runner ever hands out
+    an ``origin="integration"`` context.
+    """
+    return ctx is not None and ctx.origin == "integration"
 
 
 # ---------------------------------------------------------------------------
@@ -803,11 +824,26 @@ def _tmp_capture_dir() -> Path:
     return _sandbox_tmp_dir()
 
 
+class NoCameraError(RuntimeError):
+    """No Camera HAL, and the dev test pattern is not enabled."""
+
+
+def _test_pattern_enabled() -> bool:
+    """Whether a camera-less capture may return the dev test pattern."""
+    try:
+        from boxbot.core.config import get_config
+
+        return bool(get_config().camera.test_pattern_without_camera)
+    except Exception:
+        return False
+
+
 def _test_pattern_frame(width: int = 640, height: int = 360):
     """A solid-color frame used when no Camera HAL is available.
 
     Lets the image-attach pipeline be exercised end-to-end on dev
-    machines without a Pi. Returns an ``(H, W, 3)`` uint8 numpy array.
+    machines without a Pi (``camera.test_pattern_without_camera``).
+    Returns an ``(H, W, 3)`` uint8 numpy array.
     """
     import numpy as np
 
@@ -841,11 +877,17 @@ def _frame_to_jpeg(frame) -> bytes:
 
 
 async def _grab_frame(full_res: bool):
-    """Grab a frame from the live camera, or fall back to a test pattern."""
+    """Grab a frame from the live camera.
+
+    Raises :class:`NoCameraError` when there is no camera — synthetic
+    pixels would be pixels the agent believes it actually saw.
+    """
     from boxbot.hardware.camera import get_camera
 
     cam = get_camera()
     if cam is None:
+        if not _test_pattern_enabled():
+            raise NoCameraError
         logger.warning("camera HAL not available — returning test pattern")
         return _test_pattern_frame(), True  # fallback=True
     frame = await (cam.capture_photo() if full_res else cam.capture_frame())
@@ -921,6 +963,8 @@ async def _handle_camera_action(
             "fallback": is_fallback,
         }
 
+    except NoCameraError:
+        return {"status": "error", "error": "No camera on this device."}
     except KeyError as e:
         return {"status": "error", "error": f"missing field: {e}"}
     except Exception as e:  # noqa: BLE001
@@ -1589,7 +1633,7 @@ async def _handle_memory_action(
 async def _handle_tasks_action(
     action_type: str,
     payload: dict[str, Any],
-    ctx: ActionContext,  # unused; kept for uniform handler signature
+    ctx: ActionContext,  # threaded for the origin check
 ) -> dict[str, Any]:
     """Dispatch ``tasks.*`` — create_trigger, create_todo, list_*, get,
     complete, cancel.
@@ -1597,8 +1641,22 @@ async def _handle_tasks_action(
     Mirrors the manage_tasks core tool's surface, reachable from inside
     sandbox scripts so they can compose task management with other SDK
     calls in one turn.
+
+    Denied entirely for ``origin="integration"``: a script that creates
+    triggers that run scripts is a self-replication loop with no human in
+    it. Cron recurrence already covers re-arming.
     """
     sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+
+    if _from_integration(ctx):
+        return {
+            "status": "error",
+            "message": (
+                f"tasks.{sub} is not available to unattended scripts "
+                "(integration or trigger-run). Return an 'escalate' key so "
+                "the agent can decide."
+            ),
+        }
 
     try:
         from boxbot.core import scheduler
@@ -1628,6 +1686,10 @@ async def _handle_tasks_action(
                     entity_state=payload.get("entity_state"),
                     for_person=payload.get("for_person"),
                     todo_id=payload.get("todo_id"),
+                    run_integration=payload.get("run_integration"),
+                    run_script=payload.get("run_script"),
+                    run_inputs=payload.get("run_inputs"),
+                    rearm_after_s=payload.get("rearm_after_s"),
                     source="agent",
                 )
             except ValueError as e:
@@ -1830,6 +1892,21 @@ def _classify_display_source(name: str, agent_dir: Path) -> str:
     return "builtin"
 
 
+_MAX_HINT_FIELDS = 12
+
+
+def _available_fields_hint(source: str, sample: dict[str, Any]) -> str:
+    """Name the fields a source actually exposed, for a failed binding."""
+    data = sample.get(source)
+    if not isinstance(data, dict) or not data:
+        return f"Source '{source}' supplied no data."
+    names = sorted(data)
+    shown = ", ".join(names[:_MAX_HINT_FIELDS])
+    if len(names) > _MAX_HINT_FIELDS:
+        shown += f", … (+{len(names) - _MAX_HINT_FIELDS} more)"
+    return f"Available fields on '{source}': {shown}."
+
+
 def _collect_unresolved_bindings(
     spec_dict: dict[str, Any],
     render_data: dict[str, Any] | None = None,
@@ -1845,13 +1922,15 @@ def _collect_unresolved_bindings(
     sources whose declared ``value=`` populated the renderer's view but
     not any standalone placeholder pass.
     """
-    from boxbot.displays.data_sources import get_placeholder_data
+    from boxbot.displays.data_sources import placeholder_for_source
     from boxbot.displays.spec import _BINDING_PATTERN, _lookup_binding
 
     declared: set[str] = {"args", "current"}
+    declared_specs: dict[str, dict[str, Any]] = {}
     for src in spec_dict.get("data_sources", []) or []:
         if isinstance(src, dict) and src.get("name"):
             declared.add(src["name"])
+            declared_specs[src["name"]] = src
 
     if render_data is not None:
         sample = dict(render_data)
@@ -1864,7 +1943,10 @@ def _collect_unresolved_bindings(
         for name in declared:
             if name in ("args", "current"):
                 continue
-            sample[name] = get_placeholder_data(name) or {}
+            src = declared_specs.get(name) or {}
+            sample[name] = placeholder_for_source(
+                name, src.get("type") or "builtin", src,
+            ) or {}
         sample["args"] = {}
 
     from boxbot.displays.renderer import lucide_icon_exists
@@ -1923,7 +2005,7 @@ def _collect_unresolved_bindings(
                 if value is None:
                     warnings.append(
                         f"binding '{{{path}}}' did not resolve at render "
-                        f"time. Check the field name on '{source}'."
+                        f"time. {_available_fields_hint(source, sample)}"
                     )
 
     _walk(spec_dict.get("layout"))
@@ -2138,6 +2220,8 @@ async def _handle_display_action(
                 "status": "ok",
                 "path": str(out_path),
                 "attached": attached,
+                "width": image.width,
+                "height": image.height,
                 "warnings": _collect_unresolved_bindings(
                     spec_dict, render_data=render_data,
                 ),
@@ -2405,6 +2489,10 @@ async def _handle_display_action(
                 "path": str(out_path),
                 "attached": attached,
                 "name": active,
+                # Surface size is config-driven; reporting it stops the
+                # agent guessing.
+                "width": frame.width,
+                "height": frame.height,
             }
 
         return {"status": "error", "error": f"unknown display action: {action_type}"}
@@ -2538,6 +2626,13 @@ def _build_display_schema() -> dict[str, Any]:
                 )
             if f.name in enums:
                 field_info["valid_values"] = enum_sets[enums[f.name]]
+            if block_type == "text" and f.name == "size":
+                # Not a closed set — a pixel number is valid too. The ramp
+                # moves out of valid_values rather than contradicting it.
+                field_info["ramp_names"] = field_info.pop("valid_values")
+                field_info["describe"] = (
+                    "a ramp name, or a pixel number 8-240 for a hero readout"
+                )
             fields[f.name] = field_info
         blocks[block_type] = {
             "kind": "container" if block_type in container_types else "content",

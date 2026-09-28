@@ -7,7 +7,9 @@ multipliers. Where the SDK already computes a dollar cost
 (``ResultMessage.total_cost_usd``), that value is used verbatim.
 
 Multipliers and discounts live here, not in YAML, because they are
-constant across models per Anthropic's docs.
+constant across models per Anthropic's docs. OpenAI's are not constant
+across models, so ``from_openai_usage`` applies none — see its
+docstring.
 """
 
 from __future__ import annotations
@@ -127,6 +129,83 @@ def from_anthropic_usage(
         cache_write_5m_tokens=cw_5m,
         cache_write_1h_tokens=cw_1h,
         is_batch=is_batch,
+        iterations=iterations,
+        correlation_id=correlation_id,
+        metadata=metadata,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI — Responses / Chat Completions usage
+# ---------------------------------------------------------------------------
+
+
+def _openai_cached_tokens(usage: Any) -> int:
+    """Cached prompt tokens, Responses or Chat Completions shape."""
+    details = _pick(usage, "input_tokens_details", "prompt_tokens_details")
+    return _attr(details, "cached_tokens")
+
+
+def from_openai_usage(
+    *,
+    purpose: str,
+    model: str,
+    usage: Any,
+    iterations: int = 0,
+    correlation_id: str | None = None,
+    metadata: dict | None = None,
+) -> CostEvent:
+    """Build a CostEvent from an OpenAI Usage object.
+
+    ``usage`` may be the SDK's typed Usage, a plain dict, or any object
+    with the same field names. Both response shapes are read:
+    Responses (``input_tokens`` / ``output_tokens``) and Chat
+    Completions (``prompt_tokens`` / ``completion_tokens``).
+
+    Differences from :func:`from_anthropic_usage`, both deliberate:
+
+    * **Cached input discounts are per-model**, not the constant
+      multiplier Anthropic applies: cached tokens (a subset of input,
+      unlike Anthropic) bill at the model's ``cached_input_per_mtok``
+      when ``pricing.yaml`` declares one, else at the full input rate
+      (over-counts, never under-counts).
+    * **No ``is_batch``.** No verified batch multiplier.
+
+    Reasoning tokens are already inside ``output_tokens`` and bill at
+    the output rate, so they need no separate handling.
+    """
+    in_tok = _attr(usage, "input_tokens") or _attr(usage, "prompt_tokens")
+    out_tok = _attr(usage, "output_tokens") or _attr(usage, "completion_tokens")
+    # Subset of in_tok, not an addition to it (unlike Anthropic).
+    cached = _openai_cached_tokens(usage)
+
+    pricing = get_pricing()
+    in_per = pricing.openai_input_per_mtok(model)
+    out_per = pricing.openai_output_per_mtok(model)
+    cached_per = pricing.openai_cached_input_per_mtok(model)
+
+    if in_per is None or out_per is None:
+        logger.warning("No openai pricing for model %r; recording cost_usd=0.0", model)
+        cost = 0.0
+    else:
+        if cached_per is None:
+            cached_per = in_per
+        # cached is a subset of in_tok by contract; clamp both ways so a
+        # malformed usage object can't bill phantom tokens.
+        cached = min(cached, in_tok)
+        uncached = max(in_tok - cached, 0)
+        cost = (
+            uncached * in_per + cached * cached_per + out_tok * out_per
+        ) / 1_000_000
+
+    return CostEvent(
+        purpose=purpose,
+        provider="openai",
+        model=model,
+        cost_usd=cost,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        cache_read_tokens=cached,
         iterations=iterations,
         correlation_id=correlation_id,
         metadata=metadata,

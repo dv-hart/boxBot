@@ -161,19 +161,13 @@ machine, deploy updated HEF. This is an offline process, not real-time.
 Each known person accumulates a cloud of 512-dim ReID embedding vectors.
 New detections are compared against these clouds to estimate identity.
 
-**Matching:** Centroid-based cosine similarity.
-
-```
-For each known person:
-  similarity = cosine(new_embedding, person_centroid)
-
-Best match above high_threshold (0.85) → confident identification
-Best match in range (0.60-0.85) → tentative (logged, not acted on)
-No match above 0.60 → unknown person
-```
-
-If two people's centroids are close enough to cause ambiguity, fall back
-to k-NN voting among stored embeddings for disambiguation.
+**Matching:** cloud-based — mean of the top-k cosine similarities
+against each person's stored embeddings (see
+[voice-id-redesign.md](voice-id-redesign.md); the same scheme covers
+visual and voice clouds, with per-modality thresholds in
+`config.perception.*_confirmed_threshold` / `*_maybe_threshold` /
+`*_cloud_topk`). A cloud preserves near/far/noisy modes that a single
+centroid would average into a phantom point.
 
 ### Confirmation Rule: Voice Gates Vision
 
@@ -259,26 +253,34 @@ the images expire.
 
 ## Speaker Identification
 
-### pyannote.audio
+### Two engines, one embedding contract
 
-Speaker identification uses **pyannote.audio** for diarization and
-speaker embedding extraction. pyannote runs on CPU during conversations.
+`voice.diarization.engine` selects the backend:
 
-**Why pyannote (not a standalone speaker embedding model)?**
+- **`pyannote`** — full pyannote.audio stack. Required only when
+  `diarization.enabled: true` (multi-speaker segmentation with
+  timestamps and overlap handling).
+- **`onnx`** — wespeaker ECAPA-TDNN via onnxruntime
+  (`communication/speaker_embedding.py`). Embed-only, no torch, ~25 MB;
+  built for hardware that cannot carry pyannote.
 
-The multi-speaker scenario is the deciding factor. When two people
-talk to BB simultaneously (e.g., a couple discussing their calendar),
-pyannote provides:
-- **Diarization** — who spoke when, with timestamps
-- **Overlapping speech handling** — detects when two people talk at once
-- **Speaker embeddings** — extracted as part of diarization, reused for
-  voice identification (no separate model needed)
-- **Per-utterance attribution** — feeds directly into attributed
-  conversation input for the agent
+Diarization is **off by default**: each VAD-bounded utterance is
+assumed single-speaker and embedded whole (`embed_utterance`), which
+both engines implement — so the default path is engine-agnostic.
+Embeddings from different models share no space; switching
+`embedding_model` invalidates every enrolled cloud.
 
-A standalone speaker embedding model (ECAPA-TDNN, wespeaker) would
-handle single-speaker verification but cannot diarize multi-speaker
-audio.
+### The camera-free identity core
+
+Storage, enrollment, and the session-end commit live on
+`IdentityService` (`perception/identity.py`), which main.py starts on
+**every** device class — not on the visual pipeline. On camera+Hailo
+hardware the `PerceptionPipeline` composes the service; on camera-less
+devices it runs alone, so voice identity — cloud matching
+in the voice adapter, `identify_person` enrollment, the
+`VoiceSessionEnded → commit_session()` flush — works with no camera,
+no NPU, and no cv2 installed. Consumers reach it via `get_identity()`;
+`get_pipeline()` remains the visual-only surface (presence, crops).
 
 **Resource footprint:**
 - Models: ~300-500MB RAM (lazy-loaded, see below)

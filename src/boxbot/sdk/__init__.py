@@ -33,12 +33,15 @@ calls return raw response dicts with shapes documented per function.
 Catch any failed SDK write with ``except bb.ActionError``.
 """
 
+import sys
+
 from ._transport import ActionError
 from . import (
     audio,
     auth,
     camera,
     display,
+    integration,
     integrations,
     memory,
     packages,
@@ -48,6 +51,7 @@ from . import (
     tasks,
     workspace,
 )
+from .integration import escalate
 
 __all__ = [
     "ActionError",
@@ -55,6 +59,8 @@ __all__ = [
     "auth",
     "camera",
     "display",
+    "escalate",
+    "integration",
     "integrations",
     "memory",
     "packages",
@@ -64,3 +70,15 @@ __all__ = [
     "tasks",
     "workspace",
 ]
+
+# Docs and prompts promise ``import bb``; the alias has to live where the
+# SDK itself is imported, or it only exists in whichever launcher happened
+# to install it. Aliasing the module object (not a copy) keeps one
+# _transport singleton.
+sys.modules.setdefault("bb", sys.modules[__name__])
+
+# ``from boxbot_sdk import bb`` is a natural misreading of "importable as
+# boxbot_sdk or just bb" and the model writes it intermittently — it needs
+# ``bb`` as a real attribute, not just a sys.modules alias. Same object,
+# so every import style shares one _transport singleton.
+bb = sys.modules[__name__]

@@ -1057,6 +1057,38 @@ class TestSTT:
         assert result.words == []
 
 
+    @patch("boxbot.communication.stt.AsyncElevenLabs")
+    def test_create_stt_selects_configured_provider(self, mock_client_cls):
+        from boxbot.communication.stt import ElevenLabsSTT, create_stt
+        from boxbot.core.config import ApiKeysConfig, STTConfig
+
+        stt = create_stt(
+            STTConfig(provider="elevenlabs", model="scribe_v2"),
+            ApiKeysConfig(elevenlabs="key"),
+        )
+
+        assert isinstance(stt, ElevenLabsSTT)
+        assert stt._model == "scribe_v2"
+
+    def test_create_stt_unknown_provider_raises(self):
+        """A typo'd provider must fail at boot, not fall back silently."""
+        from boxbot.communication.stt import create_stt
+        from boxbot.core.config import ApiKeysConfig, STTConfig
+
+        with pytest.raises(ValueError, match="stt.provider must be one of"):
+            create_stt(
+                STTConfig(provider="elevenlab"),
+                ApiKeysConfig(elevenlabs="key"),
+            )
+
+    def test_create_stt_missing_key_returns_none(self):
+        """No credential degrades voice; it must not crash the box."""
+        from boxbot.communication.stt import create_stt
+        from boxbot.core.config import ApiKeysConfig, STTConfig
+
+        assert create_stt(STTConfig(), ApiKeysConfig()) is None
+
+
 # ---------------------------------------------------------------------------
 # TestTTS
 # ---------------------------------------------------------------------------
@@ -1163,6 +1195,38 @@ class TestTTS:
         assert stream.is_playing is False
 
 
+    @patch("boxbot.communication.tts.AsyncElevenLabs")
+    @patch("boxbot.communication.tts.VoiceSettings")
+    def test_create_tts_selects_configured_provider(self, mock_vs, mock_cls):
+        from boxbot.communication.tts import ElevenLabsTTS, create_tts
+        from boxbot.core.config import ApiKeysConfig, TTSConfig
+
+        tts = create_tts(
+            TTSConfig(provider="elevenlabs", voice_id="vid"),
+            ApiKeysConfig(elevenlabs="key"),
+        )
+
+        assert isinstance(tts, ElevenLabsTTS)
+        assert tts._voice_id == "vid"
+
+    def test_create_tts_unknown_provider_raises(self):
+        """A typo'd provider must fail at boot, not fall back silently."""
+        from boxbot.communication.tts import create_tts
+        from boxbot.core.config import ApiKeysConfig, TTSConfig
+
+        with pytest.raises(ValueError, match="tts.provider must be one of"):
+            create_tts(
+                TTSConfig(provider="11labs"), ApiKeysConfig(elevenlabs="key")
+            )
+
+    def test_create_tts_missing_key_returns_none(self):
+        """No credential degrades voice; it must not crash the box."""
+        from boxbot.communication.tts import create_tts
+        from boxbot.core.config import ApiKeysConfig, TTSConfig
+
+        assert create_tts(TTSConfig(), ApiKeysConfig()) is None
+
+
 # ---------------------------------------------------------------------------
 # TestDiarization
 # ---------------------------------------------------------------------------
@@ -1175,6 +1239,10 @@ class TestDiarization:
         from boxbot.core.config import DiarizationConfig
 
         defaults = dict(
+            # Every test here exercises the segmentation pipeline, which
+            # only loads when diarization is enabled. The config default is
+            # False (embed-only single-speaker mode), so opt in explicitly.
+            enabled=True,
             engine="pyannote",
             model="pyannote/speaker-diarization-3.1",
             embedding_model="pyannote/wespeaker-voxceleb-resnet34-LM",
@@ -1307,6 +1375,93 @@ class TestDiarization:
         assert result.segments[0].embedding is not None
 
 
+class TestDiarizerLazyLoad:
+    """The lazy-load path must not retry a permanently missing dependency."""
+
+    def _session(self, start_effect):
+        """A VoiceSession with only the diarizer attributes populated."""
+        from boxbot.communication.voice import VoiceSession
+
+        session = VoiceSession.__new__(VoiceSession)
+        session._diarizer = MagicMock()
+        session._diarizer.start = AsyncMock(side_effect=start_effect)
+        session._diarizer_loaded = False
+        session._diarizer_unload_task = None
+        session._diarizer_load_lock = asyncio.Lock()
+        return session
+
+    @pytest.mark.asyncio
+    async def test_import_error_disables_diarizer_permanently(self):
+        session = self._session(
+            ImportError("pyannote.audio is required for SpeakerDiarizer.")
+        )
+        diarizer = session._diarizer
+
+        await session._ensure_diarizer_loaded()
+
+        # Dropped, so no call site can retry it (this is a camera-less host:
+        # no pyannote.audio in the chroot).
+        assert session._diarizer is None
+        assert session._diarizer_loaded is False
+        assert diarizer.start.await_count == 1
+
+        # A second utterance must not touch the dependency again.
+        await session._ensure_diarizer_loaded()
+        assert diarizer.start.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_error_keeps_diarizer_for_retry(self):
+        session = self._session(RuntimeError("model download timed out"))
+        diarizer = session._diarizer
+
+        await session._ensure_diarizer_loaded()
+
+        # A transient failure may succeed later — keep it.
+        assert session._diarizer is diarizer
+        assert session._diarizer_loaded is False
+
+        await session._ensure_diarizer_loaded()
+        assert diarizer.start.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_warm_call_cancels_pending_unload(self):
+        """Activity on an already-loaded model must refresh the idle
+        window — the early return used to skip the cancel, leaving
+        orphan timers that fired mid-session."""
+        session = self._session(None)
+        session._diarizer_loaded = True
+        session._diarizer_unload_task = asyncio.create_task(asyncio.sleep(60))
+        pending = session._diarizer_unload_task
+
+        await session._ensure_diarizer_loaded()
+
+        assert pending.cancelled() or pending.cancelling()
+        assert session._diarizer_unload_task is None
+        assert session._diarizer.start.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unload_serialises_with_load_on_the_lock(self):
+        """An unload firing mid-load must wait for the lock — otherwise
+        stop() races start() and _diarizer_loaded ends True on a
+        stopped model (voice ID silently dead)."""
+        session = self._session(None)
+        session._diarizer_loaded = True
+        session._diarizer.stop = AsyncMock()
+
+        async with session._diarizer_load_lock:
+            unload = asyncio.create_task(
+                session._unload_diarizer_after_timeout(0.0)
+            )
+            await asyncio.sleep(0.01)
+            # Blocked on the lock: nothing stopped yet.
+            assert session._diarizer.stop.await_count == 0
+            assert session._diarizer_loaded is True
+
+        await unload
+        assert session._diarizer.stop.await_count == 1
+        assert session._diarizer_loaded is False
+
+
 # ---------------------------------------------------------------------------
 # TestVoiceSession
 # ---------------------------------------------------------------------------
@@ -1342,8 +1497,6 @@ class TestVoiceSession:
     @pytest.mark.asyncio
     @patch("boxbot.communication.voice.WakeWordDetector")
     @patch("boxbot.communication.voice.VoiceActivityDetector")
-    @patch("boxbot.communication.voice.ElevenLabsSTT", None)
-    @patch("boxbot.communication.voice.ElevenLabsTTS", None)
     async def test_start_enters_idle_state(self, mock_vad_cls, mock_ww_cls):
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
 
@@ -1376,6 +1529,10 @@ class TestVoiceSession:
                     await session.start()
 
         assert session.state == VoiceSessionState.IDLE
+        # No ElevenLabs key: the factories return None and voice comes
+        # up mute rather than failing to boot.
+        assert session._stt is None
+        assert session._tts is None
 
         await session.stop()
 
@@ -1415,6 +1572,25 @@ class TestVoiceSession:
         assert session._conversation_id == ""
         session._audio_capture.stop.assert_awaited_once()
         session._vad.reset.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_deactivate_clears_agent_mute(self):
+        """``mute_mic`` promises "auto-unmute … when the conversation
+        ends" — the mute is scoped to the conversation it was made in.
+        Regression: teardown kept the mute, deadlocking push-to-talk
+        (no wake word to clear it)."""
+        from boxbot.communication.push_to_talk import PushToTalkCapture
+        from boxbot.communication.voice import VoiceSessionState
+        from boxbot.core.config import TurnDetectionConfig
+
+        session, _mic, _speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        session._audio_capture = PushToTalkCapture(TurnDetectionConfig())
+        session._audio_capture.mute()
+
+        await session._deactivate_session(reason="silence_timeout")
+
+        assert not session._audio_capture.is_muted
 
     @pytest.mark.asyncio
     async def test_activate_session_starts_audio_capture(self):
@@ -1892,8 +2068,11 @@ class TestVoiceSession:
 
     @pytest.mark.asyncio
     async def test_agent_turn_ended_arms_post_response_timer(self):
-        """AgentTurnEnded for the matching session arms the post-response
-        idle timer so a silent turn doesn't leave the mic hot."""
+        """A voice-channel AgentTurnEnded arms the post-response idle
+        timer so a silent turn doesn't leave the mic hot. The event
+        carries the agent's Conversation id (conv_…), which never
+        matches the adapter's voice session id — matching is by
+        channel only."""
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
         from boxbot.core.events import AgentTurnEnded
 
@@ -1902,12 +2081,32 @@ class TestVoiceSession:
         session._conversation_id = "voice_t"
 
         await session._on_agent_turn_ended(
-            AgentTurnEnded(conversation_id="voice_t", channel="voice")
+            AgentTurnEnded(conversation_id="conv_abc123", channel="voice")
         )
 
         assert session._active_timeout_task is not None
         # Cancel so the test doesn't leak a pending sleep.
         session._active_timeout_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_agent_turn_ended_restores_listening_ring(self):
+        """The "thinking" ring set at utterance-finalize is held through
+        generation; AgentTurnEnded is the clear point — including silent
+        turns where no SPEAKING ceremony ran."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+        from boxbot.core.events import AgentTurnEnded
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        session._conversation_id = "voice_t"
+
+        await session._on_agent_turn_ended(
+            AgentTurnEnded(conversation_id="conv_abc123", channel="voice")
+        )
+
+        mic.set_led_pattern.assert_awaited_with("listening")
+        if session._active_timeout_task is not None:
+            session._active_timeout_task.cancel()
 
     @pytest.mark.asyncio
     async def test_agent_turn_ended_ignored_for_other_channel(self):
@@ -1965,6 +2164,395 @@ class TestVoiceSession:
         assert "Hello" in transcript
         assert "you" in transcript
 
+    # -- input_mode: push-to-talk ------------------------------------
+
+    @pytest.mark.asyncio
+    @patch("boxbot.communication.voice.WakeWordDetector")
+    @patch("boxbot.communication.voice.VoiceActivityDetector")
+    async def test_push_to_talk_builds_no_wake_word_or_vad(
+        self, mock_vad_cls, mock_ww_cls
+    ):
+        """push_to_talk must construct neither the wake word nor VAD.
+
+        Not merely unused — never built. Skipping them is what keeps
+        openWakeWord and torch off the panel entirely.
+        """
+        from boxbot.communication.push_to_talk import PushToTalkCapture
+
+        config = self._make_config(input_mode="push_to_talk")
+        session, mic, _speaker = self._make_session(config)
+
+        await self._start(session)
+
+        assert isinstance(session._audio_capture, PushToTalkCapture)
+        assert session._wake_word is None
+        assert session._vad is None
+        mock_ww_cls.assert_not_called()
+        mock_vad_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("boxbot.communication.voice.WakeWordDetector")
+    @patch("boxbot.communication.voice.VoiceActivityDetector")
+    async def test_push_to_talk_attaches_capture_eagerly(
+        self, mock_vad_cls, mock_ww_cls, event_bus
+    ):
+        """The capture must be listening before the first press lands.
+
+        Attached to the mic *and* subscribed to the bus, by the end of
+        start(). Starting it lazily at activation would mean the press
+        that opens a session arrives before the buffer is listening, and
+        the user's first utterance would vanish.
+        """
+        from boxbot.core.events import ButtonPressed
+
+        config = self._make_config(input_mode="push_to_talk")
+        session, mic, _speaker = self._make_session(config)
+
+        await self._start(session)
+
+        assert mic.add_consumer.called
+        # And the release edge is live: publishing one reaches the
+        # capture, which reports the hold it never had.
+        discarded = AsyncMock()
+        session._audio_capture.set_hold_discarded_callback(discarded)
+        await event_bus.publish(
+            ButtonPressed(button_id="screen", action="release")
+        )
+        discarded.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("boxbot.communication.voice.WakeWordDetector")
+    @patch("boxbot.communication.voice.VoiceActivityDetector")
+    async def test_wake_word_mode_still_builds_both(
+        self, mock_vad_cls, mock_ww_cls
+    ):
+        """Default mode is unchanged — the Pi path must not regress."""
+        from boxbot.communication.audio_capture import AudioCapture
+
+        mock_ww_cls.return_value = MagicMock(
+            start=AsyncMock(), stop=AsyncMock()
+        )
+        mock_vad_cls.return_value = MagicMock(
+            start=AsyncMock(), stop=AsyncMock()
+        )
+
+        session, _mic, _speaker = self._make_session()
+        await self._start(session)
+
+        assert isinstance(session._audio_capture, AudioCapture)
+        mock_ww_cls.assert_called_once()
+        mock_vad_cls.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_button_release_does_not_activate(self):
+        """Only a press starts a turn. Release is the capture's business."""
+        from boxbot.core.events import ButtonPressed
+
+        config = self._make_config(input_mode="push_to_talk")
+        session, _mic, _speaker = self._make_session(config)
+
+        with patch.object(
+            session, "_on_user_activation", new=AsyncMock()
+        ) as activate:
+            await session._on_button_press(
+                ButtonPressed(button_id="screen", action="release")
+            )
+            activate.assert_not_called()
+
+            await session._on_button_press(
+                ButtonPressed(button_id="screen", action="press")
+            )
+            activate.assert_awaited_once()
+
+    # -- streaming STT wiring ----------------------------------------
+
+    def _streaming_session(self):
+        """A session whose _stt is a stub streaming provider."""
+        from boxbot.communication.stt import STTResult
+
+        config = self._make_config(input_mode="push_to_talk")
+        session, mic, speaker = self._make_session(config)
+        mic.sample_rate = 16000
+
+        stt = MagicMock()
+        stt.open = MagicMock()
+        stt.feed = MagicMock()
+        stt.close = AsyncMock()
+        stt.is_live = True
+        stt.buffered_audio = b"\x01\x02" * 100
+        stt.transcribe = AsyncMock(
+            return_value=STTResult(text="hi", language="en")
+        )
+        session._stt = stt
+        session._streaming_stt = stt
+        return session, mic, stt
+
+    @pytest.mark.asyncio
+    async def test_press_opens_socket_before_activating(self):
+        """open() must run on press so the handshake overlaps capture."""
+        from boxbot.core.events import ButtonPressed
+
+        session, mic, stt = self._streaming_session()
+        with patch.object(session, "_on_user_activation", new=AsyncMock()):
+            await session._on_button_press(
+                ButtonPressed(button_id="screen", action="press")
+            )
+        stt.open.assert_called_once_with(
+            16000, session._config.stt.language, conversation_id=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_feed_forwards_pcm_and_tolerates_no_session(self):
+        """The mic consumer forwards chunks; no session is not an error."""
+        session, _mic, stt = self._streaming_session()
+        chunk = MagicMock()
+        chunk.data = b"\xaa\xbb"
+
+        await session._feed_streaming_stt(chunk)
+        stt.feed.assert_called_once_with(b"\xaa\xbb")
+
+        session._streaming_stt = None
+        await session._feed_streaming_stt(chunk)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_batch_fallback_prefers_the_prebuffer(self):
+        """A dead socket costs latency, not the user's words."""
+        from boxbot.communication.stt import STTResult
+        from boxbot.communication.utterance import Utterance
+
+        session, _mic, stt = self._streaming_session()
+        fallback = MagicMock()
+        fallback.transcribe = AsyncMock(
+            return_value=STTResult(text="recovered", language="en")
+        )
+        session._stt_fallback = fallback
+
+        utt = Utterance(
+            audio=b"\x00" * 10,
+            duration=1.0,
+            sample_rate=16000,
+            timestamp_start=0.0,
+            timestamp_end=1.0,
+        )
+        result = await session._batch_fallback(utt)
+
+        assert result.text == "recovered"
+        # The prebuffer, not utterance.audio — it is the PCM we know was
+        # actually captured and streamed.
+        assert fallback.transcribe.await_args.args[0] == stt.buffered_audio
+
+    @pytest.mark.asyncio
+    async def test_batch_fallback_without_provider_returns_none(self):
+        """No fallback configured must degrade, not raise."""
+        from boxbot.communication.utterance import Utterance
+
+        session, _mic, _stt = self._streaming_session()
+        session._stt_fallback = None
+        utt = Utterance(
+            audio=b"\x00" * 10, duration=1.0, sample_rate=16000,
+            timestamp_start=0.0, timestamp_end=1.0,
+        )
+        assert await session._batch_fallback(utt) is None
+
+    def _held_capture(self, session):
+        """Give ``session`` a real PushToTalkCapture, started on its mic."""
+        from boxbot.communication.push_to_talk import PushToTalkCapture
+        from boxbot.core.config import TurnDetectionConfig
+
+        capture = PushToTalkCapture(TurnDetectionConfig())
+        session._audio_capture = capture
+        session._push_to_talk = True
+        return capture
+
+    @pytest.mark.asyncio
+    async def test_press_during_tts_stops_playback_before_opening_the_mic(self):
+        """The ordering push-to-talk trades AEC for.
+
+        Both halves used to be bus subscribers, and ``EventBus.publish``
+        gathers handlers concurrently — so the mic opened while BB was
+        still audible. Now it is call order in one handler, and this test
+        is what keeps it that way.
+        """
+        from boxbot.core.events import ButtonPressed
+
+        session, mic, stt = self._streaming_session()
+        speaker = session._speaker
+        capture = self._held_capture(session)
+
+        order: list[str] = []
+        speaker.is_playing = True
+
+        async def _stop() -> None:
+            order.append("stop_playback")
+            speaker.is_playing = False
+
+        speaker.stop_playback = AsyncMock(side_effect=_stop)
+        session._streaming_stt.open = MagicMock(
+            side_effect=lambda *a, **k: order.append("open_socket")
+        )
+        real_begin = capture.begin_hold
+        capture.begin_hold = lambda: (order.append("begin_hold"), real_begin())
+
+        with patch.object(session, "_on_user_activation", new=AsyncMock()):
+            await session._on_button_press(
+                ButtonPressed(button_id="screen", action="press")
+            )
+
+        assert order == ["stop_playback", "open_socket", "begin_hold"]
+        assert capture.is_holding
+
+    @pytest.mark.asyncio
+    async def test_muted_press_while_active_has_no_side_effects(self):
+        """mute_mic must not leave BB interruptible or the meter running
+        while the session it muted is still live."""
+        from boxbot.communication.voice import VoiceSessionState
+        from boxbot.core.events import ButtonPressed
+
+        session, mic, stt = self._streaming_session()
+        session._state = VoiceSessionState.ACTIVE
+        speaker = session._speaker
+        capture = self._held_capture(session)
+        capture.mute()
+        speaker.is_playing = True
+
+        with patch.object(
+            session, "_on_user_activation", new=AsyncMock()
+        ) as activate:
+            await session._on_button_press(
+                ButtonPressed(button_id="screen", action="press")
+            )
+
+        speaker.stop_playback.assert_not_awaited()
+        session._streaming_stt.open.assert_not_called()
+        activate.assert_not_called()
+        assert not capture.is_holding
+
+    @pytest.mark.asyncio
+    async def test_muted_press_outside_active_unmutes_and_engages(self):
+        """The press is push-to-talk's wake-word analog: from
+        IDLE/DORMANT it clears an agent-set mute and re-engages.
+        Regression: a mute that outlived its conversation left the mic
+        permanently deaf — there is no wake word in this mode to
+        recover it."""
+        from boxbot.communication.voice import VoiceSessionState
+        from boxbot.core.events import ButtonPressed
+
+        session, mic, stt = self._streaming_session()
+        session._state = VoiceSessionState.IDLE
+        capture = self._held_capture(session)
+        capture.mute()
+
+        with patch.object(
+            session, "_on_user_activation", new=AsyncMock()
+        ) as activate:
+            await session._on_button_press(
+                ButtonPressed(button_id="screen", action="press")
+            )
+
+        assert not capture.is_muted
+        # The hold opened, so the recovering press itself is captured.
+        assert capture.is_holding
+        session._streaming_stt.open.assert_called_once()
+        activate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_press_without_an_utterance_closes_the_socket(self, event_bus):
+        """Realtime bills the open socket, so an empty hold must not leak one."""
+        from boxbot.core.events import ButtonPressed
+
+        session, mic, stt = self._streaming_session()
+        capture = self._held_capture(session)
+        capture.set_hold_discarded_callback(session._on_hold_discarded)
+        await capture.start(mic)
+
+        with patch.object(session, "_on_user_activation", new=AsyncMock()):
+            await session._on_button_press(
+                ButtonPressed(button_id="screen", action="press")
+            )
+        # Finger up with no audio in between — mic never opened.
+        await event_bus.publish(
+            ButtonPressed(button_id="screen", action="release")
+        )
+
+        session._streaming_stt.close.assert_awaited_once()
+        await capture.stop()
+
+    @pytest.mark.asyncio
+    async def test_utterance_outside_an_active_session_closes_the_socket(self):
+        from boxbot.communication.utterance import Utterance
+        from boxbot.communication.voice import VoiceSessionState
+
+        session, _mic, stt = self._streaming_session()
+        session._state = VoiceSessionState.IDLE
+
+        await session._on_utterance(
+            Utterance(
+                audio=b"\x00" * 10, duration=1.0, sample_rate=16000,
+                timestamp_start=0.0, timestamp_end=1.0,
+            )
+        )
+
+        stt.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_pausing_capture_keeps_the_press_path_alive(self, event_bus):
+        """The F1 regression.
+
+        Pausing for TTS, dormancy, or deactivation used to call
+        ``PushToTalkCapture.stop()``, which unsubscribes from
+        ``ButtonPressed`` — so the press that interrupts a reply, and the
+        first press after every silence timeout, reached a capture that
+        was no longer listening and the whole utterance was dropped. Only
+        ``VoiceSession.stop()`` may detach.
+        """
+        from boxbot.core.events import ButtonPressed
+        from boxbot.hardware.base import AudioChunk
+
+        session, mic, _stt = self._streaming_session()
+        capture = self._held_capture(session)
+        utterance = AsyncMock()
+        capture.set_utterance_callback(utterance)
+        await capture.start(mic)
+
+        await session._pause_capture()
+
+        assert capture.is_running, "pause must not detach from the mic"
+        capture.begin_hold()
+        assert capture.is_holding, "pause must not refuse a later hold"
+        await capture._on_audio_chunk(
+            AudioChunk(
+                data=b"\x01\x02" * 80,
+                timestamp=time.monotonic(),
+                sample_rate=16000,
+                channels=1,
+                frames=80,
+            )
+        )
+        await event_bus.publish(
+            ButtonPressed(button_id="screen", action="release")
+        )
+        utterance.assert_awaited_once(), "the release must still be heard"
+
+        # The one call that really does detach.
+        await capture.stop()
+        assert not capture.is_running
+
+    async def _start(self, session):
+        """Run VoiceSession.start() with the singletons stubbed out."""
+        with patch("boxbot.communication.voice.get_event_bus") as bus_fn:
+            bus_fn.return_value = MagicMock()
+            with patch(
+                "boxbot.communication.voice.SpeakerDiarizer",
+                side_effect=ImportError,
+                create=True,
+            ):
+                with patch("boxbot.core.config.get_config") as get_cfg:
+                    cfg = MagicMock()
+                    cfg.api_keys.elevenlabs = None
+                    get_cfg.return_value = cfg
+                    await session.start()
+
+
 
 # ---------------------------------------------------------------------------
 # Config integration for voice pipeline
@@ -1992,3 +2580,202 @@ class TestVoiceConfig:
         cfg = BoxBotConfig()
         assert hasattr(cfg, "voice")
         assert cfg.voice.wake_word.word == "hey_jarvis"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_speaker_identities — voice ReID + enrollment via IdentityService
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSpeakerIdentities:
+    """First coverage of the transcript-attribution path.
+
+    The panel incident: with no identity backend this method silently
+    degraded to label-only and every session restarted at "Speaker A".
+    """
+
+    def _make_session(self):
+        from boxbot.communication.voice import VoiceSession
+        from boxbot.core.config import VoiceConfig
+
+        mic = MagicMock()
+        speaker = MagicMock()
+        speaker.is_playing = False
+        return VoiceSession(mic, speaker, VoiceConfig())
+
+    def _diar_result(self, embedding):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            segments=[
+                SimpleNamespace(speaker_label="SPEAKER_00",
+                                embedding=embedding),
+            ],
+        )
+
+    def _unit(self, seed=0, dim=192):
+        rng = np.random.default_rng(seed)
+        v = rng.standard_normal(dim).astype(np.float32)
+        return v / np.linalg.norm(v)
+
+    @pytest_asyncio.fixture
+    async def identity(self, tmp_path):
+        from boxbot.perception.clouds import CloudStore
+        from boxbot.perception.identity import IdentityService
+
+        store = CloudStore(db_path=tmp_path / "resolve.db")
+        await store.initialize()
+        svc = IdentityService(cloud_store=store)
+        await svc.start()
+        yield svc
+        await svc.stop()
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_label_only_without_identity_and_logs_once(self, caplog):
+        session = self._make_session()
+
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="boxbot.communication.voice"):
+            label_map, block = await session._resolve_speaker_identities(
+                self._diar_result(self._unit())
+            )
+            await session._resolve_speaker_identities(
+                self._diar_result(self._unit())
+            )
+
+        assert label_map == {"SPEAKER_00": "Speaker A"}
+        assert block["Speaker A"]["voice_tier"] == "unknown"
+        infos = [
+            r for r in caplog.records
+            if "Voice identity unavailable" in r.message
+            and r.levelno == logging.INFO
+        ]
+        assert len(infos) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_match_buffers_under_display_label(
+        self, identity, mock_config,
+    ):
+        session = self._make_session()
+        emb = self._unit(seed=3)
+
+        label_map, block = await session._resolve_speaker_identities(
+            self._diar_result(emb)
+        )
+
+        assert label_map == {"SPEAKER_00": "Speaker A"}
+        person = identity.enrollment.get_session_person("Speaker A")
+        assert person is not None
+        assert len(person.voice_embeddings) == 1
+
+    @pytest.mark.asyncio
+    async def test_cloud_match_attributes_by_name(
+        self, identity, mock_config,
+    ):
+        emb = self._unit(seed=5)
+        store = identity.cloud_store
+        pid = await store.create_person("Jacob")
+        # Identical vector in the cloud → cosine 1.0 ≥ confirmed (0.55).
+        await store.add_voice_embedding(pid, emb)
+
+        session = self._make_session()
+        label_map, block = await session._resolve_speaker_identities(
+            self._diar_result(emb)
+        )
+
+        assert label_map == {"SPEAKER_00": "Jacob"}
+        assert block["Jacob"]["voice_tier"] == "high"
+        assert block["Jacob"]["person_id"] == pid
+        # Reinforcement buffered under the display name + non-admitting claim.
+        assert identity.enrollment.get_session_person("Jacob") is not None
+        claim = identity.enrollment.get_claim("Jacob")
+        assert claim is not None
+        assert claim.source == "voice_reid_match"
+
+    @pytest.mark.asyncio
+    async def test_agent_identify_claim_overrides_label(
+        self, identity, mock_config,
+    ):
+        session = self._make_session()
+        emb = self._unit(seed=8)
+
+        # First utterance: unknown speaker, buffered as "Speaker A".
+        await session._resolve_speaker_identities(self._diar_result(emb))
+        # Agent then identifies them mid-session.
+        await identity.enrollment.identify("Jacob", "Speaker A")
+
+        label_map, block = await session._resolve_speaker_identities(
+            self._diar_result(emb)
+        )
+
+        assert label_map == {"SPEAKER_00": "Jacob"}
+        assert block["Jacob"]["source"] == "agent_identify"
+
+    @pytest.mark.asyncio
+    async def test_segment_without_embedding_is_label_only(
+        self, identity, mock_config,
+    ):
+        session = self._make_session()
+
+        label_map, block = await session._resolve_speaker_identities(
+            self._diar_result(None)
+        )
+
+        assert label_map == {"SPEAKER_00": "Speaker A"}
+        assert block["Speaker A"]["voice_tier"] == "unknown"
+        assert identity.enrollment.get_session_refs() == []
+
+    @pytest.mark.asyncio
+    async def test_confident_match_publishes_speaker_identified(
+        self, identity, mock_config,
+    ):
+        """The voice adapter is the single SpeakerIdentified publisher."""
+        from boxbot.core.events import SpeakerIdentified
+
+        emb = self._unit(seed=11)
+        store = identity.cloud_store
+        pid = await store.create_person("Jacob")
+        await store.add_voice_embedding(pid, emb)
+
+        published = []
+
+        async def capture(event):
+            published.append(event)
+
+        bus = get_event_bus()
+        bus.subscribe(SpeakerIdentified, capture)
+        try:
+            session = self._make_session()
+            await session._resolve_speaker_identities(self._diar_result(emb))
+        finally:
+            bus.unsubscribe(SpeakerIdentified, capture)
+
+        assert len(published) == 1
+        assert published[0].person_name == "Jacob"
+        assert published[0].person_id == pid
+        assert published[0].speaker_label == "SPEAKER_00"
+
+    @pytest.mark.asyncio
+    async def test_unknown_speaker_publishes_nothing(
+        self, identity, mock_config,
+    ):
+        from boxbot.core.events import SpeakerIdentified
+
+        published = []
+
+        async def capture(event):
+            published.append(event)
+
+        bus = get_event_bus()
+        bus.subscribe(SpeakerIdentified, capture)
+        try:
+            session = self._make_session()
+            await session._resolve_speaker_identities(
+                self._diar_result(self._unit(seed=12))
+            )
+        finally:
+            bus.unsubscribe(SpeakerIdentified, capture)
+
+        assert published == []

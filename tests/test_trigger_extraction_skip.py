@@ -334,3 +334,207 @@ class TestPostConversationTriggerSkip:
 
         agent._memory_store.create_pending_extraction.assert_awaited_once()
         agent._batch_poller.submit.assert_awaited_once()
+
+
+class TestSummarizeBridgedThread:
+    """The bridged copy in a recipient's own thread carries deliveries
+    as plain assistant turns, not ``message`` tool calls."""
+
+    def _bridged_thread(self) -> list[dict]:
+        from boxbot.core import agent as agent_mod
+        from boxbot.core.conversation import Conversation
+
+        trigger_thread = [
+            _trigger_initial_msg("Morning briefing"),
+            _assistant_message_tool_use("Jacob", "Rain today, high 65."),
+            _tool_result_user_msg(),
+        ]
+        transcript = agent_mod.BoxBotAgent._build_transcript(
+            trigger_thread, None,
+        )
+        return Conversation.build_trigger_context_turns(
+            description="Morning briefing",
+            transcript=transcript,
+            recipient="Jacob",
+            delivered_texts=["Rain today, high 65."],
+        )
+
+    def test_thread_owner_is_the_recipient(self) -> None:
+        summary = _summarize_trigger_thread(
+            self._bridged_thread(),
+            started_at="2026-09-17T07:00:00+00:00",
+            thread_owner="Jacob",
+        )
+        assert summary.startswith("Delivered")
+        assert "Morning briefing" in summary
+        assert "Jacob" in summary
+        assert "9/17" in summary
+        # Still a receipt — the delivered body must not leak.
+        assert "rain" not in summary.lower()
+
+    def test_without_thread_owner_behaviour_is_unchanged(self) -> None:
+        """A trigger run with no tool-call deliveries must not claim
+        one just because a person is attached."""
+        summary = _summarize_trigger_thread(
+            [_trigger_initial_msg("Midday check")],
+            started_at="2026-09-17T12:00:00+00:00",
+        )
+        assert "nothing delivered" in summary
+
+
+class TestSweepSkipsReplyLessBridgedThread:
+    """Regression for the panel cost_log finding: every proactive text
+    boxBot sends over Signal is bridged into a persistent
+    ``signal:<phone>`` thread, and 4 h later the rolling-window sweep
+    submitted a Sonnet extraction batch (~$0.01) over a thread that
+    contained only boxBot's own words. Drives the REAL bridge and the
+    REAL sweep against a temp ``ConversationStore`` so the swept thread
+    has exactly the shape the panel produces.
+    """
+
+    PHONE = "+15551111111"
+    KEY = f"signal:{PHONE}"
+
+    async def _agent_with_store(self, tmp_path, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from conftest import FakeAuth
+
+        from boxbot.conversations.store import ConversationStore
+        from boxbot.core import agent as agent_mod
+
+        store = ConversationStore(db_path=tmp_path / "conv.db")
+        await store.initialize()
+
+        agent = object.__new__(agent_mod.BoxBotAgent)
+        agent._index_lock = asyncio.Lock()
+        agent._conversations = {}
+        agent._conversation_by_key = {}
+        agent._conversation_store = store
+        agent._memory_store = MagicMock()
+        agent._memory_store.create_pending_extraction = AsyncMock()
+        agent._memory_store.get_pending_extraction = AsyncMock(
+            return_value="row"
+        )
+        agent._memory_store.get_conversation = AsyncMock(return_value=None)
+        agent._memory_store.create_conversation = AsyncMock()
+        agent._memory_store.update_conversation = AsyncMock()
+        agent._batch_poller = MagicMock()
+        agent._batch_poller.submit = AsyncMock()
+
+        class _User:
+            name, phone, channel = "Jacob", self.PHONE, "signal"
+
+        monkeypatch.setattr(
+            "boxbot.communication.auth.get_auth_manager",
+            lambda: FakeAuth([_User()]),
+        )
+        return agent, store
+
+    async def _bridge_morning_briefing(self, agent) -> str:
+        """Run the trigger's outbound text through dispatch-as-bridge
+        exactly as ``_write_trigger_summary`` does for a trigger run."""
+        from boxbot.core import agent as agent_mod
+        from boxbot.core.conversation import Conversation
+
+        trigger_thread = [
+            _trigger_initial_msg("Morning briefing"),
+            _assistant_message_tool_use("Jacob", "Rain today, high 65."),
+            _tool_result_user_msg(),
+        ]
+        turns = Conversation.build_trigger_context_turns(
+            description="Morning briefing",
+            transcript=agent_mod.BoxBotAgent._build_transcript(
+                trigger_thread, None,
+            ),
+            recipient="Jacob",
+            delivered_texts=["Rain today, high 65."],
+        )
+        await agent._bridge_trigger_delivery("Jacob", turns)
+        rec = await agent._conversation_store.get_active(
+            self.KEY, max_inactive_seconds=14400.0,
+        )
+        assert rec is not None and rec.channel == "signal"
+        return rec.conversation_id
+
+    @staticmethod
+    async def _expire(store, conversation_id: str) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        db = store._require_db()
+        far_past = (
+            datetime.now(timezone.utc) - timedelta(seconds=20000)
+        ).isoformat()
+        await db.execute(
+            "UPDATE conversations SET last_activity_at_iso = ? "
+            "WHERE conversation_id = ?",
+            (far_past, conversation_id),
+        )
+        await db.commit()
+
+    @staticmethod
+    async def _sweep_and_settle(agent, store) -> None:
+        import asyncio
+
+        await agent._run_extraction_sweep(store, window=14400.0)
+        pending = [
+            t for t in asyncio.all_tasks()
+            if t.get_name().startswith("extraction-")
+        ]
+        if pending:
+            await asyncio.gather(*pending)
+
+    @pytest.mark.asyncio
+    async def test_bridged_only_thread_is_summarised_not_extracted(
+        self, mock_config, tmp_path, monkeypatch,
+    ) -> None:
+        agent, store = await self._agent_with_store(tmp_path, monkeypatch)
+        try:
+            conv_id = await self._bridge_morning_briefing(agent)
+            thread = await store.get_thread(conv_id)
+            # Sanity: the panel shape — [trigger] framing + BB's text.
+            assert [m["role"] for m in thread] == ["user", "assistant"]
+            assert thread[0]["content"].startswith("[trigger]")
+
+            await self._expire(store, conv_id)
+            await self._sweep_and_settle(agent, store)
+
+            agent._memory_store.create_pending_extraction.assert_not_awaited()
+            agent._batch_poller.submit.assert_not_awaited()
+            agent._memory_store.create_conversation.assert_awaited_once()
+            kwargs = agent._memory_store.create_conversation.call_args.kwargs
+            assert kwargs["conversation_id"] == conv_id
+            assert kwargs["channel"] == "signal"
+            assert "Morning briefing" in kwargs["summary"]
+            assert "Jacob" in kwargs["summary"]
+            assert "rain" not in kwargs["summary"].lower()
+            assert (await store.get(conv_id)).state == "extracted"
+            # No re-bridge: the thread is exactly as long as before.
+            assert len(await store.get_thread(conv_id)) == 2
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_thread_with_human_reply_still_extracts(
+        self, mock_config, tmp_path, monkeypatch,
+    ) -> None:
+        agent, store = await self._agent_with_store(tmp_path, monkeypatch)
+        try:
+            conv_id = await self._bridge_morning_briefing(agent)
+            await store.append_turns(conv_id, [
+                {"role": "user", "content": "[Jacob]: thanks — remind me at 5"},
+                {"role": "assistant", "content": "Will do."},
+            ])
+
+            await self._expire(store, conv_id)
+            await self._sweep_and_settle(agent, store)
+
+            agent._memory_store.create_pending_extraction.assert_awaited_once()
+            kwargs = agent._memory_store.create_pending_extraction.call_args.kwargs
+            assert kwargs["conversation_id"] == conv_id
+            assert kwargs["channel"] == "signal"
+            agent._batch_poller.submit.assert_awaited_once()
+            agent._memory_store.create_conversation.assert_not_awaited()
+        finally:
+            await store.close()

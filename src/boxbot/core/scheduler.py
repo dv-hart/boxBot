@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -73,12 +74,16 @@ CREATE TABLE IF NOT EXISTS triggers (
     entity_state TEXT,
     for_person TEXT,
     todo_id TEXT,
+    run_integration TEXT,
+    run_script TEXT,
+    run_inputs TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     source TEXT NOT NULL DEFAULT 'agent',
     created_at TEXT NOT NULL,
     expires TEXT,
     last_fired TEXT,
     fire_count INTEGER NOT NULL DEFAULT 0,
+    rearm_after_s INTEGER,
     FOREIGN KEY (todo_id) REFERENCES todos(id)
 )"""
 
@@ -88,10 +93,29 @@ CREATE TABLE IF NOT EXISTS triggers (
 _MIGRATION_COLUMNS: list[tuple[str, str, str]] = [
     ("triggers", "entity", "entity TEXT"),
     ("triggers", "entity_state", "entity_state TEXT"),
+    ("triggers", "run_integration", "run_integration TEXT"),
+    ("triggers", "run_inputs", "run_inputs TEXT"),
+    ("triggers", "rearm_after_s", "rearm_after_s INTEGER"),
+    ("triggers", "run_script", "run_script TEXT"),
 ]
+
+# Re-arming triggers never fire twice inside this window regardless of how
+# small their ``rearm_after_s`` is. This is load-bearing, not politeness:
+# the 60s time scan evaluates entity conditions against the live state
+# mirror, so while a momentary detection is still "on" (CLEAR_AFTER_S in
+# the events bridges, 10s) the scan would re-fire an edge that already
+# fired. The floor must exceed that hold time.
+_REARM_FLOOR_S = 15.0
+
+# Default expiry for re-arming condition triggers. Standing watches hold
+# real resources (an entity watch keeps the ADC/HA events bridge connected),
+# so they expire unless explicitly renewed — but a "whenever" ask deserves
+# longer than the 7-day one-shot default.
+_REARM_DEFAULT_EXPIRY_DAYS = 30
 
 # Entity condition: entity ids look like "binary_sensor.front_door_person".
 _ENTITY_ID_RE = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
+
 
 _TODOS_DDL = """\
 CREATE TABLE IF NOT EXISTS todos (
@@ -105,6 +129,67 @@ CREATE TABLE IF NOT EXISTS todos (
     completed_at TEXT,
     source TEXT NOT NULL DEFAULT 'agent'
 )"""
+
+# ---------------------------------------------------------------------------
+# Script-execution triggers (run_integration)
+# ---------------------------------------------------------------------------
+
+
+def _validate_run_script(path: str) -> None:
+    """Check a run_script path is workspace-safe and exists.
+
+    Mirrors ``_validate_run_integration``'s fail-at-creation contract:
+    an unattended 3 a.m. run must not be the first place a typo'd path
+    surfaces. Path safety is the workspace's own ``_safe_path`` (no
+    absolute paths, no ``..``, no symlink escapes).
+
+    Raises:
+        ValueError: Unsafe path, missing file, or not a ``.py`` file.
+    """
+    from boxbot.workspace import Workspace, WorkspaceError
+
+    try:
+        abs_path = Workspace()._safe_path(path, must_exist=True)
+    except WorkspaceError as exc:
+        raise ValueError(f"run_script: {exc}") from exc
+    if abs_path.suffix != ".py":
+        raise ValueError(f"run_script must name a .py file, got {path!r}")
+
+
+def _validate_run_integration(
+    name: str, inputs: dict[str, Any] | None
+) -> None:
+    """Check the integration exists and accepts ``inputs``.
+
+    Lazy imports keep the integrations package (and its sandbox/action
+    chain) out of the scheduler's import graph.
+
+    Raises:
+        ValueError: Unknown integration, or inputs the manifest rejects.
+    """
+    from boxbot.integrations.loader import get_integration
+    from boxbot.integrations.runner import IntegrationRunError, _validate_inputs
+
+    meta = get_integration(name)
+    if meta is None:
+        raise ValueError(f"unknown integration '{name}'")
+    try:
+        _validate_inputs(meta, inputs or {})
+    except IntegrationRunError as e:
+        raise ValueError(str(e)) from e
+
+
+def _decode_run_inputs(raw: object) -> dict[str, Any] | None:
+    """Decode the stored ``run_inputs`` JSON column. Never raises."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Ignoring unparseable run_inputs: %s", raw[:200])
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
 
 # ---------------------------------------------------------------------------
 # Duration parsing
@@ -307,6 +392,10 @@ async def create_trigger(
     for_person: str | None = None,
     expires: str | None = None,
     todo_id: str | None = None,
+    run_integration: str | None = None,
+    run_script: str | None = None,
+    run_inputs: dict[str, Any] | None = None,
+    rearm_after_s: int | None = None,
     source: str = "agent",
 ) -> str:
     """Create a new trigger and return its ID.
@@ -327,10 +416,33 @@ async def create_trigger(
         for_person: Who this task relates to (context).
         expires: Explicit expiry datetime (ISO).
         todo_id: Optional link to a to-do item.
+        run_integration: Run this integration instead of waking the agent.
+            The integration must exist; ``run_inputs`` is validated against
+            its manifest here so bad wiring fails at creation, not at fire
+            time. ``instructions`` becomes the escalation context.
+        run_script: Run this workspace-relative ``.py`` file instead of
+            waking the agent — same unattended sandbox and escalate
+            contract as ``run_integration``, no registry. Path safety
+            and existence are validated here. Mutually exclusive with
+            ``run_integration``.
+        run_inputs: Inputs passed to ``run_integration`` (validated
+            against its manifest) or ``run_script`` (passed through;
+            the script reads them via ``bb.integration.inputs()``).
+        rearm_after_s: Make a condition trigger re-arm instead of
+            completing on first fire ("whenever X", not "next time X").
+            The trigger stays active after firing and can fire again
+            once this many seconds have passed (cooldown; a floor of
+            ``_REARM_FLOOR_S`` always applies). Requires a person or
+            entity condition; mutually exclusive with ``cron``, whose
+            schedule already recurs.
         source: One of "config", "agent", "conversation".
 
     Returns:
         The new trigger's ID (prefixed with "t_").
+
+    Raises:
+        ValueError: On any invalid condition, or unknown integration /
+            bad ``run_inputs``.
     """
     trigger_id = f"t_{uuid4().hex[:12]}"
     now = _now_iso()
@@ -345,6 +457,35 @@ async def create_trigger(
         raise ValueError("entity_state requires entity")
     if entity is not None and entity_state is None:
         entity_state = "on"
+
+    # Validate the script-execution path up front: unknown integration or
+    # inputs the manifest won't accept must fail now, not at 3 a.m. when the
+    # trigger fires unattended.
+    if run_integration is not None and run_script is not None:
+        raise ValueError(
+            "run_integration and run_script are mutually exclusive"
+        )
+    if run_inputs is not None and run_integration is None \
+            and run_script is None:
+        raise ValueError("run_inputs requires run_integration or run_script")
+    if run_integration is not None:
+        _validate_run_integration(run_integration, run_inputs)
+    if run_script is not None:
+        _validate_run_script(run_script)
+
+    # Validate re-arm semantics
+    if rearm_after_s is not None:
+        if not isinstance(rearm_after_s, int) or rearm_after_s < 0:
+            raise ValueError("rearm_after_s must be a non-negative integer")
+        if person is None and entity is None:
+            raise ValueError(
+                "rearm_after_s requires a person or entity condition"
+            )
+        if cron is not None:
+            raise ValueError(
+                "rearm_after_s is mutually exclusive with cron "
+                "(cron already recurs)"
+            )
 
     # Resolve fire_after → fire_at
     resolved_fire_at = fire_at
@@ -386,9 +527,15 @@ async def create_trigger(
         elif person is not None or entity is not None:
             # Person- or entity-only: transient conditions get a default
             # expiry window so forgotten watches don't linger forever.
-            expires = (
-                _now_utc() + timedelta(days=person_expiry_days)
-            ).isoformat()
+            # Re-arming watches ("whenever X") get a longer leash — they
+            # were asked for as standing behaviour — but still expire:
+            # an entity watch keeps an events bridge connected.
+            days = (
+                _REARM_DEFAULT_EXPIRY_DAYS
+                if rearm_after_s is not None
+                else person_expiry_days
+            )
+            expires = (_now_utc() + timedelta(days=days)).isoformat()
         # Time-only with no person: no auto-expiry needed (fires once, done)
 
     db = await _get_db()
@@ -396,9 +543,10 @@ async def create_trigger(
         await db.execute(
             """INSERT INTO triggers
                (id, description, instructions, fire_at, cron, person,
-                entity, entity_state, for_person, todo_id, status, source,
+                entity, entity_state, for_person, todo_id, run_integration,
+                run_script, run_inputs, rearm_after_s, status, source,
                 created_at, expires, last_fired, fire_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, NULL, 0)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, NULL, 0)""",
             (
                 trigger_id,
                 description,
@@ -410,6 +558,10 @@ async def create_trigger(
                 entity_state,
                 for_person,
                 todo_id,
+                run_integration,
+                run_script,
+                json.dumps(run_inputs) if run_inputs else None,
+                rearm_after_s,
                 source,
                 now,
                 expires,
@@ -484,6 +636,8 @@ async def update_trigger(trigger_id: str, **fields: Any) -> bool:
         "expires",
         "last_fired",
         "fire_count",
+        "rearm_after_s",
+        "run_script",
     }
     to_set = {k: v for k, v in fields.items() if k in allowed}
     if not to_set:
@@ -1139,8 +1293,54 @@ class Scheduler:
                 )
                 continue
 
+            if await self._reanchor_if_stale_cron(trigger):
+                continue
+
             if evaluate_trigger(trigger, self._present_people, self._entity_states):
                 await self._fire_trigger(trigger)
+
+    async def _reanchor_if_stale_cron(self, trigger: dict[str, Any]) -> bool:
+        """Skip-and-re-anchor a pure-time recurring trigger that is stale.
+
+        A cron trigger whose ``fire_at`` is overdue by more than
+        ``schedule.catch_up_grace_seconds`` (box booted after the slot, or
+        was down across it) is advanced to its next occurrence WITHOUT
+        firing — otherwise every reboot after a scheduled time replays the
+        missed wake cycle(s) at once. Returns True when re-anchored (caller
+        skips this trigger for the tick).
+
+        Scope is deliberately narrow: only pure-time cron triggers (no
+        ``person``/``entity`` gate). Compound triggers stay event-gated, and
+        one-shot ``fire_at`` triggers are untouched (they still fire once).
+        """
+        cron = trigger.get("cron")
+        if not cron or trigger.get("person") or trigger.get("entity"):
+            return False
+        fire_at = _parse_iso(trigger.get("fire_at"))
+        if fire_at is None:
+            return False
+
+        config = _try_get_config()
+        grace = timedelta(
+            seconds=config.schedule.catch_up_grace_seconds if config else 600
+        )
+        now = _now_utc()
+        if now - fire_at <= grace:
+            return False  # fresh enough — fire normally
+
+        next_fire = CronExpr(cron).next_occurrence(now)
+        await update_trigger(trigger["id"], fire_at=next_fire.isoformat())
+        # Allow the re-anchored occurrence to be prefetched again.
+        self._prefetch_signaled.discard(trigger["id"])
+        logger.info(
+            "Trigger %s stale (overdue %.0fs > grace); re-anchored to %s "
+            "without firing: %s",
+            trigger["id"],
+            (now - fire_at).total_seconds(),
+            next_fire.isoformat(),
+            trigger["description"],
+        )
+        return True
 
     async def _check_upcoming_triggers(self) -> None:
         """Emit TriggerUpcoming for time-triggers about to fire.
@@ -1175,6 +1375,8 @@ class Scheduler:
             tid = trigger["id"]
             if tid in self._prefetch_signaled:
                 continue
+            if trigger.get("run_integration") or trigger.get("run_script"):
+                continue  # runs a script, never a model — nothing to prefetch
             fire_at = _parse_iso(trigger.get("fire_at"))
             if fire_at is None:
                 continue  # person-only trigger — no lead time
@@ -1215,8 +1417,20 @@ class Scheduler:
     async def _fire_trigger(self, trigger: dict[str, Any]) -> None:
         """Fire a trigger: update state, emit event, handle recurrence."""
         trigger_id = trigger["id"]
-        is_recurring = trigger.get("cron") is not None
+        is_cron = trigger.get("cron") is not None
+        rearm_after_s = trigger.get("rearm_after_s")
         now = _now_iso()
+
+        # Refractory window for re-arming triggers. Both the condition
+        # edge (entity/person event) and the 60s time scan can evaluate
+        # the same still-true condition; one-shots are immune (status
+        # flips to "fired") but a re-arming trigger must not double-fire.
+        if rearm_after_s is not None:
+            last = _parse_iso(trigger.get("last_fired"))
+            if last is not None:
+                elapsed = (_now_utc() - last).total_seconds()
+                if elapsed < max(float(rearm_after_s), _REARM_FLOOR_S):
+                    return
 
         # Allow the next occurrence (recurring) to be prefetched again.
         self._prefetch_signaled.discard(trigger_id)
@@ -1225,7 +1439,7 @@ class Scheduler:
             "Firing trigger %s: %s", trigger_id, trigger["description"]
         )
 
-        if is_recurring:
+        if is_cron:
             # Recurring: update last_fired, increment count, compute next fire_at
             cron_expr = CronExpr(trigger["cron"])
             next_fire = cron_expr.next_occurrence(_now_utc())
@@ -1234,6 +1448,14 @@ class Scheduler:
                 last_fired=now,
                 fire_count=trigger["fire_count"] + 1,
                 fire_at=next_fire.isoformat(),
+            )
+        elif rearm_after_s is not None:
+            # Re-arming condition trigger: stays active, fires again the
+            # next time the condition is met after the cooldown.
+            await update_trigger(
+                trigger_id,
+                last_fired=now,
+                fire_count=trigger["fire_count"] + 1,
             )
         else:
             # One-shot: mark as fired
@@ -1252,8 +1474,11 @@ class Scheduler:
             person=trigger.get("person"),
             for_person=trigger.get("for_person"),
             todo_id=trigger.get("todo_id"),
-            is_recurring=is_recurring,
+            is_recurring=is_cron or rearm_after_s is not None,
             entity=trigger.get("entity"),
+            run_integration=trigger.get("run_integration"),
+            run_script=trigger.get("run_script"),
+            run_inputs=_decode_run_inputs(trigger.get("run_inputs")),
         )
         bus = get_event_bus()
         await bus.publish(event)

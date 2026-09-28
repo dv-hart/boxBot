@@ -30,6 +30,7 @@ for _mod_name in _MOCK_MODULES:
 
 import boxbot.core.config as config_module
 import boxbot.core.events as events_module
+from boxbot.communication.auth import AuthManager
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,17 @@ def reset_event_bus():
     events_module._event_bus = original
 
 
+@pytest.fixture(autouse=True)
+def reset_identity_registry():
+    """Reset the identity-service singleton before every test."""
+    from boxbot.perception import identity as identity_module
+
+    original = identity_module._identity_instance
+    identity_module._identity_instance = None
+    yield
+    identity_module._identity_instance = original
+
+
 @pytest.fixture
 def event_bus():
     """Return a fresh EventBus instance (also set as the global singleton)."""
@@ -224,8 +236,6 @@ async def photo_store(tmp_photos_db):
 @pytest_asyncio.fixture
 async def auth_manager(tmp_auth_db):
     """Create an initialized AuthManager backed by a temp database."""
-    from boxbot.communication.auth import AuthManager
-
     auth = AuthManager(
         db_path=tmp_auth_db,
         code_expiry=600,
@@ -236,3 +246,66 @@ async def auth_manager(tmp_auth_db):
     )
     await auth.init_db()
     return auth
+
+
+class FakeAuth(AuthManager):
+    """AuthManager over an in-memory user list — no DB, real lookup logic.
+
+    Only the reads outbound routing needs are overridden, so name
+    resolution under test is the shipping ``get_user_by_name``.
+    """
+
+    def __init__(self, users: list) -> None:
+        self._users = list(users)
+
+    async def list_users(self) -> list:
+        return list(self._users)
+
+    async def get_user(self, phone: str):
+        return next((u for u in self._users if u.phone == phone), None)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _close_cost_stores():
+    """Close the lazily-created cost-log stores at session end.
+
+    ``stt``, ``tts``, and ``web_search`` each lazily build a module-level
+    ``MemoryStore`` for appending ``cost_log`` rows and never close it.
+    Each one leaves a **non-daemon** ``aiosqlite`` connection-worker
+    thread alive, so ``threading._shutdown`` blocks forever and pytest
+    hangs *after* the run has finished and printed its results — a test
+    file that executes in 0.5s appears to wedge until something external
+    kills it.
+
+    This is teardown for state the tests created, so it belongs here. The
+    underlying leak is real in production too (a SIGTERM'd boxbot cannot
+    exit cleanly for the same reason) and wants its own ticket; closing
+    them here does not fix that, it only stops the test suite lying about
+    being hung.
+    """
+    yield
+
+    import asyncio
+
+    async def _close_all() -> None:
+        for mod_path in (
+            "boxbot.communication.stt",
+            "boxbot.communication.tts",
+            "boxbot.tools.builtins.web_search",
+        ):
+            mod = sys.modules.get(mod_path)
+            store = getattr(mod, "_cost_store", None) if mod else None
+            if store is None:
+                continue
+            try:
+                # Bounded: a fixture whose whole job is to stop the suite
+                # hanging must not be able to hang in its place.
+                await asyncio.wait_for(store.close(), 5.0)
+            except Exception:
+                pass
+            mod._cost_store = None
+
+    try:
+        asyncio.run(_close_all())
+    except Exception:
+        pass

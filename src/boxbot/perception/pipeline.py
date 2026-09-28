@@ -1,12 +1,15 @@
 """Perception pipeline orchestrator.
 
 Async loop that ties together motion detection, person detection, visual
-ReID, voice-visual fusion, embedding storage, enrollment, and the state
-machine. Owns references to Camera and Hailo HAL modules (injected) and
-creates all perception components internally.
+ReID, voice-visual fusion, and the state machine. Owns references to
+Camera and Hailo HAL modules (injected) and creates the visual
+components internally. Embedding storage and enrollment live on the
+composed ``IdentityService`` (``boxbot.perception.identity``), which
+also runs standalone on camera-less devices.
 
-Publishes MotionDetected, PersonDetected, PersonIdentified, and
-SpeakerIdentified events to the internal event bus.
+Publishes MotionDetected, PersonDetected, and PersonIdentified events
+to the internal event bus. (SpeakerIdentified is published by the voice
+adapter, which attributes utterances on every device class.)
 
 Usage:
     from boxbot.perception.pipeline import PerceptionPipeline
@@ -36,9 +39,7 @@ from boxbot.core.events import (
     MotionDetected,
     PersonDetected,
     PersonIdentified,
-    SpeakerIdentified,
     TranscriptReady,
-    VoiceSessionEnded,
     get_event_bus,
 )
 from boxbot.perception.clouds import CloudStore
@@ -46,6 +47,7 @@ from boxbot.perception.crops import CropManager
 from boxbot.perception.doa import DOATracker
 from boxbot.perception.enrollment import EnrollmentManager
 from boxbot.perception.fusion import IdentityFusion
+from boxbot.perception.identity import IdentityService
 from boxbot.perception.motion import MotionDetector
 from boxbot.perception.person_detector import PersonDetector
 from boxbot.perception.state_machine import PerceptionState, PerceptionStateMachine
@@ -113,6 +115,9 @@ class PerceptionPipeline:
         camera: Camera HAL module (must implement get_lores_frame, capture_frame).
         hailo: Hailo HAL module (must implement infer, inference_session).
         cloud_store: Optional CloudStore instance. Created internally if not provided.
+        identity: Optional IdentityService to compose (main.py starts one
+            on every device class). Created — and owned — internally if
+            not provided; ``cloud_store`` is then wrapped by it.
         microphone: Optional Microphone HAL module for DOA access.
         motion_threshold: Motion detection threshold (0-255 range).
         reid_high_threshold: High confidence ReID threshold.
@@ -132,6 +137,7 @@ class PerceptionPipeline:
         camera: Any,
         hailo: Any,
         cloud_store: CloudStore | None = None,
+        identity: IdentityService | None = None,
         microphone: Any = None,
         motion_threshold: float = 12.0,
         reid_high_threshold: float = 0.85,
@@ -156,9 +162,14 @@ class PerceptionPipeline:
         self._hailo = hailo
         self._microphone = microphone
 
-        # Cloud store — created lazily if not injected
-        self._cloud_store = cloud_store
-        self._owns_cloud_store = cloud_store is None
+        # Identity core (store + enrollment + session commit) — composed,
+        # not owned by perception: it runs on camera-less devices too.
+        # ``cloud_store`` is honoured by wrapping it in an owned service.
+        self._identity = identity or IdentityService(cloud_store=cloud_store)
+        self._owns_identity = identity is None
+        # Aliases to the service's objects, set in start(); every
+        # internal reference reads these.
+        self._cloud_store: CloudStore | None = None
 
         # Components (created in start)
         self._motion = MotionDetector(threshold=motion_threshold)
@@ -209,12 +220,12 @@ class PerceptionPipeline:
         """Initialize perception components and start the async loop."""
         global _pipeline_instance
 
-        # Initialize cloud store
-        if self._cloud_store is None:
-            self._cloud_store = CloudStore()
-            await self._cloud_store.initialize()
-
-        self._enrollment = EnrollmentManager(self._cloud_store)
+        # Start (idempotent) the identity core and alias its objects —
+        # the service owns store + enrollment and commits buffers on
+        # VoiceSessionEnded; perception reads/writes the same objects.
+        await self._identity.start()
+        self._cloud_store = self._identity.cloud_store
+        self._enrollment = self._identity.enrollment
 
         # Create identity fusion (needs cloud store + perception config)
         try:
@@ -235,7 +246,6 @@ class PerceptionPipeline:
         bus.subscribe(ConversationStarted, self._on_conversation_started)
         bus.subscribe(ConversationEnded, self._on_conversation_ended)
         bus.subscribe(TranscriptReady, self._on_transcript_ready)
-        bus.subscribe(VoiceSessionEnded, self._on_voice_session_ended)
 
         # Start the main perception loop
         self._running = True
@@ -259,7 +269,6 @@ class PerceptionPipeline:
         bus.unsubscribe(ConversationStarted, self._on_conversation_started)
         bus.unsubscribe(ConversationEnded, self._on_conversation_ended)
         bus.unsubscribe(TranscriptReady, self._on_transcript_ready)
-        bus.unsubscribe(VoiceSessionEnded, self._on_voice_session_ended)
 
         self._running = False
         if self._loop_task is not None:
@@ -270,8 +279,8 @@ class PerceptionPipeline:
                 pass
             self._loop_task = None
 
-        if self._owns_cloud_store and self._cloud_store is not None:
-            await self._cloud_store.close()
+        if self._owns_identity:
+            await self._identity.stop()
 
         _pipeline_instance = None
         logger.info("Perception pipeline stopped")
@@ -597,30 +606,8 @@ class PerceptionPipeline:
             event.conversation_id,
         )
 
-    async def _on_voice_session_ended(self, event: VoiceSessionEnded) -> None:
-        """Voice session fully ended — commit enrollment buffers.
-
-        A single voice session can span many conversations (each wake
-        word → transcript → agent turn is its own ConversationStarted/
-        Ended), but the enrollment buffers accumulate across all of
-        them. We flush once the voice session itself ends, routing each
-        ref's buffered voice + visual embeddings to the person their
-        session claim points at, or dropping them if no identity was
-        ever resolved.
-        """
-        if self._enrollment is None:
-            return
-        try:
-            summary = await self._enrollment.commit_session()
-            logger.info(
-                "Enrollment committed on voice session end (%s): %s",
-                event.conversation_id, summary,
-            )
-        except Exception:
-            logger.exception(
-                "commit_session failed for voice session %s",
-                event.conversation_id,
-            )
+    # Enrollment commit on VoiceSessionEnded lives on IdentityService —
+    # it must run on camera-less devices where this pipeline never starts.
 
     async def _on_transcript_ready(self, event: TranscriptReady) -> None:
         """Process speaker segments for voice identity fusion."""
@@ -691,17 +678,10 @@ class PerceptionPipeline:
                         score=result.confidence,
                     )
 
-            # Publish SpeakerIdentified for confirmed matches
-            if result.voice_confirmed and result.person_id and result.person_name:
-                await bus.publish(
-                    SpeakerIdentified(
-                        speaker_label=speaker_label,
-                        person_id=result.person_id,
-                        person_name=result.person_name,
-                        confidence=result.confidence,
-                        source=result.source,
-                    )
-                )
+            # SpeakerIdentified is published by the voice adapter
+            # (_resolve_speaker_identities) — the single publisher for
+            # both device classes; this handler only drives fusion
+            # admissions.
 
     # ── Post-conversation ─────────────────────────────────────────
 

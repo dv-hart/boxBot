@@ -113,6 +113,17 @@ tool when the agent names or identifies someone:
 - The agent provides semantic labels; this module handles all embedding
   bookkeeping
 
+### `identity.py`
+The camera-free identity core. `IdentityService` owns the CloudStore +
+EnrollmentManager and commits enrollment buffers on `VoiceSessionEnded`
+— the only path by which buffered embeddings persist. Started by
+main.py on **every** device class; the visual `PerceptionPipeline`
+composes it on camera+Hailo hardware, while camera-less devices run
+it alone so voice identity — cloud matching,
+`identify_person` enrollment, session-end commit — works without cv2
+or an NPU. Consumers use `get_identity()`; `get_pipeline()` is for the
+visual surface only (presence, crops).
+
 ### `presence.py`
 The agent-facing presence surface:
 - `format_presence_line(people)` — renders the `[Present: ...]` header

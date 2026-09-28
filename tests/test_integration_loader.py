@@ -273,3 +273,65 @@ class TestDiscoverIntegrations:
 
     def test_get_integration_returns_none_for_missing(self, tmp_path: Path):
         assert integ_loader.get_integration("ghost", root=tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# integrations.disabled
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledIntegrations:
+    @pytest.fixture
+    def disable(self, monkeypatch):
+        def _set(*names: str) -> None:
+            monkeypatch.setattr(
+                integ_loader, "disabled_integrations", lambda: set(names)
+            )
+            monkeypatch.setattr(integ_loader, "_logged_disabled", set())
+
+        return _set
+
+    def test_disabled_integration_is_not_discovered(
+        self, tmp_path: Path, disable
+    ):
+        _make_integration(tmp_path, "weather")
+        _make_integration(tmp_path, "home_assistant")
+        disable("home_assistant")
+        names = [
+            m.name for m in integ_loader.discover_integrations(root=tmp_path)
+        ]
+        assert names == ["weather"]
+
+    def test_get_integration_refuses_disabled(self, tmp_path: Path, disable):
+        _make_integration(tmp_path, "home_assistant")
+        disable("home_assistant")
+        assert (
+            integ_loader.get_integration("home_assistant", root=tmp_path)
+            is None
+        )
+
+    def test_skip_is_logged_once(self, tmp_path: Path, disable, caplog):
+        _make_integration(tmp_path, "home_assistant")
+        disable("home_assistant")
+        with caplog.at_level("INFO", logger="boxbot.integrations.loader"):
+            integ_loader.discover_integrations(root=tmp_path)
+            integ_loader.discover_integrations(root=tmp_path)
+        skips = [
+            r for r in caplog.records if "disabled by config" in r.message
+        ]
+        assert len(skips) == 1
+
+    def test_disabled_reads_config(self, monkeypatch):
+        from boxbot.core.config import BoxBotConfig
+
+        cfg = BoxBotConfig()
+        cfg.integrations.disabled = ["home_assistant"]
+        monkeypatch.setattr("boxbot.core.config.get_config", lambda: cfg)
+        assert integ_loader.disabled_integrations() == {"home_assistant"}
+
+    def test_disabled_is_empty_without_config(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("Configuration not loaded.")
+
+        monkeypatch.setattr("boxbot.core.config.get_config", _boom)
+        assert integ_loader.disabled_integrations() == set()

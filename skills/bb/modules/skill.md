@@ -16,7 +16,7 @@ morning brief"); the user asks you to remember a workflow ("when I say
 connectors → **integrations**. One-off scratch work → `bb.workspace`.
 Credentials → `bb.secrets`.
 
-## API
+## Call signatures — skill.create(name) builder: description / body / add_resource / add_script / save
 
 ```python
 import boxbot_sdk as bb
@@ -29,7 +29,7 @@ s.description = (
 s.body = """
 # Weather
 
-Use `bb.weather.forecast(days=N)` for an N-day forecast.
+Use `bb.integrations.get("weather")` for the forecast.
 Hourly precipitation detail: HOURLY.md.
 """
 s.add_resource("HOURLY.md", "# Hourly forecast\n\n…")
@@ -46,7 +46,7 @@ s.save()
 | `s.add_resource(f, content)` | optional, repeatable | Bare basename, skill root, conventionally `.md`. Cannot be `SKILL.md`. |
 | `s.save()` | terminal | Emits `skill.save`. Fails `status: "exists"` if `skills/<name>/` is taken. |
 
-## On disk
+## On-disk layout — skills/<name>/ SKILL.md + resources + scripts/
 
 ```
 skills/weather/
@@ -63,7 +63,7 @@ after save — you cannot overwrite a skill from a sandbox script.
 **No overwrite.** An existing `<name>` makes `save()` fail fast with
 `status: "exists"` and write nothing. This protects community skills.
 
-## Activation
+## Activation — discovery picks it up next conversation, no registration
 
 The loader picks new skills up on its next discovery scan, typically
 the next conversation. No live registration — and you do not need it:

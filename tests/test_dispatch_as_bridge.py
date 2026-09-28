@@ -16,7 +16,10 @@ Covers:
 """
 from __future__ import annotations
 
+import json
+
 import pytest
+from conftest import FakeAuth
 
 from boxbot.core.agent import (
     _delivered_text_messages_from_thread,
@@ -33,17 +36,30 @@ from boxbot.core.conversation import Conversation, ConversationState
 
 def _assistant_message(
     to: str, channel: str, content: str, *, name: str = "message",
+    tool_use_id: str = "toolu_x",
 ) -> dict:
     return {
         "role": "assistant",
         "content": [
             {
                 "type": "tool_use",
-                "id": "toolu_x",
+                "id": tool_use_id,
                 "name": name,
                 "input": {"to": to, "channel": channel, "content": content},
             }
         ],
+    }
+
+
+def _tool_result(tool_use_id: str, body: dict) -> dict:
+    """The user-side turn carrying a tool's result back to the model."""
+    return {
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": json.dumps(body),
+        }],
     }
 
 
@@ -103,6 +119,40 @@ class TestDeliveredTextParser:
         ]
         assert _delivered_text_messages_from_thread(msgs) == []
 
+    def test_dropped_deliveries_are_not_bridged(self):
+        """Regression: the parser read `message` calls and never their
+        results, so content the dispatcher dropped — filler, leaked tool
+        syntax, an unknown recipient — was written into the recipient's
+        thread labelled as something BB had said to them."""
+        msgs = [
+            _assistant_message(
+                "Jacob", "text", "placeholder", tool_use_id="t1",
+            ),
+            _tool_result("t1", {
+                "status": "error",
+                "message": "filler and self-referential content is not "
+                           "deliverable.",
+            }),
+            _assistant_message(
+                "Jacob", "text", "Bins go out tonight.", tool_use_id="t2",
+            ),
+            _tool_result("t2", {
+                "status": "delivered", "to": "Jacob", "channel": "text",
+            }),
+        ]
+        assert _delivered_text_messages_from_thread(msgs) == [
+            ("Jacob", "Bins go out tonight."),
+        ]
+
+    def test_calls_without_a_result_are_still_bridged(self):
+        """The claude_agent_sdk backend runs tools inside its own MCP
+        server, so no tool_result ever reaches the thread. Absence is
+        not a failure."""
+        msgs = [_assistant_message("Jacob", "text", "Morning briefing.")]
+        assert _delivered_text_messages_from_thread(msgs) == [
+            ("Jacob", "Morning briefing."),
+        ]
+
     def test_extracts_mcp_namespaced_deliveries(self):
         """Regression: the SDK backend records the delivery as
         mcp__boxbot_tools__message. The scanner missed it before, so the
@@ -119,6 +169,17 @@ class TestDeliveredTextParser:
 
 
 class TestTriggerReceipt:
+    def test_receipt_omits_dropped_deliveries(self):
+        """A receipt records where output went; a drop is not a delivery."""
+        msgs = [
+            {"role": "user", "content": "[Trigger fired: Morning briefing]"},
+            _assistant_message("Jacob", "text", "done", tool_use_id="t1"),
+            _tool_result("t1", {"status": "error", "message": "not deliverable"}),
+        ]
+        receipt = _summarize_trigger_thread(msgs, "2026-06-05T14:00:00")
+        assert "nothing delivered" in receipt
+        assert "Jacob" not in receipt
+
     def test_receipt_recognizes_mcp_namespaced_delivery(self):
         """The receipt summarizer must also see SDK-namespaced messages,
         or it reports 'nothing delivered' for a briefing that went out."""
@@ -306,8 +367,7 @@ async def test_bridge_routes_into_live_conversation(monkeypatch, mock_config):
     store.append_turns = AsyncMock()
     agent._conversation_store = store
 
-    fake_auth = MagicMock()
-    fake_auth.list_users = AsyncMock(return_value=[_FakeUser("Jacob", "+1555")])
+    fake_auth = FakeAuth([_FakeUser("Jacob", "+1555")])
     monkeypatch.setattr(
         "boxbot.communication.auth.get_auth_manager", lambda: fake_auth,
     )
@@ -322,12 +382,17 @@ async def test_bridge_routes_into_live_conversation(monkeypatch, mock_config):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("user_channel", ["whatsapp", "signal"])
 async def test_bridge_routes_to_store_when_no_live_conversation(
-    monkeypatch, mock_config,
+    monkeypatch, mock_config, user_channel,
 ):
     """No live conversation for the recipient → the delivery goes to
     the store (get_or_create_active + append_turns), so the next
-    inbound rehydrates a thread containing the briefing."""
+    inbound rehydrates a thread containing the briefing.
+
+    The thread is keyed on the recipient's own transport — a Signal
+    user's bridged thread must be the one Signal inbound rehydrates.
+    """
     import asyncio
     from unittest.mock import AsyncMock, MagicMock
     from boxbot.core import agent as agent_mod
@@ -344,10 +409,7 @@ async def test_bridge_routes_to_store_when_no_live_conversation(
     store.append_turns = AsyncMock()
     agent._conversation_store = store
 
-    fake_auth = MagicMock()
-    fake_auth.list_users = AsyncMock(
-        return_value=[_FakeUser("Carina", "+1777")]
-    )
+    fake_auth = FakeAuth([_FakeUser("Carina", "+1777", channel=user_channel)])
     monkeypatch.setattr(
         "boxbot.communication.auth.get_auth_manager", lambda: fake_auth,
     )
@@ -362,10 +424,9 @@ async def test_bridge_routes_to_store_when_no_live_conversation(
     )
 
     store.get_or_create_active.assert_awaited_once()
-    assert (
-        store.get_or_create_active.call_args.kwargs["channel_key"]
-        == "whatsapp:+1777"
-    )
+    kwargs = store.get_or_create_active.call_args.kwargs
+    assert kwargs["channel"] == user_channel
+    assert kwargs["channel_key"] == f"{user_channel}:+1777"
     store.append_turns.assert_awaited_once()
     cid, turns = store.append_turns.call_args.args
     assert cid == "conv_carina_stored"
@@ -391,8 +452,7 @@ async def test_bridge_drops_unregistered_recipient(monkeypatch, mock_config):
     store.append_turns = AsyncMock()
     agent._conversation_store = store
 
-    fake_auth = MagicMock()
-    fake_auth.list_users = AsyncMock(return_value=[_FakeUser("Jacob", "+1555")])
+    fake_auth = FakeAuth([_FakeUser("Jacob", "+1555")])
     monkeypatch.setattr(
         "boxbot.communication.auth.get_auth_manager", lambda: fake_auth,
     )
@@ -401,6 +461,34 @@ async def test_bridge_drops_unregistered_recipient(monkeypatch, mock_config):
     await agent._bridge_trigger_delivery(
         "Stranger", _ctx_turns(recipient="Stranger"),
     )
+
+    store.get_or_create_active.assert_not_awaited()
+    store.append_turns.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bridge_drops_unknown_channel(monkeypatch, mock_config):
+    """An unrecognised channel on the user record drops the bridge —
+    guessing a key would mint a thread nothing can rehydrate."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from boxbot.core import agent as agent_mod
+
+    agent = object.__new__(agent_mod.BoxBotAgent)
+    agent._index_lock = asyncio.Lock()
+    agent._conversations = {}
+    agent._conversation_by_key = {}
+    store = MagicMock()
+    store.get_or_create_active = AsyncMock()
+    store.append_turns = AsyncMock()
+    agent._conversation_store = store
+
+    fake_auth = FakeAuth([_FakeUser("Jacob", "+1555", channel="carrier-pigeon")])
+    monkeypatch.setattr(
+        "boxbot.communication.auth.get_auth_manager", lambda: fake_auth,
+    )
+
+    await agent._bridge_trigger_delivery("Jacob", _ctx_turns())
 
     store.get_or_create_active.assert_not_awaited()
     store.append_turns.assert_not_awaited()

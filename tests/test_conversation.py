@@ -571,3 +571,30 @@ async def test_context_is_available_to_generator():
     )
     await conv._generation_task  # type: ignore[arg-type]
     assert observed == {"voice_session_id": "v123", "speaker_tier": "high"}
+
+
+@pytest.mark.asyncio
+async def test_generator_exception_publishes_agent_turn_ended():
+    """A failed turn is still a turn end — the voice adapter keys the
+    post-response mic-idle timer and the thinking-ring clear off
+    AgentTurnEnded, so the error path must publish it too."""
+    from boxbot.core.events import AgentTurnEnded, get_event_bus
+
+    received = []
+
+    async def handler(event):
+        received.append(event)
+
+    get_event_bus().subscribe(AgentTurnEnded, handler)
+
+    async def gen(conv):
+        raise RuntimeError("boom")
+
+    conv = _make_conv(gen, silence_timeout=0)
+    await conv.handle_input("first")
+    await conv._generation_task  # type: ignore[arg-type]
+
+    assert conv.state is ConversationState.LISTENING
+    assert len(received) == 1
+    assert received[0].conversation_id == conv.conversation_id
+    assert received[0].channel == conv.channel

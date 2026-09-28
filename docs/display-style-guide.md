@@ -1,48 +1,40 @@
 # boxBot Display Style Guide
 
-> **Status:** Proposal — synthesizes existing rules from
-> `display-system.md` and `display-development.md` with the project's
-> physical and brand context. Review before treating as canonical.
+> **Status:** Canonical. The `boxbot` default theme, the renderer's
+> layout rules, and every shipped display spec follow this guide.
+> Verified on real hardware at 1024×600 (7" Pi display) and 1280×800.
 
 ## 1. Premise
 
-> *What if Anthropic made a smart speaker?*
+boxBot's screen is an **ambient panel**, not an app. It is glanced at
+from across a room, mounted flush in a household — a wooden box on a
+shelf or a screen on a wall. The visual language is
+**Alarm.com, modernized**: the confidence of a security brand — deep
+slate, one signal orange, disciplined type — with the calm of a
+well-made ambient display. Fresh, not corporate; quiet, not empty.
 
-boxBot is the answer. The visual language of the display extends a
-physical object — a black walnut box with 3/4" roundovers — into pixels.
-Mid-century modern furniture meets Apple curves. A vintage wooden radio
-crossed with an iPhone. The screen is the glowing dial of that radio,
-not a generic tablet UI.
+Every choice should pass one test: **does this read instantly from
+two meters, and would it look at home next to the Alarm.com wordmark?**
 
-Every visual choice should pass one test: **does this feel like it
-belongs in the wooden box?**
+## 2. Design pillars
 
-## 2. Inspirations
-
-| Source | What we borrow |
+| Pillar | In practice |
 |---|---|
-| **Anthropic brand** | Warm coral-amber accent, restrained palette, calm tone, plain-spoken typography |
-| **Vintage radios & nixie tubes** | Amber-on-dark glow, soft warmth, physicality of materials |
-| **Mid-century modern furniture** | Honest materials, generous proportions, low-contrast confidence |
-| **Apple industrial design** | Tight type, soft roundovers, content-first restraint |
-| **Black walnut enclosure** | Backgrounds are warm charcoal, never cold black; nothing on screen should clash with the wood it sits inside |
+| **Slate, not black** | Backgrounds are deep blue-gray slate (`#141a21`), straight from Alarm.com's ink color family. Never pure black, never brown, never cold neutral gray. |
+| **One signal** | Alarm.com orange (`#f25e0f`) is *the* signal. One or two orange elements per screen. Orange means "this is the thing" — never decoration. |
+| **Type carries hierarchy** | Inter, six sizes, tight tracking on display sizes. Size + weight + tone (text/muted/dim) do the structuring; boxes and lines don't. |
+| **Soft, flat, precise** | Surfaces are flat slate cards with generous radius and a whisper of shadow. No gradients-as-decoration, no glassmorphism, no neon. |
+| **Composed, not stacked** | Content is deliberately placed on the full canvas — centered heroes, anchored footers, balanced grids. Never a top-pinned stack with a dead bottom half. |
 
-What we are **not**: dashboard-y, neon, gamer, glassmorphic, Material
-Design, generic dark-mode-grey.
+What we are **not**: dashboard-dense, Material Design, gamer RGB,
+skeuomorphic, or a web page.
 
 ## 3. Color
 
-### 3.1 Principle
+### 3.1 Token system
 
-The display should harmonize with walnut, not fight it. Backgrounds are
-**warm dark** (slight brown/amber bias), accents are **warm metals**
-(amber-coral, soft gold), and pure white / pure black are forbidden.
-Saturated primaries (Material blue, alert red) are forbidden.
-
-### 3.2 Token system
-
-Agents and contributors use **semantic tokens**, never hex literals.
-The token names are stable across themes — only the values change.
+Displays use **semantic tokens only** — never hex literals in a spec.
+Token names are stable across themes; only values change.
 
 ```
 background     surface     surface_alt
@@ -51,176 +43,147 @@ accent         accent_soft secondary
 success        warning     error
 ```
 
-See `display-system.md §Theme Schema` for the canonical schema.
+**Rule:** if you write `#` in a display spec, you're doing it wrong.
 
-**Rule:** if you find yourself writing `#` in display code, you're
-doing it wrong. Add a theme token instead.
+### 3.2 Default palette — `boxbot` theme
 
-### 3.3 Default palette — `boxbot` theme
-
-The signature theme. Everything else is a variant.
+Derived directly from Alarm.com's brand palette (slate ink `#1d252d`,
+signal orange `#e35205`/`#f25e0f`, slate grays `#505a6a`/`#8a989e`),
+tuned for a self-luminous dark panel.
 
 | Token | Value | Role |
 |---|---|---|
-| background | `#191714` | Deep warm charcoal — reads as walnut shadow |
-| surface | `#252018` | Card background, slightly lifted |
-| surface_alt | `#302a20` | Nested depth |
-| text | `#ede8e0` | Warm cream — like the inside of a lampshade |
-| muted | `#8a8078` | Warm gray |
-| dim | `#5a5550` | Timestamps, dots, subtle metadata |
-| **accent** | **`#d4845a`** | **Amber-coral — Anthropic-inspired, the BB voice** |
-| accent_soft | `#d4845a22` | Tinted backgrounds, badges |
-| secondary | `#c4a46c` | Soft gold — tube-glow warmth |
-| success | `#7a9e6c` | Earthy sage, never a bright green |
-| warning | `#d4a043` | Warm amber |
-| error | `#c45c5c` | Muted red, never fire-engine |
+| background | `#141a21` | Deep slate — Alarm.com ink, deepened for ambient use |
+| surface | `#1d252d` | Card background — Alarm.com's exact brand dark |
+| surface_alt | `#28323c` | Nested depth, chart tracks, stripes |
+| text | `#f0f2f3` | Primary text — Alarm.com light gray |
+| muted | `#8a989e` | Secondary text — Alarm.com slate gray |
+| dim | `#505a6a` | Tertiary — timestamps, grid lines, inactive dots |
+| **accent** | **`#f25e0f`** | **Signal orange — Alarm.com brand. THE highlight.** |
+| accent_soft | `#f25e0f29` | Tinted fills behind accent content (badges, pills) |
+| secondary | `#ff9965` | Orange tint — chart lines, secondary emphasis |
+| success | `#3fae5f` | Calm green (from Alarm.com `#0caa41`, desaturated for dark) |
+| warning | `#e8a33d` | Amber |
+| error | `#e2574b` | Alert red — reserved for true alarm states |
 
-The accent (`#d4845a`) is boxBot's **signature color** — it's the voice
-of the system on screen. Use it sparingly: one or two highlights per
-view, not as decoration.
-
-### 3.4 Theme variants
+### 3.3 Theme variants
 
 | Theme | When | Mood |
 |---|---|---|
-| `boxbot` | Default, daytime, ambient | Warm minimal — the canonical look |
-| `midnight` | Late hours, paired with HAL dimming | Near-black, only essentials visible, no shadows |
-| `daylight` | Bright rooms, well-lit kitchens | Warm linen background, deeper amber accent for contrast |
-| `classic` | Vintage / radio mode | Amber-tinted text on dark, nixie-tube energy |
+| `boxbot` | Default, day and evening | Slate + signal orange — the canonical look |
+| `midnight` | Late hours, paired with HAL dimming | Embers: near-black slate, dimmed text, no orange louder than a coal |
+| `daylight` | Bright rooms | Alarm.com web look: `#f4f4f4` field, white cards, ink text, `#e35205` accent |
+| `classic` | Heritage / vintage radio mode | The original warm amber-on-walnut boxBot palette, kept as a variant |
 
-All four use the same token names and the same Inter type scale. Themes
-are interchangeable per display.
+All variants share token names, the Inter scale, and spacing. Specs
+are theme-portable by construction.
+
+### 3.4 Usage rules
+
+- **Orange budget: 1–2 elements per screen.** The active state chip,
+  the next event time, the alarm badge. Two accents = no accent.
+- `secondary` (`#ff9965`) for charts and quieter emphasis so the
+  full-strength orange keeps its authority.
+- `error` appears only for genuinely wrong states (offline, alarm,
+  failure) — never as a warm decoration.
+- Eyebrow labels (`OUTSIDE`, `NEXT UP`) are `muted`, values are `text`,
+  footnotes are `dim`. Three tones, consistently.
 
 ## 4. Typography
 
 ### 4.1 Family
 
-**Inter** is the standard, always available, used in all built-in
-themes. Community themes can bundle a different font in
-`themes/{name}/fonts/`, but Inter is the default and the fallback.
-
-Why Inter: it carries the Apple-grade restraint without being SF, sits
-quietly on a warm background, and reads well at 1–2 m.
+**Inter**, bundled, all themes. Weights: Regular 400, Medium 500,
+SemiBold 600, Bold 700, ExtraBold 800.
 
 ### 4.2 Scale
 
-A single 6-step scale — never invent custom sizes.
+| Token | Size | Weight | Tracking | Use |
+|---|---|---|---|---|
+| `title` | 42 | 700 | −0.02em | Hero number/headline — once per display |
+| `heading` | 28 | 600 | −0.01em | Section headers, greeting |
+| `subtitle` | 22 | 500 | 0 | Supporting line under a hero |
+| `body` | 18 | 400 | 0 | Default text |
+| `caption` | 15 | 400 | 0 | Metadata, axis ticks |
+| `small` | 13 | 500 | +0.06em | Eyebrow labels (uppercase), footnotes |
 
-| Token | Size | Weight | Use |
-|---|---|---|---|
-| `title` | 42 | 700 | Once per display, top-of-hierarchy (clock, headline number) |
-| `heading` | 28 | 600 | Section headers, item titles |
-| `subtitle` | 22 | 500 | Supporting copy under a heading |
-| `body` | 18 | 400 | Default paragraph and list text |
-| `caption` | 15 | 400 | Metadata, labels, axis ticks |
-| `small` | 13 | 400 | Footnotes, source attributions |
+**Floor:** 18px for prose. Smaller sizes are labels/metadata only.
 
-**Floor:** 18 px for any prose. The display is read from across a
-living room — body text smaller than that is decorative, not legible.
+**Eyebrow pattern:** uppercase `small` + `semibold` + `muted` +
+positive tracking. This is the standard section label
+(`WEATHER`, `TO-DO`, `POWER DRAW`).
 
-### 4.3 Tracking
+### 4.3 Clock numerals
 
-Negative tracking on display sizes (`title: -0.02em`, `heading:
--0.01em`) for an Apple-tight feel. Body and below: default tracking.
+Clocks are the most-seen pixels boxBot renders. Dedicated sizes:
+`md` 40 / `lg` 64 / `xl` 112, weight 600, tracking −0.03em. The date
+line sits below at `subtitle`/`muted` with a fixed 12px gap, and the
+time+date group centers **as a unit** in its container — the renderer
+guarantees they never collide.
 
-## 5. Shape & spacing
+## 5. Shape, space, composition
 
-### 5.1 Roundovers
+### 5.1 Surfaces
 
-The physical box has a **3/4" roundover**. The screen echoes that — every
-card and surface uses generous corner radius. Sharp corners are reserved
-for dividers and chart grid lines.
-
-| Element | Radius |
-|---|---|
-| `card` | `14` (default) — matches enclosure feel |
-| `classic` theme override | `10` — slightly tighter, vintage |
-| Chips, badges | `8` |
-| Pills | half height |
-| Divider lines | `0` (sharp) |
+- Card radius **16** (all themes except `classic` at 10).
+- Shadow: a soft, blurred, low-alpha drop (renderer-composited) —
+  never a hard offset edge. `midnight` disables shadows entirely.
+- Card interiors: 18–24px padding. Content never touches a card edge.
 
 ### 5.2 Spacing scale
 
-Use the theme spacing tokens. No magic numbers.
+`xs 4 · sm 8 · md 16 · lg 24 · xl 32` — no magic numbers between.
+Screen margins: ≥32px on the panel canvas. Cards breathe: ≥14px gaps.
 
-| Token | Pixels | Use |
-|---|---|---|
-| `xs` | 4 | Tight inline gaps |
-| `sm` | 8 | Within a card, between label and value |
-| `md` | 16 | Between cards, section padding |
-| `lg` | 24 | Section breaks, card outer padding |
-| `xl` | 32 | Top-level layout breathing room |
+### 5.3 Composition (the anti-dead-space rules)
 
-### 5.3 Layout
-
-- **Resolution:** 1024 × 600, landscape, fixed.
-- **Layout is flow-based** (`row`, `column`, `columns([2,1])`). Agents
-  and contributors **never** write pixel coordinates.
-- **One title per display.** If you find yourself reaching for a second
-  `title`, it's probably a `heading`.
-- **Generous whitespace.** Mid-century furniture proportions —
-  air around content, not edge-to-edge density.
-- **Content-first.** Chrome (borders, backgrounds, dividers) earns its
-  place by clarifying hierarchy. Decorative chrome is removed.
+- **Own the full canvas.** Layouts must look composed at both
+  1024×600 and 1280×800. Columns support main-axis `align:
+  start|center|end` and **flex spacers** (`spacer` with no size)
+  that absorb leftover height — use them. A top-pinned stack with an
+  empty bottom half is a defect.
+- **Ambient screens center their hero** (clock, person name) slightly
+  above geometric center, metadata anchored to an edge.
+- **Dashboards balance the grid** — cards share row heights; a short
+  card gets its content vertically centered, not top-pinned over a void.
+- **Rows center-align vertically** (`valign: center` is the default):
+  icons sit on the text's optical centerline, never hanging from the
+  top edge.
+- One `title`-sized element per display. Generous negative space is a
+  feature — density is capped at ~3 information groups per screen.
 
 ## 6. Iconography
 
-- Style: **outline** in `boxbot`, `midnight`, `daylight`, `classic`. Set
-  via `icon_style: outline` in the theme.
-- Stroke weight matches Inter's regular weight — icons should feel like
-  letterforms, not stickers.
-- Color: same tokens as text (`text`, `muted`, `accent`).
-- **Filled icons** are reserved for "on/active" states (e.g. a filled
-  bell for an active alert).
+- **Lucide outline**, stroke color from the same three text tones.
+- Icon size pairs with the text it accompanies (`sm` 16 ↔ caption,
+  `md` 24 ↔ body/subtitle, `lg` 32 ↔ heading, `xl` 48 ↔ hero).
+- Icons are labels, not decoration — an icon without adjacent text
+  must be universally readable (weather glyphs, mic, wifi).
+- Accent-colored icons count against the orange budget.
 
 ## 7. Motion
 
-- Default transition: **`crossfade`** between displays. Slow enough to
-  feel intentional, fast enough not to annoy (~250 ms target).
-- Live blocks (clock, countdown) tick at 1 fps. No animations on idle.
-- Data blocks fade in on refresh — never pop or slide aggressively.
-- The `midnight` theme disables shadows; consider also softening
-  transitions there if it ever feels jarring at night.
-- **No bouncing, no parallax, no spinners-as-decoration.** A still
-  display is the default state.
+- Display switches: **crossfade ~250ms**. Nothing else moves at idle.
+- Live blocks (clock, countdown) tick at 1fps with no transition.
+- Data refreshes swap in place — no slides, no pops, no spinners.
 
-## 8. Composition principles
+## 8. Checklist
 
-1. **Calm over busy.** A boxBot display is glanced at, not studied.
-   If it has more than ~3 information densities, simplify.
-2. **One accent per view.** The amber-coral is a signal, not a
-   pattern. Two accents = no accent.
-3. **No conditional logic in the spec.** Mapping (value → icon, value
-   → color) belongs in the data source, not in the layout. Keeps
-   displays declarative and reviewable.
-4. **Theme tokens or nothing.** No hardcoded colors, no hardcoded font
-   sizes. If a token is missing for a real need, propose adding one.
-5. **Performance budget: render in <50 ms.** Heavy work in `setup()`
-   or background tasks, not the render loop.
-6. **Wood-first contrast check.** Imagine the rendered display set into
-   the walnut box. If it would visually clash with the wood (cold
-   blues, neon greens, pure white panels), revise.
+Before shipping a display:
 
-## 9. Quick checklist
+- [ ] Composed at 1280×800 **and** 1024×600 — no dead bottom half
+- [ ] ≤2 orange elements; eyebrows muted; footnotes dim
+- [ ] All colors are tokens; all sizes from the scale
+- [ ] Rows valign-centered; no icon hanging above its label's centerline
+- [ ] Text never collides — verify with the preview renderer, then on-device
+- [ ] Renders cleanly on `boxbot`, `midnight`, `daylight`
+- [ ] Reads from 2m: hero legible, eyebrows discernible, footnotes ignorable
 
-Before shipping a display, confirm:
+## 9. References
 
-- [ ] Background uses a warm dark token (not cold grey, not pure black)
-- [ ] At most one accent-colored element drives the eye
-- [ ] All colors are theme tokens — no hex in the spec
-- [ ] Body text ≥ 18 px; one `title` maximum
-- [ ] Cards use the theme `radius`; corners feel rounded, not square
-- [ ] Layout is flow-based — no pixel coordinates
-- [ ] Renders cleanly on `boxbot`, `midnight`, and `daylight`
-- [ ] No spinners, bounces, or parallax
-- [ ] Reads from 1–2 m away
-- [ ] Looks like it belongs in a wooden box
-
-## 10. References
-
-- `docs/display-system.md` — block library, theme schema, full theme
-  definitions, data binding
-- `docs/display-development.md` — author workflow, performance rules
-- `themes/` — community theme drop-in directory
-- Anthropic brand color reference — the `#d4845a` accent traces back
-  here
+- `docs/display-system.md` — block library, theme schema, data binding
+- `docs/display-development.md` — authoring workflow
+- `src/boxbot/displays/themes.py` — canonical theme values
+- Alarm.com brand palette (extracted from alarm.com production CSS):
+  orange `#e35205` / `#f25e0f` / `#bf4600` / `#ff9965`, slate ink
+  `#1d252d`, slate grays `#505a6a` / `#8a989e` / `#d7dee0` / `#f4f4f4`

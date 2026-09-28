@@ -169,6 +169,52 @@ class TurnRecord:
         )
 
 
+def render_thread_text(
+    turns: list[dict[str, Any]],
+    *,
+    user_label: str = "User",
+    agent_name: str = "boxBot",
+) -> str:
+    """Human-readable text for stored thread turns (transcript recovery).
+
+    User utterances and ``message``-tool deliveries only — assistant
+    ``text`` blocks are the model's private internal notes and never
+    re-enter a prompt. User lines that already carry a ``[Name]:``
+    speaker label are kept verbatim.
+    """
+    lines: list[str] = []
+
+    def _user_line(text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        lines.append(text if text.startswith("[") else f"[{user_label}]: {text}")
+
+    for turn in turns:
+        role = turn.get("role")
+        content = turn.get("content")
+        if role == "user":
+            if isinstance(content, str):
+                _user_line(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        _user_line(str(block.get("text") or ""))
+        elif role == "assistant" and isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == "message"
+                ):
+                    inp = block.get("input") or {}
+                    delivered = str(inp.get("content") or "").strip()
+                    if delivered:
+                        to = str(inp.get("to") or inp.get("channel") or "user")
+                        lines.append(f"[{agent_name} → {to}]: {delivered}")
+    return "\n".join(lines)
+
+
 class ConversationStore:
     """SQLite-backed conversation persistence.
 

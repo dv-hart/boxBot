@@ -7,8 +7,9 @@
   ],
   "layout": {
     "type": "column",
-    "padding": [20, 28, 20, 28],
-    "gap": 14,
+    "padding": [24, 32, 24, 32],
+    "gap": 16,
+    "align": "center",
     "children": [
       {
         "type": "row",
@@ -23,15 +24,15 @@
       {
         "type": "columns",
         "ratios": [1, 1, 1, 1],
-        "gap": 14,
+        "gap": 16,
         "children": [
           {
             "type": "card",
-            "padding": 16,
+            "padding": 18,
             "children": [
               {
                 "type": "column",
-                "gap": 6,
+                "gap": 8,
                 "children": [
                   {
                     "type": "row",
@@ -50,18 +51,18 @@
           },
           {
             "type": "card",
-            "padding": 16,
+            "padding": 18,
             "children": [
               {
                 "type": "column",
-                "gap": 6,
+                "gap": 8,
                 "children": [
                   {
                     "type": "row",
                     "align": "start",
                     "gap": 8,
                     "children": [
-                      { "type": "icon", "name": "home", "size": "sm", "color": "accent" },
+                      { "type": "icon", "name": "home", "size": "sm", "color": "muted" },
                       { "type": "text", "content": "INSIDE", "size": "small", "color": "muted", "weight": "semibold" }
                     ]
                   },
@@ -73,18 +74,18 @@
           },
           {
             "type": "card",
-            "padding": 16,
+            "padding": 18,
             "children": [
               {
                 "type": "column",
-                "gap": 6,
+                "gap": 8,
                 "children": [
                   {
                     "type": "row",
                     "align": "start",
                     "gap": 8,
                     "children": [
-                      { "type": "icon", "name": "wifi", "size": "sm", "color": "success" },
+                      { "type": "icon", "name": "wifi", "size": "sm", "color": "muted" },
                       { "type": "text", "content": "NETWORK", "size": "small", "color": "muted", "weight": "semibold" }
                     ]
                   },
@@ -96,11 +97,11 @@
           },
           {
             "type": "card",
-            "padding": 16,
+            "padding": 18,
             "children": [
               {
                 "type": "column",
-                "gap": 6,
+                "gap": 8,
                 "children": [
                   {
                     "type": "row",
@@ -122,15 +123,15 @@
       {
         "type": "columns",
         "ratios": [3, 2],
-        "gap": 14,
+        "gap": 16,
         "children": [
           {
             "type": "card",
-            "padding": 18,
+            "padding": 20,
             "children": [
               {
                 "type": "column",
-                "gap": 10,
+                "gap": 12,
                 "children": [
                   {
                     "type": "row",
@@ -142,18 +143,18 @@
                       { "type": "text", "content": "7 days · 38W avg", "size": "small", "color": "dim" }
                     ]
                   },
-                  { "type": "chart", "chart_type": "area", "data": [32, 28, 35, 41, 38, 44, 40], "height": 170, "show_dots": true, "x_labels": ["Fri","Sat","Sun","Mon","Tue","Wed","Thu"] }
+                  { "type": "chart", "chart_type": "area", "data": [32, 28, 35, 41, 38, 44, 40], "height": 200, "color": "secondary", "fill_opacity": 0.09, "show_dots": true, "x_labels": ["Fri", "Sat", "Sun", "Mon", "Tue", "Wed", "Thu"] }
                 ]
               }
             ]
           },
           {
             "type": "card",
-            "padding": 18,
+            "padding": 20,
             "children": [
               {
                 "type": "column",
-                "gap": 12,
+                "gap": 14,
                 "children": [
                   { "type": "text", "content": "SYSTEM", "size": "small", "color": "muted", "weight": "semibold" },
                   {

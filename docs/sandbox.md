@@ -151,6 +151,47 @@ boxbot-sandbox (sandbox script user):
   - Can write to skills/                 (group-writable for skill creation)
 ```
 
+#### Chroot (running as root)
+
+On the Pi, boxBot runs unprivileged and drops to `boxbot-sandbox` with
+`sudo -u`. Some hosts run boxBot **as root inside a Debian chroot**
+(e.g. on top of Android) — there is no `sudo`, and root bypasses the
+file-mode fences.
+Root is exactly what lets us drop privileges *directly*, so the same
+isolation model applies; it just uses a different mechanism.
+
+`sandbox.privilege_drop` (config) selects the mechanism:
+
+| value    | mechanism                                                    | when |
+|----------|--------------------------------------------------------------|------|
+| `auto`   | euid==0 + `user` → `setuid`; else `user` → `sudo`; else none | default |
+| `sudo`   | `sudo -n -u <user>` (boxBot non-root)                        | Pi |
+| `setuid` | parent forks; child does `setgid → setgroups → setuid`       | chroot |
+| `none`   | run as current user                                          | dev only |
+
+`BOXBOT_SANDBOX_ENFORCE=0` forces `none` regardless of config.
+
+Both launch paths (persistent runner and the per-call fallback) build
+their argv through one helper, `boxbot.tools._sandbox_launch.build_sandbox_launch`,
+so they cannot diverge. The `setuid` path resolves uid/gid in the parent
+and drops in a `preexec_fn`; **`setgroups`/`setgid` MUST run before
+`setuid`** (after `setuid` the process can no longer change its groups).
+
+- **`extra_groups`** — supplementary GIDs injected at drop time. An
+  Android-hosted chroot MUST set `extra_groups: [3003]`: Android paranoid networking
+  gates `socket()` on membership of the `inet` group (gid 3003), so
+  without it sandbox scripts have no network. Injected by the runner —
+  no `/etc/group` edit, no change to `setup-sandbox.sh`.
+- **File-mode fences still matter.** The child drops to a non-root uid,
+  so `.env` 0600, `src/`+`.git` 0700, and the read-only venv keep it out
+  exactly as on the Pi. `setup-sandbox.sh` applies the same fences in
+  chroot mode (run it as root, or with `BOXBOT_SANDBOX_CHROOT=1`).
+- **seccomp-in-chroot is UNVERIFIED** on Android-hosted chroots (old
+  kernels, SELinux permissive). The bootstrap degrades gracefully — it only
+  refuses to run when `seccomp_mode: enforce` *and* no binding loads.
+  Keep such hosts on `seccomp_mode: log` until the filter is confirmed,
+  then flip to `enforce`.
+
 #### No Subprocess Spawning: seccomp
 
 Sandbox scripts are launched with a **seccomp filter** that blocks

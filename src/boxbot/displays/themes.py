@@ -25,6 +25,12 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Bounds for numeric text sizes: below the smaller one nothing is
+# legible on a 7" display, above the larger one a single glyph is taller
+# than the screen.
+_MIN_FONT_PX = 8
+_MAX_FONT_PX = 240
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -52,9 +58,25 @@ class ThemeFonts:
     caption: FontStyle
     small: FontStyle
 
-    def get_style(self, name: str) -> FontStyle:
-        """Get a font style by name, falling back to body."""
-        return getattr(self, name, self.body)
+    def get_style(self, name: str | int) -> FontStyle:
+        """Get a font style by ramp name, or build one at a pixel size.
+
+        The ramp stops at ``title`` (42px), so a hero readout asks for a
+        number instead. Numeric styles are ``body`` resized: weight and
+        tracking carry over (tracking is em-relative, so it scales).
+        Out-of-range or unusable values degrade to a clamped size or
+        ``body`` — a bad size must never kill a render.
+        """
+        if isinstance(name, str):
+            return getattr(self, name, self.body)
+        if isinstance(name, bool) or not isinstance(name, (int, float)):
+            return self.body
+        size = max(_MIN_FONT_PX, min(int(name), _MAX_FONT_PX))
+        return FontStyle(
+            size=size,
+            weight=self.body.weight,
+            tracking=self.body.tracking,
+        )
 
 
 @dataclass(frozen=True)
@@ -195,7 +217,7 @@ _INTER_FONTS = ThemeFonts(
     subtitle=FontStyle(size=22, weight=500),
     body=FontStyle(size=18, weight=400),
     caption=FontStyle(size=15, weight=400),
-    small=FontStyle(size=13, weight=400),
+    small=FontStyle(size=13, weight=500, tracking=0.06),
 )
 
 _DEFAULT_SPACING = ThemeSpacing(xs=4, sm=8, md=16, lg=24, xl=32)
@@ -203,24 +225,24 @@ _DEFAULT_SPACING = ThemeSpacing(xs=4, sm=8, md=16, lg=24, xl=32)
 
 THEME_BOXBOT = Theme(
     name="boxbot",
-    description="Warm minimal — designed for the wooden enclosure",
+    description="Slate + signal orange — Alarm.com brand, modernized",
     colors=ThemeColors(
-        background="#191714",
-        surface="#252018",
-        surface_alt="#302a20",
-        text="#ede8e0",
-        muted="#8a8078",
-        dim="#5a5550",
-        accent="#d4845a",
-        accent_soft="#d4845a22",
-        secondary="#c4a46c",
-        success="#7a9e6c",
-        warning="#d4a043",
-        error="#c45c5c",
+        background="#141a21",
+        surface="#1d252d",
+        surface_alt="#28323c",
+        text="#f0f2f3",
+        muted="#8a989e",
+        dim="#505a6a",
+        accent="#f25e0f",
+        accent_soft="#f25e0f29",
+        secondary="#ff9965",
+        success="#3fae5f",
+        warning="#e8a33d",
+        error="#e2574b",
     ),
     fonts=_INTER_FONTS,
     spacing=_DEFAULT_SPACING,
-    radius=14,
+    radius=16,
     shadow=True,
     icon_style="outline",
     transition="crossfade",
@@ -228,24 +250,24 @@ THEME_BOXBOT = Theme(
 
 THEME_MIDNIGHT = Theme(
     name="midnight",
-    description="Near-black for nighttime — only essentials visible",
+    description="Near-black slate for nighttime — only embers visible",
     colors=ThemeColors(
-        background="#0c0b0a",
-        surface="#141210",
-        surface_alt="#1a1816",
-        text="#6a6560",
-        muted="#3a3835",
-        dim="#2a2825",
-        accent="#8a6040",
-        accent_soft="#8a604015",
-        secondary="#7a6840",
-        success="#4a6a44",
-        warning="#8a7030",
-        error="#7a3a3a",
+        background="#0a0e12",
+        surface="#11161c",
+        surface_alt="#181f26",
+        text="#77828b",
+        muted="#46515a",
+        dim="#2c343c",
+        accent="#a04413",
+        accent_soft="#a0441317",
+        secondary="#8f6a52",
+        success="#2e6b42",
+        warning="#8a6420",
+        error="#7e3b34",
     ),
     fonts=_INTER_FONTS,
     spacing=_DEFAULT_SPACING,
-    radius=14,
+    radius=16,
     shadow=False,
     icon_style="outline",
     transition="crossfade",
@@ -253,24 +275,24 @@ THEME_MIDNIGHT = Theme(
 
 THEME_DAYLIGHT = Theme(
     name="daylight",
-    description="Warm cream for bright rooms — high contrast readability",
+    description="Light slate for bright rooms — the Alarm.com web look",
     colors=ThemeColors(
-        background="#f5f0e6",
+        background="#f4f4f4",
         surface="#ffffff",
-        surface_alt="#ece7dd",
-        text="#2a2218",
-        muted="#7a7068",
-        dim="#a09890",
-        accent="#c46a3c",
-        accent_soft="#c46a3c18",
-        secondary="#8a7040",
-        success="#4a7a40",
-        warning="#b08020",
-        error="#b04040",
+        surface_alt="#e7ebed",
+        text="#1d252d",
+        muted="#505a6a",
+        dim="#8a989e",
+        accent="#e35205",
+        accent_soft="#e3520514",
+        secondary="#bf4600",
+        success="#048631",
+        warning="#a86a00",
+        error="#c23b2e",
     ),
     fonts=_INTER_FONTS,
     spacing=_DEFAULT_SPACING,
-    radius=14,
+    radius=16,
     shadow=True,
     icon_style="outline",
     transition="crossfade",

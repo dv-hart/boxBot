@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from boxbot.skills import loader as loader_mod
 from boxbot.skills.loader import (
     SkillMeta,
     discover_skills,
@@ -156,6 +157,30 @@ class TestIndex:
         out = get_skill_index(tmp_path)
         assert "- plain: Just a description." in out
 
+    def test_compact_prefers_description_and_keeps_subpath_rule(
+        self, tmp_path: Path
+    ):
+        _write_skill(
+            tmp_path,
+            "hal-audio",
+            description="Play sounds and drive the LED ring.",
+            when_to_use="Scripts that need audio.",
+        )
+        out = get_skill_index(tmp_path, compact=True)
+        assert "## Available skills" in out
+        assert "- hal-audio: Play sounds and drive the LED ring." in out
+        assert "Scripts that need audio." not in out
+        assert "subpath" in out
+
+    def test_compact_falls_back_to_no_description(self, tmp_path: Path):
+        skill_dir = tmp_path / "bare"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: bare\n---\nbody\n", encoding="utf-8"
+        )
+        out = get_skill_index(tmp_path, compact=True)
+        assert "- bare: (no description)" in out
+
 
 # ---------------------------------------------------------------------------
 # load_skill — body + sub-files
@@ -260,3 +285,66 @@ class TestSeedSkill:
         body = load_skill("hal-sandbox-ref")
         assert "boxbot_sdk" in body
         assert "---" not in body.splitlines()[0]  # frontmatter stripped
+
+
+# ---------------------------------------------------------------------------
+# skills.disabled
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledSkills:
+    @pytest.fixture
+    def disable(self, monkeypatch):
+        def _set(*names: str) -> None:
+            monkeypatch.setattr(
+                loader_mod, "disabled_skills", lambda: set(names)
+            )
+            monkeypatch.setattr(loader_mod, "_logged_disabled", set())
+
+        return _set
+
+    def test_disabled_skill_is_not_discovered(self, tmp_path: Path, disable):
+        _write_skill(tmp_path, "alpha")
+        _write_skill(tmp_path, "home")
+        disable("home")
+        assert [s.name for s in discover_skills(tmp_path)] == ["alpha"]
+
+    def test_disabled_skill_absent_from_index(self, tmp_path: Path, disable):
+        _write_skill(tmp_path, "alpha")
+        _write_skill(tmp_path, "home", when_to_use="Controlling the house.")
+        disable("home")
+        index = get_skill_index(tmp_path)
+        assert "alpha" in index
+        assert "home" not in index
+
+    def test_load_skill_refuses_disabled_skill(self, tmp_path: Path, disable):
+        _write_skill(tmp_path, "home")
+        disable("home")
+        with pytest.raises(ValueError, match="disabled"):
+            load_skill("home", root=tmp_path)
+
+    def test_skip_is_logged_once(self, tmp_path: Path, disable, caplog):
+        _write_skill(tmp_path, "home")
+        disable("home")
+        with caplog.at_level("INFO", logger="boxbot.skills.loader"):
+            discover_skills(tmp_path)
+            discover_skills(tmp_path)
+        skips = [r for r in caplog.records if "disabled by config" in r.message]
+        assert len(skips) == 1
+
+    def test_disabled_reads_config(self, monkeypatch, tmp_path: Path):
+        from boxbot.core.config import BoxBotConfig
+
+        cfg = BoxBotConfig()
+        cfg.skills.disabled = ["home"]
+        monkeypatch.setattr(
+            "boxbot.core.config.get_config", lambda: cfg
+        )
+        assert loader_mod.disabled_skills() == {"home"}
+
+    def test_disabled_is_empty_without_config(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("Configuration not loaded.")
+
+        monkeypatch.setattr("boxbot.core.config.get_config", _boom)
+        assert loader_mod.disabled_skills() == set()

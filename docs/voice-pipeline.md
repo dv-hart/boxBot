@@ -404,6 +404,58 @@ voice:
     match_threshold: 0.65       # cosine similarity for speaker matching
 ```
 
+### Engine: `onnx` (embed-only, no torch)
+
+For hardware that cannot carry pyannote + torch — e.g. a 4-core A53
+host with ~1 GB free — `engine: "onnx"` runs the same
+wespeaker weights through `onnxruntime` instead. It produces the same
+256-dim embedding for voice ReID but **cannot diarize**: there is no
+segmentation head, so `enabled: true` with this engine is rejected at
+config load. That is no loss where push-to-talk is the input mode, since
+one person holding the screen is single-speaker by construction.
+
+`embedding_model` switches meaning per engine: a HuggingFace id under
+`pyannote`, a path to the `.onnx` file under `onnx`.
+
+```yaml
+voice:
+  diarization:
+    enabled: false              # required — the onnx engine cannot diarize
+    engine: "onnx"
+    embedding_model: "/opt/boxbot/data/models/voxceleb_ECAPA512.onnx"
+```
+
+The model is ~25 MB and is not in git (`data/models/` is gitignored):
+
+```bash
+mkdir -p data/models
+curl -sSL -o data/models/voxceleb_ECAPA512.onnx \
+  https://huggingface.co/Wespeaker/wespeaker-voxceleb-ecapa-tdnn512/resolve/main/voxceleb_ECAPA512.onnx
+```
+
+**Which model.** Both wespeaker exports take the same 80-bin fbank input,
+so either drops in. Measured on a 4xA53 aarch64 host:
+
+| model | 2 s utterance | 4 s utterance | dim |
+|-------|--------------|--------------|-----|
+| `voxceleb_ECAPA512` | 0.18 s | 0.36 s | 192 |
+| `voxceleb_resnet34_LM` | 0.76 s | 1.38 s | 256 |
+
+ECAPA512 is 4-5x cheaper and clears a ~2 s/utterance budget
+with room to spare; resnet34-LM only just fits at 4 s. resnet34-LM's one
+advantage is that it is the same checkpoint pyannote loads by default, so
+its embeddings share a space with the Pi's — irrelevant unless voice
+profiles are ever moved between devices. Embeddings from different models
+are **not** comparable: changing this on a box with enrolled voices
+invalidates every stored centroid.
+
+The model consumes 80-bin Kaldi filterbank features rather than raw
+audio, so `speaker_embedding.compute_fbank` reimplements that frontend in
+numpy (no torchaudio at runtime). `tests/test_speaker_embedding.py`
+asserts it matches `torchaudio.compliance.kaldi.fbank` wherever
+torchaudio is installed — a subtly wrong window or mel bank still yields
+plausible vectors, so the equivalence is checked rather than assumed.
+
 ## Speech-to-Text (STT)
 
 ### Engine: ElevenLabs Scribe
@@ -503,7 +555,7 @@ voice:
   tts:
     provider: "elevenlabs"
     voice_id: "configured_voice_id"
-    model: "eleven_turbo_v2_5"
+    model: "eleven_flash_v2_5"
     stability: 0.5
     similarity_boost: 0.75
     # Provider-specific settings
@@ -806,7 +858,7 @@ voice:
   tts:
     provider: "elevenlabs"
     voice_id: "configured_voice_id"
-    model: "eleven_turbo_v2_5"
+    model: "eleven_flash_v2_5"
     stability: 0.5
     similarity_boost: 0.75
     elevenlabs:

@@ -305,37 +305,27 @@ class TestTriggerRepoint:
 # ---------------------------------------------------------------------------
 
 
-class _FakePipeline:
-    def __init__(self, cloud_store, enrollment=None):
-        self.cloud_store = cloud_store
-        self.enrollment = enrollment
-
-
 @pytest_asyncio.fixture
 async def tool_env(cloud_store, monkeypatch):
-    """identify_person tool wired to a real CloudStore + enrollment.
+    """identify_person tool wired to a live IdentityService.
 
-    The real pipeline module pulls cv2 at import time (not available on
-    dev boxes), so a stub module supplying ``get_pipeline`` is injected
-    into sys.modules instead.
+    The tool reads through ``get_identity()`` — camera-free, so the
+    real service runs here. The visual pipeline module is stubbed dead
+    (its import pulls cv2) to prove nothing in the tool still needs it.
     """
     import sys
-    import types
 
-    from boxbot.perception.enrollment import EnrollmentManager
+    from boxbot.perception.identity import IdentityService
     from boxbot.tools.builtins import identify_person as ip_mod
 
-    enrollment = EnrollmentManager(cloud_store)
-    pipeline = _FakePipeline(cloud_store, enrollment)
+    monkeypatch.setitem(sys.modules, "boxbot.perception.pipeline", None)
 
-    fake_mod = types.ModuleType("boxbot.perception.pipeline")
-    fake_mod.get_pipeline = lambda: pipeline  # type: ignore[attr-defined]
-    monkeypatch.setitem(
-        sys.modules, "boxbot.perception.pipeline", fake_mod
-    )
+    service = IdentityService(cloud_store=cloud_store)
+    await service.start()
 
     tool = ip_mod.IdentifyPersonTool()
-    return tool, cloud_store, enrollment
+    yield tool, cloud_store, service.enrollment
+    await service.stop()
 
 
 def _no_side_effects(monkeypatch):
@@ -381,6 +371,31 @@ class TestIdentifyPersonToolActions:
         result = json.loads(await tool.execute(name="Jacob", ref="Person A"))
         assert result["outcome"] == "create"
         assert (await store.get_person_by_name("Jacob")) is not None
+
+    @pytest.mark.asyncio
+    async def test_voice_only_identify_persists_at_session_end(self, tool_env):
+        """The panel incident, replayed: pipeline module dead, identify
+        must still enroll — buffered voice embeddings hit the store when
+        the voice session ends."""
+        from boxbot.core.events import VoiceSessionEnded, get_event_bus
+
+        tool, store, enrollment = tool_env
+        emb = _vec(dim=192, seed=7)
+        enrollment.buffer_voice_embedding("Speaker A", emb)
+
+        result = json.loads(await tool.execute(name="Jacob", ref="Speaker A"))
+        assert result["status"] == "ok"
+        assert result["outcome"] == "create"
+        assert result["embeddings_buffered"] == 1
+        assert "not be persisted" not in result["message"]
+
+        await get_event_bus().publish(
+            VoiceSessionEnded(conversation_id="voice_incident")
+        )
+
+        person = await store.get_person_by_name("Jacob")
+        assert person is not None
+        assert len(await store.get_voice_embeddings(person["id"])) == 1
 
     @pytest.mark.asyncio
     async def test_rename_happy_path(self, tool_env, monkeypatch):
@@ -496,13 +511,22 @@ class TestIdentifyPersonToolActions:
     async def test_list_flags_no_report(self, tool_env, tmp_path, monkeypatch):
         from boxbot.perception import reconcile
 
-        tool, _, _ = tool_env
+        tool, store, _ = tool_env
+        await store.create_person("Jacob")
         monkeypatch.setattr(
             reconcile, "REPORT_PATH", tmp_path / "missing.json"
         )
         result = json.loads(await tool.execute(action="list_flags"))
         assert result["status"] == "ok"
         assert "No identity-reconcile report" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_list_flags_says_nobody_is_enrolled(self, tool_env):
+        tool, _, _ = tool_env
+        result = json.loads(await tool.execute(action="list_flags"))
+        assert result["status"] == "ok"
+        assert result["persons"] == 0
+        assert "No person records are enrolled" in result["message"]
 
     @pytest.mark.asyncio
     async def test_list_flags_surfaces_duplicates(
@@ -526,13 +550,94 @@ class TestIdentifyPersonToolActions:
         }))
         monkeypatch.setattr(reconcile, "REPORT_PATH", report_path)
 
-        tool, _, _ = tool_env
+        tool, store, _ = tool_env
+        await store.create_person("Eric")
         result = json.loads(await tool.execute(action="list_flags"))
         assert result["status"] == "ok"
         assert len(result["duplicate_persons"]) == 1
         assert result["duplicate_persons"][0]["a"] == "Eric"
         assert result["outlier_count"] == 1
         assert "merge" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# Camera-less device: record actions keep working, identify does not
+# ---------------------------------------------------------------------------
+
+
+async def _noop(*a, **k):
+    return None
+
+
+@pytest_asyncio.fixture
+async def no_perception(cloud_store, monkeypatch):
+    """identify_person on a device where the pipeline import dies (no cv2).
+
+    A None entry in sys.modules is what an uninstallable module looks
+    like to the import system — ``import`` raises ImportError.
+    """
+    import sys
+
+    from boxbot.perception import clouds
+    from boxbot.tools.builtins import identify_person as ip_mod
+
+    monkeypatch.setitem(sys.modules, "boxbot.perception.pipeline", None)
+
+    # The standalone fallback must reach the same DB the test seeds.
+    monkeypatch.setattr(clouds, "CloudStore", lambda *a, **k: cloud_store)
+    monkeypatch.setattr(cloud_store, "initialize", _noop)
+    monkeypatch.setattr(cloud_store, "close", _noop)
+
+    return ip_mod.IdentifyPersonTool(), cloud_store
+
+
+class TestWithoutPerceptionModule:
+    @pytest.mark.asyncio
+    async def test_rename_works(self, no_perception, monkeypatch):
+        tool, store = no_perception
+        _no_side_effects(monkeypatch)
+        pid = await store.create_person("Jacob")
+
+        result = json.loads(
+            await tool.execute(action="rename", name="Jacob", new_name="Jake")
+        )
+        assert result["status"] == "ok"
+        assert (await store.get_person(pid))["name"] == "Jake"
+        assert result["session_claims_repointed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_merge_works(self, no_perception, monkeypatch):
+        tool, store = no_perception
+        _no_side_effects(monkeypatch)
+        winner = await store.create_person("Eric")
+        loser = await store.create_person("Erik")
+
+        result = json.loads(
+            await tool.execute(
+                action="merge", name="Eric", duplicate_name="Erik",
+            )
+        )
+        assert result["status"] == "ok"
+        assert (await store.get_person(loser))["merged_into"] == winner
+
+    @pytest.mark.asyncio
+    async def test_identify_acknowledges_without_identity_service(
+        self, no_perception,
+    ):
+        """No identity service (very early boot) → honest no-op, not an
+        error. With the service live, identify works even when the
+        visual pipeline module can't import — see
+        test_voice_only_identify_persists_at_session_end."""
+        tool, _ = no_perception
+        result = json.loads(await tool.execute(name="Jacob", ref="Person A"))
+        assert result["status"] == "acknowledged"
+        assert "not be persisted" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_list_flags_reports_empty_roster(self, no_perception):
+        tool, _ = no_perception
+        result = json.loads(await tool.execute(action="list_flags"))
+        assert result["persons"] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ process.
 Full onboarding playbook: the `onboarding` skill. This is the API
 reference.
 
-## Who is registered
+## Who is registered — list_users()
 
 ```python
 import boxbot_sdk as bb
@@ -21,7 +21,7 @@ users = bb.auth.list_users()
 Empty list = no admin bootstrapped yet. That is the canonical "is BB
 set up?" signal.
 
-## First-admin bootstrap
+## First-admin bootstrap — generate_bootstrap_code()
 
 ```python
 code = bb.auth.generate_bootstrap_code()   # 6 digits, 10 min, single use
@@ -32,7 +32,7 @@ Works only while **no admin exists**; raises afterward. Show the code
 *physical presence*. Never speak it or send it over any messaging
 channel. The human texts it to BB and becomes the first admin.
 
-## Invite a user (admin-initiated)
+## Invite a user — generate_registration_code(), admin-initiated
 
 ```python
 code = bb.auth.generate_registration_code()
@@ -46,7 +46,7 @@ user texts it to BB and registers as a standard user.
 
 6 digits, 10-minute expiry, single use, 3/hour per admin.
 
-## Message every admin
+## Message every admin — notify_admins(text)
 
 ```python
 bb.auth.notify_admins("Heads up: a new user just registered.")
@@ -56,14 +56,14 @@ Delivers to each admin on their registered `channel` ("signal" or
 "whatsapp"); the main process picks the right outbound client. Use for
 security notifications and "new user joined" — not general chat.
 
-## Errors
+## Errors — ActionError on bootstrap-after-admin, non-admin invite, rate limit, empty text
 
 `generate_bootstrap_code`, `generate_registration_code`,
 `notify_admins` raise `bb.ActionError` on rejection: bootstrap after an
 admin exists, non-admin minting an invite, rate limit, empty text.
 `list_users` raises only if the auth manager is unavailable.
 
-## Never
+## Never — no code path skips the human, no direct registration, no credential reveal
 
 - Hand you a code path that skips the human. Codes always travel
   out-of-band — screen for bootstrap, admin's phone for invites.

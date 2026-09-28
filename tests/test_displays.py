@@ -109,6 +109,74 @@ class TestThemes:
         assert a == 128  # 0x80 = 128
 
 
+class TestNumericTextSize:
+    """The ramp stops at title/42px, so hero readouts ask for pixels.
+
+    Before this, a numeric size crashed the whole render inside
+    ``getattr(self, 96, ...)`` — a hero temperature was impossible.
+    """
+
+    def test_ramp_name_still_resolves(self):
+        fonts = get_theme("boxbot").fonts
+        assert fonts.get_style("title") is fonts.title
+
+    def test_unknown_name_falls_back_to_body(self):
+        fonts = get_theme("boxbot").fonts
+        assert fonts.get_style("gigantic") is fonts.body
+
+    def test_number_becomes_that_pixel_size(self):
+        fonts = get_theme("boxbot").fonts
+        assert fonts.get_style(96).size == 96
+
+    def test_number_keeps_body_weight_and_tracking(self):
+        from boxbot.displays.themes import FontStyle, ThemeFonts
+
+        base = get_theme("boxbot").fonts
+        fonts = ThemeFonts(
+            family=base.family,
+            title=base.title,
+            heading=base.heading,
+            subtitle=base.subtitle,
+            body=FontStyle(size=18, weight=400, tracking=0.04),
+            caption=base.caption,
+            small=base.small,
+        )
+        style = fonts.get_style(96)
+        assert style.weight == 400
+        assert style.tracking == 0.04
+
+    def test_out_of_range_numbers_clamp(self):
+        fonts = get_theme("boxbot").fonts
+        assert fonts.get_style(10_000).size == 240
+        assert fonts.get_style(-4).size == 8
+
+    def test_spec_accepts_a_pixel_size(self):
+        spec = DisplaySpec(
+            name="hero",
+            theme="boxbot",
+            root_block=TextBlock(content="71°", size=140),
+        )
+        assert validate_spec(spec) == []
+
+    def test_spec_rejects_a_nonpositive_pixel_size(self):
+        spec = DisplaySpec(
+            name="hero",
+            theme="boxbot",
+            root_block=TextBlock(content="71°", size=0),
+        )
+        assert validate_spec(spec) == ["text.size in pixels must be positive"]
+
+    def test_bad_size_degrades_instead_of_crashing_the_render(self):
+        from boxbot.displays.renderer import render_to_image
+
+        theme = get_theme("boxbot")
+        for size in (140, 10_000, "gigantic", None):
+            block = TextBlock(content="71°")
+            block.params["size"] = size
+            img = render_to_image(block, theme, {}, width=400, height=300)
+            assert img.size == (400, 300)
+
+
 # ---------------------------------------------------------------------------
 # Block tests
 # ---------------------------------------------------------------------------
@@ -774,6 +842,110 @@ class TestUpdateData:
             set_display_manager(None)
 
 
+class TestPreviewDataPrecedence:
+    """Source names are a global namespace, so live data from the display
+    that happens to be on screen must not leak into the preview of a
+    *different* spec that reuses the name. That shadowing silently
+    rendered live values for a spec's own declared statics and cost an
+    on-device agent a whole turn budget chasing a phantom binding bug.
+    """
+
+    @staticmethod
+    def _spec(name: str, value: dict[str, Any]) -> DisplaySpec:
+        return DisplaySpec(
+            name=name,
+            theme="boxbot",
+            data_sources=[
+                DataSourceSpec(name="climate", source_type="static", value=value),
+            ],
+            root_block=TextBlock(content="{climate.temp}"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_spec_declared_values_win_over_live_source(self):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._spec("onscreen", {"temp": 71, "mode": "Heat"}))
+        await mgr.switch("onscreen")
+        try:
+            draft = self._spec("draft", {"temp": 64, "humidity": 43})
+            preview = mgr.build_preview_data(draft)
+            assert preview["climate"] == {"temp": 64, "humidity": 43}
+        finally:
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_self_preview_sees_pushed_update_data(self):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._spec("onscreen", {"temp": 71}))
+        await mgr.switch("onscreen")
+        try:
+            mgr.update_static_data("onscreen", "climate", {"temp": 68})
+            preview = mgr.build_preview_data(mgr.get_spec("onscreen"))
+            assert preview["climate"]["temp"] == 68
+        finally:
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_caller_override_wins(self):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        spec = self._spec("draft", {"temp": 64})
+        mgr.register_spec(spec)
+        preview = mgr.build_preview_data(spec, data={"climate": {"temp": 99}})
+        assert preview["climate"] == {"temp": 99}
+
+    @pytest.mark.asyncio
+    async def test_falsy_caller_override_still_wins(self):
+        """An empty override is a choice, not an absence."""
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        spec = self._spec("draft", {"temp": 64})
+        mgr.register_spec(spec)
+        preview = mgr.build_preview_data(spec, data={"climate": {}})
+        assert preview["climate"] == {}
+
+    @pytest.mark.asyncio
+    async def test_undeclared_source_falls_back_to_placeholder(self):
+        from boxbot.displays.manager import DisplayManager
+
+        spec = DisplaySpec(
+            name="brief",
+            theme="boxbot",
+            data_sources=[DataSourceSpec(name="weather", source_type="builtin")],
+            root_block=TextBlock(content="{weather.temp}"),
+        )
+        mgr = DisplayManager()
+        preview = mgr.build_preview_data(spec, args={"who": "jacob"})
+        assert preview["weather"]
+        assert preview["args"] == {"who": "jacob"}
+
+    def test_unresolved_binding_warning_lists_available_fields(self):
+        from boxbot.tools._sandbox_actions import _collect_unresolved_bindings
+
+        spec_dict = {
+            "name": "draft",
+            "data_sources": [
+                {
+                    "name": "climate",
+                    "type": "static",
+                    "value": {"temp": 71, "mode": "Heat"},
+                },
+            ],
+            "layout": {"type": "text", "content": "{climate.humidity}"},
+        }
+        warnings = _collect_unresolved_bindings(
+            spec_dict, render_data={"climate": {"temp": 71, "mode": "Heat"}},
+        )
+        assert len(warnings) == 1
+        assert "Available fields on 'climate': mode, temp." in warnings[0]
+
+
 class TestPictureSlideshow:
     """Picture display slideshow mode.
 
@@ -890,3 +1062,113 @@ class TestPictureSlideshow:
         finally:
             mgr._stop_slideshow()
             await mgr._data_manager.stop_all()
+
+
+# ---------------------------------------------------------------------------
+# Status pill (transient agent-activity overlay)
+# ---------------------------------------------------------------------------
+
+
+class TestStatusPill:
+    """The tool-derived status pill composited over the active frame."""
+
+    def _mgr_with_frame(self, size=(1024, 600)):
+        from PIL import Image
+
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager(width=size[0], height=size[1])
+        base = Image.new("RGB", size, (20, 26, 33))
+        mgr._update_frame(base)
+        return mgr, base
+
+    def test_set_status_composites_and_bumps_generation(self):
+        mgr, base = self._mgr_with_frame()
+        g0 = mgr.get_frame_generation()
+
+        mgr.set_status_text("Searching the web…")
+
+        assert mgr.get_frame_generation() == g0 + 1
+        assert mgr._current_frame.tobytes() != base.tobytes()
+        # Base frame is preserved un-overlaid.
+        assert mgr._base_frame.tobytes() == base.tobytes()
+
+    def test_same_text_is_noop_but_refreshes_deadline(self):
+        mgr, _ = self._mgr_with_frame()
+        mgr.set_status_text("Recalling…")
+        g1 = mgr.get_frame_generation()
+        d1 = mgr._status_deadline
+
+        mgr.set_status_text("Recalling…")
+
+        assert mgr.get_frame_generation() == g1
+        assert mgr._status_deadline >= d1
+
+    def test_new_base_frame_reapplies_pill(self):
+        from PIL import Image
+
+        mgr, _ = self._mgr_with_frame()
+        mgr.set_status_text("Checking the camera…")
+
+        base2 = Image.new("RGB", (1024, 600), (40, 40, 40))
+        mgr._update_frame(base2)
+
+        assert mgr._base_frame is base2
+        assert mgr._current_frame.tobytes() != base2.tobytes()
+
+    def test_clear_restores_base_frame(self):
+        mgr, _ = self._mgr_with_frame()
+        mgr.set_status_text("Fetching data…")
+        g1 = mgr.get_frame_generation()
+
+        mgr.clear_status_text()
+
+        assert mgr.get_frame_generation() == g1 + 1
+        assert mgr._current_frame is mgr._base_frame
+        assert mgr._status_text is None
+
+    def test_clear_without_status_is_noop(self):
+        mgr, _ = self._mgr_with_frame()
+        g0 = mgr.get_frame_generation()
+        mgr.clear_status_text()
+        assert mgr.get_frame_generation() == g0
+
+    def test_pill_renders_at_panel_resolution(self):
+        mgr, base = self._mgr_with_frame(size=(1280, 800))
+        mgr.set_status_text("Searching the web…")
+        assert mgr._current_frame.size == (1280, 800)
+        assert mgr._current_frame.tobytes() != base.tobytes()
+
+    @pytest.mark.asyncio
+    async def test_tool_called_event_voice_only(self):
+        from boxbot.core.events import AgentToolCalled
+
+        mgr, base = self._mgr_with_frame()
+
+        await mgr._on_agent_tool_called(
+            AgentToolCalled(
+                conversation_id="whatsapp_1", channel="whatsapp",
+                tool_name="web_search", status_text="Searching the web…",
+            )
+        )
+        assert mgr._status_text is None
+
+        await mgr._on_agent_tool_called(
+            AgentToolCalled(
+                conversation_id="voice_room", channel="voice",
+                tool_name="web_search", status_text="Searching the web…",
+            )
+        )
+        assert mgr._status_text == "Searching the web…"
+
+    @pytest.mark.asyncio
+    async def test_status_clear_handler(self):
+        from boxbot.core.events import AgentTurnEnded
+
+        mgr, _ = self._mgr_with_frame()
+        mgr.set_status_text("Working on it…")
+
+        await mgr._on_status_clear(
+            AgentTurnEnded(conversation_id="voice_room", channel="voice")
+        )
+        assert mgr._status_text is None

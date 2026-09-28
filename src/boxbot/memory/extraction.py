@@ -1,19 +1,35 @@
-"""Post-conversation memory extraction via Anthropic Message Batches.
+"""Post-conversation memory extraction.
 
-After every conversation ends, the agent persists the transcript to
-``pending_extractions`` and submits a 1-request batch to Anthropic. The
-batch poller (``boxbot.memory.batch_poller``) wakes up, fetches the
-result when ready (typically within ~30 minutes), parses the structured
-``tool_use`` block, and applies the result to the memory store.
+Two front-ends share one policy, parser target, and apply path:
+
+**Thread-append (OpenAI loop conversations, preferred).** The agent
+replays the just-ended conversation's exact request — same messages,
+tools, and ``response_format`` — with an extraction instruction appended
+as one more user message. Byte-identical prefix ⇒ Azure prompt-cache hit
+(~95% of input tokens at the cached rate; survives the 180s silence
+timeout, verified 2026-08-29). The result rides inside the
+internal-notes ``thought`` field because ``response_format`` is part of
+the cache key and must not change.
+
+**Anthropic Message Batches (fallback + non-OpenAI paths).** The agent
+persists the transcript to ``pending_extractions`` and submits a
+1-request batch. The batch poller (``boxbot.memory.batch_poller``)
+fetches the result when ready (typically within ~30 minutes), parses the
+structured ``tool_use`` block, and applies it. Used when the
+conversation ran on an Anthropic loop, for persistent (WhatsApp) threads
+swept hours after their prefix cache died, and whenever the thread call
+fails.
 
 Public API:
-    submit_extraction_batch(...)     # called on conversation end
-    parse_extraction_result(...)     # called by poller from raw message
-    process_extraction_result(...)   # apply parsed result to the store
-    record_extraction_cost(...)      # cost log helper
+    build_thread_extraction_message(...)  # thread-append user message
+    parse_thread_extraction_content(...)  # thread reply → ExtractionResult
+    submit_extraction_batch(...)          # called on conversation end
+    parse_extraction_result(...)          # called by poller from raw message
+    process_extraction_result(...)        # apply parsed result to the store
+    record_extraction_cost(...)           # cost log helper (Anthropic)
 
-The structured-output schema, system prompt, and pricing live here so
-they're version-controlled together with the extraction logic.
+The structured-output schema, prompts, and pricing live here so they're
+version-controlled together with the extraction logic.
 """
 
 from __future__ import annotations
@@ -264,16 +280,12 @@ EXTRACTION_TOOL: dict[str, Any] = {
 }
 
 
-# Cached system prompt. Encodes the extraction policy so the model
-# emits high-quality, conservative results. Anything that varies per
-# call (transcript, injected memories) goes in the user message — the
-# system block stays identical across requests so prompt caching can
-# hit on it.
-EXTRACTION_SYSTEM_PROMPT = """\
-You are the post-conversation memory extractor for boxBot, a household assistant.
-
-Your job: read the transcript and decide what — if anything — is worth saving to long-term memory for future conversations. Emit the result via the `emit_extraction` tool exactly once.
-
+# Extraction policy shared verbatim by both front-ends: the batch
+# system prompt (below) and the thread-append extraction message
+# (build_thread_extraction_message). Keep it format-neutral — no
+# mention of the transcript, the user message, or emit_extraction;
+# those live in the per-front-end preamble/tail.
+EXTRACTION_POLICY = """\
 # The conversation_summary is a RECEIPT, not a recap
 
 `conversation_summary.summary` is a one-line index entry — its only job is to let a future agent decide *whether to go read this conversation*. It is NOT a place to record what was concluded.
@@ -345,7 +357,7 @@ Aim for 0-2 memories per conversation. Even technical sessions usually warrant 0
 
 # Invalidations
 
-ONLY invalidate memories listed in the [Active Memories] block of the user message. Those are the memories the in-conversation model could see.
+ONLY invalidate memories listed in the [Active Memories] block provided with this extraction request. Those are the memories the in-conversation model could see.
 
 Invalidate when the conversation directly contradicts an injected memory. Example: injected says "Jacob is vegetarian", user says "I'm not vegetarian anymore" → invalidate, with a `replacement` memory if the conversation gave the corrected fact.
 
@@ -365,11 +377,27 @@ When in doubt, leave system memory alone. The dream phase will catch slow-burn p
 # Empty extractions are the default, not the exception
 
 Most conversations have nothing worth extracting. Short voice exchanges, photo-display requests, calendar lookups, ambient chatter, status pings — all return `extracted_memories: []`. Trigger-fired wake-ups bypass this path entirely now, but you'll still see them occasionally if a human chimed in. The bar for extraction is "future conversations will be measurably better if this is in memory" — not "something happened here."
+"""
 
+
+# Cached system prompt for the batch front-end. Anything that varies
+# per call (transcript, injected memories) goes in the user message —
+# the system block stays identical across requests so prompt caching
+# can hit on it.
+EXTRACTION_SYSTEM_PROMPT = (
+    """\
+You are the post-conversation memory extractor for boxBot, a household assistant.
+
+Your job: read the transcript and decide what — if anything — is worth saving to long-term memory for future conversations. Emit the result via the `emit_extraction` tool exactly once.
+
+"""
+    + EXTRACTION_POLICY
+    + """
 # Always emit the tool call
 
 Even with zero extractions, call `emit_extraction` with at minimum the `conversation_summary`. Never respond with prose.
 """
+)
 
 
 def build_user_message(
@@ -395,6 +423,106 @@ def build_user_message(
         header += "[Active Memories]\n(none injected)\n\n"
 
     return header + "[Transcript]\n" + transcript.strip() + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Thread-append front-end (OpenAI loop)
+# ---------------------------------------------------------------------------
+
+
+# The extraction reply is constrained to the conversation's own
+# internal-notes response_format (changing it would bust the prompt
+# cache), so the payload travels as a JSON string inside ``thought``.
+# The shape mirrors EXTRACTION_TOOL's input_schema — keep them in sync.
+_THREAD_EXTRACTION_OUTPUT = """\
+# Output format
+
+Reply in your usual internal-notes JSON shape. Do NOT call any tools. Put the extraction result — the JSON object below, serialized as a string — in `thought`; leave `observations` empty; set `final_turn` true.
+
+{"conversation_summary": {"topics": ["1-5 short topic tags"], "summary": "one-line receipt"},
+ "extracted_memories": [{"type": "person|household|methodology", "person": "name or null", "content": "1-3 sentences, self-contained", "summary": "<80 chars", "tags": ["1-4 lowercase words"]}],
+ "invalidations": [{"memory_id": "...", "reason": "...", "replacement": null}],
+ "system_memory_updates": [{"section": "Household|Standing Instructions|Operational Notes", "action": "set|add_entry|remove_entry", "content": "..."}]}
+
+An invalidation's `replacement` may instead carry the corrected fact in the same shape as an `extracted_memories` item. Empty lists are fine (and the default); `conversation_summary` is always required.
+"""
+
+
+def build_thread_extraction_message(
+    *,
+    injected_memories_block: str,
+    channel: str,
+    participants: list[str],
+    started_at: str,
+) -> str:
+    """Build the user message appended to a finished OpenAI thread.
+
+    The conversation itself is already in the (cached) prompt above, so
+    unlike :func:`build_user_message` there is no transcript here —
+    just the mode switch, the metadata, the [Active Memories] block
+    (repeated so memory IDs are unambiguous even if the injected copy
+    scrolled deep into the thread), the shared policy, and the output
+    contract.
+    """
+    header = (
+        f"Conversation metadata: channel={channel}, "
+        f"participants={', '.join(participants) or '(unknown)'}, "
+        f"started_at={started_at}.\n\n"
+    )
+    block = injected_memories_block.strip() or "[Active Memories]\n(none injected)"
+    return (
+        "[Conversation ended. Mode switch: drop the assistant persona — "
+        "you are now the post-conversation memory extractor auditing the "
+        "conversation above. Decide what — if anything — is worth saving "
+        "to long-term memory for future conversations.]\n\n"
+        + header
+        + block
+        + "\n\n"
+        + EXTRACTION_POLICY
+        + "\n"
+        + _THREAD_EXTRACTION_OUTPUT
+    )
+
+
+def parse_thread_extraction_content(content: str) -> ExtractionResult:
+    """Parse a thread-append extraction reply into an ExtractionResult.
+
+    Expected shape: internal-notes JSON with the extraction payload as a
+    JSON string in ``thought``. Lenient on the ways models bend that:
+    the payload directly as the top-level object, ``thought`` already
+    decoded to an object, or fenced in markdown. Raises ValueError when
+    no payload with a ``conversation_summary`` can be recovered — the
+    caller falls back to the batch front-end.
+    """
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`\n")
+        if text.startswith("json"):
+            text = text[4:]
+    if not text:
+        raise ValueError("empty thread-extraction reply")
+
+    try:
+        outer = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"thread-extraction reply was not JSON: {e}") from e
+    if not isinstance(outer, dict):
+        raise ValueError(f"thread-extraction reply was not an object: {outer!r}")
+
+    payload: Any = outer
+    if "conversation_summary" not in outer:
+        thought = outer.get("thought")
+        if isinstance(thought, str):
+            try:
+                payload = json.loads(thought)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"thought was not extraction JSON: {e}") from e
+        elif isinstance(thought, dict):
+            payload = thought
+
+    if not isinstance(payload, dict) or "conversation_summary" not in payload:
+        raise ValueError("thread-extraction reply had no conversation_summary")
+    return _payload_to_result(payload)
 
 
 # ---------------------------------------------------------------------------

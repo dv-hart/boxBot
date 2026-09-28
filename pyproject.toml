@@ -26,6 +26,8 @@ dependencies = [
     # Core agent
     "anthropic>=0.40.0",
     "claude-agent-sdk>=0.2.0",
+    # >=3.3: ReasoningEffort admits "none" (the GPT-5.6 floor).
+    "openai>=3.3",
     "pyyaml>=6.0",
     "pydantic>=2.0",
 
@@ -39,6 +41,10 @@ dependencies = [
     "onnxruntime",
     "faiss-cpu",
     "silero-vad",
+    # WordPiece for the ONNX text-embedding backend
+    # (models.embedding_onnx) — hosts where torch/sentence-transformers
+    # don't fit.
+    "tokenizers",
 
     # Communication
     "pyaudio",
@@ -50,6 +56,9 @@ dependencies = [
     # Display
     "pillow",
     "pygame",
+    # Rasterizes the bundled Lucide SVGs; without it every icon
+    # degrades to a circled letter.
+    "cairosvg",
 
     # Storage
     "aiosqlite",

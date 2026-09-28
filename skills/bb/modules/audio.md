@@ -11,7 +11,7 @@ automatically through structured voice output. Not for internet URLs —
 download to the workspace first (`requests.get`), then play. The player
 only reads workspace-resident files.
 
-## Conversation interaction
+## Playback vs the conversation — mic detaches, room state, interrupts
 
 Playback shares the TTS path:
 
@@ -26,7 +26,7 @@ Playback shares the TTS path:
 After it returns your script usually has nothing left to do; the turn
 ends and the conversation lands in LISTENING.
 
-## API
+## Call signature — play(path, volume=…) and its result
 
 ```python
 import boxbot_sdk as bb
@@ -49,7 +49,7 @@ bb.audio.play("music/favorite_song.mp3", volume=0.5)   # volume restores on retu
 `AudioError` on path / format / quota / decoder failure. Catch it for a
 graceful fallback; otherwise let it propagate so you see the failure.
 
-## Patterns
+## Pattern — workspace.search to find the file, then play it
 
 ```python
 hits = bb.workspace.search("favorite song")
@@ -66,7 +66,7 @@ if result["status"] == "interrupted":
     print("user wake-word'd over playback — they want to talk")
 ```
 
-## Limits
+## Limits — wav/flac/ogg/mp3, 25 MB file cap, 5 min duration cap
 
 - Formats: wav, flac, ogg, mp3. Decoded by `miniaudio` in the main
   process. No ffmpeg.
@@ -76,7 +76,7 @@ if result["status"] == "interrupted":
 - One playback at a time. If TTS is mid-sentence, `play()` waits for it
   to drain. To start immediately, finish the spoken response first.
 
-## Layout suggestion
+## Suggested workspace layout for audio files
 
 ```
 workspace/audio/chimes/timer_done.wav

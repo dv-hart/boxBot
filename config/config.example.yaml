@@ -14,12 +14,20 @@ system:
 agent:
   name: "boxBot"
   wake_word: "hey box"
-  # Models are set in .env (BOXBOT_MODEL_LARGE, BOXBOT_MODEL_SMALL)
+  # Models are set in .env (BOXBOT_MODEL_LARGE, BOXBOT_MODEL_SMALL,
+  # BOXBOT_MODEL_FAST) — never in YAML.
   # Large model: conversations, reasoning, memory extraction, skill creation
   # Small model: photo tagging, intent classification, structured extraction,
   #              wake-word transcript filtering, routine pre-processing
+  # Fast model:  optional third tier (e.g. gpt-6-luna); unset = off.
+  #              Provider derived from the id — see boxbot.core.models.
   # Maximum conversation turns before auto-compaction
   max_turns: 20
+  # Wake-cycle (trigger) runs get a tighter budget — nobody is waiting on
+  # them, so a long run is the agent talking to itself. The second cap is
+  # on messages actually delivered per trigger conversation.
+  max_turns_trigger: 10
+  max_messages_trigger: 2
   # Which client runs the main conversation turn.
   #   raw_anthropic    — direct Messages API, billed via Console.
   #   claude_agent_sdk — Claude Agent SDK over OAuth, billed against the
@@ -29,6 +37,13 @@ agent:
   # Switching to claude_agent_sdk requires CLAUDE_CODE_OAUTH_TOKEN in .env
   # and the `claude` CLI (npm @anthropic-ai/claude-code) installed on PATH.
   backend: "raw_anthropic"
+  # Fast-tier (OpenAI-path) per-call timeout + SDK retry count. Shared
+  # Azure deployments occasionally hold a request ~60s server-side; a
+  # 20s timeout + retry converts that into a quick recovery instead of
+  # a minute of silence. Raise the timeout if your fast model routinely
+  # generates long responses.
+  openai_timeout_seconds: 20.0
+  openai_max_retries: 2
 
 # ── Schedule ──────────────────────────────────────────────────────────
 # The agent's internal planning system (triggers + to-do list).
@@ -155,10 +170,23 @@ camera:
   scan_fps: 5
   # Framerate during active interaction
   active_fps: 15
+  # Dev machines only: bb.camera.capture() returns a teal test frame
+  # instead of an error when no camera is attached. Never enable on a
+  # real device — the agent believes the pixels it is shown.
+  test_pattern_without_camera: false
 
 # ── Voice ─────────────────────────────────────────────────────────────
 voice:
-  # Wake word detection
+  # Audio HAL backend: "portaudio" (ReSpeaker + HDMI, the Pi) or "none".
+  audio_backend: "portaudio"
+
+  # Turn activation: "wake_word" (listen continuously, VAD finds the end)
+  # or "push_to_talk" (hold a button to talk, release to send — driven by
+  # ButtonPressed events). push_to_talk loads neither the wake-word model
+  # nor VAD and needs no echo cancellation.
+  input_mode: "wake_word"
+
+  # Wake word detection (input_mode: wake_word only)
   wake_word:
     engine: "openwakeword"
     word: "hey_jarvis"            # built-in model; swap to "bb" for custom
@@ -198,17 +226,34 @@ voice:
     max_speakers: 6
     match_threshold: 0.65
 
-  # Speech-to-text
+  # Speech-to-text.
+  #
+  # provider and model are a matched pair — "elevenlabs" is batch (the
+  # whole utterance is uploaded after speech ends) and wants scribe_v2;
+  # "elevenlabs_realtime" streams over a websocket opened on touch-down
+  # and REQUIRES a realtime model, refusing to start otherwise. Changing
+  # provider alone does not work.
   stt:
     provider: "elevenlabs"
     model: "scribe_v2"
     language: "en"
 
+  # Streaming alternative (needs input_mode: push_to_talk,
+  # since the socket opens on press and is harvested on release). Falls
+  # back to batch scribe_v2 automatically if the socket never comes good,
+  # so a bad network costs latency, not the user's words. Billed per
+  # minute of open connection rather than per minute of audio.
+  #
+  # stt:
+  #   provider: "elevenlabs_realtime"
+  #   model: "scribe_v2_realtime"
+  #   language: "en"
+
   # Text-to-speech
   tts:
     provider: "elevenlabs"
     voice_id: ""                  # must be configured
-    model: "eleven_turbo_v2_5"
+    model: "eleven_flash_v2_5"    # turbo is deprecated; flash is ~75ms
     stability: 0.5
     similarity_boost: 0.75
     optimize_streaming_latency: 3
@@ -262,6 +307,13 @@ memory:
   decay_rate: 0.98
   # Minimum importance to remain in active pool
   archive_threshold: 0.1
+  # Post-conversation extraction as one live call appended to the
+  # just-ended OpenAI thread (prompt-cache hit => ~85-95% cheaper than
+  # the Anthropic batch; applies in seconds). Only reachable for
+  # conversations that ran on the OpenAI loop; everything else — and
+  # any thread-call failure — uses the Anthropic batch path. false
+  # forces the batch path everywhere.
+  thread_extraction: true
 
 # ── Photos ────────────────────────────────────────────────────────────
 photos:
@@ -320,6 +372,22 @@ sandbox:
     - "display"          # tap YES on touchscreen
     - "whatsapp"         # admin replies YES via WhatsApp
 
+# ── Skills ────────────────────────────────────────────────────────────
+# Skills whose metadata should not be injected into the system prompt and
+# that load_skill must refuse. Names are the directory names under
+# skills/. Use this where a skill's backing service doesn't exist on the
+# device — e.g. "home" on a box with no Home Assistant.
+skills:
+  disabled: []
+
+# ── Integrations ──────────────────────────────────────────────────────
+# Integrations hidden from this deployment: not listable or callable via
+# bb.integrations. Names are the directory names under integrations/.
+# Same idea as skills.disabled — e.g. "home_assistant" on a box that
+# has no Home Assistant instance to talk to.
+integrations:
+  disabled: []
+
 # ── SDK Authoring ────────────────────────────────────────────────────
 # Controls how agent-created skills/displays are handled.
 # The agent creates these through boxbot_sdk (declarative builder),
@@ -332,10 +400,12 @@ sdk:
   auto_activate_displays: false
 
 # ── Prefetch layer ────────────────────────────────────────────────────
-# A small read-only mini-agent (Haiku) that pre-assembles the context the
-# main agent will likely need into its first turn — relevant memories,
-# skills, workspace docs, message history, pulled calendar/weather — to
-# cut repeat tool-call turns and context bloat.
+# Parallel ONE-SHOT selector calls — one read-only lane per context
+# source (skills, bb SDK module docs, memories, workspace, pulled
+# calendar/weather) — that pre-assemble the context the main agent will
+# likely need into its first turn. No tool loop: wall clock ≈ one
+# fast-model round trip regardless of source count. A lane with no
+# candidates for a message skips its model call entirely.
 #
 # Ships disabled. Enable in "shadow" mode first: it runs and logs what it
 # WOULD prefetch (into the prefetch_events table) but injects nothing, so
@@ -345,22 +415,43 @@ sdk:
 prefetch:
   enabled: false
   mode: shadow            # shadow (log only) | active (inject bundles)
-  # Channels that get prefetch. Voice is deferred from v1 (latency-
-  # sensitive + ephemeral); its tool usage is still logged regardless.
-  channels: [whatsapp, signal, trigger]
+  # Channels that get prefetch. Voice runs the same inline path as the
+  # text channels; the fan-out blocks the reply, so watch prefetch
+  # latency in voice round-trip numbers.
+  channels: [whatsapp, signal, trigger, voice]
+  # Selector lanes that run (see src/boxbot/prefetch/sources.py).
+  sources: [skills, sdk, memory, workspace, pulled]
+  # Integrations the "pulled" lane may run — security allowlist crossed
+  # with a hard-coded read-only action map; the selector can only pick
+  # from names listed here.
+  pull_sources: [calendar, weather]
   # Scheduled triggers: precompute this many minutes before fire_at.
   # Keep small so pulled data (calendar/weather) isn't stale at fire.
   lookahead_minutes: 5
-  # Hard cap on the assembled bundle — the point is to REDUCE bloat.
-  token_budget: 1500
-  # Wall-clock ceiling per prefetch run. Text channels block the reply
-  # path, so their ceiling stays tight-ish; scheduled triggers precompute
-  # in the background at T-minus-lookahead and get far more headroom.
-  timeout_seconds: 20.0
+  # Size-log threshold for the assembled bundle — NOT a truncation cap.
+  # Per-lane pick caps bound the bundle; an over-budget render logs a
+  # warning for offline analysis instead of cutting sections.
+  token_budget: 20000
+  # Wall-clock ceilings. timeout_seconds covers the whole fan-out on
+  # text channels (which block the reply path); per_call is one lane;
+  # scheduled triggers precompute in the background at T-minus-lookahead
+  # and get far more headroom.
+  timeout_seconds: 8.0
+  per_call_timeout_seconds: 6.0
   trigger_timeout_seconds: 120.0
-  max_iterations: 6
-  # Override the mini-agent model; null falls back to models.small (Haiku).
+  # Override the selector model; null falls back to models.fast (the
+  # latency tier, e.g. gpt-5.6-luna) then models.small.
   model: null
+  # Hot tasks: common formulaic requests get a precomputed skills+sdk
+  # bundle; a matched utterance skips the selector fan-out on the reply
+  # path entirely (src/boxbot/prefetch/hot.py). A stock task list ships
+  # in code (config.py _DEFAULT_HOT_TASKS); override it wholesale here:
+  #   hot_tasks:
+  #     - name: show_camera
+  #       exemplars: ["show me the garage camera", "show me the front door"]
+  hot_tasks_enabled: true
+  # Minimum cosine similarity (utterance vs task centroid) for a hit.
+  hot_match_threshold: 0.60
 
 # ── WhatsApp ──────────────────────────────────────────────────────────
 # WhatsApp credentials live in a separate file: config/whatsapp.yaml

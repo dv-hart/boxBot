@@ -147,6 +147,8 @@ def _staged_script_path(meta: IntegrationMeta, runtime_dir: Path) -> Path | None
     fly (see :func:`run`) so a just-created integration is runnable
     immediately, with no re-stage required.
     """
+    if meta.name.startswith("script:"):
+        return None  # workspace scripts are never staged — always copied
     staged = runtime_dir / "integrations" / meta.name / "script.py"
     return staged if staged.exists() else None
 
@@ -160,27 +162,51 @@ def _build_command(
     enforce_sandbox: bool,
     include_secrets_path: bool = False,
     script_path: Path | None = None,
-) -> list[str]:
+) -> tuple[list[str], dict[str, Any]]:
+    """Return ``(argv, popen_kwargs)`` for the integration subprocess.
+
+    Uses the shared :func:`build_sandbox_launch` so integrations drop
+    privilege exactly like ``execute_script`` — ``sudo`` on the Pi,
+    ``setuid`` (preexec_fn) on root-in-chroot hosts. ``popen_kwargs``
+    carries a ``preexec_fn`` on the setuid path and is empty otherwise.
+    """
+    from boxbot.tools._sandbox_launch import build_sandbox_launch
+
     target_script = script_path if script_path is not None else meta.script_path
-    if enforce_sandbox and sandbox_user:
-        preserve = [
-            "BOXBOT_SECCOMP_MODE", "BOXBOT_SECCOMP_DISABLE",
-            "BOXBOT_SKILLS_ROOT",
-            "BOXBOT_INTEGRATION_INPUTS_PATH", "BOXBOT_INTEGRATION_OUTPUT_PATH",
-        ]
-        if include_secrets_path:
-            # Secret *values* never cross sudo (it logs every preserved
-            # var); only the path to the staged secrets file does. The
-            # bootstrap reads it into the env after the privilege drop.
-            preserve.append("BOXBOT_SECRETS_PATH")
-        return [
-            "sudo", "-n",
-            "--preserve-env=" + ",".join(preserve),
-            "-u", sandbox_user,
-            "--", str(venv_python), str(bootstrap_path),
-            str(target_script),
-        ]
-    return [str(venv_python), str(bootstrap_path), str(target_script)]
+
+    # Fresh-read privilege_drop/extra_groups each run (same pattern as
+    # SandboxRunner.start) so a runtime config edit takes effect without
+    # a code change.
+    privilege_drop = "auto"
+    extra_groups: list[int] = []
+    try:
+        from boxbot.core.config import get_config
+        _sbx = get_config().sandbox
+        privilege_drop = _sbx.privilege_drop
+        extra_groups = list(_sbx.extra_groups)
+    except Exception:
+        pass
+
+    # sudo strips env not listed here. Secret *values* never cross sudo
+    # (it logs every preserved var); only BOXBOT_SECRETS_PATH does, and
+    # the bootstrap reads the file after the drop. (No-op on the
+    # setuid/none paths, where env passes through untouched.)
+    preserve = [
+        "BOXBOT_SECCOMP_MODE", "BOXBOT_SECCOMP_DISABLE",
+        "BOXBOT_SKILLS_ROOT",
+        "BOXBOT_INTEGRATION_INPUTS_PATH", "BOXBOT_INTEGRATION_OUTPUT_PATH",
+    ]
+    if include_secrets_path:
+        preserve.append("BOXBOT_SECRETS_PATH")
+
+    return build_sandbox_launch(
+        [str(venv_python), str(bootstrap_path), str(target_script)],
+        user=sandbox_user,
+        privilege_drop=privilege_drop,
+        extra_groups=extra_groups,
+        preserve_env_keys=preserve,
+        enforce=enforce_sandbox,
+    )
 
 
 def _build_env(
@@ -266,7 +292,10 @@ async def _pump_actions(proc: asyncio.subprocess.Process) -> tuple[list[str], li
         read_sandbox_line,
     )
 
-    ctx = ActionContext()
+    # Integration scripts run unattended — no model, no human in the loop.
+    # The origin marker lets action handlers deny the privileged surfaces
+    # (tasks.*) structurally rather than by prompt.
+    ctx = ActionContext(origin="integration")
     output_lines: list[str] = []
 
     assert proc.stdout is not None
@@ -324,7 +353,73 @@ async def run(
 
     validated_inputs = _validate_inputs(meta, inputs)
     timeout = timeout_override if timeout_override is not None else meta.timeout
+    return await _execute(
+        meta, validated_inputs, timeout, require_output=True
+    )
 
+
+# Trigger-run workspace scripts get a fixed budget — there is no
+# manifest to declare one, and an unattended chore that needs more than
+# this should escalate instead of running longer.
+DEFAULT_SCRIPT_TIMEOUT_S = 120
+
+
+async def run_workspace_script(
+    path: str,
+    inputs: dict[str, Any] | None = None,
+    *,
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    """Execute a workspace-relative Python file in the unattended sandbox.
+
+    The chore-script counterpart of :func:`run`: same subprocess, same
+    seccomp bootstrap, same ``bb.*`` action demux under
+    ``origin="integration"`` (``tasks.*`` structurally denied), same runs.db logging (under ``script:<path>``)
+    and the same escalate contract — minus the integration registry.
+    Differences: ``inputs`` pass through unvalidated (no manifest; read
+    them via ``bb.integration.inputs()``), no secrets are staged, and a
+    script that never calls ``return_output`` / ``bb.escalate`` is a
+    SILENT SUCCESS, not an error — plain chores just exit 0.
+
+    Raises :class:`IntegrationRunError` for an unsafe or missing path.
+    """
+    from boxbot.workspace import Workspace, WorkspaceError
+
+    ws = Workspace()
+    try:
+        abs_path = ws._safe_path(path, must_exist=True)
+    except WorkspaceError as exc:
+        raise IntegrationRunError(f"run_script path rejected: {exc}") from exc
+    if abs_path.suffix != ".py":
+        raise IntegrationRunError(
+            f"run_script must name a .py file, got {path!r}"
+        )
+
+    meta = IntegrationMeta(
+        name=f"script:{path}",
+        description="trigger-run workspace script",
+        inputs={},
+        outputs={},
+        secrets=(),
+        timeout=timeout if timeout is not None else DEFAULT_SCRIPT_TIMEOUT_S,
+        root_path=abs_path.parent,
+        manifest_path=abs_path,
+        script_path=abs_path,
+    )
+    return await _execute(
+        meta, inputs or {}, meta.timeout, require_output=False
+    )
+
+
+async def _execute(
+    meta: IntegrationMeta,
+    validated_inputs: dict[str, Any],
+    timeout: int,
+    *,
+    require_output: bool,
+) -> dict[str, Any]:
+    """Shared sandbox-execution body for integrations and workspace scripts."""
+    name = meta.name
     started_at = run_logs.now()
 
     inputs_path: Path | None = None
@@ -413,15 +508,23 @@ async def run(
                     "could not chmod integration script tmp file: %s", exc
                 )
             script_path = script_tmp_path
-        cmd = _build_command(
-            meta,
-            venv_python=venv_python,
-            bootstrap_path=bootstrap_path,
-            sandbox_user=sandbox_user,
-            enforce_sandbox=enforce_sandbox,
-            include_secrets_path=secrets_path is not None,
-            script_path=script_path,
-        )
+        try:
+            cmd, popen_kwargs = _build_command(
+                meta,
+                venv_python=venv_python,
+                bootstrap_path=bootstrap_path,
+                sandbox_user=sandbox_user,
+                enforce_sandbox=enforce_sandbox,
+                include_secrets_path=secrets_path is not None,
+                script_path=script_path,
+            )
+        except RuntimeError as exc:
+            # Privilege drop can't be built (missing sandbox user, or
+            # refusing to run as root with no drop). Return an error result;
+            # the finally block cleans up the staged temp/secrets files.
+            error = f"sandbox privilege drop unavailable: {exc}"
+            logger.warning("integration '%s': %s", name, error)
+            return {"status": "error", "error": error}
 
         # Same lazy import as _pump_actions — dodge the boxbot.core init chain.
         # asyncio's default StreamReader limit is 64 KiB per line, far too
@@ -438,6 +541,7 @@ async def run(
                 env=env,
                 cwd=str(Path.cwd()),
                 limit=SANDBOX_STREAM_LIMIT,
+                **popen_kwargs,
             )
         except FileNotFoundError as exc:
             error = f"sandbox python not found at {venv_python}: {exc}"
@@ -476,6 +580,11 @@ async def run(
             error = f"failed to read integration output file: {exc}"
             return {"status": "error", "error": error}
         if not raw.strip():
+            if not require_output:
+                # Workspace chore script that just did its work and
+                # exited 0 — silence IS the success signal.
+                status = "ok"
+                return {"status": "ok", "output": None}
             error = (
                 f"integration '{name}' did not call return_output(); "
                 "no output recorded"

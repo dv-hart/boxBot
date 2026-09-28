@@ -1,7 +1,7 @@
 ---
 name: bb
-description: The bb Python package — your hands inside the sandbox. Import it from execute_script for camera stills, photo search, the 7" display, a persistent notes/CSV workspace, memory, triggers and to-dos, audio playback, new skills, secrets, and data-pipe integrations (calendar lives here). Load when the user mentions photos, the camera, the screen, notes, lists tracked over time, reminders, or anything worth composing in one turn.
-when_to_use: User mentions photos, camera, display/screen, notes, keeping a list, tracking something over time, reminders, or asks for a multi-step action that would otherwise cost several tool calls.
+description: The bb Python package — your hands inside the sandbox. Camera stills, photos, the 7" display, a notes/CSV workspace, memory, triggers and to-dos, audio, skill authoring, secrets, and data-pipe integrations (calendar lives here). Import from execute_script.
+when_to_use: User mentions photos, cameras, display/screen, notes, keeping a list, tracking something over time, reminders, or asks for a multi-step action that would otherwise cost several tool calls.
 ---
 
 # bb — the boxBot SDK

@@ -26,7 +26,7 @@ What this module provides:
   scoped to ours, an optional ``can_use_tool`` gate for per-turn tool
   filtering (used for the final-turn ``message``-only restriction),
   and the chosen model + max_turns from config.
-* :func:`flatten_system_prompt` — concatenates the existing two-block
+* :func:`flatten_system_prompt` — concatenates the system prompt block
   system prompt into the single string the SDK accepts. Cache markers
   are dropped (the SDK manages caching internally).
 * :func:`mcp_tool_name` — canonical ``mcp__boxbot_tools__<name>`` form
@@ -158,8 +158,15 @@ def wrap_tool(tool: "Tool", conv: Any = None) -> "SdkMcpTool[Any]":
 
     @sdk_tool(tool.name, tool.description, tool.parameters)
     async def _wrapped(args: dict[str, Any]) -> dict[str, Any]:
+        from boxbot.core.tool_status import publish_tool_status
         from boxbot.tools._tool_context import current_conversation
 
+        # Surface "working on X" to the room before the (possibly slow)
+        # tool runs — display manager renders it as a pill. This wrapper
+        # is the only exact pre-execution point on the SDK path; the
+        # streamed ToolUseBlock in the agent loop arrives with ambiguous
+        # timing relative to execution.
+        await publish_tool_status(conv, tool.name, args)
         token = current_conversation.set(conv)
         try:
             result = await tool.execute(**args)
@@ -205,7 +212,7 @@ def build_mcp_server(
 
 
 def flatten_system_prompt(blocks: list[dict[str, Any]]) -> str:
-    """Flatten the existing two-block system prompt into a single string.
+    """Flatten the system prompt block list into a single string.
 
     The raw Anthropic path passes a list of text blocks with mixed
     ``cache_control`` markers; the SDK's ``system_prompt`` field is a

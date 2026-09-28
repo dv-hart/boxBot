@@ -437,10 +437,14 @@ class TestDisplaySchemaBuilder:
         assert text["kind"] == "content"
         assert "size" in text["fields"]
         # Semantic taxonomy — distinct from icon/clock t-shirt sizes.
-        sizes = text["fields"]["size"]["valid_values"]
+        # Listed as ramp_names, not valid_values: a pixel number is
+        # valid too, so the ramp is not a closed set.
+        assert "valid_values" not in text["fields"]["size"]
+        sizes = text["fields"]["size"]["ramp_names"]
         assert "title" in sizes
         assert "body" in sizes
         assert "lg" not in sizes  # t-shirt sizes belong to other blocks
+        assert "8-240" in text["fields"]["size"]["describe"]
 
     def test_schema_clock_block_uses_t_shirt_sizes(self):
         from boxbot.tools._sandbox_actions import _build_display_schema
@@ -968,3 +972,29 @@ class TestSDKAudio:
         fake_request["responses"]["audio.play"] = {"status": "wat"}
         with pytest.raises(audio.AudioError, match="unexpected"):
             audio.play("audio/chime.wav")
+
+
+class TestBBAlias:
+    """``import bb`` must work anywhere the SDK is imported."""
+
+    def test_alias_registered_on_import(self):
+        import boxbot.sdk
+
+        assert sys.modules.get("bb") is boxbot.sdk
+
+    def test_import_bb_in_fresh_interpreter(self):
+        import subprocess
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parents[1] / "src")
+        code = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "import boxbot.sdk\n"
+            "import bb\n"
+            "assert bb is boxbot.sdk\n"
+            "assert bb.memory is boxbot.sdk.memory\n" % src
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        )
+        assert proc.returncode == 0, proc.stderr

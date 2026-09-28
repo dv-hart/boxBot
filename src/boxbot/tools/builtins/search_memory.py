@@ -26,8 +26,10 @@ class SearchMemoryTool(Tool):
         "- summary: one synthesized answer from relevant memories\n"
         "- get: one full record by memory_id\n"
         "- transcript: raw conversation text. Pass conversation_id for "
-        "one thread, or query to substring-search the last 14 days. Use "
-        "when memory is thin and you need what was actually said."
+        "one thread (incl. ids from the Recent conversations block; "
+        "still-open text threads resolve too), or query to "
+        "substring-search the last 14 days. Use when memory is thin "
+        "and you need what was actually said."
     )
     parameters = {
         "type": "object",

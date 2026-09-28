@@ -139,18 +139,21 @@ async def hybrid_search(
     scored: dict[str, float] = {pid: 0.0 for pid in candidates}
 
     if query:
-        # Vector similarity scoring
+        # Vector similarity scoring. None query embedding = no embedding
+        # model installed; BM25 then carries the full weight.
         query_embedding = embed(query)
+        bm25_weight = BM25_WEIGHT if query_embedding is not None else 1.0
 
-        for pid, row in candidates.items():
-            if row["embedding"]:
-                photo_embedding = np.frombuffer(
-                    row["embedding"], dtype=np.float32
-                )
-                if len(photo_embedding) == EMBEDDING_DIM:
-                    sim = cosine_similarity(query_embedding, photo_embedding)
-                    # Normalize similarity from [-1, 1] to [0, 1]
-                    scored[pid] += VECTOR_WEIGHT * ((sim + 1.0) / 2.0)
+        if query_embedding is not None:
+            for pid, row in candidates.items():
+                if row["embedding"]:
+                    photo_embedding = np.frombuffer(
+                        row["embedding"], dtype=np.float32
+                    )
+                    if len(photo_embedding) == EMBEDDING_DIM:
+                        sim = cosine_similarity(query_embedding, photo_embedding)
+                        # Normalize similarity from [-1, 1] to [0, 1]
+                        scored[pid] += VECTOR_WEIGHT * ((sim + 1.0) / 2.0)
 
         # BM25 scoring via FTS5
         bm25_scores = await _bm25_scores(db, query, set(candidates.keys()))
@@ -160,7 +163,7 @@ async def hybrid_search(
             if max_bm25 > 0:
                 for pid, bm25_score in bm25_scores.items():
                     if pid in scored:
-                        scored[pid] += BM25_WEIGHT * (bm25_score / max_bm25)
+                        scored[pid] += bm25_weight * (bm25_score / max_bm25)
     else:
         # No query: score by recency (newest first)
         all_dates = []

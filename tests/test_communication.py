@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -73,6 +74,20 @@ class TestAuthManagerUserCRUD:
     async def test_get_nonexistent_user_returns_none(self, auth_manager):
         user = await auth_manager.get_user("+10000000000")
         assert user is None
+
+    @pytest.mark.asyncio
+    async def test_get_user_by_name_ignores_case_and_whitespace(
+        self, auth_manager
+    ):
+        code = await auth_manager.generate_bootstrap_code()
+        await auth_manager.register_user("+15551234567", "Jacob", code)
+        user = await auth_manager.get_user_by_name("  jacob ")
+        assert user is not None
+        assert user.phone == "+15551234567"
+
+    @pytest.mark.asyncio
+    async def test_get_user_by_name_unknown_returns_none(self, auth_manager):
+        assert await auth_manager.get_user_by_name("Stranger") is None
 
     @pytest.mark.asyncio
     async def test_remove_user(self, auth_manager):
@@ -535,3 +550,5 @@ class TestMessageRouter:
             Channel.WHATSAPP, phone, "Let me in"
         )
         assert result is False
+
+

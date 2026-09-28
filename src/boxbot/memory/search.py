@@ -6,6 +6,8 @@ Provides hybrid vector + BM25 retrieval used by:
 - SDK boxbot_sdk.memory.search() (via execute_script)
 
 Scoring: 0.6 * vector_cosine + 0.4 * BM25_normalized (configurable).
+With no embedding model available the vector branch is skipped entirely
+and BM25 carries the full weight — see embeddings.py.
 
 ## Anthropic client threading
 
@@ -30,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from boxbot.memory.embeddings import EMBEDDING_DIM, cosine_similarity, embed
+from boxbot.memory.embeddings import cosine_similarity, embed
 from boxbot.memory.store import MemoryStore
 
 if TYPE_CHECKING:
@@ -107,6 +109,9 @@ async def hybrid_search(
     include_archived: bool = False,
     memory_limit: int = DEFAULT_MEMORY_CANDIDATES,
     conversation_limit: int = DEFAULT_CONVERSATION_CANDIDATES,
+    relax_fts: bool = True,
+    query_embedding: np.ndarray | None = None,
+    allow_vector: bool = True,
 ) -> list[SearchCandidate]:
     """Perform hybrid vector + BM25 search across memories and conversations.
 
@@ -119,20 +124,34 @@ async def hybrid_search(
         include_archived: Whether to include archived memories.
         memory_limit: Max memory candidates to return.
         conversation_limit: Max conversation candidates to return.
+        relax_fts: Retry BM25 with an any-term match when the all-terms
+            match finds nothing. Pass False when the results are used
+            unranked — see ``_fts_query_forms``.
+        query_embedding: Precomputed embedding of ``query``, to skip the
+            embed call when the caller already has one (hot-task match).
+        allow_vector: False skips the embed call entirely (BM25-only) —
+            for cheap supplemental passes on the reply path where an
+            extra API embed round trip isn't worth it.
 
     Returns:
         List of SearchCandidate sorted by combined_score descending.
     """
-    query_embedding = embed(query)
+    # None when no embedding model is available: the vector branch is
+    # skipped and BM25 becomes the whole score.
+    if query_embedding is None and allow_vector:
+        query_embedding = embed(query)
+    use_vector = query_embedding is not None
 
     # --- Vector search on memories ---
-    memory_candidates = await _vector_search_memories(
-        store, query_embedding,
-        types=types,
-        person=person,
-        include_archived=include_archived,
-        limit=memory_limit * 2,  # Over-fetch for merging with BM25
-    )
+    memory_candidates: list[SearchCandidate] = []
+    if use_vector:
+        memory_candidates = await _vector_search_memories(
+            store, query_embedding,
+            types=types,
+            person=person,
+            include_archived=include_archived,
+            limit=memory_limit * 2,  # Over-fetch for merging with BM25
+        )
 
     # --- BM25 search on memories ---
     bm25_candidates = await _bm25_search_memories(
@@ -141,25 +160,31 @@ async def hybrid_search(
         person=person,
         include_archived=include_archived,
         limit=memory_limit * 2,
+        relax_fts=relax_fts,
     )
 
     # --- Merge memory candidates ---
     merged_memories = _merge_candidates(
-        memory_candidates, bm25_candidates, limit=memory_limit
+        memory_candidates, bm25_candidates,
+        limit=memory_limit, use_vector=use_vector,
     )
 
     all_candidates = merged_memories
 
     # --- Conversation search ---
     if include_conversations:
-        conv_vector = await _vector_search_conversations(
-            store, query_embedding, limit=conversation_limit * 2
-        )
+        conv_vector: list[SearchCandidate] = []
+        if use_vector:
+            conv_vector = await _vector_search_conversations(
+                store, query_embedding, limit=conversation_limit * 2
+            )
         conv_bm25 = await _bm25_search_conversations(
-            store, query, limit=conversation_limit * 2
+            store, query, limit=conversation_limit * 2,
+            relax_fts=relax_fts,
         )
         merged_convs = _merge_candidates(
-            conv_vector, conv_bm25, limit=conversation_limit
+            conv_vector, conv_bm25,
+            limit=conversation_limit, use_vector=use_vector,
         )
         all_candidates.extend(merged_convs)
 
@@ -243,16 +268,16 @@ async def _bm25_search_memories(
     person: str | None,
     include_archived: bool,
     limit: int,
+    relax_fts: bool = True,
 ) -> list[SearchCandidate]:
     """Search memories by FTS5 BM25 scoring."""
-    # Build FTS query — escape special characters
-    fts_query = _escape_fts_query(query)
-    if not fts_query.strip():
+    forms = _fts_query_forms(query, relax=relax_fts)
+    if not forms:
         return []
 
     # Join with memories table for status/type filtering
     conditions = ["memories_fts MATCH ?"]
-    params: list = [fts_query]
+    params: list = []
 
     if include_archived:
         conditions.append("m.status IN ('active', 'archived')")
@@ -270,20 +295,24 @@ async def _bm25_search_memories(
 
     where = " AND ".join(conditions)
 
-    try:
-        cursor = await store.db.execute(
-            f"""SELECT m.*, bm25(memories_fts) AS rank
-                FROM memories_fts
-                JOIN memories m ON m.rowid = memories_fts.rowid
-                WHERE {where}
-                ORDER BY rank
-                LIMIT ?""",
-            params + [limit],
-        )
-        rows = await cursor.fetchall()
-    except Exception as e:
-        logger.warning("FTS5 search failed: %s", e)
-        return []
+    rows = []
+    for fts_query in forms:
+        try:
+            cursor = await store.db.execute(
+                f"""SELECT m.*, bm25(memories_fts) AS rank
+                    FROM memories_fts
+                    JOIN memories m ON m.rowid = memories_fts.rowid
+                    WHERE {where}
+                    ORDER BY rank
+                    LIMIT ?""",
+                [fts_query] + params + [limit],
+            )
+            rows = await cursor.fetchall()
+        except Exception as e:
+            logger.warning("FTS5 search failed: %s", e)
+            return []
+        if rows:
+            break
 
     candidates = []
     for row in rows:
@@ -356,26 +385,27 @@ async def _bm25_search_conversations(
     query: str,
     *,
     limit: int,
+    relax_fts: bool = True,
 ) -> list[SearchCandidate]:
     """Search conversations by FTS5 BM25 scoring."""
-    fts_query = _escape_fts_query(query)
-    if not fts_query.strip():
-        return []
-
-    try:
-        cursor = await store.db.execute(
-            """SELECT c.*, bm25(conversations_fts) AS rank
-               FROM conversations_fts
-               JOIN conversations c ON c.rowid = conversations_fts.rowid
-               WHERE conversations_fts MATCH ?
-               ORDER BY rank
-               LIMIT ?""",
-            (fts_query, limit),
-        )
-        rows = await cursor.fetchall()
-    except Exception as e:
-        logger.warning("Conversation FTS5 search failed: %s", e)
-        return []
+    rows = []
+    for fts_query in _fts_query_forms(query, relax=relax_fts):
+        try:
+            cursor = await store.db.execute(
+                """SELECT c.*, bm25(conversations_fts) AS rank
+                   FROM conversations_fts
+                   JOIN conversations c ON c.rowid = conversations_fts.rowid
+                   WHERE conversations_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (fts_query, limit),
+            )
+            rows = await cursor.fetchall()
+        except Exception as e:
+            logger.warning("Conversation FTS5 search failed: %s", e)
+            return []
+        if rows:
+            break
 
     candidates = []
     for row in rows:
@@ -406,11 +436,16 @@ def _merge_candidates(
     bm25_candidates: list[SearchCandidate],
     *,
     limit: int,
+    use_vector: bool = True,
 ) -> list[SearchCandidate]:
     """Merge vector and BM25 candidates with normalized score combination.
 
-    Normalizes each score type to [0, 1] range before combining with weights.
+    Normalizes each score type to [0, 1] range before combining with
+    weights. With ``use_vector=False`` (no embedding model) BM25 carries
+    the full weight.
     """
+    vector_weight = VECTOR_WEIGHT if use_vector else 0.0
+    bm25_weight = BM25_WEIGHT if use_vector else 1.0
     # Build lookup by ID
     by_id: dict[str, SearchCandidate] = {}
 
@@ -432,17 +467,18 @@ def _merge_candidates(
     for c in candidates:
         norm_vector = c.vector_score / max_vector
         norm_bm25 = c.bm25_score / max_bm25
-        c.combined_score = VECTOR_WEIGHT * norm_vector + BM25_WEIGHT * norm_bm25
+        c.combined_score = vector_weight * norm_vector + bm25_weight * norm_bm25
 
     candidates.sort(key=lambda c: c.combined_score, reverse=True)
     return candidates[:limit]
 
 
-def _escape_fts_query(query: str) -> str:
+def _escape_fts_query(query: str, *, match_any: bool = False) -> str:
     """Escape a query string for FTS5 MATCH syntax.
 
     Wraps each word in double quotes to avoid FTS5 syntax errors from
-    special characters.
+    special characters. Bare terms are ANDed by FTS5; ``match_any``
+    joins them with OR instead.
     """
     words = query.split()
     escaped = []
@@ -451,7 +487,30 @@ def _escape_fts_query(query: str) -> str:
         clean = "".join(c for c in word if c.isalnum() or c in "-_'")
         if clean:
             escaped.append(f'"{clean}"')
-    return " ".join(escaped)
+    return (" OR " if match_any else " ").join(escaped)
+
+
+def _fts_query_forms(query: str, *, relax: bool = True) -> list[str]:
+    """All-terms query first, any-term query as a fallback.
+
+    FTS5 ANDs bare terms, so a whole utterance ("Jacob what should I eat
+    tonight?") matches nothing and BM25 contributes zero candidates.
+    Retrying with OR keeps keyword search useful on natural language —
+    load-bearing when there is no embedding model and BM25 is the entire
+    ranking signal.
+
+    ``relax=False`` drops the fallback for callers that use the results
+    unranked: matching any single token means the speaker's own name
+    matches everything ever recorded about them, all at the top of a
+    normalized score.
+    """
+    strict = _escape_fts_query(query)
+    if not strict.strip():
+        return []
+    if not relax:
+        return [strict]
+    relaxed = _escape_fts_query(query, match_any=True)
+    return [strict] if relaxed == strict else [strict, relaxed]
 
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1214,13 @@ async def _search_transcript(
     if conversation_id:
         text = await store.get_transcript(conversation_id)
         if text is None:
+            # Text threads (WhatsApp/Signal) have no extraction row
+            # until their inactivity window closes — and keep their
+            # turns in the ConversationStore past transcript purge.
+            # Fall through so activity-log ids always resolve.
+            thread = await _thread_store_transcript(conversation_id)
+            if thread is not None:
+                return thread
             return {
                 "error": (
                     f"Transcript for {conversation_id} not available "
@@ -1187,6 +1253,52 @@ async def _search_transcript(
             for (cid, started_at, snippet) in matches
         ],
     }
+
+
+async def _thread_store_transcript(conversation_id: str) -> dict | None:
+    """Recover a persistent thread from the ConversationStore.
+
+    Opens a short-lived read connection (WAL — safe alongside the
+    agent's writer); returns None on any miss or failure so the caller
+    falls back to its normal not-available error.
+    """
+    try:
+        from boxbot.conversations import store as conv_store_module
+        from boxbot.conversations.store import render_thread_text
+    except Exception:
+        return None
+    # Recovery is read-only: never create the DB where none exists.
+    if not conv_store_module.DB_PATH.exists():
+        return None
+    conv_store = conv_store_module.ConversationStore()
+    try:
+        await conv_store.initialize()
+        rec = await conv_store.get(conversation_id)
+        if rec is None:
+            return None
+        turns = await conv_store.get_thread(conversation_id)
+        text = render_thread_text(turns)
+        if not text.strip():
+            return None
+        return {
+            "conversation_id": conversation_id,
+            "started_at": rec.started_at_iso,
+            "channel": rec.channel,
+            "participants": rec.participants,
+            "thread_state": rec.state,
+            "transcript": text,
+        }
+    except Exception:
+        logger.debug(
+            "thread-store transcript fallback failed for %s",
+            conversation_id, exc_info=True,
+        )
+        return None
+    finally:
+        try:
+            await conv_store.close()
+        except Exception:
+            pass
 
 
 async def _search_get(store: MemoryStore, memory_id: str) -> dict:

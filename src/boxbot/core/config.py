@@ -98,6 +98,23 @@ def _overlay_env(data: dict[str, Any]) -> None:
         data["models"]["large"] = val
     if val := os.environ.get("BOXBOT_MODEL_SMALL"):
         data["models"]["small"] = val
+    if val := os.environ.get("BOXBOT_MODEL_FAST"):
+        data["models"]["fast"] = val
+    if val := os.environ.get("BOXBOT_MODEL_EMBEDDING"):
+        data["models"]["embedding"] = val
+    if val := os.environ.get("BOXBOT_MODEL_EMBEDDING_ONNX"):
+        data["models"]["embedding_onnx"] = val
+
+    # OpenAI endpoint shape — env only, same rule as models.
+    if "openai" not in data:
+        data["openai"] = {}
+    for env_name, field in (
+        ("OPENAI_API_TYPE", "api_type"),
+        ("OPENAI_API_BASE", "api_base"),
+        ("OPENAI_API_VERSION", "api_version"),
+    ):
+        if val := os.environ.get(env_name):
+            data["openai"][field] = val
 
     # API keys — env only, never in YAML
     if "api_keys" not in data:
@@ -154,6 +171,12 @@ class AgentConfig(BaseModel):
     name: str = "boxBot"
     wake_word: str = "hey box"
     max_turns: int = 25
+    # Trigger (wake-cycle) runs get a tighter budget than interactive
+    # channels: nobody is waiting, so a long run is the agent talking to
+    # itself. ``max_messages_trigger`` caps *delivered* messages per
+    # trigger conversation; the message tool refuses past it.
+    max_turns_trigger: int = 10
+    max_messages_trigger: int = 2
     # Which client carries the main conversation turn.
     #   ``raw_anthropic`` — direct ``anthropic.AsyncAnthropic.messages.create``
     #       calls billed via Console at API rates. The original path.
@@ -162,6 +185,26 @@ class AgentConfig(BaseModel):
     #       (Haiku rerank, batches, web-search firewall, photo tagging)
     #       stay on the raw client regardless of this setting.
     backend: Literal["raw_anthropic", "claude_agent_sdk"] = "raw_anthropic"
+
+    # Fast-tier (OpenAI-path) per-call safety net. The shared Azure
+    # Luna deployment intermittently holds a request ~60s server-side
+    # before answering normally (~5% of calls, healthy median <1s);
+    # the SDK's 600s default turns each stall into a minute of dead
+    # air on voice. Time out early and let the SDK retry — a retry
+    # almost always lands on a fast path. ``openai_max_retries`` is
+    # the SDK's own retry count (timeouts, connection errors, 429,
+    # 5xx), applied per call on top of the loop-level retry.
+    openai_timeout_seconds: float = 20.0
+    openai_max_retries: int = 2
+
+    # Rolling within-thread compaction. Keeps a long OPEN thread bounded:
+    # when its estimated tokens exceed ``compaction_threshold_tokens`` the
+    # oldest turns are summarized (small model) into one note and the
+    # recent tail is kept verbatim. Defaults sit well under the large
+    # model's ~200k context. No-op when disabled.
+    compaction_enabled: bool = True
+    compaction_threshold_tokens: int = 150_000
+    compaction_keep_recent_tokens: int = 30_000
 
 
 class WakeCycleEntry(BaseModel):
@@ -203,6 +246,11 @@ class ScheduleConfig(BaseModel):
     ])
     idle_timeout: int = 300
     person_trigger_expiry_days: int = 7
+    # Recurring (cron) triggers overdue by more than this are re-anchored to
+    # their next occurrence WITHOUT firing — prevents a boot after a scheduled
+    # slot (or after downtime) from replaying every missed wake cycle at once.
+    # One-shot (fire_at) triggers are unaffected: they still fire once.
+    catch_up_grace_seconds: int = 600
 
 
 class HomeAssistantConfig(BaseModel):
@@ -237,6 +285,13 @@ class DisplayConfig(BaseModel):
     brightness: float = 0.8
     night_mode: NightModeConfig = Field(default_factory=NightModeConfig)
 
+    # Screen HAL backend + canvas geometry. "pygame" (HDMI, default) or
+    # "none" (headless, no screen). width/height drive both the renderer
+    # (DisplayManager canvas) and the backend.
+    backend: Literal["pygame", "none"] = "pygame"
+    width: int = 1024
+    height: int = 600
+
 
 class CameraConfig(BaseModel):
     """Camera hardware settings."""
@@ -244,6 +299,10 @@ class CameraConfig(BaseModel):
     resolution: list[int] = Field(default_factory=lambda: [1280, 720])
     scan_fps: int = 5
     active_fps: int = 15
+    # Dev only: return a synthetic test frame instead of an error when
+    # there is no camera. Off everywhere real — the agent treats attached
+    # pixels as something it saw.
+    test_pattern_without_camera: bool = False
 
     @model_validator(mode="after")
     def validate_resolution(self) -> CameraConfig:
@@ -390,18 +449,39 @@ class DiarizationConfig(BaseModel):
     adds ~4 s/utterance latency plus heavy CPU-tensor churn.
     """
 
-    enabled: bool = False
-    engine: str = "pyannote"
-    model: str = "pyannote/speaker-diarization-3.1"
-    embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
-    min_speakers: int = 1
-    max_speakers: int = 6
-    match_threshold: float = 0.65
     # When False, skip the diarization pipeline and embed each VAD
     # utterance whole (single-speaker assumption). Avoids fragmenting a
     # clean utterance into weak sub-second embeddings and the 3.6-4.5s
     # pipeline latency. See docs/voice-id-redesign.md.
     enabled: bool = False
+
+    # Which speaker backend supplies the embedding.
+    #   "pyannote" — torch + pyannote.audio; the only engine that can
+    #                diarize, so it is required when enabled is True.
+    #   "onnx"     — wespeaker via onnxruntime, embed-only, ~26 MB and no
+    #                torch. For hardware that cannot carry pyannote, where
+    #                push-to-talk already guarantees one speaker per
+    #                utterance.
+    engine: Literal["pyannote", "onnx"] = "pyannote"
+    model: str = "pyannote/speaker-diarization-3.1"
+    # Names the embedding model for whichever engine is selected: a
+    # HuggingFace id under "pyannote", a path to the .onnx file under "onnx".
+    embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
+    min_speakers: int = 1
+    max_speakers: int = 6
+    match_threshold: float = 0.65
+
+    @model_validator(mode="after")
+    def _check_engine_supports_diarization(self) -> "DiarizationConfig":
+        # Fail at load, not per-utterance: the onnx model has no
+        # segmentation head, so this pairing can never work.
+        if self.enabled and self.engine == "onnx":
+            raise ValueError(
+                "voice.diarization.engine 'onnx' cannot diarize (embed-only). "
+                "Set voice.diarization.enabled: false, or use engine "
+                "'pyannote' for multi-speaker segmentation."
+            )
+        return self
 
 
 class STTConfig(BaseModel):
@@ -417,7 +497,10 @@ class TTSConfig(BaseModel):
 
     provider: str = "elevenlabs"
     voice_id: str = ""  # must be configured
-    model: str = "eleven_turbo_v2_5"
+    # Flash, not Turbo: ElevenLabs deprecated the turbo models and states
+    # the two families are functionally equivalent except Flash is lower
+    # latency (~75 ms). Same price per character in config/pricing.yaml.
+    model: str = "eleven_flash_v2_5"
     stability: float = 0.5
     similarity_boost: float = 0.75
     optimize_streaming_latency: int = 3
@@ -433,6 +516,19 @@ class SessionConfig(BaseModel):
 
 class VoiceConfig(BaseModel):
     """Voice pipeline settings."""
+
+    # Audio HAL backend. "portaudio" (ReSpeaker mic + HDMI speaker,
+    # default) or "none" (no audio I/O).
+    audio_backend: Literal["portaudio", "none"] = "portaudio"
+
+    # How a turn starts. "wake_word" listens continuously and finds the
+    # utterance end with VAD (default). "push_to_talk" takes both
+    # boundaries from a held button — press to talk, release to send —
+    # for installs where the user stands at the device anyway.
+    # Push-to-talk loads neither the wake-word model nor VAD, and
+    # needs no echo cancellation: the mic is live only while held, so
+    # BB's own voice can never reach the buffer.
+    input_mode: Literal["wake_word", "push_to_talk"] = "wake_word"
 
     wake_word: WakeWordConfig = Field(default_factory=WakeWordConfig)
     vad: VADConfig = Field(default_factory=VADConfig)
@@ -485,6 +581,20 @@ class SignalConfig(BaseModel):
     # Off by default until Phase 5 of the migration flips the default
     # on. Operators with the daemon running can override locally.
     enabled: bool = False
+
+    # Which outbound/inbound transport backs the Signal channel:
+    #   "cli"   — the real signal-cli daemon (Pi/prod; default, unchanged)
+    #   "local" — a dev/eval "local chat" TCP server that SPOOFS Signal
+    #             end to end (no signal-cli, no SIGNAL_ACCOUNT needed).
+    #             Talk to the agent over a socket; see
+    #             communication/local_chat.py.
+    driver: Literal["cli", "local"] = "cli"
+
+    # local-driver bind address + dev-user identity (driver="local" only).
+    local_host: str = "127.0.0.1"
+    local_port: int = 8765
+    local_user_phone: str = "15550000000"
+    local_user_name: str = "Dev"
 
     # signal-cli daemon JSON-RPC unix socket. Matches the
     # ``--socket`` flag in scripts/systemd/signal-cli.service.
@@ -581,6 +691,15 @@ class MemoryConfig(BaseModel):
     max_context_memories: int = 15
     decay_rate: float = 0.98
     archive_threshold: float = 0.1
+
+    # Post-conversation extraction as one live call appended to the
+    # just-ended OpenAI thread (prompt-cache hit ⇒ ~85-95% cheaper than
+    # the Anthropic batch; result applies in seconds, not minutes).
+    # Only reachable for conversations that ran on the OpenAI loop;
+    # Anthropic-loop conversations, persistent (WhatsApp) threads, and
+    # any thread-call failure use the batch path regardless. False
+    # forces the batch path everywhere.
+    thread_extraction: bool = True
 
     # Dream phase (PR1: deterministic clustering + dedup batch).
     # Lifecycle plan step 8: audit-only flipped OFF. The dream cycle's
@@ -684,6 +803,21 @@ class SandboxConfig(BaseModel):
     timeout: int = 30
     memory_limit_mb: int = 256
     allow_network: bool = True
+    # How the sandbox subprocess drops privilege. Four values:
+    #   "auto"   — euid==0 + ``user`` set → setuid; else ``user`` set →
+    #              sudo; else none. Covers both a non-root boxBot (→ sudo)
+    #              and a root boxBot in a chroot (→ setuid).
+    #   "sudo"   — ``sudo -n -u <user>`` UID-drop (boxBot must be non-root).
+    #   "setuid" — parent is root; drop directly via a ``preexec_fn``
+    #              (setgid → setgroups → setuid) with no sudo binary.
+    #   "none"   — run as the current user (== ``BOXBOT_SANDBOX_ENFORCE=0``).
+    # ``BOXBOT_SANDBOX_ENFORCE=0`` forces "none" regardless of this value.
+    privilege_drop: str = "auto"
+    # Supplementary GIDs granted to the sandbox child at drop time
+    # (setuid mode) — e.g. a group that gates network access on hosts
+    # with paranoid networking. Injected at drop time by the runner; no
+    # /etc/group edit required.
+    extra_groups: list[int] = Field(default_factory=list)
     install_approval_timeout: int = 300
     install_approval_channels: list[str] = Field(
         default_factory=lambda: ["display", "whatsapp"]
@@ -711,6 +845,15 @@ class SandboxConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_privilege_drop(self) -> SandboxConfig:
+        if self.privilege_drop not in {"auto", "sudo", "setuid", "none"}:
+            raise ValueError(
+                f"privilege_drop must be one of auto/sudo/setuid/none, "
+                f"got {self.privilege_drop!r}"
+            )
+        return self
+
     @property
     def venv_path(self) -> str:
         return f"{self.runtime_dir.rstrip('/')}/venv"
@@ -728,6 +871,23 @@ class SandboxConfig(BaseModel):
         return f"{self.runtime_dir.rstrip('/')}/tmp"
 
 
+class SkillsConfig(BaseModel):
+    """Skill availability controls."""
+
+    # Skill directory names to hide from this deployment: no Level-1
+    # metadata in the system prompt, not loadable via load_skill.
+    disabled: list[str] = Field(default_factory=list)
+
+
+class IntegrationsConfig(BaseModel):
+    """Integration availability controls."""
+
+    # Integration directory names to hide from this deployment: not
+    # listable or callable via bb.integrations. Same contract as
+    # skills.disabled.
+    disabled: list[str] = Field(default_factory=list)
+
+
 class SDKConfig(BaseModel):
     """SDK authoring controls."""
 
@@ -736,15 +896,121 @@ class SDKConfig(BaseModel):
 
 
 class ModelsConfig(BaseModel):
-    """Claude model selection (populated from env vars)."""
+    """Model selection (populated from env vars).
+
+    Provider follows from the id — see ``boxbot.core.models``.
+    """
 
     large: str = "claude-sonnet-4-20250514"
     small: str = "claude-haiku-4-5-20251001"
+    # Fast tier — optional third model (e.g. gpt-6-luna). None = off.
+    fast: str | None = None
+    # API text-embedding fallback (e.g. text-embedding-3-small), used
+    # only when no local backend is available. None = no API fallback
+    # (degrade to keyword-only search). On Azure this is the deployment
+    # name — see ``OpenAIConfig``.
+    embedding: str | None = None
+    # Local ONNX text embedder (path to an all-MiniLM-L6-v2 export;
+    # tokenizer.json expected alongside in the same directory). Used
+    # when sentence-transformers is unavailable — hosts where torch does
+    # not fit but onnxruntime is already present for speaker
+    # embeddings. Preferred over the API fallback: local,
+    # free, ~10x faster than a network round-trip.
+    embedding_onnx: str | None = None
+
+
+class OpenAIConfig(BaseModel):
+    """OpenAI endpoint shape (populated from env vars, never from YAML).
+
+    Public OpenAI needs none of this. Azure OpenAI needs all three:
+    ``api_type == "azure"`` selects ``AsyncAzureOpenAI``, and the
+    endpoint + api_version are per-resource. On Azure the ``model``
+    argument is the **deployment name**, not the public model id — keep
+    deployments named after the model they serve so `pricing.yaml` and
+    ``provider_for_model`` keep working unchanged.
+    """
+
+    api_type: str | None = None      # OPENAI_API_TYPE — "azure" or unset
+    api_base: str | None = None      # OPENAI_API_BASE — Azure resource URL
+    api_version: str | None = None   # OPENAI_API_VERSION — Azure api-version
+
+    @property
+    def is_azure(self) -> bool:
+        """True when the endpoint is Azure-hosted.
+
+        Explicit ``api_type`` wins; otherwise infer from the base host so
+        a bare OPENAI_API_BASE still routes correctly.
+        """
+        if (self.api_type or "").lower() == "azure":
+            return True
+        return ".openai.azure.com" in (self.api_base or "")
+
+
+class HotTaskConfig(BaseModel):
+    """One hot task: a name plus exemplar phrasings.
+
+    Exemplars are embedded and averaged into the task's match centroid,
+    and (joined) become the selector text when its bundle is prebuilt —
+    so they should span the phrasings the household actually uses.
+    """
+
+    name: str
+    exemplars: list[str]
+    # Live-context provider names (see ``prefetch/providers.py``)
+    # resolved at consume time — the cached bundle stays static, the
+    # injected context carries current device state. Not part of the
+    # centroid fingerprint: providers change what a hit injects, never
+    # what matches.
+    providers: list[str] = Field(default_factory=list)
+
+
+# The stock hot-task set: common household one-shots. Overridable
+# wholesale via ``prefetch.hot_tasks`` in config.yaml.
+_DEFAULT_HOT_TASKS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("show_display", (
+        "show me the clock",
+        "put the weather display on the screen",
+        "show the thermostat display",
+        "switch the screen to the photo display",
+    ), ()),
+    ("show_camera", (
+        "show me the garage camera",
+        "show me the front door",
+        "can you pull up the backyard camera",
+    ), ()),
+    ("locks", (
+        "lock the front door",
+        "unlock the door",
+        "is the door locked",
+    ), ()),
+    ("lights", (
+        "turn off the lights",
+        "turn on the living room lights",
+        "dim the lights",
+    ), ()),
+    ("thermostat", (
+        "set the temperature to 72",
+        "make it warmer in here",
+        "turn down the AC",
+    ), ()),
+    ("run_script", (
+        "run the go to bed script",
+        "execute the goodnight routine",
+    ), ()),
+    # No "weather" task: its value is the pulled lane's LIVE data, which
+    # a canned bundle can't carry — let it take the normal fan-out.
+    ("time_date", (
+        "what time is it",
+        "what's the date today",
+    ), ()),
+)
 
 
 class PrefetchConfig(BaseModel):
-    """Prefetch layer — a small read-only mini-agent that pre-assembles
-    the context the main agent will likely need into its first turn.
+    """Prefetch layer — parallel one-shot selector calls (one per
+    context source) that pre-assemble the context the main agent will
+    likely need into its first turn. No tool loop: wall clock ≈ one
+    fast-model round trip regardless of source count.
 
     Ships disabled. When enabled it runs in ``shadow`` mode first: it
     logs what it *would* prefetch (into ``prefetch_events``) but injects
@@ -757,32 +1023,74 @@ class PrefetchConfig(BaseModel):
     # shadow: run + log predictions, inject nothing.
     # active: inject the assembled bundle into the first turn.
     mode: str = "shadow"
-    # Which channels get prefetch. Voice is deferred from v1 (latency-
-    # sensitive + ephemeral) but its tool usage is still logged by the
-    # telemetry layer regardless of this list.
+    # Which channels get prefetch. Voice runs the same inline path as
+    # the text channels; the fan-out blocks the reply, so watch
+    # prefetch latency in voice round-trip numbers.
     channels: list[str] = Field(
-        default_factory=lambda: ["whatsapp", "signal", "trigger"]
+        default_factory=lambda: ["whatsapp", "signal", "trigger", "voice"]
+    )
+    # Which selector lanes run (see ``prefetch/sources.py``). A lane
+    # with no candidates for a request skips its model call entirely.
+    sources: list[str] = Field(
+        default_factory=lambda: [
+            "skills", "sdk", "memory", "workspace", "pulled",
+        ]
+    )
+    # Integrations the ``pulled`` lane may run. Security allowlist:
+    # crossed with a hard-coded read-only action map in sources.py —
+    # the model can only pick from names listed here.
+    pull_sources: list[str] = Field(
+        default_factory=lambda: ["calendar", "weather"]
     )
     # Scheduled triggers: run the precompute this many minutes before
     # fire_at. Small by default so pulled data (calendar/weather) isn't
     # stale at fire; the bundle stamps pull-time regardless.
     lookahead_minutes: int = 5
-    # Hard cap on the assembled bundle. The whole point is to REDUCE
-    # bloat, so the bundle is truncated to this budget by priority.
-    token_budget: int = 1500
-    # Wall-clock ceiling for one prefetch run (mini-agent loop). Applies
-    # to text channels, where the prefetch blocks the reply path — keep
-    # it bounded, but generous enough that a 2-3 iteration run (each a
-    # Haiku round trip + tool call) can actually finish.
-    timeout_seconds: float = 20.0
+    # Recent-activity log (prefetch/activity.py): deterministic recency
+    # index over the last few conversations across all channels,
+    # injected on a conversation's first turn and mirrored into the
+    # selector briefing. No model call; resolved at consume time, never
+    # cached.
+    activity_log: bool = True
+    activity_items: int = 5
+    activity_window_hours: float = 48.0
+    # Size-log threshold for the assembled bundle — NOT a truncation
+    # cap. Per-lane pick caps bound the bundle at assembly time; a
+    # render over this estimate logs a warning for offline analysis.
+    token_budget: int = 20000
+    # Wall-clock ceiling for one prefetch run (all lanes, in parallel).
+    # Applies to the inline channels (text + voice), where prefetch
+    # blocks the reply path.
+    timeout_seconds: float = 8.0
+    # Per-selector-call ceiling. A lane that misses it contributes
+    # nothing; the rest of the fan-out is unaffected.
+    per_call_timeout_seconds: float = 6.0
     # Ceiling for scheduled-trigger precompute. That path runs in the
     # background at T-minus-lookahead_minutes with nothing waiting on
     # it, so it gets far more headroom than the inline text path.
     trigger_timeout_seconds: float = 120.0
-    # Max mini-agent iterations before it must return best-effort.
-    max_iterations: int = 6
-    # Override the model; null falls back to ``models.small`` (Haiku).
+    # Override the selector model; null falls back to ``models.fast``
+    # (the latency tier, e.g. gpt-5.6-luna) then ``models.small``.
     model: str | None = None
+    # Hot tasks: the household's most common formulaic requests. Each
+    # gets a precomputed skills+sdk bundle (built through the normal
+    # selector fan-out, cached in prefetch_cache, invalidated by a
+    # content fingerprint over the skill/SDK docs). At message time the
+    # utterance embedding is matched against per-task exemplar
+    # centroids; a hit skips the selector fan-out on the reply path
+    # entirely. See ``prefetch/hot.py``.
+    hot_tasks_enabled: bool = True
+    # Minimum cosine similarity (utterance vs task centroid) for a hit.
+    hot_match_threshold: float = 0.60
+    hot_tasks: list["HotTaskConfig"] = Field(
+        default_factory=lambda: [
+            HotTaskConfig(
+                name=name, exemplars=list(exemplars),
+                providers=list(providers),
+            )
+            for name, exemplars, providers in _DEFAULT_HOT_TASKS
+        ]
+    )
 
 
 class ApiKeysConfig(BaseModel):
@@ -905,8 +1213,11 @@ class BoxBotConfig(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     photos: PhotosConfig = Field(default_factory=PhotosConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     sdk: SDKConfig = Field(default_factory=SDKConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     prefetch: PrefetchConfig = Field(default_factory=PrefetchConfig)
     api_keys: ApiKeysConfig = Field(default_factory=ApiKeysConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

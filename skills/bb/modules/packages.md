@@ -5,7 +5,7 @@ is owner-only, site-packages is read-only. Only path is
 **request → human approval → main-process install**. Nothing you do in
 the sandbox short-circuits the human.
 
-## Flow
+## Approval flow — request() queues; admins reply approve/deny out-of-band
 
 1. `bb.packages.request("name", reason="…")` validates the spec, queues
    a **pending** request, messages every admin with reply instructions
@@ -21,7 +21,7 @@ the sandbox short-circuits the human.
 Lifecycle: `pending → approved → installed | failed`, or
 `pending → denied`.
 
-## API
+## Call signatures — request(package, reason) / status(id) / list(status)
 
 ```python
 import boxbot_sdk as bb
@@ -68,7 +68,7 @@ bb.tasks.create_trigger(
   admins were not re-pinged. `admins_notified: 0` — nobody got the
   message (no admins, or channel down); the request still queues.
 
-## Cannot, by design
+## Cannot, by design — no self-approval, no pip options through names
 
 - Approve your own request. There is no SDK approval action — only an
   inbound admin message on Signal/WhatsApp, honored only from senders

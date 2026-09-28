@@ -442,6 +442,14 @@ def _validate_block(block: Block, errors: list[str],
             value = block.params[field_name]
             if isinstance(value, str) and value.startswith("{") and value.endswith("}"):
                 continue
+            # text.size doubles as a pixel escape hatch for hero
+            # readouts the ramp doesn't reach (it stops at 42px).
+            if block.block_type == "text" and field_name == "size" and (
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+            ):
+                if value <= 0:
+                    errors.append("text.size in pixels must be positive")
+                continue
             if value not in valid_values:
                 errors.append(
                     f"{block.block_type}.{field_name} value '{value}' "

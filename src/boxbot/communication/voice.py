@@ -35,17 +35,28 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from boxbot.communication.audio_capture import AudioCapture, Utterance
 from boxbot.communication.audio_player import AudioPlayer, PlaybackResult
-from boxbot.communication.stt import ElevenLabsSTT, STTResult
-from boxbot.communication.tts import ElevenLabsTTS, TTSStream
+from boxbot.communication.push_to_talk import PushToTalkCapture
+from boxbot.communication.stt import (
+    STTProvider,
+    STTResult,
+    StreamingSTTProvider,
+    StreamingSTTUnavailableError,
+    create_stt,
+    create_stt_fallback,
+)
+from boxbot.communication.tts import TTSProvider, TTSStream, create_tts
 from boxbot.communication.vad import VoiceActivityDetector
 from boxbot.communication.wake_word import WakeWordDetector
 from boxbot.core import latency
 from boxbot.core.conversation import RelayContext
 from boxbot.core.events import (
+    ButtonPressed,
     AgentSpeaking,
     AgentSpeakingDone,
     AgentTurnEnded,
     ConversationInterruptRequested,
+    SpeakerIdentified,
+    TranscriptDraft,
     TranscriptReady,
     VoiceSessionEnded,
     WakeWordHeard,
@@ -63,6 +74,9 @@ logger = logging.getLogger(__name__)
 # Ring patterns that only make sense while a voice session is live. If one
 # of these is still showing when the session is gone, the ring is lying.
 _SESSION_LED_PATTERNS = frozenset({"listening", "thinking", "speaking"})
+
+# Idle window before the speaker-embedding/diarization models unload.
+_DIARIZER_WARM_SECONDS = 1800.0
 
 # ---------------------------------------------------------------------------
 # Singleton accessor
@@ -148,9 +162,22 @@ class VoiceSession:
         # Voice pipeline components (built lazily in start())
         self._wake_word: WakeWordDetector | None = None
         self._vad: VoiceActivityDetector | None = None
-        self._audio_capture: AudioCapture | None = None
-        self._stt: ElevenLabsSTT | None = None
-        self._tts: ElevenLabsTTS | None = None
+        self._audio_capture: AudioCapture | PushToTalkCapture | None = None
+        self._stt: STTProvider | None = None
+        # Set only when _stt streams. Holds the same object; the
+        # separate name is what open()/feed() dispatch on.
+        self._streaming_stt: StreamingSTTProvider | None = None
+        # Batch provider that transcribes the prebuffer when the
+        # socket never came good. None unless _stt streams.
+        self._stt_fallback: STTProvider | None = None
+        # Handle for the mic consumer that feeds _streaming_stt. Stored
+        # because remove_consumer is handle-keyed — bound methods are not
+        # identity-stable, so the callable is not a usable key.
+        self._streaming_consumer: int | None = None
+        # True when turns are bounded by a held button rather than VAD.
+        # Decides whether pausing capture may detach it from the bus.
+        self._push_to_talk = False
+        self._tts: TTSProvider | None = None
         self._tts_stream: TTSStream | None = None
         self._diarizer: SpeakerDiarizer | None = None
         self._audio_player: AudioPlayer | None = None
@@ -189,9 +216,17 @@ class VoiceSession:
         # fresh per utterance from voice-ReID + any enrollment claim.
         self._latest_speaker_identities: dict[str, dict[str, Any]] = {}
 
+        # A dead identity path logs once at INFO, then at debug — per
+        # utterance would flood, silence hid a real outage for days.
+        self._identity_unavailable_logged = False
+
         # Diarizer lazy-loading state
         self._diarizer_loaded: bool = False
         self._diarizer_unload_task: asyncio.Task[None] | None = None
+        self._diarizer_warm_task: asyncio.Task[None] | None = None
+        # Serialises load vs unload (press-time warm kick, utterance
+        # processing, and the idle-unload timer).
+        self._diarizer_load_lock = asyncio.Lock()
 
     @property
     def state(self) -> VoiceSessionState:
@@ -308,49 +343,68 @@ class VoiceSession:
             logger.warning("Voice session cannot start: no microphone")
             return
 
-        # Build components
-        self._wake_word = WakeWordDetector(self._config.wake_word)
-        self._vad = VoiceActivityDetector(self._config.vad)
-        self._audio_capture = AudioCapture(
-            self._vad, self._config.turn_detection
-        )
+        # Build components. Push-to-talk takes both utterance boundaries
+        # from the button, so neither the wake-word model nor VAD is
+        # constructed — that is the point of the mode, not an oversight.
+        push_to_talk = self._config.input_mode == "push_to_talk"
+        if push_to_talk:
+            self._audio_capture = PushToTalkCapture(
+                self._config.turn_detection
+            )
+        else:
+            self._wake_word = WakeWordDetector(self._config.wake_word)
+            self._vad = VoiceActivityDetector(self._config.vad)
+            self._audio_capture = AudioCapture(
+                self._vad, self._config.turn_detection
+            )
         self._audio_capture.set_utterance_callback(self._on_utterance)
+        self._push_to_talk = push_to_talk
+        if push_to_talk:
+            # A press opens the streaming socket; a release that yields
+            # no utterance means no harvest is coming, and the socket
+            # would otherwise stay open and billing.
+            self._audio_capture.set_hold_discarded_callback(
+                self._on_hold_discarded
+            )
 
-        # STT
+        # STT / TTS, selected by voice.stt.provider and
+        # voice.tts.provider. Either factory returns None when its
+        # credential is missing (voice degrades, box still boots); an
+        # unknown provider name raises here, at start().
         from boxbot.core.config import get_config
 
         api_keys = get_config().api_keys
-        if api_keys.elevenlabs:
-            self._stt = ElevenLabsSTT(
-                api_key=api_keys.elevenlabs,
-                model=self._config.stt.model,
-            )
-            self._tts = ElevenLabsTTS(
-                api_key=api_keys.elevenlabs,
-                voice_id=self._config.tts.voice_id,
-                model=self._config.tts.model,
-                stability=self._config.tts.stability,
-                similarity_boost=self._config.tts.similarity_boost,
-                optimize_streaming_latency=self._config.tts.optimize_streaming_latency,
-            )
-            if self._speaker:
-                self._tts_stream = TTSStream(self._tts, self._speaker)
-        else:
-            logger.warning(
-                "ElevenLabs API key not configured — STT/TTS disabled"
-            )
+        self._stt = create_stt(self._config.stt, api_keys)
+        self._tts = create_tts(self._config.tts, api_keys)
 
-        # Arbitrary audio playback (independent of ElevenLabs — works
-        # as long as we have a speaker). Reuses the speaker's TTS path
-        # so AEC + barge-in semantics are identical.
+        # A streaming provider needs its socket opened on press and fed
+        # during the hold. One permanent mic consumer is enough: feed()
+        # no-ops when no session is open, so there is no add/remove churn
+        # per turn and no window where a chunk arrives unclaimed.
+        if isinstance(self._stt, StreamingSTTProvider):
+            self._streaming_stt = self._stt
+            self._stt_fallback = create_stt_fallback(
+                self._config.stt, api_keys
+            )
+            self._streaming_consumer = self._microphone.add_consumer(
+                self._feed_streaming_stt, name="streaming_stt"
+            )
+        if self._tts and self._speaker:
+            self._tts_stream = TTSStream(self._tts, self._speaker)
+
+        # Arbitrary audio playback (independent of the TTS provider —
+        # works as long as we have a speaker). Reuses the speaker's
+        # TTS path so AEC + barge-in semantics are identical.
         if self._speaker:
             self._audio_player = AudioPlayer(self._speaker)
 
-        # Diarization (lazy-loaded when person detected)
+        # Speaker backend (lazy-loaded when person detected). Engine
+        # picks pyannote or the embed-only ONNX model; see
+        # DiarizationConfig.engine.
         try:
-            from boxbot.communication.diarization import SpeakerDiarizer
+            from boxbot.communication.diarization import create_speaker_backend
 
-            self._diarizer = SpeakerDiarizer(self._config.diarization)
+            self._diarizer = create_speaker_backend(self._config.diarization)
             self._diarizer_loaded = False
             # Don't call start() here — models will be lazy-loaded
         except Exception:
@@ -360,15 +414,26 @@ class VoiceSession:
             self._diarizer = None
             self._diarizer_loaded = False
 
-        # Start VAD model
-        await self._vad.start()
-
-        # Start wake word detection
-        await self._wake_word.start(self._microphone)
+        if push_to_talk:
+            # Attach the capture NOW, not lazily at activation. The press
+            # that activates a session is the same press that must open
+            # the buffer, and PushToTalkCapture subscribes to
+            # ButtonPressed inside its own start() — start it on
+            # activation and the first press activates a session whose
+            # buffer was not yet listening, silently losing the user's
+            # first utterance. Always-attached costs nothing: it
+            # accumulates only between a press and its release.
+            await self._audio_capture.start(self._microphone)
+        else:
+            await self._vad.start()
+            await self._wake_word.start(self._microphone)
 
         # Subscribe to events
         bus = get_event_bus()
-        bus.subscribe(WakeWordHeard, self._on_wake_word)
+        if push_to_talk:
+            bus.subscribe(ButtonPressed, self._on_button_press)
+        else:
+            bus.subscribe(WakeWordHeard, self._on_wake_word)
 
         from boxbot.core.events import ConversationEnded, PersonDetected
         bus.subscribe(PersonDetected, self._on_person_detected)
@@ -399,13 +464,15 @@ class VoiceSession:
 
         self._cancel_timers()
 
-        # Cancel diarizer unload task
-        if self._diarizer_unload_task and not self._diarizer_unload_task.done():
-            self._diarizer_unload_task.cancel()
+        # Cancel diarizer unload + press-warm tasks
+        for task in (self._diarizer_unload_task, self._diarizer_warm_task):
+            if task and not task.done():
+                task.cancel()
 
         # Unsubscribe from events
         bus = get_event_bus()
         bus.unsubscribe(WakeWordHeard, self._on_wake_word)
+        bus.unsubscribe(ButtonPressed, self._on_button_press)
 
         from boxbot.core.events import ConversationEnded, PersonDetected
         bus.unsubscribe(PersonDetected, self._on_person_detected)
@@ -417,7 +484,16 @@ class VoiceSession:
         if self._wake_word:
             await self._wake_word.stop()
         if self._audio_capture:
+            # The one stop that really does detach: the session is over,
+            # so the capture gives up the mic AND the button.
             await self._audio_capture.stop()
+        # Retire the streaming feed and any socket still open. Both are
+        # per-session, and add_consumer without remove_consumer would
+        # double-feed every chunk after a restart.
+        if self._streaming_consumer is not None and self._microphone:
+            self._microphone.remove_consumer(self._streaming_consumer)
+            self._streaming_consumer = None
+        await self._discard_streaming_session("voice session stopped")
         if self._vad:
             await self._vad.stop()
         if self._diarizer and self._diarizer_loaded:
@@ -597,9 +673,7 @@ class VoiceSession:
         # wake word resumes this session, and must not inherit it.
         self._discard_pending_relay("mic went dormant")
 
-        if self._audio_capture:
-            await self._audio_capture.stop()
-            self._audio_capture.reset()
+        await self._pause_capture()
 
         if self._vad:
             self._vad.reset()
@@ -641,11 +715,19 @@ class VoiceSession:
             "active" if was_active else "dormant",
         )
 
-        # From DORMANT capture is already stopped; only call stop again
-        # if we were actually still capturing.
-        if was_active and self._audio_capture:
-            await self._audio_capture.stop()
-            self._audio_capture.reset()
+        # From DORMANT capture is already paused; only pause again if we
+        # were actually still capturing.
+        if was_active:
+            await self._pause_capture()
+        # Nothing will harvest a socket opened by a press into a session
+        # that is now over.
+        await self._discard_streaming_session("voice session deactivated")
+
+        # An agent-set mute is scoped to the conversation it was made
+        # in — ``mute_mic`` promises "auto-unmute … when the
+        # conversation ends". A mute that outlives teardown deadlocks
+        # push-to-talk, which has no wake word to clear it.
+        self.unmute_mic()
 
         if was_active and self._vad:
             self._vad.reset()
@@ -659,10 +741,18 @@ class VoiceSession:
         self._display_labels.clear()
         self._latest_speaker_identities.clear()
 
-        # Warm-unload diarizer after a minute of inactivity.
+        # Warm-unload the diarizer after a long idle window. Interactions
+        # are usually minutes apart, so a short window meant nearly every
+        # first press paid the reload + first-inference warmup (~1s on
+        # the utterance critical path). ~+44MB RSS while warm.
         if self._diarizer_loaded and self._diarizer:
+            # Cancel before re-arming: without this, every session end
+            # leaves an orphan timer that fires on its own deadline
+            # regardless of later activity.
+            if self._diarizer_unload_task and not self._diarizer_unload_task.done():
+                self._diarizer_unload_task.cancel()
             self._diarizer_unload_task = asyncio.create_task(
-                self._unload_diarizer_after_timeout(60.0)
+                self._unload_diarizer_after_timeout(_DIARIZER_WARM_SECONDS)
             )
 
         # Set LED pattern.
@@ -692,8 +782,188 @@ class VoiceSession:
     # Event handlers
     # ------------------------------------------------------------------
 
-    async def _on_wake_word(self, event: WakeWordHeard) -> None:
-        """Handle wake word detection.
+    async def _on_button_press(self, event: ButtonPressed) -> None:
+        """Screen press — the push-to-talk counterpart of the wake word.
+
+        Owns the whole press edge, in this order, and the order is the
+        design:
+
+        1. **Muted?** While the session is ACTIVE, stop: a muted mic
+           must not stop BB mid-sentence, interrupt a generation, or
+           open a billed socket — that is what ``mute_mic`` promises.
+           Outside ACTIVE the press is the wake-word analog — the only
+           re-engagement signal this mode has — so it unmutes and
+           proceeds, same as a wake word from IDLE/DORMANT. Without
+           this, an agent-set mute that outlives its session leaves
+           the mic permanently deaf (no wake word to clear it).
+        2. **Stop playback.** Before anything opens the mic, so BB's own
+           voice can never land in the buffer. Push-to-talk has no AEC
+           precisely because this is guaranteed rather than raced.
+        3. **Open the socket.** Sync, returns before the socket exists;
+           the handshake then overlaps the hold.
+        4. **Open the hold.** Also sync, so the first PCM of the press
+           is captured, not waited for.
+        5. **Activate.** Everything with an await in it comes last.
+
+        Steps 2-4 used to be two concurrent bus handlers
+        (``PushToTalkCapture`` subscribed to the same event), which
+        ``EventBus.publish`` dispatches with ``asyncio.gather`` — so the
+        mic could and did open while BB was still audible, and any path
+        that detached the capture ate the press entirely.
+        """
+        if event.action != "press":
+            return
+
+        # Warm the speaker-embedding model in the background: the ~2s
+        # hold masks the load, keeping it off the utterance critical
+        # path. _ensure_diarizer_loaded serialises against the
+        # utterance-time call via the load lock.
+        if self._diarizer and not self._diarizer_loaded:
+            self._diarizer_warm_task = asyncio.create_task(
+                self._ensure_diarizer_loaded()
+            )
+
+        capture = self._audio_capture
+        if capture is not None and capture.is_muted:
+            if self._state is VoiceSessionState.ACTIVE:
+                logger.debug("Press while muted — ignoring the whole press")
+                return
+            # Unmute before begin_hold — a muted capture ignores the
+            # hold, so the press that recovers the mic would otherwise
+            # record nothing.
+            self.unmute_mic()
+
+        await self._stop_playback_for_interrupt()
+
+        if self._streaming_stt is not None:
+            self._streaming_stt.open(
+                self._microphone.sample_rate,
+                self._config.stt.language,
+                conversation_id=self._conversation_id or None,
+            )
+        if isinstance(capture, PushToTalkCapture):
+            capture.begin_hold()
+
+        await self._on_user_activation()
+
+    async def _pause_capture(self) -> None:
+        """Stop accumulating audio. Keeps the press path alive.
+
+        Called wherever the mic should go quiet but the session is not
+        over: before TTS, on going dormant, on deactivation.
+
+        The distinction matters only for push-to-talk.
+        ``AudioCapture.stop()`` detaches the mic consumer, which is what
+        keeps BB's own speech out of a VAD-bounded turn.
+        ``PushToTalkCapture.stop()`` *also* unsubscribes from
+        ``ButtonPressed`` — so calling it here left the capture unable to
+        see the release edge of the very press that is supposed to
+        re-engage the session. Push-to-talk needs no detach anyway: the
+        buffer only accumulates between a hold's open and close, and the
+        mic is only read while a finger is down.
+        """
+        if self._audio_capture is None:
+            return
+        if self._push_to_talk:
+            self._audio_capture.reset()
+            return
+        # AudioCapture.stop() resets on the way out, so this is the same
+        # "drop the partial utterance and detach" it always was.
+        await self._audio_capture.stop()
+
+    async def _stop_playback_for_interrupt(self) -> None:
+        """Cut off in-flight TTS. No-op when BB is not speaking.
+
+        The no-op has to be cheap: it sits in front of the mic opening on
+        every single press, and ``is_playing`` is an attribute read.
+        """
+        if self._speaker is None or not self._speaker.is_playing:
+            return
+        logger.info("User signal during TTS — stopping playback")
+        self._tts_interrupted = True
+        await self._speaker.stop_playback()
+        try:
+            await get_event_bus().publish(
+                AgentSpeakingDone(
+                    conversation_id=self._conversation_id,
+                    interrupted=True,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to publish AgentSpeakingDone after user interrupt"
+            )
+
+    async def _on_hold_discarded(self, reason: str) -> None:
+        """A hold ended with nothing to transcribe — retire its socket."""
+        await self._discard_streaming_session(reason)
+
+    async def _discard_streaming_session(self, reason: str) -> None:
+        """Close a streaming STT session nothing is going to harvest.
+
+        Realtime bills per minute of open connection, so a socket with no
+        harvest coming is a live meter, not just a leaked fd. Worse, a
+        session left open makes the *next* ``open()`` a no-op (it refuses
+        to discard a live buffer), and turn N+1 would be transcribed with
+        turn N's audio glued to the front of it.
+
+        Safe to call when no session is open, and never raises.
+        """
+        stt = self._streaming_stt
+        if stt is None or not stt.is_live:
+            return
+        logger.info("Closing unharvested streaming STT session (%s)", reason)
+        try:
+            await stt.close()
+        except Exception:
+            logger.exception("Failed to close streaming STT session")
+
+    async def _batch_fallback(self, utterance: Utterance) -> STTResult | None:
+        """Transcribe the streaming prebuffer with the batch provider.
+
+        Prefers the streaming session's own buffer over
+        ``utterance.audio``: both hold the same PCM, but the streaming
+        buffer is the one whose bytes we know were captured, and reading
+        it keeps the two paths from silently disagreeing.
+        """
+        if self._stt_fallback is None:
+            logger.error("No batch STT fallback configured — turn lost")
+            return None
+        audio = utterance.audio
+        if self._streaming_stt is not None:
+            buffered = self._streaming_stt.buffered_audio
+            if buffered:
+                audio = buffered
+        if not audio:
+            return None
+        try:
+            return await self._stt_fallback.transcribe(
+                audio,
+                utterance.sample_rate,
+                self._config.stt.language,
+                conversation_id=self._conversation_id or None,
+            )
+        except Exception:
+            logger.exception("Batch STT fallback also failed")
+            return None
+
+    async def _feed_streaming_stt(self, chunk: Any) -> None:
+        """Hand mic PCM to the open streaming session, if any.
+
+        Registered for the life of the session. ``feed`` never blocks,
+        never awaits, and no-ops when nothing is open.
+        """
+        if self._streaming_stt is not None:
+            self._streaming_stt.feed(chunk.data)
+
+    async def _on_user_activation(
+        self, event: WakeWordHeard | None = None
+    ) -> None:
+        """Start a turn from a user signal — wake word or button press.
+
+        Both signals mean the same thing ("drop what you are doing and
+        listen to me"), so they share one body. ``event`` is None for a
+        press, which carries no confidence score.
 
         The wake word is the unified re-engagement signal:
 
@@ -709,24 +979,9 @@ class VoiceSession:
         STT is re-attached either way — it's detached during BB's own
         speech, and the wake word is the only path back to a hot mic.
         """
-        if (
-            self._speaker is not None
-            and self._speaker.is_playing
-        ):
-            logger.info("Wake word during TTS — stopping playback")
-            self._tts_interrupted = True
-            await self._speaker.stop_playback()
-            try:
-                await get_event_bus().publish(
-                    AgentSpeakingDone(
-                        conversation_id=self._conversation_id,
-                        interrupted=True,
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to publish AgentSpeakingDone after wake-word interrupt"
-                )
+        # Idempotent: the press path already did this, before it opened
+        # the mic. The wake-word path arrives here with TTS still live.
+        await self._stop_playback_for_interrupt()
 
         # Always publish the interrupt request when there's an active
         # conversation. The agent's handler is idempotent and is a
@@ -748,6 +1003,10 @@ class VoiceSession:
 
         await self._activate_session(event)
 
+    async def _on_wake_word(self, event: WakeWordHeard) -> None:
+        """Wake-word entry point. See :meth:`_on_user_activation`."""
+        await self._on_user_activation(event)
+
     async def _on_conversation_ended(self, event: Any) -> None:
         """React to ConversationEnded — deactivate capture for voice.
 
@@ -766,14 +1025,28 @@ class VoiceSession:
         whole point: previously a silent turn left the mic hot for
         180s, so ambient chatter would round-trip through the model
         again and again. Now the timer arms regardless.
+
+        Matched by channel, like ``_on_conversation_ended``: the event
+        carries the agent's Conversation id (``conv_…``), which this
+        adapter never learns — its own ``_conversation_id`` is the
+        voice *session* id (``voice_…``). There is exactly one voice
+        room conversation at a time, so channel + ACTIVE is the guard.
         """
         if event.channel != "voice":
-            return
-        if event.conversation_id != self._conversation_id:
             return
         if self._state is not VoiceSessionState.ACTIVE:
             return
         self._arm_post_response_idle_timer()
+        # Turn settled — drop the "thinking" ring set at utterance-
+        # finalize and held through generation. This is the clear point
+        # for silent turns, where no SPEAKING ceremony ran to restore
+        # the pattern; for spoken turns it's an idempotent repeat of
+        # the ceremony's own restore.
+        if self._microphone:
+            try:
+                await self._microphone.set_led_pattern("listening")
+            except Exception:
+                pass
 
     async def _on_agent_speaking(self, event: AgentSpeaking) -> None:
         """Cancel the post-response idle timer — BB is speaking.
@@ -834,6 +1107,9 @@ class VoiceSession:
     async def _on_utterance(self, utterance: Utterance) -> None:
         """Process a finalized utterance: run STT + diarization, publish transcript."""
         if self._state is not VoiceSessionState.ACTIVE:
+            # Nothing downstream will call transcribe(), so nothing will
+            # harvest the socket this utterance's press opened.
+            await self._discard_streaming_session("utterance outside an active session")
             return
 
         # An utterance arrived — cancel any pending mic-idle timer
@@ -904,8 +1180,32 @@ class VoiceSession:
         if stt_task:
             try:
                 stt_result = await stt_task
+            except StreamingSTTUnavailableError as exc:
+                # The socket never produced a transcript, but the
+                # prebuffer still holds every byte the user spoke — so
+                # this costs latency, not their words.
+                logger.warning(
+                    "Streaming STT unavailable (%s); falling back to batch",
+                    exc,
+                )
+                stt_result = await self._batch_fallback(utterance)
             except Exception:
                 logger.exception("STT failed for utterance")
+
+        # STT is done but speaker resolution is still ~0.5s out — hand
+        # the bare text to the agent now so prefetch (embedding, hot
+        # lookup, memory search) overlaps the wait instead of running
+        # after it. Best-effort: a lost draft only costs the overlap.
+        if stt_result and stt_result.text.strip():
+            try:
+                await get_event_bus().publish(
+                    TranscriptDraft(
+                        conversation_id=self._conversation_id,
+                        text=stt_result.text.strip(),
+                    )
+                )
+            except Exception:
+                logger.debug("TranscriptDraft publish failed", exc_info=True)
 
         if voice_task:
             try:
@@ -981,18 +1281,18 @@ class VoiceSession:
             TranscriptReady(
                 conversation_id=self._conversation_id,
                 transcript=transcript,
+                raw_text=stt_result.text.strip(),
                 speaker_segments=speaker_segments,
                 speaker_identities=identity_block,
                 source="voice",
             )
         )
 
-        # Set LED back to listening
-        if self._microphone:
-            try:
-                await self._microphone.set_led_pattern("listening")
-            except Exception:
-                pass
+        # The ring stays "thinking" through generation — the user is
+        # waiting on the model now, not on us. It clears when the turn
+        # actually resolves: the SPEAKING ceremony takes over for spoken
+        # replies, and _on_agent_turn_ended restores "listening" for
+        # every turn, spoken or silent.
 
     # ------------------------------------------------------------------
     # Speech output
@@ -1007,8 +1307,11 @@ class VoiceSession:
         - Sets the mic LED to "speaking".
         - Publishes ``AgentSpeaking`` so the room conversation flips to
           SPEAKING state.
-        - Detaches the STT/diarization consumer so chatter and BB's
-          residual echo cannot enter the transcript.
+        - Pauses capture so chatter and BB's residual echo cannot enter
+          the transcript. For a VAD-bounded turn that means detaching
+          the STT/diarization consumer; for push-to-talk it means only
+          dropping any open hold, because the capture must stay able to
+          see the press that interrupts this very reply.
         - On exit, publishes ``AgentSpeakingDone(interrupted=False)``
           and re-attaches STT — *unless* the wake-word handler already
           stopped playback and published ``AgentSpeakingDone(
@@ -1050,8 +1353,7 @@ class VoiceSession:
             )
         )
 
-        if self._audio_capture is not None:
-            await self._audio_capture.stop()
+        await self._pause_capture()
 
         try:
             yield
@@ -1308,41 +1610,49 @@ class VoiceSession:
         if not diarization_result or not diarization_result.segments:
             return label_map, identity_block
 
-        # Lazy-import perception to avoid circular deps and to gracefully
-        # degrade when perception is disabled.
+        # Lazy-import the identity core (camera-free; runs on every
+        # device class) and degrade to label-only if it isn't up.
         voice_centroids: dict[str, tuple[str, Any]] = {}
         voice_reid: Any = None
         enrollment: Any = None
         try:
-            from boxbot.perception.pipeline import get_pipeline
+            from boxbot.perception.identity import get_identity
             from boxbot.perception.voice_reid import VoiceReID
 
-            pipeline = get_pipeline()
-            if pipeline is not None:
-                store = getattr(pipeline, "_cloud_store", None)
-                enrollment = getattr(pipeline, "enrollment", None)
-                if store is not None:
-                    try:
-                        # Cloud matching (mean top-k cosine) replaces the
-                        # single-centroid path. See docs/voice-id-redesign.md.
-                        voice_centroids = await store.get_voice_clouds()
-                    except Exception:
-                        logger.debug(
-                            "Could not load voice clouds", exc_info=True
-                        )
-                from boxbot.core.config import get_config
-                _p = get_config().perception
-                voice_reid = VoiceReID(
-                    confirmed_threshold=_p.voice_confirmed_threshold,
-                    maybe_threshold=_p.voice_maybe_threshold,
-                    topk=_p.voice_cloud_topk,
-                )
-        except Exception:
-            # Pipeline not running — we'll still assign display labels.
-            logger.debug(
-                "Voice ReID/enrollment unavailable; proceeding label-only",
-                exc_info=True,
+            identity = get_identity()
+            store = identity.cloud_store
+            enrollment = identity.enrollment
+            if store is not None:
+                try:
+                    # Cloud matching (mean top-k cosine) replaces the
+                    # single-centroid path. See docs/voice-id-redesign.md.
+                    voice_centroids = await store.get_voice_clouds()
+                except Exception:
+                    logger.debug(
+                        "Could not load voice clouds", exc_info=True
+                    )
+            from boxbot.core.config import get_config
+            _p = get_config().perception
+            voice_reid = VoiceReID(
+                confirmed_threshold=_p.voice_confirmed_threshold,
+                maybe_threshold=_p.voice_maybe_threshold,
+                topk=_p.voice_cloud_topk,
             )
+        except Exception:
+            # Identity service not running — still assign display
+            # labels, but say so once: a silent except here hid a
+            # dead voice-identity path for days on camera-less hardware.
+            if not self._identity_unavailable_logged:
+                self._identity_unavailable_logged = True
+                logger.info(
+                    "Voice identity unavailable — transcripts will be "
+                    "label-only (Speaker A/B/…) for this process",
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "Voice identity unavailable", exc_info=True,
+                )
 
         # Pick ONE representative embedding per raw speaker label
         # (multiple segments from the same speaker in one utterance share
@@ -1421,6 +1731,30 @@ class VoiceSession:
                     entry["source"] = "agent_identify"
 
             identity_block[display] = entry
+
+            # Publish SpeakerIdentified for confident attributions —
+            # the single publisher for both device classes (the visual
+            # pipeline's transcript handler no longer publishes it).
+            # Consumers (agent recently-seen names, live speaker maps)
+            # want name+label; confidence rides along.
+            if entry["person_id"] and entry["person_name"] and (
+                entry["voice_tier"] == "high"
+                or entry["source"] == "agent_identify"
+            ):
+                try:
+                    await get_event_bus().publish(
+                        SpeakerIdentified(
+                            speaker_label=raw,
+                            person_id=entry["person_id"],
+                            person_name=entry["person_name"],
+                            confidence=float(entry["voice_score"]),
+                            source=entry["source"],
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "SpeakerIdentified publish failed", exc_info=True,
+                    )
 
             # Buffer the embedding + seed the session claim so commit at
             # session end routes correctly. Uses the raw pyannote label as
@@ -1506,19 +1840,40 @@ class VoiceSession:
 
     async def _ensure_diarizer_loaded(self) -> None:
         """Lazy-load diarizer models if not already loaded."""
-        if self._diarizer is None or self._diarizer_loaded:
+        if self._diarizer is None:
             return
 
-        # Cancel any pending unload
+        # Cancel any pending unload FIRST — even when already loaded,
+        # so activity on a warm model refreshes the idle window instead
+        # of letting an old timer fire mid-session.
         if self._diarizer_unload_task and not self._diarizer_unload_task.done():
             self._diarizer_unload_task.cancel()
             self._diarizer_unload_task = None
 
+        if self._diarizer_loaded:
+            return
+        async with self._diarizer_load_lock:
+            await self._load_diarizer_locked()
+
+    async def _load_diarizer_locked(self) -> None:
+        if self._diarizer is None or self._diarizer_loaded:
+            return
         try:
             logger.info("Lazy-loading diarization models...")
             await self._diarizer.start()
             self._diarizer_loaded = True
             logger.info("Diarization models loaded")
+        except (ImportError, FileNotFoundError) as e:
+            # Missing dependency or missing model file — retrying every
+            # utterance cannot fix either. Drop the backend so the voice
+            # path degrades once, quietly, to no voice ReID (STT and the
+            # rest are unaffected).
+            self._diarizer = None
+            logger.warning(
+                "Voice embedding model unavailable (%s) — speaker "
+                "identification by voice is disabled for this session",
+                e,
+            )
         except Exception:
             logger.warning("Failed to lazy-load diarization models", exc_info=True)
 
@@ -1530,10 +1885,14 @@ class VoiceSession:
         """Unload diarizer models after timeout to reclaim RAM."""
         try:
             await asyncio.sleep(timeout)
-            if self._diarizer and self._diarizer_loaded:
-                await self._diarizer.stop()
-                self._diarizer_loaded = False
-                logger.info("Diarization models unloaded (warm timeout)")
+            # Same lock as the load path: an unload racing an in-flight
+            # load would otherwise stop() a model whose loaded flag ends
+            # up True — silently killing voice ID until restart.
+            async with self._diarizer_load_lock:
+                if self._diarizer and self._diarizer_loaded:
+                    await self._diarizer.stop()
+                    self._diarizer_loaded = False
+                    logger.info("Diarization models unloaded (warm timeout)")
         except asyncio.CancelledError:
             pass
 

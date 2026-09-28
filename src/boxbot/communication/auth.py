@@ -254,6 +254,22 @@ class AuthManager:
                 for row in rows
             ]
 
+    async def get_user_by_name(self, name: str) -> User | None:
+        """Get a user by display name, or None if nobody matches.
+
+        Case-insensitive, whitespace-trimmed exact match — the shared
+        name→user lookup behind every outbound path (dispatcher, trigger
+        bridge, router). Matched in Python with ``str.lower()``, not in
+        SQL — SQLite's ``LOWER`` is ASCII-only, and ``lower()`` is how
+        person names fold everywhere else (see ``photos/store.py``), so
+        the same name resolves to the same person in both stores.
+        """
+        target = name.strip().lower()
+        for user in await self.list_users():
+            if user.name.strip().lower() == target:
+                return user
+        return None
+
     async def update_last_seen(self, phone: str) -> None:
         """Update the last_seen timestamp for a user."""
         now = datetime.now().isoformat()

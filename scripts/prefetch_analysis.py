@@ -59,10 +59,21 @@ def _json_list(raw: str | None) -> list[Any]:
 
 
 def _skill_name(raw_input: str | None) -> str | None:
+    """load_skill input → the key predicted_skills uses.
+
+    Bare skill loads join on the name; sub-file loads join on
+    "name/subpath" — the same shape the sdk lane's predictions take
+    ("bb/modules/panel.md").
+    """
     if not raw_input:
         return None
     try:
-        return json.loads(raw_input).get("name")
+        parsed = json.loads(raw_input)
+        name = parsed.get("name")
+        subpath = parsed.get("subpath")
+        if name and subpath:
+            return f"{name}/{subpath}"
+        return name
     except Exception:
         return None
 
@@ -227,7 +238,7 @@ def main() -> None:
     print("=" * 64)
     print("Prefetch analysis")
     print(f"  prefetch_events: {len(events)}  unmatched (no telemetry): {unmatched}")
-    for mode in ("shadow", "active"):
+    for mode in ("shadow", "active", "hot"):
         _report(mode, by_mode.get(mode, []))
     conn.close()
 

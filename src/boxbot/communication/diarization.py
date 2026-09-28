@@ -299,3 +299,27 @@ class SpeakerDiarizer:
                 exc_info=True,
             )
             return None
+
+
+def create_speaker_backend(config: DiarizationConfig) -> Any:
+    """Build the speaker backend named by ``config.engine``.
+
+    Both backends expose ``start`` / ``stop`` / ``embed_utterance``; only
+    the pyannote one can ``diarize``, and ``DiarizationConfig`` rejects
+    the enabled+onnx pairing at load time, so callers that honour
+    ``config.enabled`` need no engine check of their own.
+
+    An unknown engine raises rather than silently falling back — running
+    a different embedding model than intended would put incompatible
+    vectors into the same person's cloud.
+    """
+    if config.engine == "onnx":
+        from boxbot.communication.speaker_embedding import OnnxSpeakerEmbedder
+
+        return OnnxSpeakerEmbedder(config)
+    if config.engine == "pyannote":
+        return SpeakerDiarizer(config)
+    raise ValueError(
+        f"voice.diarization.engine must be 'pyannote' or 'onnx', "
+        f"got {config.engine!r}"
+    )

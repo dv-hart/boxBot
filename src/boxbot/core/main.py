@@ -275,10 +275,18 @@ async def _init_hal(
     except Exception:
         logger.warning("Camera not available — perception will be disabled", exc_info=True)
 
-    # Speaker BEFORE microphone. The speaker opens two streams: the
-    # HDMI audible output and the AEC reference path on the ReSpeaker
-    # USB playback channel. Once the microphone has claimed the
-    # ReSpeaker capture side, PortAudio sometimes hides the same
+    # Audio HAL — backend selected by config, the same way the screen
+    # backend is. "portaudio" opens the ReSpeaker capture + HDMI output
+    # streams (default); "none" skips audio entirely.
+    audio_backend = config.voice.audio_backend
+    if audio_backend == "none":
+        logger.info("Audio backend 'none' — no microphone or speaker")
+        return modules
+
+    # Speaker BEFORE microphone. On PortAudio the speaker opens two
+    # streams: the HDMI audible output and the AEC reference path on the
+    # ReSpeaker USB playback channel. Once the microphone has claimed
+    # the ReSpeaker capture side, PortAudio sometimes hides the same
     # device's output side from query_devices() (USB shared resource
     # race). Opening the AEC reference *first* avoids that. The speaker
     # also raises HardwareInitFatal — not a HardwareUnavailableError —
@@ -292,13 +300,13 @@ async def _init_hal(
         await speaker.start()
         system.register_module(speaker)
         modules["speaker"] = speaker
-        logger.info("Speaker started")
+        logger.info("Speaker started (backend=%s)", audio_backend)
     except HardwareUnavailableError:
         logger.warning(
             "Speaker not available — TTS will be disabled", exc_info=True
         )
 
-    # Microphone (ReSpeaker 4-Mic Array)
+    # Microphone — ReSpeaker 4-Mic Array.
     try:
         from boxbot.hardware.microphone import Microphone
 
@@ -306,7 +314,7 @@ async def _init_hal(
         await microphone.start()
         system.register_module(microphone)
         modules["microphone"] = microphone
-        logger.info("Microphone started")
+        logger.info("Microphone started (backend=%s)", audio_backend)
     except HardwareUnavailableError:
         logger.warning(
             "Microphone not available — voice pipeline will be disabled",
@@ -329,7 +337,23 @@ async def _stop_hal(modules: dict[str, Any]) -> None:
             logger.exception("Error stopping HAL module: %s", name)
 
 
-async def _init_perception(hal_modules: dict[str, Any], config: Any) -> Any | None:
+async def _init_identity() -> Any:
+    """Initialise the camera-free identity core.
+
+    Runs on every device class — it is what lets voice identity
+    (cloud matching, identify_person enrollment, session-end commit)
+    work on hardware with no camera or Hailo.
+    """
+    from boxbot.perception.identity import IdentityService
+
+    identity = IdentityService()
+    await identity.start()
+    return identity
+
+
+async def _init_perception(
+    hal_modules: dict[str, Any], config: Any, identity: Any,
+) -> Any | None:
     """Initialise the perception pipeline if camera and Hailo are available."""
     camera = hal_modules.get("camera")
     hailo = hal_modules.get("hailo")
@@ -337,7 +361,8 @@ async def _init_perception(hal_modules: dict[str, Any], config: Any) -> Any | No
 
     if camera is None or hailo is None:
         logger.warning(
-            "Perception pipeline disabled (camera=%s, hailo=%s)",
+            "Perception pipeline disabled (camera=%s, hailo=%s) — "
+            "visual detection off; voice identity unaffected",
             "ok" if camera else "missing",
             "ok" if hailo else "missing",
         )
@@ -348,6 +373,7 @@ async def _init_perception(hal_modules: dict[str, Any], config: Any) -> Any | No
     pipeline = PerceptionPipeline(
         camera=camera,
         hailo=hailo,
+        identity=identity,
         microphone=microphone,
         motion_threshold=config.perception.motion_threshold,
         reid_high_threshold=config.perception.reid_high_threshold,
@@ -442,8 +468,13 @@ async def _init_ha_events(config: Any) -> Any | None:
 async def _init_display_manager() -> Any:
     """Initialise and start the DisplayManager."""
     from boxbot.displays.manager import DisplayManager, set_display_manager
+    from boxbot.core.config import get_config
 
-    manager = DisplayManager()
+    cfg = get_config()
+    manager = DisplayManager(
+        width=cfg.display.width,
+        height=cfg.display.height,
+    )
     await manager.start()
     # Publish for sandbox action handlers (bb.photos.show_on_screen, …)
     # and the switch_display tool.
@@ -496,7 +527,7 @@ async def _init_voice(hal_modules: dict[str, Any], config: Any) -> Any | None:
         return None
 
 
-async def _init_communication() -> Any | None:
+async def _init_communication(camera_available: bool = True) -> Any | None:
     """Initialise the communication layer (auth + per-channel clients +
     message router).
 
@@ -540,7 +571,7 @@ async def _init_communication() -> Any | None:
     # agent picks these up on its next wake cycle and runs the
     # onboarding skill against them. Idempotent: re-runs see the
     # `setup:bootstrap` todo and bail.
-    await _maybe_seed_setup_todos(auth)
+    await _maybe_seed_setup_todos(auth, camera_available)
 
     return router
 
@@ -583,6 +614,32 @@ async def _init_signal_client(config: Any) -> bool:
     if not config.signal.enabled:
         logger.info("Signal channel disabled in config")
         return False
+
+    if config.signal.driver == "local":
+        # Dev/eval driver: a TCP "local chat" server spoofs Signal. No
+        # signal-cli, no SIGNAL_ACCOUNT. Build + register the outbound
+        # side here; _init_signal_inbound starts its server on the same
+        # instance. Returns True so the router gets built and inbound runs.
+        from boxbot.communication.channels import (
+            Channel,
+            register_outbound_channel,
+        )
+        from boxbot.communication.local_chat import (
+            LocalChatChannel,
+            set_local_chat_channel,
+        )
+
+        channel = LocalChatChannel(
+            host=config.signal.local_host,
+            port=config.signal.local_port,
+            dev_phone=config.signal.local_user_phone,
+            dev_name=config.signal.local_user_name,
+        )
+        set_local_chat_channel(channel)
+        register_outbound_channel(Channel.SIGNAL, channel)
+        logger.info("Signal local-chat driver registered (outbound)")
+        return True
+
     if not config.api_keys.signal_account:
         logger.warning(
             "Signal enabled but SIGNAL_ACCOUNT env var not set; skipping"
@@ -603,7 +660,9 @@ async def _init_signal_client(config: Any) -> bool:
     return True
 
 
-async def _maybe_seed_setup_todos(auth: Any) -> None:
+async def _maybe_seed_setup_todos(
+    auth: Any, camera_available: bool = True,
+) -> None:
     """Seed first-run setup todos if no admin exists and none were seeded.
 
     The skill is the *how*; these todos are the *what*. Each is a
@@ -611,6 +670,9 @@ async def _maybe_seed_setup_todos(auth: Any) -> None:
     tagged ``setup:`` already exists, this is a no-op even if the
     admin record was somehow deleted later — we don't want to re-seed
     a partially completed run.
+
+    Camera-dependent todos (face anchors) are skipped on camera-less
+    devices — an unactionable standing todo just burns agent attention.
     """
     from boxbot.core import scheduler
 
@@ -686,6 +748,11 @@ async def _maybe_seed_setup_todos(auth: Any) -> None:
         ),
     ]
 
+    if not camera_available:
+        seeds = [
+            s for s in seeds if not s[0].startswith("setup:face_anchors")
+        ]
+
     for description, notes in seeds:
         await scheduler.create_todo(
             description=description,
@@ -702,12 +769,15 @@ async def _init_whatsapp_inbound(router: Any) -> Any | None:
     Returns the poller if started, otherwise None. Required env:
     BOXBOT_SQS_QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
     """
-    from boxbot.communication.whatsapp_inbound import WhatsAppInboundPoller
     from boxbot.core.config import get_config
 
     config = get_config()
     if not config.whatsapp.enabled:
         return None
+    # Import here, after the enabled-check, so a WhatsApp-disabled boot never
+    # pulls the SQS transport's heavy aioboto3 dependency (may be absent on
+    # headless installs).
+    from boxbot.communication.whatsapp_inbound import WhatsAppInboundPoller
     queue_url = config.api_keys.whatsapp_sqs_queue_url
     key = config.api_keys.aws_access_key_id
     secret = config.api_keys.aws_secret_access_key
@@ -746,6 +816,26 @@ async def _init_signal_inbound(router: Any) -> Any | None:
     config = get_config()
     if not config.signal.enabled:
         return None
+
+    if config.signal.driver == "local":
+        # Start the local-chat TCP server on the same instance built in
+        # _init_signal_client, now that the router exists.
+        from boxbot.communication.local_chat import get_local_chat_channel
+
+        channel = get_local_chat_channel()
+        if channel is None:
+            logger.warning(
+                "Signal local driver: outbound channel missing; skipping inbound"
+            )
+            return None
+        channel.set_router(router)
+        try:
+            await channel.start()
+        except Exception:
+            logger.exception("local chat server failed to start")
+            return None
+        return channel
+
     if not config.api_keys.signal_account:
         logger.info("Signal inbound: SIGNAL_ACCOUNT not set; skipping")
         return None
@@ -817,6 +907,13 @@ async def _shutdown(
         "communication",
         "photo_intake",
         "perception",
+        # Identity stops after perception: the pipeline reads through the
+        # service's store, so the store must outlive the pipeline.
+        "identity",
+        # The screen lives in subsystems, not hal_modules, so _stop_hal never
+        # reached it — stop it explicitly so the frame buffer is released
+        # for the next process.
+        "screen",
         "display_manager",
         "ha_events",
         "scheduler",
@@ -858,6 +955,10 @@ async def _shutdown(
             elif name == "photo_intake":
                 await instance.stop()
             elif name == "perception":
+                await instance.stop()
+            elif name == "identity":
+                await instance.stop()
+            elif name == "screen":
                 await instance.stop()
             elif name == "display_manager":
                 await instance.stop()
@@ -1053,23 +1154,35 @@ async def _async_main() -> None:
         # Start idle display rotation
         display_manager.start_rotation()
 
-        # Screen HAL — renders display frames to HDMI via pygame
-        try:
-            from boxbot.hardware.screen import Screen
+        # Screen HAL — backend selected by config. "pygame" blits frames to
+        # HDMI (default); "none" skips screen output entirely.
+        screen_backend = config.display.backend
+        if screen_backend == "none":
+            logger.info("Screen backend 'none' — no screen output")
+        else:
+            try:
+                from boxbot.hardware.screen import Screen
 
-            screen = Screen(
-                display_manager=display_manager,
-                brightness=config.display.brightness,
-            )
-            await screen.start()
-            hal_modules.get("system") and hal_modules["system"].register_module(screen)
-            subsystems["screen"] = screen
-            logger.info("Screen started")
-        except Exception:
-            logger.warning("Screen not available — display will not render to HDMI", exc_info=True)
+                screen = Screen(
+                    display_manager=display_manager,
+                    brightness=config.display.brightness,
+                )
+                await screen.start()
+                hal_modules.get("system") and hal_modules["system"].register_module(screen)
+                subsystems["screen"] = screen
+                logger.info("Screen started (backend=%s)", screen_backend)
+            except Exception:
+                logger.warning(
+                    "Screen not available (backend=%s) — display will not render",
+                    screen_backend, exc_info=True,
+                )
+
+        # Identity core — person store + enrollment; every device class
+        identity = await _init_identity()
+        subsystems["identity"] = identity
 
         # Perception pipeline — visual detection and re-identification
-        perception = await _init_perception(hal_modules, config)
+        perception = await _init_perception(hal_modules, config, identity)
         if perception is not None:
             subsystems["perception"] = perception
 
@@ -1083,7 +1196,9 @@ async def _async_main() -> None:
             subsystems["voice"] = voice_session
 
         # Communication — auth + per-channel clients + message routing
-        comm_router = await _init_communication()
+        comm_router = await _init_communication(
+            camera_available=hal_modules.get("camera") is not None,
+        )
         if comm_router is not None:
             subsystems["communication"] = comm_router
             inbound = await _init_whatsapp_inbound(comm_router)

@@ -10,8 +10,11 @@ The mute persists until one of:
   unmutes at TTS-end before re-attaching audio_capture. The agent
   speaking implies it is engaging the room and wants follow-up.
 - The conversation ends naturally (silence_timeout, etc.). Teardown
-  resets audio_capture state.
-- The wake word fires and starts a fresh session.
+  unmutes — the mute is scoped to the conversation it was made in.
+- The wake word fires and starts a fresh session. In push-to-talk
+  mode a screen press is the wake-word analog: while the session is
+  ACTIVE a muted press is ignored (that is the point of the mute),
+  but from IDLE/DORMANT it unmutes and re-engages.
 
 No-op on non-voice conversations (WhatsApp, trigger-fired) — there is
 no live mic to mute there.
@@ -35,7 +38,8 @@ class MuteMicTool(Tool):
     description = (
         "Drop mic input on the current voice conversation. No effect on "
         "text or trigger conversations.\n"
-        "Wake word stays armed — the room re-engages you by saying it. "
+        "Re-engagement stays armed — wake word, or push-to-talk press "
+        "once the current session ends. "
         "Auto-clears on your next message(channel=\"speak\") or at "
         "conversation end. Also drops utterances queued while you thought.\n"
         "Background noise or unrelated speech mid-task: mute immediately, "

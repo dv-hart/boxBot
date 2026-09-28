@@ -30,7 +30,16 @@
 #   Called by setup.sh, or run standalone:
 #   ./scripts/setup-sandbox.sh
 #
-# Do NOT run as root — the script uses sudo where needed.
+# Privilege model — two supported environments:
+#   - Pi (default): run as your normal non-root user; the script uses
+#     sudo where root is needed, and the sandbox drops to boxbot-sandbox
+#     via ``sudo -u`` at launch.
+#   - Chroot: boxBot runs AS ROOT inside a Debian chroot where
+#     there is no sudo. Trigger with BOXBOT_SANDBOX_CHROOT=1 or just run
+#     as root — the script then runs escalated commands directly and
+#     drops to the sandbox user via ``runuser``. The file-mode fences
+#     below STILL MATTER: the sandbox child drops to a non-root uid at
+#     launch (setuid), so 0600 .env / 0700 src / ro venv keep it out.
 
 set -euo pipefail
 
@@ -53,15 +62,30 @@ echo "====================================="
 echo ""
 
 # -------------------------------------------------------------------
-# Preflight
+# Preflight — privilege mode
 # -------------------------------------------------------------------
+#
+# CHROOT_MODE is on when we are already root (Debian chroot) or
+# explicitly asked for it. In that mode escalation is a no-op ($SUDO
+# empty) and we drop to the sandbox user with runuser instead of sudo
+# (there is no sudo in the chroot). Otherwise we are on the Pi: escalate
+# with sudo, drop with ``sudo -u`` — byte-for-byte the original path.
 
-if [[ $EUID -eq 0 ]]; then
-    echo "Error: Do not run as root. Run as your normal user."
-    echo "The script will use sudo where needed."
-    exit 1
+if [[ $EUID -eq 0 || "${BOXBOT_SANDBOX_CHROOT:-0}" == "1" ]]; then
+    CHROOT_MODE=1
+    SUDO=""
+    AS_SANDBOX="runuser -u $SANDBOX_USER --"
+else
+    CHROOT_MODE=0
+    SUDO="sudo"
+    AS_SANDBOX="sudo -u $SANDBOX_USER"
 fi
 
+if [[ $CHROOT_MODE -eq 1 ]]; then
+    echo "  Mode:    chroot/root (privilege drop happens at sandbox launch)"
+else
+    echo "  Mode:    Pi (sudo)"
+fi
 echo "  User:    $REAL_USER"
 echo "  Sandbox: $SANDBOX_VENV"
 echo ""
@@ -77,7 +101,7 @@ echo "--- Creating sandbox user ---"
 if id "$SANDBOX_USER" &>/dev/null; then
     echo "User $SANDBOX_USER already exists."
 else
-    sudo useradd \
+    $SUDO useradd \
         --system \
         --no-create-home \
         --shell /usr/sbin/nologin \
@@ -93,10 +117,16 @@ fi
 echo ""
 echo "--- Configuring group ---"
 
+# Note: we do NOT add the sandbox user to Android's ``inet`` group
+# (gid 3003) here, even on Android-hosted chroots. Editing /etc/group inside the
+# chroot is fragile and Android-specific; instead the runner injects
+# the supplementary gid at privilege-drop time via ``sandbox.extra_groups``
+# (set it to ``[3003]`` in that host's config). Keeps this script generic.
+
 if getent group "$SANDBOX_GROUP" &>/dev/null; then
     echo "Group $SANDBOX_GROUP already exists."
 else
-    sudo groupadd "$SANDBOX_GROUP"
+    $SUDO groupadd "$SANDBOX_GROUP"
     echo "Created group: $SANDBOX_GROUP"
     CHANGES+=("Created group: $SANDBOX_GROUP")
 fi
@@ -109,7 +139,7 @@ for user in "$REAL_USER" "$SANDBOX_USER"; do
     if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$SANDBOX_GROUP"; then
         echo "$user already in $SANDBOX_GROUP group."
     else
-        sudo usermod -aG "$SANDBOX_GROUP" "$user"
+        $SUDO usermod -aG "$SANDBOX_GROUP" "$user"
         echo "Added $user to $SANDBOX_GROUP group."
         CHANGES+=("Added $user to $SANDBOX_GROUP group")
     fi
@@ -127,9 +157,9 @@ echo "--- Creating sandbox virtual environment ---"
 # parent owned by the operator so the rest of the script can manage it
 # without escalation; the per-subdir owner/perm fixups happen below.
 if [[ ! -d "$SANDBOX_DIR" ]]; then
-    sudo mkdir -p "$SANDBOX_DIR"
-    sudo chown "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_DIR"
-    sudo chmod 750 "$SANDBOX_DIR"
+    $SUDO mkdir -p "$SANDBOX_DIR"
+    $SUDO chown "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_DIR"
+    $SUDO chmod 750 "$SANDBOX_DIR"
     echo "Created sandbox root at $SANDBOX_DIR"
     CHANGES+=("Created sandbox root at $SANDBOX_DIR")
 fi
@@ -150,8 +180,8 @@ fi
 # bypasses this, but the per-call ``execute_script`` path needs the
 # bootstrap on disk somewhere boxbot-sandbox can read.
 cp "$SCRIPT_DIR/sandbox_bootstrap.py" "$SANDBOX_DIR/sandbox_bootstrap.py"
-sudo chown "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/sandbox_bootstrap.py"
-sudo chmod 750 "$SANDBOX_DIR/sandbox_bootstrap.py"
+$SUDO chown "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/sandbox_bootstrap.py"
+$SUDO chmod 750 "$SANDBOX_DIR/sandbox_bootstrap.py"
 echo "Copied sandbox_bootstrap.py to $SANDBOX_DIR/"
 CHANGES+=("Copied sandbox_bootstrap.py to $SANDBOX_DIR/")
 
@@ -161,19 +191,27 @@ CHANGES+=("Copied sandbox_bootstrap.py to $SANDBOX_DIR/")
 # than chown the project tree because home dir 0700 blocks
 # traversal even with group-readable target files. Only the
 # manifest+script land here; data/credentials/ etc never do.
-if [[ -d "$PROJECT_DIR/integrations" ]]; then
-    sudo mkdir -p "$SANDBOX_DIR/integrations"
-    sudo rsync -a --delete \
+if [[ -d "$PROJECT_DIR/integrations" ]] && command -v rsync >/dev/null 2>&1; then
+    $SUDO mkdir -p "$SANDBOX_DIR/integrations"
+    $SUDO rsync -a --delete \
         --include='*/' \
         --include='manifest.yaml' \
         --include='script.py' \
         --exclude='*' \
         "$PROJECT_DIR/integrations/" "$SANDBOX_DIR/integrations/"
-    sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/integrations"
-    find "$SANDBOX_DIR/integrations" -type d -exec sudo chmod 750 {} +
-    find "$SANDBOX_DIR/integrations" -type f -exec sudo chmod 640 {} +
+    $SUDO chown -R "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/integrations"
+    find "$SANDBOX_DIR/integrations" -type d -exec $SUDO chmod 750 {} +
+    find "$SANDBOX_DIR/integrations" -type f -exec $SUDO chmod 640 {} +
     echo "Staged integrations/ to $SANDBOX_DIR/integrations/"
     CHANGES+=("Staged integrations/ to $SANDBOX_DIR/integrations/")
+elif [[ -d "$PROJECT_DIR/integrations" ]]; then
+    # rsync is absent on minimal rootfs images (e.g. a Debian chroot).
+    # Integration staging is optional — the sandbox core (privilege drop,
+    # venv, fences) does not need it, so warn and continue rather than
+    # aborting under ``set -e``. Sandbox-run integrations stay unavailable
+    # until rsync is installed and setup is re-run.
+    echo "WARNING: rsync not found — skipping integrations staging. " \
+         "Sandbox integrations disabled until rsync is installed + re-run."
 fi
 
 "$SANDBOX_VENV/bin/pip" install --upgrade pip --quiet
@@ -229,27 +267,44 @@ CHANGES+=("Installed sandbox packages + boxbot_sdk")
 # If apt is unavailable (non-Debian) the operator can ``pip install
 # pyseccomp`` into the sandbox venv as a fallback; the bootstrap tries
 # both module names.
+#
+# Degrade gracefully: inside a chroot (old kernel, SELinux
+# permissive) neither binding is guaranteed to install or even load, and
+# apt may have no network. A failure here must NOT abort setup — the
+# bootstrap already runs without a filter in ``log`` mode (chroot
+# default) and only refuses in ``enforce``. So each install step is
+# best-effort (``|| true``) and we finish with a clear note either way.
 if command -v apt-get >/dev/null 2>&1; then
     if ! dpkg -s python3-seccomp >/dev/null 2>&1; then
         echo "--- Installing python3-seccomp ---"
-        sudo apt-get install -y python3-seccomp >/dev/null
-        CHANGES+=("Installed python3-seccomp (libseccomp Python binding)")
+        if $SUDO apt-get install -y python3-seccomp >/dev/null 2>&1; then
+            CHANGES+=("Installed python3-seccomp (libseccomp Python binding)")
+        else
+            echo "  WARNING: apt could not install python3-seccomp (offline?)."
+        fi
     fi
-    # Also expose the apt-installed binding to the sandbox venv. The
-    # venv was created with ``--system-site-packages`` (see step 3) so
-    # this should already be visible; we just verify.
-    if ! sudo -u "$SANDBOX_USER" "$SANDBOX_VENV/bin/python3" \
+    # Also expose the binding to the sandbox venv. If it isn't visible
+    # (venv without --system-site-packages, or apt failed above), fall
+    # back to the PyPI binding — also best-effort.
+    if ! $AS_SANDBOX "$SANDBOX_VENV/bin/python3" \
            -c "import seccomp" >/dev/null 2>&1; then
         echo "  Note: seccomp module not visible to sandbox venv —"
-        echo "  the venv was probably created without --system-site-packages."
-        echo "  Falling back to pyseccomp via pip (PyPI binding)."
-        "$SANDBOX_VENV/bin/pip" install pyseccomp --quiet
-        CHANGES+=("Installed pyseccomp into sandbox venv (fallback)")
+        echo "  falling back to pyseccomp via pip (PyPI binding)."
+        if "$SANDBOX_VENV/bin/pip" install pyseccomp --quiet 2>/dev/null; then
+            CHANGES+=("Installed pyseccomp into sandbox venv (fallback)")
+        else
+            echo "  WARNING: pyseccomp install failed — seccomp filter will be"
+            echo "  unavailable. Keep sandbox.seccomp_mode=log until resolved."
+        fi
     fi
 else
     echo "  apt-get not found — installing pyseccomp via pip"
-    "$SANDBOX_VENV/bin/pip" install pyseccomp --quiet
-    CHANGES+=("Installed pyseccomp into sandbox venv (no apt available)")
+    if "$SANDBOX_VENV/bin/pip" install pyseccomp --quiet 2>/dev/null; then
+        CHANGES+=("Installed pyseccomp into sandbox venv (no apt available)")
+    else
+        echo "  WARNING: pyseccomp install failed — seccomp filter will be"
+        echo "  unavailable. Keep sandbox.seccomp_mode=log until resolved."
+    fi
 fi
 
 # -------------------------------------------------------------------
@@ -279,7 +334,7 @@ echo "--- Setting filesystem permissions ---"
 #   - python3 binary: 750 (group can execute)
 #   - pip binaries: 700 (owner-only — sandbox CANNOT install packages)
 
-sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_VENV"
+$SUDO chown -R "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_VENV"
 
 # CRITICAL: ``find -type f`` and ``find -type d`` exclude symlinks, but
 # the bare ``chmod`` calls below need to stay symlink-safe too —
@@ -288,15 +343,15 @@ sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$SANDBOX_VENV"
 # would silently chmod the *system* Python, breaking it for every user
 # on the box. We skip symlinks (their perms come from the target file,
 # which already has the right system perms).
-find "$SANDBOX_VENV" -type d -exec sudo chmod 750 {} +
-find "$SANDBOX_VENV" -type f -exec sudo chmod 640 {} +
+find "$SANDBOX_VENV" -type d -exec $SUDO chmod 750 {} +
+find "$SANDBOX_VENV" -type f -exec $SUDO chmod 640 {} +
 
 # Python interpreter binary inside the venv (real file, not a symlink)
 # must be executable by the sandbox group. The bin/python3 *symlink*
 # inherits its target's perms, so we leave it alone.
 for pybin in "$SANDBOX_VENV"/bin/python3*; do
     if [[ -f "$pybin" && ! -L "$pybin" ]]; then
-        sudo chmod 750 "$pybin"
+        $SUDO chmod 750 "$pybin"
     fi
 done
 
@@ -304,46 +359,46 @@ done
 # the sandbox user cannot install packages.
 for pipbin in "$SANDBOX_VENV"/bin/pip*; do
     if [[ -f "$pipbin" && ! -L "$pipbin" ]]; then
-        sudo chmod 700 "$pipbin"
+        $SUDO chmod 700 "$pipbin"
     fi
 done
 
 # -- Sandbox working directories: owned by sandbox user --
-sudo chown -R "$SANDBOX_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/output"
-sudo chown -R "$SANDBOX_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/tmp"
-sudo chown -R "$SANDBOX_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/scripts"
+$SUDO chown -R "$SANDBOX_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/output"
+$SUDO chown -R "$SANDBOX_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/tmp"
+$SUDO chown -R "$SANDBOX_USER:$SANDBOX_GROUP" "$SANDBOX_DIR/scripts"
 # 2770 = rwx for owner+group, setgid so new files inherit the boxbot
 # group regardless of which user created them. Without setgid, files
 # the main process (running as $REAL_USER) drops here for the sandbox
 # to read/write end up with the wrong group and hit EACCES.
-sudo chmod -R 2770 "$SANDBOX_DIR/output"
-sudo chmod -R 2770 "$SANDBOX_DIR/tmp"
-sudo chmod -R 2770 "$SANDBOX_DIR/scripts"
+$SUDO chmod -R 2770 "$SANDBOX_DIR/output"
+$SUDO chmod -R 2770 "$SANDBOX_DIR/tmp"
+$SUDO chmod -R 2770 "$SANDBOX_DIR/scripts"
 
 # -- Skills directory: group-writable (sandbox can create skills) --
 if [[ -d "$PROJECT_DIR/skills" ]]; then
-    sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$PROJECT_DIR/skills"
-    find "$PROJECT_DIR/skills" -type d -exec sudo chmod 775 {} +
-    find "$PROJECT_DIR/skills" -type f -exec sudo chmod 664 {} +
+    $SUDO chown -R "$REAL_USER:$SANDBOX_GROUP" "$PROJECT_DIR/skills"
+    find "$PROJECT_DIR/skills" -type d -exec $SUDO chmod 775 {} +
+    find "$PROJECT_DIR/skills" -type f -exec $SUDO chmod 664 {} +
 fi
 
 # -- Displays directory: group-readable --
 if [[ -d "$PROJECT_DIR/displays" ]]; then
-    sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$PROJECT_DIR/displays"
-    find "$PROJECT_DIR/displays" -type d -exec sudo chmod 750 {} +
-    find "$PROJECT_DIR/displays" -type f -exec sudo chmod 640 {} +
+    $SUDO chown -R "$REAL_USER:$SANDBOX_GROUP" "$PROJECT_DIR/displays"
+    find "$PROJECT_DIR/displays" -type d -exec $SUDO chmod 750 {} +
+    find "$PROJECT_DIR/displays" -type f -exec $SUDO chmod 640 {} +
 fi
 
 # -- Integrations directory: group-readable (runner spawns as sandbox user) --
 if [[ -d "$PROJECT_DIR/integrations" ]]; then
-    sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$PROJECT_DIR/integrations"
-    find "$PROJECT_DIR/integrations" -type d -exec sudo chmod 750 {} +
-    find "$PROJECT_DIR/integrations" -type f -exec sudo chmod 640 {} +
+    $SUDO chown -R "$REAL_USER:$SANDBOX_GROUP" "$PROJECT_DIR/integrations"
+    find "$PROJECT_DIR/integrations" -type d -exec $SUDO chmod 750 {} +
+    find "$PROJECT_DIR/integrations" -type f -exec $SUDO chmod 640 {} +
 fi
 
 # -- .env: owner-only (sandbox CANNOT read secrets) --
 if [[ -f "$PROJECT_DIR/.env" ]]; then
-    sudo chown "$REAL_USER:$REAL_USER" "$PROJECT_DIR/.env"
+    $SUDO chown "$REAL_USER:$REAL_USER" "$PROJECT_DIR/.env"
     chmod 600 "$PROJECT_DIR/.env"
 fi
 
@@ -351,29 +406,35 @@ fi
 for dir in "$PROJECT_DIR/data/memory" "$PROJECT_DIR/data/photos" \
            "$PROJECT_DIR/data/scheduler"; do
     if [[ -d "$dir" ]]; then
-        sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$dir"
-        find "$dir" -type d -exec sudo chmod 750 {} +
-        find "$dir" -type f -exec sudo chmod 640 {} +
+        $SUDO chown -R "$REAL_USER:$SANDBOX_GROUP" "$dir"
+        find "$dir" -type d -exec $SUDO chmod 750 {} +
+        find "$dir" -type f -exec $SUDO chmod 640 {} +
     fi
 done
 
-# -- Config directory: group-readable --
+# -- Config directory: owner-only, sandbox has NO access --
+# config.yaml carries runtime settings (HA URL, phone numbers, thresholds)
+# that the sandbox has no business reading. On the Pi the operator's 0700
+# home dir blocks traversal regardless of these modes; inside a
+# chroot there is NO such traversal block (/opt/boxbot is world-traversable),
+# so the group MUST be the owner (not boxbot) or the sandbox user — which is
+# in the boxbot group — could read config/ directly. Owner-only, like src/.
 if [[ -d "$PROJECT_DIR/config" ]]; then
-    sudo chown -R "$REAL_USER:$SANDBOX_GROUP" "$PROJECT_DIR/config"
-    find "$PROJECT_DIR/config" -type d -exec sudo chmod 750 {} +
-    find "$PROJECT_DIR/config" -type f -exec sudo chmod 640 {} +
+    $SUDO chown -R "$REAL_USER:$REAL_USER" "$PROJECT_DIR/config"
+    find "$PROJECT_DIR/config" -type d -exec $SUDO chmod 750 {} +
+    find "$PROJECT_DIR/config" -type f -exec $SUDO chmod 640 {} +
 fi
 
 # -- Source code: owner-only (sandbox has NO access) --
 if [[ -d "$PROJECT_DIR/src" ]]; then
-    sudo chown -R "$REAL_USER:$REAL_USER" "$PROJECT_DIR/src"
-    find "$PROJECT_DIR/src" -type d -exec sudo chmod 750 {} +
-    find "$PROJECT_DIR/src" -type f -exec sudo chmod 640 {} +
+    $SUDO chown -R "$REAL_USER:$REAL_USER" "$PROJECT_DIR/src"
+    find "$PROJECT_DIR/src" -type d -exec $SUDO chmod 750 {} +
+    find "$PROJECT_DIR/src" -type f -exec $SUDO chmod 640 {} +
 fi
 
 # -- .git: owner-only --
 if [[ -d "$PROJECT_DIR/.git" ]]; then
-    sudo chown -R "$REAL_USER:$REAL_USER" "$PROJECT_DIR/.git"
+    $SUDO chown -R "$REAL_USER:$REAL_USER" "$PROJECT_DIR/.git"
 fi
 
 echo "Filesystem permissions configured."
@@ -483,19 +544,19 @@ verify() {
 }
 
 # Test 1: Sandbox user can execute Python
-sudo -u "$SANDBOX_USER" "$SANDBOX_VENV/bin/python3" -c "print('ok')" &>/dev/null && rc=0 || rc=$?
+$AS_SANDBOX "$SANDBOX_VENV/bin/python3" -c "print('ok')" &>/dev/null && rc=0 || rc=$?
 verify "Sandbox can run Python interpreter" "should_succeed" "$rc"
 
 # Test 2: Sandbox user can import boxbot_sdk
-sudo -u "$SANDBOX_USER" "$SANDBOX_VENV/bin/python3" -c "import boxbot_sdk" &>/dev/null && rc=0 || rc=$?
+$AS_SANDBOX "$SANDBOX_VENV/bin/python3" -c "import boxbot_sdk" &>/dev/null && rc=0 || rc=$?
 verify "Sandbox can import boxbot_sdk" "should_succeed" "$rc"
 
 # Test 3: Sandbox user can import third-party packages
-sudo -u "$SANDBOX_USER" "$SANDBOX_VENV/bin/python3" -c "import requests; import numpy" &>/dev/null && rc=0 || rc=$?
+$AS_SANDBOX "$SANDBOX_VENV/bin/python3" -c "import requests; import numpy" &>/dev/null && rc=0 || rc=$?
 verify "Sandbox can import requests, numpy" "should_succeed" "$rc"
 
 # Test 4: Sandbox user can write to output directory
-sudo -u "$SANDBOX_USER" touch "$SANDBOX_DIR/output/.verify_test" &>/dev/null && rc=0 || rc=$?
+$AS_SANDBOX touch "$SANDBOX_DIR/output/.verify_test" &>/dev/null && rc=0 || rc=$?
 rm -f "$SANDBOX_DIR/output/.verify_test" 2>/dev/null
 verify "Sandbox can write to $SANDBOX_DIR/output/" "should_succeed" "$rc"
 
@@ -506,41 +567,65 @@ verify "Sandbox can write to $SANDBOX_DIR/output/" "should_succeed" "$rc"
 # direct filesystem access to config/. Treat readable config as a
 # misconfiguration to flag.
 if [[ -f "$PROJECT_DIR/config/config.example.yaml" ]]; then
-    sudo -u "$SANDBOX_USER" test -r "$PROJECT_DIR/config/config.example.yaml" \
+    $AS_SANDBOX test -r "$PROJECT_DIR/config/config.example.yaml" \
         &>/dev/null && rc=0 || rc=$?
     verify "Sandbox cannot read project config/" "should_fail" "$rc"
 fi
 
 # Test 6: Sandbox user CANNOT read .env
 if [[ -f "$PROJECT_DIR/.env" ]]; then
-    sudo -u "$SANDBOX_USER" cat "$PROJECT_DIR/.env" &>/dev/null && rc=0 || rc=$?
+    $AS_SANDBOX cat "$PROJECT_DIR/.env" &>/dev/null && rc=0 || rc=$?
     verify "Sandbox cannot read .env" "should_fail" "$rc"
 else
     echo "  - Skipped .env test (file not created yet)"
 fi
 
 # Test 7: Sandbox user CANNOT execute pip
-sudo -u "$SANDBOX_USER" "$SANDBOX_VENV/bin/pip" --version &>/dev/null && rc=0 || rc=$?
+$AS_SANDBOX "$SANDBOX_VENV/bin/pip" --version &>/dev/null && rc=0 || rc=$?
 verify "Sandbox cannot execute pip" "should_fail" "$rc"
 
 # Test 8: Sandbox user CANNOT write to site-packages
 SITE_PACKAGES=$("$SANDBOX_VENV/bin/python3" -c "import site; print(site.getsitepackages()[0])")
-sudo -u "$SANDBOX_USER" touch "$SITE_PACKAGES/.verify_test" &>/dev/null && rc=0 || rc=$?
+$AS_SANDBOX touch "$SITE_PACKAGES/.verify_test" &>/dev/null && rc=0 || rc=$?
 rm -f "$SITE_PACKAGES/.verify_test" 2>/dev/null
 verify "Sandbox cannot write to site-packages" "should_fail" "$rc"
 
 # Test 9: Sandbox user CANNOT read source code
 if [[ -d "$PROJECT_DIR/src/boxbot" ]]; then
-    sudo -u "$SANDBOX_USER" ls "$PROJECT_DIR/src/boxbot/" &>/dev/null && rc=0 || rc=$?
+    $AS_SANDBOX ls "$PROJECT_DIR/src/boxbot/" &>/dev/null && rc=0 || rc=$?
     verify "Sandbox cannot access src/boxbot/" "should_fail" "$rc"
 else
     echo "  - Skipped src/ test (directory not populated yet)"
 fi
 
 # Test 10: Sandbox user CANNOT write to the venv
-sudo -u "$SANDBOX_USER" touch "$SANDBOX_VENV/.verify_test" &>/dev/null && rc=0 || rc=$?
+$AS_SANDBOX touch "$SANDBOX_VENV/.verify_test" &>/dev/null && rc=0 || rc=$?
 rm -f "$SANDBOX_VENV/.verify_test" 2>/dev/null
 verify "Sandbox cannot write to venv" "should_fail" "$rc"
+
+# Test 11: Sandbox user CAN read a shipped display.json (group boxbot,
+# 640). This is the positive counterpart to the "cannot read .env" test:
+# with a correct group set after privilege drop, group-readable content
+# must be reachable. A regression here means the drop lost the boxbot
+# group (initgroups bug) — displays/config/data/secrets would all break.
+DISPLAY_JSON="$(find "$PROJECT_DIR/displays" -name display.json -type f 2>/dev/null | head -1)"
+if [[ -n "$DISPLAY_JSON" ]]; then
+    $AS_SANDBOX cat "$DISPLAY_JSON" &>/dev/null && rc=0 || rc=$?
+    verify "Sandbox CAN read a shipped display.json (group boxbot)" "should_succeed" "$rc"
+else
+    echo "  - Skipped display.json read test (no displays/ found)"
+fi
+
+# Test 12: Sandbox user CAN read a staged secrets-style file. The host
+# drops the resolved-secrets JSON into the setgid scripts dir (2770,
+# group boxbot) at mode 0640; the sandbox reads + unlinks it after the
+# drop. Prove that path works end to end.
+SECRET_PROBE="$SANDBOX_DIR/scripts/.verify_secret.json"
+echo '{"BOXBOT_SECRET_PROBE":"x"}' > "$SECRET_PROBE" 2>/dev/null || true
+chmod 640 "$SECRET_PROBE" 2>/dev/null || true
+$AS_SANDBOX cat "$SECRET_PROBE" &>/dev/null && rc=0 || rc=$?
+rm -f "$SECRET_PROBE" 2>/dev/null
+verify "Sandbox CAN read a staged secrets file (group boxbot, 0640)" "should_succeed" "$rc"
 
 echo ""
 if [[ $VERIFY_FAILED -eq 0 ]]; then
@@ -572,10 +657,10 @@ echo "  Sandbox venv:   $SANDBOX_VENV"
 echo "  Seccomp:        config/seccomp-sandbox.json"
 echo ""
 echo "  Permission summary:"
-echo "    CAN read:     config/, data/memory/, data/photos/, data/scheduler/"
+echo "    CAN read:     displays/, data/memory/, data/photos/, data/scheduler/"
 echo "    CAN write:    $SANDBOX_DIR/output/, $SANDBOX_DIR/tmp/, skills/"
 echo "    CAN execute:  $SANDBOX_VENV/bin/python3"
-echo "    CANNOT read:  .env, src/boxbot/, .git/"
+echo "    CANNOT read:  .env, config/, src/boxbot/, .git/"
 echo "    CANNOT write: site-packages, venv/"
 echo "    CANNOT exec:  pip, any subprocess (seccomp)"
 echo ""

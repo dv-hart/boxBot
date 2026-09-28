@@ -526,3 +526,148 @@ class TestPersonTriggerFiring:
         await sched._on_person_detected(PersonDetected(person_ref="A"))
         await sched._on_person_detected(PersonDetected(person_ref="A"))
         assert sched._check_person_triggers.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Re-arming condition triggers (rearm_after_s)
+# ---------------------------------------------------------------------------
+
+
+class TestRearmingTriggers:
+    """rearm_after_s: "whenever X", not "next time X"."""
+
+    def _entity_on(self, entity="binary_sensor.front_door_person"):
+        from boxbot.core.events import EntityStateChanged
+
+        return EntityStateChanged(
+            entity_id=entity, new_state="on", old_state="off",
+            friendly_name="Front Door person", snapshot=False,
+        )
+
+    def _entity_off(self, entity="binary_sensor.front_door_person"):
+        from boxbot.core.events import EntityStateChanged
+
+        return EntityStateChanged(
+            entity_id=entity, new_state="off", old_state="on",
+            friendly_name="Front Door person", snapshot=False,
+        )
+
+    async def _rearm_trigger(self, **kwargs):
+        return await create_trigger(
+            description="Front door person alert",
+            instructions="Text Jacob",
+            entity="binary_sensor.front_door_person",
+            rearm_after_s=0,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stays_active_and_refires_after_cooldown(self):
+        tid = await self._rearm_trigger()
+        sched = Scheduler()
+        await sched._on_entity_state(self._entity_on())
+        trigger = await get_trigger(tid)
+        assert trigger["status"] == "active"
+        assert trigger["fire_count"] == 1
+
+        # Age the first firing past the refractory floor, then a fresh
+        # off->on edge must fire again.
+        old = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        await update_trigger(tid, last_fired=old)
+        await sched._on_entity_state(self._entity_off())
+        await sched._on_entity_state(self._entity_on())
+        trigger = await get_trigger(tid)
+        assert trigger["status"] == "active"
+        assert trigger["fire_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_refractory_floor_blocks_immediate_refire(self):
+        tid = await self._rearm_trigger()
+        sched = Scheduler()
+        await sched._on_entity_state(self._entity_on())
+        await sched._on_entity_state(self._entity_off())
+        await sched._on_entity_state(self._entity_on())
+        trigger = await get_trigger(tid)
+        assert trigger["fire_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_time_scan_does_not_double_fire_while_condition_holds(self):
+        # The 60s scan evaluates entity conditions against the live
+        # mirror; while the momentary "on" is still held it must not
+        # re-fire an edge that already fired.
+        tid = await self._rearm_trigger()
+        sched = Scheduler()
+        await sched._on_entity_state(self._entity_on())
+        await sched._check_time_triggers()
+        trigger = await get_trigger(tid)
+        assert trigger["fire_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_cooldown_longer_than_floor_is_honoured(self):
+        tid = await create_trigger(
+            description="Front door person alert",
+            instructions="Text Jacob",
+            entity="binary_sensor.front_door_person",
+            rearm_after_s=3600,
+        )
+        sched = Scheduler()
+        await sched._on_entity_state(self._entity_on())
+        # Aged past the floor but inside the requested cooldown: no refire.
+        old = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        await update_trigger(tid, last_fired=old)
+        await sched._on_entity_state(self._entity_off())
+        await sched._on_entity_state(self._entity_on())
+        trigger = await get_trigger(tid)
+        assert trigger["fire_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_fired_event_reports_recurring(self):
+        from boxbot.core.events import TriggerFired, get_event_bus
+
+        received = []
+
+        async def handler(event):
+            received.append(event)
+
+        bus = get_event_bus()
+        bus.subscribe(TriggerFired, handler)
+        try:
+            await self._rearm_trigger()
+            sched = Scheduler()
+            await sched._on_entity_state(self._entity_on())
+        finally:
+            bus.unsubscribe(TriggerFired, handler)
+        assert len(received) == 1
+        assert received[0].is_recurring is True
+
+    @pytest.mark.asyncio
+    async def test_requires_person_or_entity_condition(self):
+        with pytest.raises(ValueError, match="person or entity"):
+            await create_trigger(
+                description="x", instructions="y",
+                fire_at="2027-01-01T00:00:00", rearm_after_s=60,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejected_with_cron(self):
+        with pytest.raises(ValueError, match="mutually exclusive with cron"):
+            await create_trigger(
+                description="x", instructions="y",
+                cron="0 8 * * *", person="Jacob", rearm_after_s=60,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_negative_or_non_int(self):
+        with pytest.raises(ValueError, match="non-negative integer"):
+            await create_trigger(
+                description="x", instructions="y",
+                person="Jacob", rearm_after_s=-1,
+            )
+
+    @pytest.mark.asyncio
+    async def test_default_expiry_extends_to_30_days(self):
+        tid = await self._rearm_trigger()
+        trigger = await get_trigger(tid)
+        expires = datetime.fromisoformat(trigger["expires"])
+        delta = expires - datetime.now(timezone.utc)
+        assert timedelta(days=29) < delta <= timedelta(days=30)

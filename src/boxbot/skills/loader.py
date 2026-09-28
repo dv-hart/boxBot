@@ -40,6 +40,9 @@ _DEFAULT_SKILLS_ROOT: Path = (
 
 _SKILL_FILE = "SKILL.md"
 
+# Names already announced as disabled, so repeat discovery stays quiet.
+_logged_disabled: set[str] = set()
+
 
 @dataclass(frozen=True)
 class SkillMeta:
@@ -134,6 +137,28 @@ def _resolve_root(root: Path | None) -> Path:
     return (root if root is not None else _DEFAULT_SKILLS_ROOT).resolve()
 
 
+def disabled_skills() -> set[str]:
+    """Skill names switched off for this deployment (``skills.disabled``).
+
+    Empty when config isn't loaded — discovery must work in tests and
+    during early startup.
+    """
+    try:
+        from boxbot.core.config import get_config
+
+        return {name.strip() for name in get_config().skills.disabled if name.strip()}
+    except Exception:
+        return set()
+
+
+def _log_disabled_once(name: str) -> None:
+    """Announce a skipped skill once — discovery runs every conversation."""
+    if name in _logged_disabled:
+        return
+    _logged_disabled.add(name)
+    logger.info("Skill %r disabled by config (skills.disabled)", name)
+
+
 def discover_skills(root: Path | None = None) -> list[SkillMeta]:
     """Scan the skills root directory and return frontmatter records.
 
@@ -146,6 +171,7 @@ def discover_skills(root: Path | None = None) -> list[SkillMeta]:
     if not resolved.exists() or not resolved.is_dir():
         return []
 
+    disabled = disabled_skills()
     skills: list[SkillMeta] = []
     try:
         entries = sorted(resolved.iterdir(), key=lambda p: p.name)
@@ -159,6 +185,9 @@ def discover_skills(root: Path | None = None) -> list[SkillMeta]:
             logger.warning("Skipping symlinked skill entry: %s", entry.name)
             continue
         if not entry.is_dir():
+            continue
+        if entry.name in disabled:
+            _log_disabled_once(entry.name)
             continue
         skill_md = entry / _SKILL_FILE
         if not skill_md.is_file():
@@ -218,9 +247,37 @@ Some skills link to sub-files in their body. Only pass `subpath=` after the
 base body tells you that sub-file exists — do not guess sub-file names.
 """
 
+_COMPACT_HEADER = """## Available skills
 
-def get_skill_index(root: Path | None = None) -> str:
-    """Return a markdown-formatted skill index for system-prompt injection.
+load_skill(name=…) pulls one in when the task calls for it. Pass
+`subpath=` only for a sub-file the loaded body names — do not guess.
+
+"""
+
+
+def get_skill_index(
+    root: Path | None = None,
+    *,
+    compact: bool = False,
+    exclude: set[str] | None = None,
+) -> str:
+    """Return a markdown-formatted skill index.
+
+    ``exclude`` drops skills by name — the prefetch selector passes the
+    conversation's already-loaded set so in-context skills leave its
+    candidate menu entirely (an absent candidate can't be re-picked).
+
+    Two renderings of one registry, for two readers with different jobs:
+
+    - Default (``compact=False``) — name + full ``when_to_use`` match
+      conditions. This is the **prefetch selector's** candidate corpus
+      (``prefetch.sources._skills_source``): picking the right skill IS its
+      whole job, so it needs every trigger condition spelled out.
+    - ``compact=True`` — name + one-line ``description``. This is the
+      **system prompt's** copy, on every call of every turn. The large model
+      only needs to know a skill EXISTS; prefetch has already loaded the one
+      that matched, and the conditions it matched on are not worth re-reading
+      on each call.
 
     - Returns ``""`` if no skills exist or discovery fails.
     - Never raises.
@@ -231,8 +288,19 @@ def get_skill_index(root: Path | None = None) -> str:
         logger.warning("Skill discovery failed: %s", exc)
         return ""
 
+    if exclude:
+        skills = [m for m in skills if m.name not in exclude]
     if not skills:
         return ""
+
+    if compact:
+        lines = [_COMPACT_HEADER.rstrip("\n"), ""]
+        for meta in skills:
+            blurb = " ".join(
+                (meta.description or meta.when_to_use or "(no description)").split()
+            )
+            lines.append(f"- {meta.name}: {blurb}")
+        return "\n".join(lines) + "\n"
 
     lines = [_INDEX_HEADER.rstrip("\n")]
     lines.append("")
@@ -265,6 +333,11 @@ def _find_skill(name: str, root: Path | None) -> SkillMeta:
     # Reject any path-ish characters in the skill name itself.
     if "/" in name or "\\" in name or name in ("", ".", ".."):
         raise ValueError(f"Invalid skill name: {name!r}")
+    if name in disabled_skills():
+        raise ValueError(
+            f"Skill {name!r} is disabled on this device (skills.disabled) "
+            f"and cannot be loaded."
+        )
     for meta in discover_skills(root):
         if meta.name == name:
             return meta

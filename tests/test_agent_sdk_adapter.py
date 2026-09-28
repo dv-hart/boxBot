@@ -174,7 +174,7 @@ def test_build_mcp_server_registers_under_namespace():
     assert server.get("name") == A.MCP_SERVER_NAME or server.get("type") == "sdk"
 
 
-def test_build_options_pins_output_format_and_allowed_tools():
+def test_build_options_pins_output_format_and_allowed_tools(mock_config):
     schema = {"type": "json_schema", "schema": {"type": "object"}}
     tools = [_StubTool()]
 
@@ -194,7 +194,7 @@ def test_build_options_pins_output_format_and_allowed_tools():
     assert A.MCP_SERVER_NAME in opts.mcp_servers
 
 
-def test_build_options_threads_can_use_tool_callback():
+def test_build_options_threads_can_use_tool_callback(mock_config):
     async def gate(*args, **kwargs):
         from claude_agent_sdk import PermissionResultAllow
         return PermissionResultAllow(behavior="allow")
@@ -209,3 +209,57 @@ def test_build_options_threads_can_use_tool_callback():
     )
 
     assert opts.can_use_tool is gate
+
+
+class _StatusConv:
+    conversation_id = "voice_room"
+    channel = "voice"
+
+
+class _SearchTool(_StubTool):
+    name = "web_search"
+    description = "Stub with a status-mapped name."
+
+
+@pytest.mark.asyncio
+async def test_wrap_tool_publishes_agent_tool_called(event_bus):
+    """The MCP wrapper is the exact pre-execution point on the SDK path —
+    it publishes AgentToolCalled so the display manager can show the
+    status pill before the (possibly slow) tool runs."""
+    from boxbot.core.events import AgentToolCalled
+
+    received = []
+
+    async def handler(event):
+        received.append(event)
+
+    event_bus.subscribe(AgentToolCalled, handler)
+
+    tool = _SearchTool(returns="ok")
+    wrapped = A.wrap_tool(tool, conv=_StatusConv())
+    await wrapped.handler({"q": "weather"})
+
+    assert len(received) == 1
+    assert received[0].tool_name == "web_search"
+    assert received[0].status_text == "Searching the web…"
+    assert received[0].conversation_id == "voice_room"
+    # Tool still executed normally after the publish.
+    assert tool.calls == [{"q": "weather"}]
+
+
+@pytest.mark.asyncio
+async def test_wrap_tool_no_status_event_for_unmapped_tool(event_bus):
+    from boxbot.core.events import AgentToolCalled
+
+    received = []
+
+    async def handler(event):
+        received.append(event)
+
+    event_bus.subscribe(AgentToolCalled, handler)
+
+    tool = _StubTool(returns="ok")  # name "stub" has no status mapping
+    wrapped = A.wrap_tool(tool, conv=_StatusConv())
+    await wrapped.handler({"q": "x"})
+
+    assert received == []

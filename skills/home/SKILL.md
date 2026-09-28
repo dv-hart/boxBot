@@ -1,6 +1,6 @@
 ---
 name: home
-description: Control the household through Home Assistant — lights, scenes, climate, media, smart plugs — and read live state like alarm armed/disarmed, doors, sensors, presence. The home_assistant integration is the single pipe; this skill is the map. Loads when the user asks BB to do anything touching a physical device, set a mood, check the house, or peek at a camera.
+description: Household control through Home Assistant — lights, scenes, climate, media, plugs — and live house state (alarm, doors, sensors, presence, cameras). The home_assistant integration is the single pipe; this skill is the map.
 when_to_use: |
   Load when the user:
     - Turns something on/off, changes brightness/color, runs a scene ("set the

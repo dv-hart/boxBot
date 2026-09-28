@@ -110,7 +110,7 @@ def preview(
     *,
     data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Render a spec to a 1024x600 PNG and attach it to the tool result.
+    """Render a spec at the live surface size and attach it as a PNG.
 
     The image is reachable via ``result["path"]`` and (when there's
     capacity in this script run) attached as a multimodal content block
@@ -123,7 +123,8 @@ def preview(
             a real fetch — pass the JSON the API would return and the
             transform runs against it.
 
-    Returns ``{"path": str, "attached": bool, "warnings": [...]}``.
+    Returns ``{"path": str, "attached": bool, "width": int,
+    "height": int, "warnings": [...]}``.
 
     Raises:
         RuntimeError: If validation fails.
@@ -234,7 +235,7 @@ def set_rotation(
 
 
 def screenshot() -> dict[str, Any]:
-    """Capture the live 1024x600 display surface and attach it as an image.
+    """Capture the live display surface and attach it as an image.
 
     Renders the *current* state of the screen (live data and all) to a
     PNG and attaches it to the tool result so you literally see what
@@ -242,7 +243,10 @@ def screenshot() -> dict[str, Any]:
     real data flowing — preview() shows placeholders, screenshot() is
     the truth.
 
-    Returns ``{"path": str, "attached": bool, "name": str | None}``.
+    Returns ``{"path": str, "attached": bool, "name": str | None,
+    "width": int, "height": int}`` — the surface size is config-driven
+    (1024x600 on the 7" LCD; other surfaces differ), so read it here
+    rather than assuming.
     Subject to the per-call image-attachment cap; ``attached`` is
     ``False`` if the cap was already hit (the PNG path is still
     viewable via ``bb.workspace.view``).

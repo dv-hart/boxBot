@@ -7,8 +7,10 @@ be imported without pulling in hardware-specific libraries.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -213,4 +215,115 @@ class HardwareModule(ABC):
                 status=status.value,
                 detail=detail,
             )
+        )
+
+
+# Consumer callback type: async callable receiving AudioChunk
+AudioConsumer = Callable[[AudioChunk], Awaitable[None]]
+
+
+class AudioFanout(HardwareModule):
+    """A HardwareModule that fans one PCM stream out to N async consumers.
+
+    Shared by every microphone backend — today the ReSpeaker array
+    (``hardware/microphone.py``). Capture lands on a non-async thread
+    (PortAudio's audio callback), so
+    ``deliver_chunk`` hops onto the event loop before awaiting anything.
+    Subclasses set ``self._loop`` in ``start()``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Consumers are keyed by a stable integer handle returned from
+        # add_consumer(). This avoids the bound-method identity pitfall:
+        # ``obj.method is obj.method`` is False, so using the callable
+        # itself as the key silently breaks remove_consumer().
+        self._consumers: list[tuple[int, AudioConsumer, str]] = []
+        self._next_consumer_id: int = 1
+
+    def add_consumer(self, callback: AudioConsumer, name: str = "") -> int:
+        """Register an async callback to receive audio chunks.
+
+        Args:
+            callback: Async callable that receives AudioChunk.
+            name: Human-readable name for logging.
+
+        Returns:
+            A handle id. Pass this to ``remove_consumer`` to unregister.
+            Callers MUST store this id — bound methods are not
+            identity-stable across accesses, so the callable itself is
+            not a reliable key.
+        """
+        handle = self._next_consumer_id
+        self._next_consumer_id += 1
+        display = name or repr(callback)
+        self._consumers.append((handle, callback, display))
+        logger.debug(
+            "Audio consumer added: %s [id=%d] (total: %d)",
+            display, handle, len(self._consumers),
+        )
+        return handle
+
+    def remove_consumer(self, handle: int) -> bool:
+        """Remove a previously registered consumer by handle.
+
+        Args:
+            handle: The integer handle returned from ``add_consumer``.
+
+        Returns:
+            True if a consumer was removed; False if the handle was
+            unknown (caller logic bug — should never happen if handles
+            are stored correctly).
+        """
+        for i, (h, _cb, name) in enumerate(self._consumers):
+            if h == handle:
+                self._consumers.pop(i)
+                logger.debug(
+                    "Audio consumer removed: %s [id=%d] (total: %d)",
+                    name, handle, len(self._consumers),
+                )
+                return True
+        logger.warning(
+            "remove_consumer called with unknown handle %d — consumer "
+            "list unchanged (total: %d)",
+            handle, len(self._consumers),
+        )
+        return False
+
+    @property
+    def consumer_count(self) -> int:
+        """Number of registered audio consumers."""
+        return len(self._consumers)
+
+    def deliver_chunk(self, chunk: AudioChunk) -> None:
+        """Dispatch a chunk to the consumers from a capture thread."""
+        if not self._consumers or self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(
+            self._loop.create_task, self._dispatch_chunk(chunk)
+        )
+
+    async def _dispatch_chunk(self, chunk: AudioChunk) -> None:
+        """Distribute an audio chunk to all registered consumers.
+
+        Each consumer is called concurrently. Slow or failing consumers
+        do not block others.
+        """
+        if not self._consumers:
+            return
+
+        async def _safe_deliver(
+            callback: AudioConsumer, name: str, chunk: AudioChunk
+        ) -> None:
+            try:
+                await callback(chunk)
+            except Exception:
+                logger.exception("Error in audio consumer %s", name)
+
+        # Snapshot the consumer list: a consumer that unregisters itself
+        # during delivery must not mutate the iterable we're awaiting on.
+        snapshot = list(self._consumers)
+        await asyncio.gather(
+            *(_safe_deliver(cb, name, chunk) for _h, cb, name in snapshot)
         )

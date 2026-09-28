@@ -34,7 +34,7 @@ def get_builtin_specs() -> list[DisplaySpec]:
 
 
 def _clock_display() -> DisplaySpec:
-    """Simple full-screen clock with date."""
+    """Full-screen clock, time + date centered as a group."""
     root = ColumnBlock(gap=0, align="center", padding=[0, 0, 0, 0])
     root.children = [
         ClockBlock(format="12h", show_date=True, show_seconds=False, size="xl"),
@@ -50,31 +50,34 @@ def _clock_display() -> DisplaySpec:
 
 
 def _weather_simple_display() -> DisplaySpec:
-    """Simple weather display with current conditions."""
-    from boxbot.displays.blocks import IconBlock, MetricBlock, SpacerBlock
+    """Current conditions as a centered hero: icon + temp, condition,
+    humidity/wind footnote."""
+    from boxbot.displays.blocks import IconBlock, SpacerBlock
 
-    root = ColumnBlock(gap=16, align="center", padding=[40, 40, 40, 40])
+    root = ColumnBlock(
+        gap=10, align="center", item_align="center", padding=[40, 40, 40, 40],
+    )
 
-    header = RowBlock(gap=16, align="center")
-    header.children = [
-        IconBlock(name="{weather.icon}", size="xl"),
-        MetricBlock(
-            value="{weather.temp}\u00b0F",
-            label="{weather.condition}",
-            animation="count_up",
-        ),
+    hero = RowBlock(gap=20, align="center")
+    hero.children = [
+        IconBlock(name="{weather.icon}", size="xl", color="accent"),
+        TextBlock(content="{weather.temp}\u00b0", size="title", weight="bold"),
     ]
 
-    details = RowBlock(gap=24, align="center")
+    details = RowBlock(gap=12, align="center")
     details.children = [
-        TextBlock(content="Humidity: {weather.humidity}%", size="body", color="muted"),
-        TextBlock(content="Wind: {weather.wind}", size="body", color="muted"),
+        TextBlock(content="Humidity {weather.humidity}%", size="caption", color="muted"),
+        TextBlock(content="\u00b7", size="caption", color="dim"),
+        TextBlock(content="Wind {weather.wind}", size="caption", color="muted"),
     ]
 
     root.children = [
-        SpacerBlock(size=40),
-        header,
-        SpacerBlock(size=16),
+        hero,
+        TextBlock(
+            content="{weather.condition}", size="subtitle", color="muted",
+            align="center",
+        ),
+        SpacerBlock(size=14),
         details,
     ]
 
@@ -106,17 +109,22 @@ def _notice_display() -> DisplaySpec:
     """
     from boxbot.displays.blocks import SpacerBlock
 
-    root = ColumnBlock(gap=0, align="center", padding=[0, 0, 0, 0])
-    card = CardBlock(padding=[40, 56, 40, 56])
-    body = ColumnBlock(gap=20, align="center")
+    root = ColumnBlock(
+        gap=0, align="center", item_align="center", padding=[0, 0, 0, 0],
+    )
+    card = CardBlock(padding=[44, 64, 44, 64])
+    body = ColumnBlock(gap=10, item_align="center")
     body.children = [
-        TextBlock(content="{args.title}", size="xl", weight="bold", align="center"),
+        TextBlock(
+            content="{args.title}", size="heading", weight="bold",
+            align="center",
+        ),
         SpacerBlock(size=8),
         TextBlock(content="{args.lines[0]}", size="body", align="center"),
-        TextBlock(content="{args.lines[1]}", size="body", align="center"),
+        TextBlock(content="{args.lines[1]}", size="subtitle", align="center"),
         TextBlock(
             content="{args.lines[2]}",
-            size="body",
+            size="caption",
             color="muted",
             align="center",
         ),

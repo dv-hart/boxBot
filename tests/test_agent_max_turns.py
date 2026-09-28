@@ -284,3 +284,46 @@ async def test_natural_end_turn_skips_headsup_and_fallback(
     for call in agent._client.messages.create.call_args_list:
         names = [t["name"] for t in call.kwargs["tools"]]
         assert "execute_script" in names
+
+
+# ---------------------------------------------------------------------------
+# Channel-aware cap: a wake cycle nobody is waiting on gets a tighter
+# budget than an interactive conversation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("channel,trigger_budget", [
+    ("trigger", True),
+    ("voice", False),
+    ("signal", False),
+])
+@pytest.mark.asyncio
+async def test_max_turns_follows_the_channel(
+    agent_with_mock_client, mock_config, monkeypatch, channel, trigger_budget,
+):
+    agent = agent_with_mock_client
+    captured: dict[str, Any] = {}
+
+    async def _fake_loop(**kwargs):
+        captured.update(kwargs)
+        return [], 1
+    monkeypatch.setattr(agent, "_agent_loop", _fake_loop)
+
+    async def _fake_prompt(**_kwargs):
+        return [{"type": "text", "text": "sys"}]
+    monkeypatch.setattr(agent, "_build_system_prompt_blocks", _fake_prompt)
+
+    conv = SimpleNamespace(
+        conversation_id="conv-test",
+        channel=channel,
+        thread=[{"role": "user", "content": "wake"}],
+        current_context={},
+        set_state=lambda _s: None,
+    )
+
+    await agent._generate_for_conversation(conv)
+
+    cfg = mock_config.agent
+    assert captured["max_turns"] == (
+        cfg.max_turns_trigger if trigger_budget else cfg.max_turns
+    )

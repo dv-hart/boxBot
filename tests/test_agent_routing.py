@@ -141,6 +141,45 @@ async def test_transcript_creates_room_conversation(agent):
 
 
 @pytest.mark.asyncio
+async def test_transcript_runs_voice_prefetch_and_passes_bundle(
+    agent, monkeypatch,
+):
+    """The voice path runs the inline prefetch and forwards its context."""
+    sentinel = object()
+    prefetch_calls: dict = {}
+
+    async def _fake_prefetch(conv, channel, sender_name, text, warm_key=None):
+        prefetch_calls["channel"] = channel
+        prefetch_calls["text"] = text
+        prefetch_calls["warm_key"] = warm_key
+        return {"prefetch_text": "SENTINEL-TEXT"}
+
+    monkeypatch.setattr(agent, "_prefetch_context_for_text", _fake_prefetch)
+
+    captured: dict = {}
+    orig_handle_input = Conversation.handle_input
+
+    async def _capture(self, text, **kwargs):
+        captured["context"] = kwargs.get("context")
+        return await orig_handle_input(self, text, **kwargs)
+
+    monkeypatch.setattr(Conversation, "handle_input", _capture)
+
+    await agent._on_transcript_ready(TranscriptReady(
+        conversation_id="vs_pf",
+        transcript="[Jacob]: lock the door",
+        speaker_identities={},
+        source="voice",
+    ))
+    await _drain_active(agent)
+
+    assert prefetch_calls["channel"] == "voice"
+    assert "lock the door" in prefetch_calls["text"]
+    assert prefetch_calls["warm_key"] == "vs_pf"
+    assert captured["context"]["prefetch_text"] == "SENTINEL-TEXT"
+
+
+@pytest.mark.asyncio
 async def test_two_transcripts_same_session_reuse_conversation(agent):
     await agent._on_transcript_ready(TranscriptReady(
         conversation_id="vs_001",
@@ -783,6 +822,85 @@ async def test_rehydrate_stubs_memory_conversations_row(tmp_path):
         bus.unsubscribe(WhatsAppMessage, agent._on_whatsapp_message)
         bus.unsubscribe(ConversationEnded, agent._on_conversation_ended)
         await mem_store.close()
+        await conv_store.close()
+        config_module._config = None
+
+
+@pytest.mark.asyncio
+async def test_bridged_signal_thread_is_reachable_by_inbound_signal(
+    tmp_path, monkeypatch,
+):
+    """A trigger delivery to a Signal user must bridge into the thread
+    that Signal inbound actually rehydrates.
+
+    The bridge used to hardcode ``whatsapp:<phone>``, so on a
+    Signal-only device the briefing landed in a thread no inbound
+    message could ever reach — the recipient's reply started from
+    zero, and the orphaned rows escaped the trigger-channel extraction
+    guards.
+    """
+    from conftest import FakeAuth
+    from boxbot.communication.auth import User
+    from boxbot.conversations.store import ConversationStore
+    from boxbot.core import config as config_module
+    from boxbot.core.conversation import Conversation
+    from boxbot.core.events import SignalMessage
+
+    config_module._config = config_module.BoxBotConfig()
+    conv_store = ConversationStore(db_path=tmp_path / "conv.db")
+    await conv_store.initialize()
+
+    fake_auth = FakeAuth([User(
+        phone="+15035086292", name="Jacob", role="admin",
+        registered_at="2026-08-01T00:00:00", channel="signal",
+    )])
+    monkeypatch.setattr(
+        "boxbot.communication.auth.get_auth_manager", lambda: fake_auth,
+    )
+
+    bus = get_event_bus()
+    mem = MagicMock()
+    mem.read_system_memory = MagicMock(return_value="")
+    agent = BoxBotAgent(memory_store=mem, conversation_store=conv_store)
+    agent._client = MagicMock()
+    agent._running = True
+    bus.subscribe(SignalMessage, agent._on_signal_message)
+    bus.subscribe(ConversationEnded, agent._on_conversation_ended)
+    agent._generate_for_conversation = _make_stub_generate(reply="ack")
+
+    try:
+        await agent._bridge_trigger_delivery(
+            "Jacob",
+            Conversation.build_trigger_context_turns(
+                description="Morning briefing",
+                transcript="[boxBot → Jacob via text]: Morning briefing — Thu.",
+                recipient="Jacob",
+                delivered_texts=["Morning briefing — Thu."],
+            ),
+        )
+        record = await conv_store.get_active(
+            "signal:+15035086292", max_inactive_seconds=14400.0,
+        )
+        assert record is not None, "delivery was not bridged onto the Signal key"
+        bridged_id = record.conversation_id
+
+        await agent._on_signal_message(SignalMessage(
+            sender_name="Jacob",
+            sender_phone="+15035086292",
+            text="thanks — where did the 9am come from?",
+        ))
+        await _drain_active(agent)
+
+        # The reply continues the bridged thread, and that thread opens
+        # with the trigger framing so the model has the run's context.
+        assert (
+            agent._conversation_by_key["signal:+15035086292"] == bridged_id
+        )
+        thread = await conv_store.get_thread(bridged_id)
+        assert thread[0]["content"].startswith("[trigger] Scheduled run")
+    finally:
+        bus.unsubscribe(SignalMessage, agent._on_signal_message)
+        bus.unsubscribe(ConversationEnded, agent._on_conversation_ended)
         await conv_store.close()
         config_module._config = None
 

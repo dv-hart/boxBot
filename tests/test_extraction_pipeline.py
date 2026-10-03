@@ -842,10 +842,62 @@ class TestParseThreadExtractionContent:
             parse_thread_extraction_content(bad)
 
 
+class _FakeCompletion:
+    def __init__(self, content: str):
+        self.choices = [
+            types.SimpleNamespace(
+                message=types.SimpleNamespace(content=content, tool_calls=None),
+            ),
+        ]
+        self.usage = types.SimpleNamespace(
+            prompt_tokens=7000,
+            completion_tokens=90,
+            prompt_tokens_details=types.SimpleNamespace(cached_tokens=6700),
+        )
 
 
+def _thread_ctx() -> dict:
+    return {
+        "model": "gpt-5.6-luna",
+        "system_prompt": "You are boxBot.",
+        "tools": [],
+        "response_format": {"type": "json_schema"},
+        "effort_kwargs": {},
+    }
 
 
+def _agent_with_fakes(completion=None, create_side_effect=None):
+    """Minimal BoxBotAgent surface for the thread-extraction path
+    (same object.__new__ pattern as TestPostConversationTriggerSkip in
+    test_trigger_extraction_skip.py)."""
+    from boxbot.core import agent as agent_mod
+
+    agent = object.__new__(agent_mod.BoxBotAgent)
+    store = MagicMock()
+    store.create_pending_extraction = AsyncMock()
+    store.get_pending_extraction = AsyncMock(return_value="row")
+    store.mark_pending_applied = AsyncMock()
+    store.get_conversation = AsyncMock(return_value=None)
+    store.create_conversation = AsyncMock()
+    store.update_conversation = AsyncMock()
+    store.create_memory = AsyncMock(return_value="mem_new")
+    store.invalidate_memory = AsyncMock()
+    store.update_system_memory = AsyncMock()
+    # boxbot.cost.record writes straight through store.db
+    store.db.execute = AsyncMock()
+    store.db.commit = AsyncMock()
+    agent._memory_store = store
+    agent._batch_poller = MagicMock()
+    agent._batch_poller.submit = AsyncMock()
+
+    client = MagicMock()
+    if create_side_effect is not None:
+        client.chat.completions.create = AsyncMock(side_effect=create_side_effect)
+    else:
+        client.chat.completions.create = AsyncMock(return_value=completion)
+    agent._openai_client = client
+    agent._ensure_openai_client = lambda: client
+    return agent, store, client
 
 
 _THREAD_MESSAGES = [
@@ -854,5 +906,135 @@ _THREAD_MESSAGES = [
 ]
 
 
+class TestTryThreadExtraction:
+    @pytest.mark.asyncio
+    async def test_success_applies_and_marks_row(self, mock_config):
+        payload = dict(_MINIMAL_PAYLOAD)
+        payload["invalidations"] = [
+            {"memory_id": "mem_0412", "reason": "contradicted"},
+        ]
+        agent, store, client = _agent_with_fakes(
+            completion=_FakeCompletion(_thread_reply(payload)),
+        )
+
+        applied = await agent._try_thread_extraction(
+            conversation_id="conv_t1",
+            channel="voice",
+            participants=["BB", "Jacob"],
+            started_at="2026-08-29T21:00:00",
+            messages=list(_THREAD_MESSAGES),
+            accessed_memory_ids=["mem_0412"],
+            injected_memories_block="[Active Memories]\n- mem_0412: stale",
+            ctx=_thread_ctx(),
+        )
+
+        assert applied is True
+        store.mark_pending_applied.assert_awaited_once_with("conv_t1")
+        store.invalidate_memory.assert_awaited_once()
+        # Cost row appended (boxbot.cost.record → store.db.execute;
+        # params run (timestamp, purpose, provider, model, ...)).
+        store.db.execute.assert_awaited_once()
+        cost_params = store.db.execute.call_args.args[1]
+        assert cost_params[1] == "extraction"
+        assert cost_params[2] == "openai"
+
+        # The request replayed the conversation's exact shape: same
+        # tools/response_format from ctx, tool_choice=none, and the
+        # extraction instruction appended as the final user message.
+        call = client.chat.completions.create.call_args.kwargs
+        assert call["tool_choice"] == "none"
+        assert call["response_format"] == {"type": "json_schema"}
+        assert call["messages"][0]["role"] == "system"
+        assert call["messages"][-1]["role"] == "user"
+        assert "memory extractor" in call["messages"][-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_api_failure_returns_false(self, mock_config):
+        agent, store, _ = _agent_with_fakes(
+            create_side_effect=RuntimeError("azure stall"),
+        )
+        applied = await agent._try_thread_extraction(
+            conversation_id="conv_t2",
+            channel="voice",
+            participants=["BB"],
+            started_at="2026-08-29T21:00:00",
+            messages=list(_THREAD_MESSAGES),
+            accessed_memory_ids=[],
+            injected_memories_block="",
+            ctx=_thread_ctx(),
+        )
+        assert applied is False
+        store.mark_pending_applied.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unparseable_reply_returns_false(self, mock_config):
+        agent, store, _ = _agent_with_fakes(
+            completion=_FakeCompletion("Sure, the door is locked!"),
+        )
+        applied = await agent._try_thread_extraction(
+            conversation_id="conv_t3",
+            channel="voice",
+            participants=["BB"],
+            started_at="2026-08-29T21:00:00",
+            messages=list(_THREAD_MESSAGES),
+            accessed_memory_ids=[],
+            injected_memories_block="",
+            ctx=_thread_ctx(),
+        )
+        assert applied is False
+        store.mark_pending_applied.assert_not_awaited()
 
 
+class TestPostConversationThreadRouting:
+    @pytest.mark.asyncio
+    async def test_thread_success_skips_batch(self, mock_config):
+        agent, store, _ = _agent_with_fakes(
+            completion=_FakeCompletion(_thread_reply(_MINIMAL_PAYLOAD)),
+        )
+        await agent._post_conversation(
+            conversation_id="conv_t4",
+            channel="voice",
+            person_name="Jacob",
+            messages=list(_THREAD_MESSAGES),
+            accessed_memory_ids=[],
+            started_at="2026-08-29T21:00:00",
+            openai_thread_ctx=_thread_ctx(),
+        )
+        # Durable row still written first, then applied live — batch
+        # never submitted.
+        store.create_pending_extraction.assert_awaited_once()
+        store.mark_pending_applied.assert_awaited_once()
+        agent._batch_poller.submit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_thread_failure_falls_back_to_batch(self, mock_config):
+        agent, store, _ = _agent_with_fakes(
+            create_side_effect=RuntimeError("azure stall"),
+        )
+        await agent._post_conversation(
+            conversation_id="conv_t5",
+            channel="voice",
+            person_name="Jacob",
+            messages=list(_THREAD_MESSAGES),
+            accessed_memory_ids=[],
+            started_at="2026-08-29T21:00:00",
+            openai_thread_ctx=_thread_ctx(),
+        )
+        store.create_pending_extraction.assert_awaited_once()
+        agent._batch_poller.submit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_ctx_goes_straight_to_batch(self, mock_config):
+        agent, store, client = _agent_with_fakes(
+            completion=_FakeCompletion(_thread_reply(_MINIMAL_PAYLOAD)),
+        )
+        await agent._post_conversation(
+            conversation_id="conv_t6",
+            channel="voice",
+            person_name="Jacob",
+            messages=list(_THREAD_MESSAGES),
+            accessed_memory_ids=[],
+            started_at="2026-08-29T21:00:00",
+        )
+        client.chat.completions.create.assert_not_awaited()
+        agent._batch_poller.submit.assert_awaited_once()

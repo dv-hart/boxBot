@@ -40,12 +40,13 @@ VALID_TRANSITIONS = {"crossfade", "slide_left", "slide_right", "none"}
 
 VALID_DIVIDER_ORIENTATIONS = {"horizontal", "vertical"}
 
-VALID_DATA_SOURCE_TYPES = {"integration", "http_json", "http_text", "static", "memory_query"}
+VALID_DATA_SOURCE_TYPES = {
+    "integration", "http_json", "http_text", "static", "memory_query",
+}
 # Built-ins read live in-process state (the clock, scheduler todos,
 # present people, agent state). Weather and calendar are integrations
 # now — declare them as ``type: "integration"`` in the display spec.
 VALID_BUILTIN_SOURCES = {"clock", "tasks", "people", "agent_status"}
-
 # "operational" was dropped in lifecycle step 7 — extraction rejects it
 # and retrieval gives it no budget. Taxonomy is these three only.
 VALID_MEMORY_TYPES = {"person", "household", "methodology"}

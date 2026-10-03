@@ -10,10 +10,10 @@ back a display.
 
 **Not for:** durable *facts* you should recognize later without being
 told where to look → memory. Credentials → `bb.secrets`. Camera
-captures and household photos → `bb.photos`. The workspace holds what
-*you* wrote or curated.
+captures and household photos → `bb.photos`. The workspace holds
+what *you* wrote or curated.
 
-## Layout
+## Layout — yours to organize; suggested tree
 
 Yours to organize. Sensible default:
 
@@ -29,7 +29,7 @@ workspace/
 
 Root exists already. Subdirectories are created on `write()`.
 
-## API
+## Call signatures — write/append/read · ls/exists · search · view · delete · csv_write/csv_append/csv_read
 
 Paths are **relative** to the workspace root. Absolute paths, `..`
 segments, symlink escapes, and null bytes are rejected.
@@ -107,7 +107,7 @@ rows = bb.workspace.csv_read("data/chores.csv")   # → list[dict]
 `fieldnames=[...]`. `csv_append` reuses the existing header, or writes
 one from the row's keys.
 
-## Quota and errors
+## Quota and errors — 100 MB soft cap, WorkspaceError on every failure
 
 Soft cap, default 100 MB. Over-cap writes raise. Prune with
 `delete()`. Images here count against it; photo-library images do not.
@@ -115,7 +115,7 @@ Soft cap, default 100 MB. Over-cap writes raise. Prune with
 Every failure raises `WorkspaceError` (bad path, missing file, quota).
 It subclasses `bb.ActionError`.
 
-## Patterns
+## Patterns — pair a workspace file with a memory pointer
 
 Note plus memory pointer:
 

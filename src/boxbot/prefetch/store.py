@@ -52,13 +52,18 @@ async def record_prefetch_event(
             channel,
             mode,
             json.dumps(bundle.predicted_memory_ids()),
-            json.dumps(bundle.predicted_skills()),
+            # sdk-module picks ride the skills column as "bb/modules/x.md"
+            # so the offline join needs no schema migration.
+            json.dumps(
+                bundle.predicted_skills()
+                + [f"bb/modules/{m}.md" for m in bundle.predicted_sdk_modules()]
+            ),
             json.dumps(bundle.predicted_workspace_paths()),
             json.dumps(calls),
             bundle.token_estimate,
             latency_ms,
             cost_usd,
-            (bundle.likely_next_note or "")[:500],
+            "",  # note column retired with the likely_next_note field
             pulled_at,
         ),
     )
@@ -113,6 +118,44 @@ async def cache_get(store: Any, trigger_id: str) -> PrefetchBundle | None:
 async def cache_has_fresh(store: Any, trigger_id: str) -> bool:
     """True if a non-expired cache row already exists for this trigger."""
     return (await cache_get(store, trigger_id)) is not None
+
+
+# Hot-task rows (``hot:*`` keys) ride the prefetch_cache table with a
+# sentinel expiry: validity is content-fingerprinted by the caller
+# (prefetch/hot.py), not time-based.
+_KV_EXPIRY = "9999-12-31T00:00:00+00:00"
+
+
+async def kv_put(store: Any, key: str, payload: dict[str, Any]) -> None:
+    """Upsert an arbitrary JSON payload row (hot-task bundles/centroids)."""
+    await store.db.execute(
+        """
+        INSERT INTO prefetch_cache (trigger_id, bundle_json, pulled_at, expires_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(trigger_id) DO UPDATE SET
+            bundle_json=excluded.bundle_json,
+            pulled_at=excluded.pulled_at,
+            expires_at=excluded.expires_at
+        """,
+        (key, json.dumps(payload), _now().isoformat(), _KV_EXPIRY),
+    )
+    await store.db.commit()
+
+
+async def kv_get(store: Any, key: str) -> dict[str, Any] | None:
+    """Return the JSON payload stored under ``key``, or None."""
+    cur = await store.db.execute(
+        "SELECT bundle_json FROM prefetch_cache WHERE trigger_id = ?",
+        (key,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 async def cache_stamp_conversation(

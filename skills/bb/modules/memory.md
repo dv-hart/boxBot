@@ -8,7 +8,7 @@ lookup.
 For facts that should *ring a bell* later. For detail you'll *look up*
 (long lists, CSVs, drafts) use `bb.workspace`.
 
-## API
+## Call signatures — save / search / invalidate / delete
 
 ```python
 import boxbot_sdk as bb
@@ -49,7 +49,7 @@ straight to `invalidate()` / `delete()`.
 An `invalidate()` that finds nothing FAILS LOUDLY. Before you tell the
 user "corrected", confirm the call returned a record.
 
-## Corrections
+## Correcting a wrong fact — invalidate(id, reason) then save
 
 1. Find the record — the injected `#prefix` if it's in context, else
    `bb.memory.search(...)`.
@@ -61,7 +61,7 @@ If the wrong fact came from an external source you can see (a calendar
 event a briefing pulled), fixing memory is not enough — the source
 regenerates it. Offer to fix the source too.
 
-## Not this
+## Not this — bulky content→workspace, live data→integrations
 
 - Long or bulky content → `bb.workspace`. Records stay short.
 - Transient conversation state → not a durable fact.

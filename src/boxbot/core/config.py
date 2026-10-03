@@ -171,6 +171,12 @@ class AgentConfig(BaseModel):
     name: str = "boxBot"
     wake_word: str = "hey box"
     max_turns: int = 25
+    # Optional tighter budgets for trigger (wake-cycle) runs. None = no
+    # separate cap: turns follow ``max_turns`` and deliveries are
+    # unlimited. ``max_messages_trigger`` caps *delivered* messages per
+    # trigger conversation; the message tool refuses past it.
+    max_turns_trigger: int | None = None
+    max_messages_trigger: int | None = None
     # Which client carries the main conversation turn.
     #   ``raw_anthropic`` — direct ``anthropic.AsyncAnthropic.messages.create``
     #       calls billed via Console at API rates. The original path.
@@ -179,6 +185,25 @@ class AgentConfig(BaseModel):
     #       (Haiku rerank, batches, web-search firewall, photo tagging)
     #       stay on the raw client regardless of this setting.
     backend: Literal["raw_anthropic", "claude_agent_sdk"] = "raw_anthropic"
+
+    # OpenAI-path per-call safety net. Hosted deployments occasionally
+    # hold a request for tens of seconds server-side before answering
+    # normally; the SDK's 600s default turns each stall into dead air
+    # on voice. Time out early and let the SDK retry — a retry almost
+    # always lands on a fast path. ``openai_max_retries`` is the SDK's
+    # own retry count (timeouts, connection errors, 429, 5xx), applied
+    # per call on top of the loop-level retry.
+    openai_timeout_seconds: float = 20.0
+    openai_max_retries: int = 2
+
+    # Rolling within-thread compaction. Keeps a long OPEN thread bounded:
+    # when its estimated tokens exceed ``compaction_threshold_tokens`` the
+    # oldest turns are summarized (small model) into one note and the
+    # recent tail is kept verbatim. Defaults sit well under the large
+    # model's ~200k context. No-op when disabled.
+    compaction_enabled: bool = True
+    compaction_threshold_tokens: int = 150_000
+    compaction_keep_recent_tokens: int = 30_000
 
 
 class WakeCycleEntry(BaseModel):
@@ -423,18 +448,18 @@ class DiarizationConfig(BaseModel):
     adds ~4 s/utterance latency plus heavy CPU-tensor churn.
     """
 
+    # When False, skip the diarization pipeline and embed each VAD
+    # utterance whole (single-speaker assumption). Avoids fragmenting a
+    # clean utterance into weak sub-second embeddings and the 3.6-4.5s
+    # pipeline latency. See docs/voice-id-redesign.md.
     enabled: bool = False
+
     engine: str = "pyannote"
     model: str = "pyannote/speaker-diarization-3.1"
     embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
     min_speakers: int = 1
     max_speakers: int = 6
     match_threshold: float = 0.65
-    # When False, skip the diarization pipeline and embed each VAD
-    # utterance whole (single-speaker assumption). Avoids fragmenting a
-    # clean utterance into weak sub-second embeddings and the 3.6-4.5s
-    # pipeline latency. See docs/voice-id-redesign.md.
-    enabled: bool = False
 
 
 class STTConfig(BaseModel):
@@ -450,9 +475,9 @@ class TTSConfig(BaseModel):
 
     provider: str = "elevenlabs"
     voice_id: str = ""  # must be configured
-    # Flash, not Turbo: ElevenLabs deprecated the turbo models; Flash is
-    # functionally equivalent at lower latency (~75 ms). Same price per
-    # character in config/pricing.yaml.
+    # Flash, not Turbo: ElevenLabs deprecated the turbo models and states
+    # the two families are functionally equivalent except Flash is lower
+    # latency (~75 ms). Same price per character in config/pricing.yaml.
     model: str = "eleven_flash_v2_5"
     stability: float = 0.5
     similarity_boost: float = 0.75
@@ -629,6 +654,15 @@ class MemoryConfig(BaseModel):
     decay_rate: float = 0.98
     archive_threshold: float = 0.1
 
+    # Post-conversation extraction as one live call appended to the
+    # just-ended OpenAI thread (prompt-cache hit ⇒ ~85-95% cheaper than
+    # the Anthropic batch; result applies in seconds, not minutes).
+    # Only reachable for conversations that ran on the OpenAI loop;
+    # Anthropic-loop conversations, persistent (WhatsApp) threads, and
+    # any thread-call failure use the batch path regardless. False
+    # forces the batch path everywhere.
+    thread_extraction: bool = True
+
     # Dream phase (PR1: deterministic clustering + dedup batch).
     # Lifecycle plan step 8: audit-only flipped OFF. The dream cycle's
     # candidate selection now expands via nearest-neighbour search
@@ -731,17 +765,20 @@ class SandboxConfig(BaseModel):
     timeout: int = 30
     memory_limit_mb: int = 256
     allow_network: bool = True
-    # How the sandbox subprocess drops privilege:
+    # How the sandbox subprocess drops privilege. Four values:
     #   "auto"   — euid==0 + ``user`` set → setuid; else ``user`` set →
-    #              sudo; else none. Non-root boxBot (the Pi) → sudo.
+    #              sudo; else none. Covers both a non-root boxBot (→ sudo)
+    #              and a root boxBot in a container (→ setuid).
     #   "sudo"   — ``sudo -n -u <user>`` UID-drop (boxBot must be non-root).
-    #   "setuid" — parent is root (container hosts); drop directly via a
-    #              ``preexec_fn`` (setgid → setgroups → setuid), no sudo.
+    #   "setuid" — parent is root; drop directly via a ``preexec_fn``
+    #              (setgid → setgroups → setuid) with no sudo binary.
     #   "none"   — run as the current user (== ``BOXBOT_SANDBOX_ENFORCE=0``).
     # ``BOXBOT_SANDBOX_ENFORCE=0`` forces "none" regardless of this value.
     privilege_drop: str = "auto"
     # Supplementary GIDs granted to the sandbox child at drop time
-    # (setuid mode only). Injected by the runner; no /etc/group edit.
+    # (setuid mode) — e.g. a group that gates network access on hosts
+    # with paranoid networking. Injected at drop time by the runner; no
+    # /etc/group edit required.
     extra_groups: list[int] = Field(default_factory=list)
     install_approval_timeout: int = 300
     install_approval_channels: list[str] = Field(
@@ -837,10 +874,11 @@ class ModelsConfig(BaseModel):
     # name — see ``OpenAIConfig``.
     embedding: str | None = None
     # Local ONNX text embedder (path to an all-MiniLM-L6-v2 export;
-    # tokenizer.json expected alongside). Used when sentence-transformers
-    # is unavailable — hosts where torch does not fit but onnxruntime is
-    # already present. Preferred over the API fallback: local, free,
-    # ~10x faster than a network round-trip.
+    # tokenizer.json expected alongside in the same directory). Used
+    # when sentence-transformers is unavailable — hosts where torch does
+    # not fit but onnxruntime is already present for speaker
+    # embeddings. Preferred over the API fallback: local,
+    # free, ~10x faster than a network round-trip.
     embedding_onnx: str | None = None
 
 
@@ -871,9 +909,61 @@ class OpenAIConfig(BaseModel):
         return ".openai.azure.com" in (self.api_base or "")
 
 
+class HotTaskConfig(BaseModel):
+    """One hot task: a name plus exemplar phrasings.
+
+    Exemplars are embedded and averaged into the task's match centroid,
+    and (joined) become the selector text when its bundle is prebuilt —
+    so they should span the phrasings the household actually uses.
+    """
+
+    name: str
+    exemplars: list[str]
+    # Live-context provider names (see ``prefetch/providers.py``)
+    # resolved at consume time — the cached bundle stays static, the
+    # injected context carries current device state. Not part of the
+    # centroid fingerprint: providers change what a hit injects, never
+    # what matches.
+    providers: list[str] = Field(default_factory=list)
+
+
+# The stock hot-task set: common household one-shots. Overridable
+# wholesale via ``prefetch.hot_tasks`` in config.yaml.
+_DEFAULT_HOT_TASKS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("show_display", (
+        "show me the clock",
+        "put the weather display on the screen",
+        "show the calendar display",
+        "switch the screen to the photo display",
+    ), ()),
+    ("show_camera", (
+        "show me the garage camera",
+        "show me the front door",
+        "can you pull up the backyard camera",
+    ), ()),
+    ("lights", (
+        "turn off the lights",
+        "turn on the living room lights",
+        "dim the lights",
+    ), ()),
+    ("run_script", (
+        "run the go to bed script",
+        "execute the goodnight routine",
+    ), ()),
+    # No "weather" task: its value is the pulled lane's LIVE data, which
+    # a canned bundle can't carry — let it take the normal fan-out.
+    ("time_date", (
+        "what time is it",
+        "what's the date today",
+    ), ()),
+)
+
+
 class PrefetchConfig(BaseModel):
-    """Prefetch layer — a small read-only mini-agent that pre-assembles
-    the context the main agent will likely need into its first turn.
+    """Prefetch layer — parallel one-shot selector calls (one per
+    context source) that pre-assemble the context the main agent will
+    likely need into its first turn. No tool loop: wall clock ≈ one
+    fast-model round trip regardless of source count.
 
     Ships disabled. When enabled it runs in ``shadow`` mode first: it
     logs what it *would* prefetch (into ``prefetch_events``) but injects
@@ -886,32 +976,74 @@ class PrefetchConfig(BaseModel):
     # shadow: run + log predictions, inject nothing.
     # active: inject the assembled bundle into the first turn.
     mode: str = "shadow"
-    # Which channels get prefetch. Voice is deferred from v1 (latency-
-    # sensitive + ephemeral) but its tool usage is still logged by the
-    # telemetry layer regardless of this list.
+    # Which channels get prefetch. Voice runs the same inline path as
+    # the text channels; the fan-out blocks the reply, so watch
+    # prefetch latency in voice round-trip numbers.
     channels: list[str] = Field(
-        default_factory=lambda: ["whatsapp", "signal", "trigger"]
+        default_factory=lambda: ["whatsapp", "signal", "trigger", "voice"]
+    )
+    # Which selector lanes run (see ``prefetch/sources.py``). A lane
+    # with no candidates for a request skips its model call entirely.
+    sources: list[str] = Field(
+        default_factory=lambda: [
+            "skills", "sdk", "memory", "workspace", "pulled",
+        ]
+    )
+    # Integrations the ``pulled`` lane may run. Security allowlist:
+    # crossed with a hard-coded read-only action map in sources.py —
+    # the model can only pick from names listed here.
+    pull_sources: list[str] = Field(
+        default_factory=lambda: ["calendar", "weather"]
     )
     # Scheduled triggers: run the precompute this many minutes before
     # fire_at. Small by default so pulled data (calendar/weather) isn't
     # stale at fire; the bundle stamps pull-time regardless.
     lookahead_minutes: int = 5
-    # Hard cap on the assembled bundle. The whole point is to REDUCE
-    # bloat, so the bundle is truncated to this budget by priority.
-    token_budget: int = 1500
-    # Wall-clock ceiling for one prefetch run (mini-agent loop). Applies
-    # to text channels, where the prefetch blocks the reply path — keep
-    # it bounded, but generous enough that a 2-3 iteration run (each a
-    # Haiku round trip + tool call) can actually finish.
-    timeout_seconds: float = 20.0
+    # Recent-activity log (prefetch/activity.py): deterministic recency
+    # index over the last few conversations across all channels,
+    # injected on a conversation's first turn and mirrored into the
+    # selector briefing. No model call; resolved at consume time, never
+    # cached.
+    activity_log: bool = True
+    activity_items: int = 5
+    activity_window_hours: float = 48.0
+    # Size-log threshold for the assembled bundle — NOT a truncation
+    # cap. Per-lane pick caps bound the bundle at assembly time; a
+    # render over this estimate logs a warning for offline analysis.
+    token_budget: int = 20000
+    # Wall-clock ceiling for one prefetch run (all lanes, in parallel).
+    # Applies to the inline channels (text + voice), where prefetch
+    # blocks the reply path.
+    timeout_seconds: float = 8.0
+    # Per-selector-call ceiling. A lane that misses it contributes
+    # nothing; the rest of the fan-out is unaffected.
+    per_call_timeout_seconds: float = 6.0
     # Ceiling for scheduled-trigger precompute. That path runs in the
     # background at T-minus-lookahead_minutes with nothing waiting on
     # it, so it gets far more headroom than the inline text path.
     trigger_timeout_seconds: float = 120.0
-    # Max mini-agent iterations before it must return best-effort.
-    max_iterations: int = 6
-    # Override the model; null falls back to ``models.small`` (Haiku).
+    # Override the selector model; null falls back to ``models.fast``
+    # (the latency tier) then ``models.small``.
     model: str | None = None
+    # Hot tasks: the household's most common formulaic requests. Each
+    # gets a precomputed skills+sdk bundle (built through the normal
+    # selector fan-out, cached in prefetch_cache, invalidated by a
+    # content fingerprint over the skill/SDK docs). At message time the
+    # utterance embedding is matched against per-task exemplar
+    # centroids; a hit skips the selector fan-out on the reply path
+    # entirely. See ``prefetch/hot.py``.
+    hot_tasks_enabled: bool = True
+    # Minimum cosine similarity (utterance vs task centroid) for a hit.
+    hot_match_threshold: float = 0.60
+    hot_tasks: list["HotTaskConfig"] = Field(
+        default_factory=lambda: [
+            HotTaskConfig(
+                name=name, exemplars=list(exemplars),
+                providers=list(providers),
+            )
+            for name, exemplars, providers in _DEFAULT_HOT_TASKS
+        ]
+    )
 
 
 class ApiKeysConfig(BaseModel):

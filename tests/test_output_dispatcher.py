@@ -4,10 +4,16 @@ from __future__ import annotations
 import json
 
 import pytest
+from conftest import FakeAuth
 
 from boxbot.core.output_dispatcher import (
+    BUDGET_SPENT,
+    DEGENERATE_CONTENT,
     INTERNAL_NOTES_SCHEMA,
+    TOOL_SYNTAX,
+    UNRETRYABLE_DROPS,
     DispatchResult,
+    _is_degenerate_content,
     dispatch_outputs,
     parse_internal_notes,
     parse_structured_notes,
@@ -28,7 +34,9 @@ class TestInternalNotesSchema:
 
     def test_required_top_level_keys(self):
         assert INTERNAL_NOTES_SCHEMA["type"] == "object"
-        assert set(INTERNAL_NOTES_SCHEMA["required"]) == {"thought"}
+        assert set(INTERNAL_NOTES_SCHEMA["required"]) == {
+            "thought", "final_turn",
+        }
         assert INTERNAL_NOTES_SCHEMA["additionalProperties"] is False
 
     def test_thought_is_string(self):
@@ -177,14 +185,6 @@ class _FakeUser:
         self.channel = channel
 
 
-class _FakeAuth:
-    def __init__(self, users):
-        self._users = users
-
-    async def list_users(self):
-        return list(self._users)
-
-
 class _FakeWhatsApp:
     name = "whatsapp"
 
@@ -206,7 +206,7 @@ def fake_voice(monkeypatch):
 
 @pytest.fixture
 def fake_auth(monkeypatch):
-    auth = _FakeAuth([
+    auth = FakeAuth([
         _FakeUser("Jacob", "+15551111111", role="admin"),
         _FakeUser("Sarah", "+15552222222"),
     ])
@@ -447,3 +447,109 @@ class TestDispatchOutputs:
         )
         assert results[0].status == "dropped"
         assert "voice session" in results[0].reason
+
+
+# ---------------------------------------------------------------------------
+# Degenerate content — filler and self-referential noise the agent emits
+# once it has run out of real work. Observed on-device: "placeholder" and
+# "done" delivered to a user, then texts apologising for those texts.
+# ---------------------------------------------------------------------------
+
+
+class TestDegenerateContent:
+
+    @pytest.mark.parametrize("content", [
+        "placeholder",
+        "Placeholder",
+        "test",
+        "(no further action needed for now)",
+        "(nothing to report)",
+        "ignore my last message",
+        "Please ignore my previous message.",
+        "Sorry for the noise.",
+        "sorry about the spam",
+        "Disregard the stray message.",
+        "Oops — ignore that last text.",
+        "   ",
+    ])
+    def test_degenerate(self, content):
+        assert _is_degenerate_content(content)
+
+    @pytest.mark.parametrize("content", [
+        "Yes.",
+        "No.",
+        "Done — the lights are off.",
+        "OK, I've added milk to the list.",
+        "Test results are in: 14 passed.",
+        "None of your triggers fired today.",
+        # A genuine apology that carries real content: it opens like
+        # noise but the answer is right there behind it.
+        "Sorry for the noise above — ignore the placeholder text, the "
+        "garage door is closed.",
+        "Sorry about the spam earlier. Your 3pm moved to 4pm.",
+        "I put a placeholder in the spec where the number goes.",
+    ])
+    def test_deliverable(self, content):
+        assert not _is_degenerate_content(content)
+
+    @pytest.mark.parametrize("content", ["done", "Done.", "ok", "OK!", "n/a", "none"])
+    def test_bare_acknowledgement_is_filler_only_on_a_trigger(self, content):
+        """"Did you lock the door?" — "Done." is the answer, not noise."""
+        assert _is_degenerate_content(content, "trigger")
+        for channel in ("voice", "signal", "whatsapp"):
+            assert not _is_degenerate_content(content, channel), channel
+
+    @pytest.mark.asyncio
+    async def test_terse_answer_is_spoken(self, fake_voice, fake_auth):
+        results = await dispatch_outputs(
+            [{"to": "Jacob", "channel": "voice", "content": "Done."}],
+            conversation_id="c12",
+            channel_context="voice",
+            current_speaker="Jacob",
+        )
+        assert results[0].status == "delivered"
+        assert fake_voice.spoken == ["Done."]
+
+    @pytest.mark.asyncio
+    async def test_filler_is_dropped_before_delivery(
+        self, fake_voice, fake_auth, fake_whatsapp
+    ):
+        results = await dispatch_outputs(
+            [
+                {"to": "Jacob", "channel": "text", "content": "placeholder"},
+                {"to": "Jacob", "channel": "text", "content": "Bins go out."},
+            ],
+            conversation_id="c11",
+            channel_context="trigger",
+            current_speaker=None,
+        )
+        assert [r.status for r in results] == ["dropped", "delivered"]
+        assert fake_whatsapp.sent == [("+15551111111", "Bins go out.")]
+        # The drop reason points the agent at the flag, not at a retry.
+        assert "final_turn=true" in results[0].reason
+        assert results[0].reason_code == DEGENERATE_CONTENT
+
+    @pytest.mark.asyncio
+    async def test_leaked_tool_syntax_is_tagged_unretryable(
+        self, fake_voice, fake_auth, fake_whatsapp
+    ):
+        """Regenerating the same broken generation is not a recovery, so
+        this drop must not hold a trigger turn open either."""
+        # Assembled, not written literally: a real fragment in this file
+        # would be a tripwire for anything else scanning the tree.
+        leaked = "Bins go out." + "</" + "invoke>"
+        results = await dispatch_outputs(
+            [{"to": "Jacob", "channel": "text", "content": leaked}],
+            conversation_id="c13",
+            channel_context="trigger",
+            current_speaker=None,
+        )
+        assert results[0].status == "dropped"
+        assert results[0].reason_code == TOOL_SYNTAX
+        assert fake_whatsapp.sent == []
+
+    def test_every_tagged_drop_is_declared_unretryable(self):
+        """The tags exist for one consumer — agent._message_results_settled.
+        A new one that is not in the set silently reopens the burn-the-cap
+        bug, so the set is the definition, not a copy of it."""
+        assert UNRETRYABLE_DROPS == {DEGENERATE_CONTENT, TOOL_SYNTAX, BUDGET_SPENT}

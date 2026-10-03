@@ -243,3 +243,47 @@ async def test_reconnect_handler_runs_concurrently_without_deadlock():
     client._stopped.set()
     reader.feed(b"")  # EOF unblocks readline so the loop can exit
     await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_eof_during_shutdown_is_not_a_warning(caplog):
+    """Regression: the inbound watchdog retires a client every refresh.
+
+    disconnect() closes the socket under a readline() that is already
+    pending, so the EOF branch runs once per intentional teardown. That
+    is not a dropped daemon and must not read like one in the log.
+    """
+    client = _make_client()
+    reader = _FakeReader()
+    client._reader = reader
+    client._writer = _FakeWriter(lambda data: None)
+
+    with caplog.at_level("DEBUG", logger="boxbot.communication.signal_client"):
+        task = asyncio.create_task(client._read_loop())
+        await asyncio.sleep(0)  # let the loop block on readline()
+        client._stopped.set()  # what disconnect() does
+        reader.feed(b"")
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert "closed during shutdown" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unexpected_eof_still_warns(caplog):
+    client = _make_client()
+    reader = _FakeReader()
+    client._reader = reader
+    client._writer = _FakeWriter(lambda data: None)
+
+    async def fake_open() -> None:
+        client._stopped.set()  # stop the loop instead of reconnecting
+
+    client._open = fake_open  # type: ignore[assignment]
+
+    with caplog.at_level("WARNING", logger="boxbot.communication.signal_client"):
+        task = asyncio.create_task(client._read_loop())
+        reader.feed(b"")
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert "daemon disconnected" in caplog.text

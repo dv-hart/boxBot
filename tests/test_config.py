@@ -1,4 +1,5 @@
-"""Tests for boxbot.core.config — configuration loading and validation."""
+"""Tests for boxbot.core.config — configuration loading and validation,
+plus boxbot.core.models id → provider routing."""
 
 from __future__ import annotations
 
@@ -23,6 +24,10 @@ from boxbot.core.config import (
     get_config,
     load_config,
 )
+from boxbot.core.models import (
+    provider_for_model,
+    reasoning_effort_for_model,
+)
 
 
 class TestDefaultConfig:
@@ -40,6 +45,10 @@ class TestDefaultConfig:
         cfg = BoxBotConfig()
         assert "claude" in cfg.models.large.lower() or cfg.models.large
         assert "claude" in cfg.models.small.lower() or cfg.models.small
+
+    def test_fast_tier_off_by_default(self):
+        cfg = BoxBotConfig()
+        assert cfg.models.fast is None
 
     def test_default_schedule_has_three_wake_cycles(self):
         cfg = BoxBotConfig()
@@ -113,6 +122,21 @@ class TestEnvOverlay:
             cfg = load_config(tmp_config)
         assert cfg.models.large == "test-env-model"
 
+    def test_env_overlays_model_fast(self, tmp_config):
+        with patch.dict("os.environ", {"BOXBOT_MODEL_FAST": "gpt-5.6-luna"}, clear=True):
+            cfg = load_config(tmp_config)
+        assert cfg.models.fast == "gpt-5.6-luna"
+
+    def test_model_fast_unset_leaves_tier_off(self, tmp_config):
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = load_config(tmp_config)
+        assert cfg.models.fast is None
+
+    def test_env_overlays_openai_api_key(self, tmp_config):
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-openai-123"}, clear=True):
+            cfg = load_config(tmp_config)
+        assert cfg.api_keys.openai == "sk-openai-123"
+
     def test_env_overlays_anthropic_api_key(self, tmp_config):
         with patch.dict(
             "os.environ",
@@ -157,3 +181,127 @@ class TestApiKeysRedaction:
         keys = ApiKeysConfig()
         text = repr(keys)
         assert "anthropic=None" in text
+
+
+class TestSandboxConfig:
+    """Validation for the sandbox privilege-drop fields."""
+
+    def test_defaults(self):
+        from boxbot.core.config import SandboxConfig
+
+        cfg = SandboxConfig()
+        assert cfg.privilege_drop == "auto"
+        assert cfg.extra_groups == []
+
+    @pytest.mark.parametrize("mode", ["auto", "sudo", "setuid", "none"])
+    def test_privilege_drop_accepts_enum(self, mode):
+        from boxbot.core.config import SandboxConfig
+
+        assert SandboxConfig(privilege_drop=mode).privilege_drop == mode
+
+    def test_privilege_drop_rejects_unknown(self):
+        from boxbot.core.config import SandboxConfig
+
+        with pytest.raises(ValidationError):
+            SandboxConfig(privilege_drop="root")
+
+    def test_extra_groups_inet(self):
+        from boxbot.core.config import SandboxConfig
+
+        cfg = SandboxConfig(privilege_drop="setuid", extra_groups=[3003])
+        assert cfg.extra_groups == [3003]
+
+
+class TestProviderForModel:
+    """boxbot.core.models — id → provider routing."""
+
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-5.6-luna", "gpt-4o-mini", "o1", "o3-mini", "o4", "GPT-5.6-LUNA"],
+    )
+    def test_openai_ids(self, model):
+        assert provider_for_model(model) == "openai"
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-5",
+            "claude-haiku-4-5-20251001",
+            "",
+            "some-unknown-model",
+            "opus-5",
+        ],
+    )
+    def test_anthropic_is_the_default(self, model):
+        assert provider_for_model(model) == "anthropic"
+
+
+class TestReasoningEffortForModel:
+    """The fast tier always asks for the floor — which floor varies."""
+
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("gpt-5.6-luna", "none"),
+            ("gpt-5.6-luna-2026-07-09", "none"),
+            ("GPT-5.6-LUNA", "none"),
+            ("gpt-5.1", "minimal"),
+            ("gpt-5", "minimal"),
+            ("o3-mini", "minimal"),
+            # Minor is an int, not a float digit: 5.10 > 5.6.
+            ("gpt-5.10-x", "none"),
+            ("gpt-6", "none"),
+            ("gpt-10.2", "none"),
+            # Non-reasoning ids 400 on the parameter — omit it.
+            ("gpt-4o", None),
+            ("claude-opus-5", None),
+            ("", None),
+        ],
+    )
+    def test_floor_per_id(self, model, expected):
+        assert reasoning_effort_for_model(model) == expected
+
+
+class TestOpenAIEndpointShape:
+    """OpenAIConfig — Azure vs public OpenAI routing."""
+
+    @pytest.mark.parametrize(
+        "api_type,api_base",
+        [
+            ("azure", "https://x.openai.azure.com/"),   # explicit
+            ("AZURE", "https://x.openai.azure.com/"),   # case-insensitive
+            (None, "https://x.openai.azure.com/"),      # inferred from host
+        ],
+    )
+    def test_is_azure(self, api_type, api_base):
+        from boxbot.core.config import OpenAIConfig
+
+        assert OpenAIConfig(api_type=api_type, api_base=api_base).is_azure
+
+    @pytest.mark.parametrize(
+        "api_type,api_base",
+        [
+            (None, None),                          # public, nothing set
+            (None, "https://proxy.internal/v1"),   # public via a gateway
+            ("open_ai", None),                     # explicit non-azure
+        ],
+    )
+    def test_is_not_azure(self, api_type, api_base):
+        from boxbot.core.config import OpenAIConfig
+
+        assert not OpenAIConfig(api_type=api_type, api_base=api_base).is_azure
+
+    def test_env_overlay_populates_the_block(self, monkeypatch, tmp_path):
+        from boxbot.core.config import load_config
+
+        monkeypatch.setenv("OPENAI_API_TYPE", "azure")
+        monkeypatch.setenv("OPENAI_API_BASE", "https://r.openai.azure.com/")
+        monkeypatch.setenv("OPENAI_API_VERSION", "2025-01-01-preview")
+        cfg_path = tmp_path / "c.yaml"
+        cfg_path.write_text("{}\n")
+
+        cfg = load_config(str(cfg_path))
+
+        assert cfg.openai.is_azure
+        assert cfg.openai.api_base == "https://r.openai.azure.com/"
+        assert cfg.openai.api_version == "2025-01-01-preview"

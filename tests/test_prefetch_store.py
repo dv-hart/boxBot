@@ -18,10 +18,10 @@ def _bundle():
     return PrefetchBundle(
         memories=[("m1", "s1"), ("m2", "s2")],
         skill_bodies={"weather": "body"},
+        sdk_modules={"zz_legacy": "zz_legacy doc"},
         workspace_excerpts=[("notes/a.md", "hi")],
         pulled_data=[{"source": "calendar", "action": "list_upcoming_events",
                       "payload": {"n": 1}, "pulled_at": "2026-07-01T10:00:00Z"}],
-        likely_next_note="remind Jacob",
     )
 
 
@@ -54,8 +54,10 @@ class TestEventLog:
             assert row[1] == "shadow"
             assert "m1" in row[2] and "m2" in row[2]
             assert "weather" in row[3]
+            # sdk-module picks ride the skills column, path-prefixed.
+            assert "bb/modules/zz_legacy.md" in row[3]
             assert "calendar" in row[4]
-            assert row[5] == "remind Jacob"
+            assert row[5] == ""
         finally:
             await store.close()
 
@@ -71,7 +73,7 @@ class TestCache:
             assert await cache_has_fresh(store, "t-1")
             got = await cache_get(store, "t-1")
             assert got is not None
-            assert got.likely_next_note == "remind Jacob"
+            assert got.sdk_modules == {"zz_legacy": "zz_legacy doc"}
             assert got.predicted_memory_ids() == ["m1", "m2"]
         finally:
             await store.close()

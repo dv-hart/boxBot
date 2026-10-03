@@ -12,6 +12,11 @@ a spoken acknowledgement to the room plus a text to an absent spouse).
 Routing is delegated to ``output_dispatcher.dispatch_outputs`` so this
 tool and trigger-fired turns share one delivery implementation.
 
+Trigger conversations carry a delivery budget
+(``agent.max_messages_trigger``): a wake cycle nobody is waiting on has
+no business sending more than a couple of messages, so the cap is
+enforced here rather than trusted to the prompt.
+
 Channel naming: the dispatcher's internal channel id is ``"voice"``,
 but the tool exposes it to the agent as ``"speak"`` (a verb, parallel
 with ``"text"``). The mapping is done here.
@@ -72,6 +77,17 @@ class MessageTool(Tool):
                 "type": "string",
                 "description": "The exact words to deliver.",
             },
+            "final_turn": {
+                "type": "boolean",
+                "description": (
+                    "true when this message finishes the turn: it is the "
+                    "only call, or its siblings are fire-and-forget "
+                    "commands whose results you will not report. Ends the "
+                    "turn here, saving a round trip. Never beside a lookup "
+                    "whose result you still owe (the answer would go "
+                    "unheard)."
+                ),
+            },
         },
         "required": ["to", "channel", "content"],
         "additionalProperties": False,
@@ -84,7 +100,9 @@ class MessageTool(Tool):
         ``message`` always dispatches exactly one entry, so we inspect
         ``results[0]``. A dropped delivery comes back as a ``status:
         error`` the agent can act on (e.g. retry with a valid recipient
-        name) — never a false ``delivered``.
+        name) — never a false ``delivered``. ``reason_code`` rides along
+        when the dispatcher classified the drop, so the trigger backstop
+        can tell filler from a recoverable failure.
         """
         result = results[0] if results else None
         if result is not None and result.status == "delivered":
@@ -98,12 +116,14 @@ class MessageTool(Tool):
                 else "message could not be delivered"
             ),
         }
+        if result is not None and result.reason_code:
+            payload["reason_code"] = result.reason_code
         if result is not None and result.valid_recipients is not None:
             payload["valid_recipients"] = result.valid_recipients
         return json.dumps(payload)
 
     async def execute(self, **kwargs: Any) -> str:
-        from boxbot.core.output_dispatcher import dispatch_outputs
+        from boxbot.core.output_dispatcher import BUDGET_SPENT, dispatch_outputs
         from boxbot.tools._tool_context import get_current_conversation
 
         to = str(kwargs.get("to", "")).strip()
@@ -146,6 +166,34 @@ class MessageTool(Tool):
             )
             return self._result_json(results, to, channel)
 
+        # A wake cycle is silent by default — nobody is waiting on it.
+        # Past a couple of deliveries it is spamming, not working, so the
+        # budget is refused here rather than trusted to the prompt.
+        from boxbot.core.config import get_config
+
+        budget = get_config().agent.max_messages_trigger
+        if (
+            budget is not None
+            and conv.channel == "trigger"
+            and conv.delivered_messages >= budget
+        ):
+            logger.warning(
+                "Trigger message budget spent (%d) — refusing send to %s "
+                "(conv=%s)",
+                budget, to, conv.conversation_id,
+            )
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    f"this wake cycle has already delivered its {budget} "
+                    "messages; nothing more goes out. Set final_turn=true "
+                    "in your notes to finish."
+                ),
+                # Nothing to retry — every further call is refused
+                # identically, so this must not hold the turn open.
+                "reason_code": BUDGET_SPENT,
+            })
+
         # Resolve current_speaker from the conversation's participants.
         # Mirrors how _publish_started picks primary_person.
         current_speaker: str | None = None
@@ -160,5 +208,8 @@ class MessageTool(Tool):
             current_speaker=current_speaker,
             segment_recorder=conv.record_segment,
         )
+
+        if any(r.status == "delivered" for r in results):
+            conv.delivered_messages += 1
 
         return self._result_json(results, to, channel)

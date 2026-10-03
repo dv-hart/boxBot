@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from boxbot.core.output_dispatcher import BUDGET_SPENT
 from boxbot.tools.base import Tool
 from boxbot.tools._sandbox_actions import ActionContext, process_action
 from boxbot.tools.builtins.execute_script import (
@@ -253,6 +255,78 @@ class TestMessageTool:
             ))
         assert result["status"] == "error"
         assert result["valid_recipients"] == ["Jacob"]
+
+
+class TestTriggerMessageBudget:
+    """A wake cycle nobody is waiting on gets a fixed number of
+    deliveries. Past it the tool refuses and points at ``final_turn``.
+    """
+
+    @staticmethod
+    def _conv(channel: str):
+        return SimpleNamespace(
+            conversation_id="conv-1", channel=channel, participants=set(),
+            record_segment=lambda _seg: None, delivered_messages=0,
+        )
+
+    async def _send(self, conv, results):
+        from boxbot.tools.builtins.message import MessageTool
+
+        with patch(
+            "boxbot.core.output_dispatcher.dispatch_outputs",
+            new=AsyncMock(return_value=results),
+        ), patch(
+            "boxbot.tools._tool_context.get_current_conversation",
+            return_value=conv,
+        ):
+            return json.loads(await MessageTool().execute(
+                to="Jacob", channel="text", content="Bins go out tonight.",
+            ))
+
+    @pytest.mark.asyncio
+    async def test_third_trigger_message_is_refused(self, mock_config):
+        from boxbot.core.output_dispatcher import DispatchResult
+
+        mock_config.agent.max_messages_trigger = 2
+        conv = self._conv("trigger")
+        ok = [DispatchResult(to="Jacob", channel="text", status="delivered")]
+
+        assert (await self._send(conv, ok))["status"] == "delivered"
+        assert (await self._send(conv, ok))["status"] == "delivered"
+        third = await self._send(conv, ok)
+
+        assert third["status"] == "error"
+        assert "final_turn=true" in third["message"]
+        assert conv.delivered_messages == 2
+        # Tagged unretryable: every further call is refused identically, so
+        # the trigger backstop must be able to end the run on it.
+        assert third["reason_code"] == BUDGET_SPENT
+
+    @pytest.mark.asyncio
+    async def test_dropped_messages_do_not_spend_the_budget(self, mock_config):
+        from boxbot.core.output_dispatcher import DispatchResult
+
+        mock_config.agent.max_messages_trigger = 2
+        conv = self._conv("trigger")
+        dropped = [DispatchResult(
+            to="Jacob", channel="text", status="dropped",
+            reason="content contains tool-call syntax; not delivered",
+        )]
+
+        for _ in range(3):
+            assert (await self._send(conv, dropped))["status"] == "error"
+        assert conv.delivered_messages == 0
+
+    @pytest.mark.asyncio
+    async def test_interactive_channels_are_not_budgeted(self, mock_config):
+        from boxbot.core.output_dispatcher import DispatchResult
+
+        conv = self._conv("signal")
+        ok = [DispatchResult(to="Jacob", channel="text", status="delivered")]
+
+        for _ in range(5):
+            assert (await self._send(conv, ok))["status"] == "delivered"
+        assert conv.delivered_messages == 5
 
 
 # ---------------------------------------------------------------------------

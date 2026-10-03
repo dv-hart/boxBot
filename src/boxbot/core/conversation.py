@@ -289,6 +289,11 @@ class Conversation:
         # opaque IDs. Empty string if no memories were ever injected.
         self.injected_memories_block: str = ""
 
+        # Messages actually delivered to a human over this conversation's
+        # lifetime. Trigger runs are budgeted against it (see the
+        # ``message`` tool and ``agent.max_messages_trigger``).
+        self.delivered_messages: int = 0
+
         # Wall-clock start of the conversation (UTC ISO 8601). Recorded
         # at construction so post-conversation extraction has a stable
         # ``started_at`` independent of how long the conversation ran.
@@ -311,6 +316,17 @@ class Conversation:
     def thread(self) -> list[dict[str, Any]]:
         """Live view of the message thread (do not mutate externally)."""
         return self._thread
+
+    def replace_thread(self, messages: list[dict[str, Any]]) -> None:
+        """Replace the in-memory thread in place (used by compaction).
+
+        Mutates the live list object so existing references (the running
+        generation, the store-persist paths) stay valid. In-memory only:
+        the store keeps the full history, which is fine — it gives memory
+        extraction the complete transcript and a rehydrate just re-runs
+        compaction if the thread is still over budget.
+        """
+        self._thread[:] = messages
 
     @property
     def pending_segments(self) -> list[SpokenSegment]:
@@ -404,6 +420,33 @@ class Conversation:
             user_message = self._format_user_message(
                 cleaned, speaker_name=speaker_name, source=source,
             )
+
+            # Prefetched context rides ON the user turn it was assembled
+            # for — as turn METADATA, not inside the content string. It
+            # thus (a) lands in the thread and survives every later turn
+            # (cross-turn dedup's claims are only true because of this),
+            # (b) travels WITH the message through the SPEAKING/THINKING
+            # queue paths below (which return before ``_current_context``
+            # is written — a barge-in used to lose its bundle while the
+            # tracker recorded it as delivered), and (c) stays OUT of
+            # ``content`` so every consumer that reads the thread as
+            # human speech — memory-search queries off thread[-1],
+            # extraction/summary transcripts — sees only the utterance.
+            # The agent loops merge it into the API payload at build
+            # time (``_materialize_history``).
+            prefetch_text = (context or {}).get("prefetch_text")
+            if prefetch_text:
+                user_message["prefetch_text"] = prefetch_text
+            # The legacy-recall suppression flag must travel WITH the
+            # message too: a queued barge-in's generation runs later
+            # under a fresh drain (below), where the context dict that
+            # carried the flag is long gone — reading the PREVIOUS
+            # turn's ``_current_context`` there suppressed or doubled
+            # recall depending on which turn had memories.
+            if (context or {}).get("prefetch_memories") is not None:
+                user_message["prefetch_memories"] = bool(
+                    context["prefetch_memories"]
+                )
 
             # SPEAKING: queue without cancelling. The generator will
             # drain pending inputs after TTS completes.
@@ -816,6 +859,22 @@ class Conversation:
                 if self._state is not ConversationState.ENDED:
                     self._state = ConversationState.LISTENING
                 self._pending_segments = []
+                # A failed turn is still a turn end: the voice adapter
+                # keys the post-response mic-idle timer and the
+                # thinking-ring clear off this event. Without it a
+                # generation error left the mic hot and the ring lit.
+                try:
+                    await get_event_bus().publish(
+                        AgentTurnEnded(
+                            conversation_id=self.conversation_id,
+                            channel=self.channel,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to publish AgentTurnEnded for %s",
+                        self.conversation_id,
+                    )
                 return GenerationResult(completed_cleanly=False)
 
             # Normal completion: apply additions and decide whether to
@@ -899,6 +958,16 @@ class Conversation:
                 drained = self._pending_inputs
                 self._pending_inputs = []
                 self._thread.extend(drained)
+                # The fresh generation must run under the DRAINED turns'
+                # prefetch state, not the finished turn's: clear the
+                # stale keys, then adopt the drained flags (last wins).
+                self._current_context.pop("prefetch_text", None)
+                self._current_context.pop("prefetch_memories", None)
+                for item in drained:
+                    if item.get("prefetch_memories") is not None:
+                        self._current_context["prefetch_memories"] = bool(
+                            item["prefetch_memories"]
+                        )
                 if self._store is not None and drained:
                     try:
                         await self._store.append_turns(

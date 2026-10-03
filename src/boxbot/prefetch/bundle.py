@@ -1,19 +1,23 @@
-"""The assembled prefetch bundle and its budgeted rendering.
+"""The assembled prefetch bundle and its rendering.
 
-A bundle is intentionally small. The whole point of the prefetch layer
-is to REDUCE bloat and repeat tool calls — a bundle that injects context
-the agent didn't need is a failure (low precision, measured in shadow
-mode). :meth:`PrefetchBundle.render` therefore emits sections in
-priority order and hard-stops at the configured token budget.
+A bundle is small BY CONSTRUCTION: every source lane caps its own picks
+(1 skill body, 2 sdk modules, 5 memories, 2 workspace excerpts, 2
+pulls — see ``prefetch/sources.py``). ``render`` therefore never
+truncates; it emits everything and LOGS the per-section token estimates
+so the offline harness can analyse real bundle sizes. ``token_budget``
+is a log-threshold only — a bundle over it draws a warning, not a cut.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-# Rough tokens ≈ chars / 4. Good enough for a budget gate; we never bill
-# on this number (the real cost row uses the API usage totals).
+logger = logging.getLogger(__name__)
+
+# Rough tokens ≈ chars / 4. Good enough for size telemetry; we never
+# bill on this number (the real cost row uses the API usage totals).
 _CHARS_PER_TOKEN = 4
 
 
@@ -25,24 +29,35 @@ def _est_tokens(text: str) -> int:
 class PrefetchBundle:
     """Curated context for the main agent's first turn.
 
-    Every field is what the prefetcher decided is very likely needed —
-    not everything it looked at. Selection happens in the mini-agent;
-    this object is the deterministic, budget-truncated result.
+    Every field is what a selector lane decided is very likely needed —
+    materialized by re-fetching ids/names, never from model-copied text.
     """
 
     # (memory_id, summary) pairs, highest-relevance first.
     memories: list[tuple[str, str]] = field(default_factory=list)
     # skill_name -> full SKILL.md body (inlined so the agent skips a
-    # load_skill round-trip). Capped to 1 by the runner.
+    # load_skill round-trip). Capped to 1 by the skills lane.
     skill_bodies: dict[str, str] = field(default_factory=dict)
+    # bb module name -> spliced doc text (preamble + selected H2
+    # sections; see sources._sdk_source). Capped to 4 sections total.
+    sdk_modules: dict[str, str] = field(default_factory=dict)
+    # bb module name -> selected section keys ("display.3", or the bare
+    # module name when the whole doc was included). Feeds already_loaded
+    # so later turns dedup at section granularity.
+    sdk_sections: dict[str, list[str]] = field(default_factory=dict)
     # (workspace_path, excerpt) pairs.
     workspace_excerpts: list[tuple[str, str]] = field(default_factory=list)
-    # Free-text highlights pulled from prior conversations.
-    history_highlights: list[str] = field(default_factory=list)
     # Pulled/reviewed data: [{source, action, payload, pulled_at}].
     pulled_data: list[dict[str, Any]] = field(default_factory=list)
-    # One-line "what you'll likely need to do".
-    likely_next_note: str = ""
+    # Live device-state lines resolved at consume time (see
+    # prefetch/providers.py). NEVER persisted — to_dict drops them so a
+    # cached bundle can't serve stale state; each hit resolves fresh.
+    live_context: list[str] = field(default_factory=list)
+    # Recent-activity lines (see prefetch/activity.py): deterministic
+    # cross-channel conversation recency, attached at consume time on a
+    # conversation's first turn. Same never-persisted rule as
+    # live_context — recency is perishable.
+    recent_activity: list[str] = field(default_factory=list)
     # Filled by render(); the estimated size of the rendered block.
     token_estimate: int = 0
 
@@ -53,6 +68,16 @@ class PrefetchBundle:
 
     def predicted_skills(self) -> list[str]:
         return list(self.skill_bodies.keys())
+
+    def predicted_sdk_modules(self) -> list[str]:
+        return list(self.sdk_modules.keys())
+
+    def predicted_sdk_sections(self) -> list[str]:
+        """Section-granular keys; falls back to whole-module form for
+        bundles cached before section selection existed."""
+        if self.sdk_sections:
+            return [k for keys in self.sdk_sections.values() for k in keys]
+        return [f"bb/modules/{m}.md" for m in self.sdk_modules]
 
     def predicted_workspace_paths(self) -> list[str]:
         return [p for p, _ in self.workspace_excerpts]
@@ -71,10 +96,11 @@ class PrefetchBundle:
         return not (
             self.memories
             or self.skill_bodies
+            or self.sdk_modules
             or self.workspace_excerpts
-            or self.history_highlights
             or self.pulled_data
-            or self.likely_next_note.strip()
+            or self.live_context
+            or self.recent_activity
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,10 +108,10 @@ class PrefetchBundle:
         return {
             "memories": [list(m) for m in self.memories],
             "skill_bodies": self.skill_bodies,
+            "sdk_modules": self.sdk_modules,
+            "sdk_sections": self.sdk_sections,
             "workspace_excerpts": [list(w) for w in self.workspace_excerpts],
-            "history_highlights": self.history_highlights,
             "pulled_data": self.pulled_data,
-            "likely_next_note": self.likely_next_note,
             "token_estimate": self.token_estimate,
         }
 
@@ -94,21 +120,23 @@ class PrefetchBundle:
         return cls(
             memories=[tuple(m) for m in d.get("memories", [])],
             skill_bodies=dict(d.get("skill_bodies", {})),
+            sdk_modules=dict(d.get("sdk_modules", {})),
+            sdk_sections={
+                k: list(v) for k, v in d.get("sdk_sections", {}).items()
+            },
             workspace_excerpts=[
                 tuple(w) for w in d.get("workspace_excerpts", [])
             ],
-            history_highlights=list(d.get("history_highlights", [])),
             pulled_data=list(d.get("pulled_data", [])),
-            likely_next_note=str(d.get("likely_next_note", "")),
-            token_estimate=int(d.get("token_estimate", 0) or 0),
+            token_estimate=int(d.get("token_estimate", 0)),
         )
 
     def render(self, *, token_budget: int) -> str:
-        """Render the injected markdown section, truncated to budget.
+        """Render the injected markdown section and log section sizes.
 
-        Sections are appended in priority order; once the running token
-        estimate would exceed ``token_budget`` the remaining lower-
-        priority sections are dropped. Sets ``self.token_estimate``.
+        Nothing is truncated: the per-lane caps bound the bundle at
+        assembly time. ``token_budget`` only sets the warning threshold
+        for the size log. Sets ``self.token_estimate``.
         """
         header = (
             "## Prefetched context (assembled for this turn)\n"
@@ -116,62 +144,76 @@ class PrefetchBundle:
             "head start, not ground truth — verify before acting._"
         )
         blocks: list[str] = [header]
-        used = _est_tokens(header)
+        sizes: dict[str, int] = {}
 
-        def _try_add(text: str) -> bool:
-            nonlocal used
-            cost = _est_tokens(text)
-            if used + cost > token_budget:
-                return False
+        def _add(section: str, text: str) -> None:
             blocks.append(text)
-            used += cost
-            return True
+            sizes[section] = sizes.get(section, 0) + _est_tokens(text)
 
-        # Priority 1 — the note (cheap, high value).
-        if self.likely_next_note.strip():
-            _try_add(f"**Likely next:** {self.likely_next_note.strip()}")
-
-        # Priority 2 — memories.
-        if self.memories:
-            lines = [f"- #{mid[:8]}: {summ}" for mid, summ in self.memories]
-            _try_add("**Relevant memories:**\n" + "\n".join(lines))
-
-        # Priority 3 — pulled data (calendar/weather).
-        for d in self.pulled_data:
-            payload = d.get("payload")
-            src = d.get("source")
-            at = d.get("pulled_at")
-            _try_add(
-                f"**{src}** (pulled {at}):\n"
-                + _stringify_payload(payload)
+        # Perishable data first, then capability docs, then recall.
+        if self.live_context:
+            _add(
+                "live",
+                "**Live device state (read just now — trust it, don't "
+                "re-read):**\n" + "\n".join(f"- {l}" for l in self.live_context),
             )
 
-        # Priority 4 — workspace excerpts.
-        for path, excerpt in self.workspace_excerpts:
-            if not _try_add(f"**Workspace `{path}`:**\n{excerpt}"):
-                break
+        if self.recent_activity:
+            _add(
+                "activity",
+                "**Recent conversations** (newest first; full text: "
+                'search_memory mode="transcript" with the id):\n'
+                + "\n".join(self.recent_activity),
+            )
 
-        # Priority 5 — history highlights.
-        if self.history_highlights:
-            lines = [f"- {h}" for h in self.history_highlights]
-            _try_add("**From prior conversations:**\n" + "\n".join(lines))
+        for d in self.pulled_data:
+            _add(
+                "pulled",
+                f"**{d.get('source')}** (pulled {d.get('pulled_at')}):\n"
+                + _stringify_payload(d.get("payload")),
+            )
 
-        # Priority 6 (bulkiest, lowest) — inlined skill bodies.
         for name, body in self.skill_bodies.items():
-            if not _try_add(f"**Skill `{name}` (pre-loaded):**\n{body}"):
-                break
+            _add(
+                "skills",
+                f"**Skill `{name}` (pre-loaded — treat as if you called "
+                f"load_skill):**\n{body}",
+            )
 
-        self.token_estimate = used
-        return "\n\n".join(blocks)
+        for name, body in self.sdk_modules.items():
+            _add("sdk", f"**bb module `{name}` (pre-loaded):**\n{body}")
+
+        if self.memories:
+            lines = [f"- #{mid[:8]}: {summ}" for mid, summ in self.memories]
+            _add("memory", "**Relevant memories:**\n" + "\n".join(lines))
+
+        for path, excerpt in self.workspace_excerpts:
+            _add("workspace", f"**Workspace `{path}`:**\n{excerpt}")
+
+        rendered = "\n\n".join(blocks)
+        self.token_estimate = _est_tokens(rendered)
+        if sizes:
+            logger.info(
+                "prefetch bundle rendered: total≈%d tokens, sections=%s",
+                self.token_estimate,
+                {k: f"≈{v}t" for k, v in sizes.items()},
+            )
+        if self.token_estimate > token_budget:
+            logger.warning(
+                "prefetch bundle ≈%d tokens exceeds budget %d — injected "
+                "anyway; tighten per-lane caps if this recurs",
+                self.token_estimate, token_budget,
+            )
+        return rendered if not self.is_empty() else ""
 
 
 def _stringify_payload(payload: Any) -> str:
-    """Compactly render a pulled integration payload for the prompt."""
+    """Compact, deterministic text form of a pulled payload."""
     import json
 
     if isinstance(payload, str):
-        return payload.strip()
+        return payload
     try:
-        return json.dumps(payload, default=str, ensure_ascii=False, indent=None)
-    except Exception:
+        return json.dumps(payload, indent=None, sort_keys=True, default=str)
+    except (TypeError, ValueError):
         return str(payload)

@@ -20,6 +20,11 @@ agent:
   #              wake-word transcript filtering, routine pre-processing
   # Maximum conversation turns before auto-compaction
   max_turns: 20
+  # Optional tighter budgets for wake-cycle (trigger) runs. Unset = no
+  # separate cap. max_messages_trigger caps messages actually delivered
+  # per trigger conversation; the message tool refuses past it.
+  # max_turns_trigger: 10
+  # max_messages_trigger: 2
   # Which client runs the main conversation turn.
   #   raw_anthropic    — direct Messages API, billed via Console.
   #   claude_agent_sdk — Claude Agent SDK over OAuth, billed against the
@@ -29,6 +34,18 @@ agent:
   # Switching to claude_agent_sdk requires CLAUDE_CODE_OAUTH_TOKEN in .env
   # and the `claude` CLI (npm @anthropic-ai/claude-code) installed on PATH.
   backend: "raw_anthropic"
+  # OpenAI-path per-call timeout + SDK retry count (applies when
+  # BOXBOT_MODEL_LARGE / BOXBOT_MODEL_FAST is an OpenAI id). Hosted
+  # deployments occasionally hold a request for tens of seconds; a
+  # short timeout + retry turns that into a quick recovery.
+  openai_timeout_seconds: 20.0
+  openai_max_retries: 2
+  # Rolling within-thread compaction for long open threads: above the
+  # threshold the oldest turns are summarized (small model) and the
+  # recent tail kept verbatim.
+  compaction_enabled: true
+  compaction_threshold_tokens: 150000
+  compaction_keep_recent_tokens: 30000
 
 # ── Schedule ──────────────────────────────────────────────────────────
 # The agent's internal planning system (triggers + to-do list).
@@ -278,6 +295,12 @@ memory:
   decay_rate: 0.98
   # Minimum importance to remain in active pool
   archive_threshold: 0.1
+  # Post-conversation extraction as one live call appended to the
+  # just-ended thread (prompt-cache hit => far cheaper than the batch;
+  # applies in seconds). Only for conversations that ran on an OpenAI
+  # model; everything else, and any thread-call failure, uses the
+  # Anthropic batch path. false forces the batch path everywhere.
+  thread_extraction: true
 
 # ── Photos ────────────────────────────────────────────────────────────
 photos:
@@ -370,10 +393,12 @@ sdk:
   auto_activate_displays: false
 
 # ── Prefetch layer ────────────────────────────────────────────────────
-# A small read-only mini-agent (Haiku) that pre-assembles the context the
-# main agent will likely need into its first turn — relevant memories,
-# skills, workspace docs, message history, pulled calendar/weather — to
-# cut repeat tool-call turns and context bloat.
+# Parallel ONE-SHOT selector calls — one read-only lane per context
+# source (skills, bb SDK module docs, memories, workspace, pulled
+# calendar/weather) — that pre-assemble the context the main agent will
+# likely need into its first turn. No tool loop: wall clock ≈ one
+# fast-model round trip regardless of source count. A lane with no
+# candidates for a message skips its model call entirely.
 #
 # Ships disabled. Enable in "shadow" mode first: it runs and logs what it
 # WOULD prefetch (into the prefetch_events table) but injects nothing, so
@@ -383,22 +408,43 @@ sdk:
 prefetch:
   enabled: false
   mode: shadow            # shadow (log only) | active (inject bundles)
-  # Channels that get prefetch. Voice is deferred from v1 (latency-
-  # sensitive + ephemeral); its tool usage is still logged regardless.
-  channels: [whatsapp, signal, trigger]
+  # Channels that get prefetch. Voice runs the same inline path as the
+  # text channels; the fan-out blocks the reply, so watch prefetch
+  # latency in voice round-trip numbers.
+  channels: [whatsapp, signal, trigger, voice]
+  # Selector lanes that run (see src/boxbot/prefetch/sources.py).
+  sources: [skills, sdk, memory, workspace, pulled]
+  # Integrations the "pulled" lane may run — security allowlist crossed
+  # with a hard-coded read-only action map; the selector can only pick
+  # from names listed here.
+  pull_sources: [calendar, weather]
   # Scheduled triggers: precompute this many minutes before fire_at.
   # Keep small so pulled data (calendar/weather) isn't stale at fire.
   lookahead_minutes: 5
-  # Hard cap on the assembled bundle — the point is to REDUCE bloat.
-  token_budget: 1500
-  # Wall-clock ceiling per prefetch run. Text channels block the reply
-  # path, so their ceiling stays tight-ish; scheduled triggers precompute
-  # in the background at T-minus-lookahead and get far more headroom.
-  timeout_seconds: 20.0
+  # Size-log threshold for the assembled bundle — NOT a truncation cap.
+  # Per-lane pick caps bound the bundle; an over-budget render logs a
+  # warning for offline analysis instead of cutting sections.
+  token_budget: 20000
+  # Wall-clock ceilings. timeout_seconds covers the whole fan-out on
+  # text channels (which block the reply path); per_call is one lane;
+  # scheduled triggers precompute in the background at T-minus-lookahead
+  # and get far more headroom.
+  timeout_seconds: 8.0
+  per_call_timeout_seconds: 6.0
   trigger_timeout_seconds: 120.0
-  max_iterations: 6
-  # Override the mini-agent model; null falls back to models.small (Haiku).
+  # Override the selector model; null falls back to models.fast (the
+  # latency tier) then models.small.
   model: null
+  # Hot tasks: common formulaic requests get a precomputed skills+sdk
+  # bundle; a matched utterance skips the selector fan-out on the reply
+  # path entirely (src/boxbot/prefetch/hot.py). A stock task list ships
+  # in code (config.py _DEFAULT_HOT_TASKS); override it wholesale here:
+  #   hot_tasks:
+  #     - name: show_camera
+  #       exemplars: ["show me the garage camera", "show me the front door"]
+  hot_tasks_enabled: true
+  # Minimum cosine similarity (utterance vs task centroid) for a hit.
+  hot_match_threshold: 0.60
 
 # ── WhatsApp ──────────────────────────────────────────────────────────
 # WhatsApp credentials live in a separate file: config/whatsapp.yaml

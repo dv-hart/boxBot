@@ -1,9 +1,9 @@
 """The unit every capture path produces and STT consumes.
 
 Lives on its own so a capture backend can produce one without importing
-its siblings: ``communication/push_to_talk.py`` has no business pulling
-in ``communication/vad.py`` (and, through it, torch) just to name the
-type it hands to ``voice.py::_on_utterance``.
+its siblings: another capture front-end has no business pulling in
+``communication/vad.py`` (and, through it, torch) just to name the type
+it hands to ``voice.py::_on_utterance``.
 """
 
 from __future__ import annotations

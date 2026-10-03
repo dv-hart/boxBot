@@ -19,9 +19,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Re-exported: Utterance moved to its own module so the push-to-talk
-# backend can produce one without importing VAD, but every existing
-# importer says ``from ...audio_capture import AudioCapture, Utterance``.
+# Re-exported: Utterance lives in its own module so other capture
+# front-ends can share it without importing the VAD pipeline.
 __all__ = ["AudioCapture", "Utterance"]
 
 

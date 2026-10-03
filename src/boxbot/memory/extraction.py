@@ -454,6 +454,7 @@ def build_thread_extraction_message(
     channel: str,
     participants: list[str],
     started_at: str,
+    prior_extracted_turns: int = 0,
 ) -> str:
     """Build the user message appended to a finished OpenAI thread.
 
@@ -469,6 +470,14 @@ def build_thread_extraction_message(
         f"participants={', '.join(participants) or '(unknown)'}, "
         f"started_at={started_at}.\n\n"
     )
+    if prior_extracted_turns > 0:
+        header += (
+            f"Incremental pass: the first {prior_extracted_turns} messages "
+            "of this thread were already extracted in an earlier pass. "
+            "Save only facts that are NEW in the messages after them "
+            "(do not re-save what those earlier messages established); "
+            "conversation_summary still covers the whole thread.\n\n"
+        )
     block = injected_memories_block.strip() or "[Active Memories]\n(none injected)"
     return (
         "[Conversation ended. Mode switch: drop the assistant persona — "

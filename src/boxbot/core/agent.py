@@ -1317,6 +1317,12 @@ class BoxBotAgent:
         # post-conversation thread extraction can append to the same
         # cached prefix. Popped in _on_conversation_ended.
         self._thread_extraction_ctx: dict[str, dict[str, Any]] = {}
+        # Idle-window thread extraction for persistent text threads: how
+        # many thread messages each conversation has already had
+        # extracted, and the armed idle timer. The 4h close extracts
+        # only the turns past the recorded index.
+        self._thread_extracted_upto: dict[str, int] = {}
+        self._idle_extraction_tasks: dict[str, asyncio.Task[None]] = {}
 
         # People currently detected by the perception pipeline.
         # Updated via PersonIdentified event subscription.
@@ -1674,6 +1680,14 @@ class BoxBotAgent:
                 # Another sweeper raced us, or the row was already
                 # extracted out-of-band.
                 continue
+            # Grab the OpenAI request shape and the idle-extraction
+            # progress BEFORE ending the conversation: ConversationEnded
+            # pops the ctx, and the close must know how much is new.
+            self._cancel_idle_thread_extraction(rec.conversation_id)
+            thread_ctx = self.__dict__.setdefault(
+                "_thread_extraction_ctx", {},
+            ).get(rec.conversation_id)
+            extracted_upto = self._idle_state()[0].pop(rec.conversation_id, 0)
             # Pull the canonical thread from the store (in-memory may
             # be missing if we restarted between window expiry and
             # warm-load).
@@ -1706,7 +1720,13 @@ class BoxBotAgent:
             turn_count = sum(
                 1 for m in thread if m.get("role") == "assistant"
             )
-            if thread and turn_count > 0:
+            if thread and extracted_upto >= len(thread):
+                logger.info(
+                    "Sweep: conversation %s fully extracted by the idle "
+                    "pass (%d messages); nothing to queue",
+                    rec.conversation_id, len(thread),
+                )
+            elif thread and turn_count > 0:
                 # Persistent (WhatsApp) conversations may be swept long
                 # after the live Conversation object was discarded, so
                 # we don't have an in-memory injection block to forward
@@ -1721,6 +1741,8 @@ class BoxBotAgent:
                         accessed_memory_ids=[],
                         started_at=rec.started_at_iso,
                         injected_memories_block="",
+                        openai_thread_ctx=thread_ctx,
+                        already_extracted_upto=extracted_upto,
                     ),
                     name=f"extraction-{rec.conversation_id}",
                 )
@@ -3224,6 +3246,7 @@ class BoxBotAgent:
         # Per-conversation prefetch tracking dies with the conversation
         # (it grew unbounded across a process's lifetime otherwise).
         self._prefetch_injected.pop(conv_id, None)
+        self._cancel_idle_thread_extraction(conv_id)
         if conv is None:
             return
 
@@ -3521,6 +3544,10 @@ class BoxBotAgent:
 
         additions = messages[len(conv.thread):]
         summary = self._extract_summary(messages)
+
+        # Persistent text threads: extract while the provider cache is
+        # still warm instead of hours later at the window close.
+        self._arm_idle_thread_extraction(conv)
 
         # ``completed_cleanly`` is False when the loop ran out of turns
         # — even though we dispatched a graceful close-out, the
@@ -5331,8 +5358,15 @@ class BoxBotAgent:
         started_at: str,
         injected_memories_block: str = "",
         openai_thread_ctx: dict[str, Any] | None = None,
+        already_extracted_upto: int = 0,
     ) -> None:
         """Persist transcript + run extraction for this conversation.
+
+        ``already_extracted_upto`` is how many leading messages an
+        idle-window pass already extracted (persistent text threads).
+        Only the turns past it are new: no new human turn means nothing
+        to do, the thread path extracts incrementally, and the batch
+        path receives just the delta transcript.
 
         Runs after the conversation ends. The transcript is recorded in
         ``pending_extractions`` (durable queue, retained 14 days) first.
@@ -5362,7 +5396,16 @@ class BoxBotAgent:
         On any failure, the row is left in queued status with no batch
         id, and the next boot's poller resume will retry submission.
         """
-        if not _has_human_reply(messages):
+        upto = max(0, min(already_extracted_upto, len(messages)))
+        if upto > 0:
+            if not _has_human_reply(messages[upto:]):
+                logger.info(
+                    "Conversation %s: no new human turns since the idle "
+                    "extraction (%d/%d messages) — nothing to extract",
+                    conversation_id, upto, len(messages),
+                )
+                return
+        elif not _has_human_reply(messages):
             await self._write_trigger_summary(
                 conversation_id=conversation_id,
                 channel=channel,
@@ -5373,7 +5416,14 @@ class BoxBotAgent:
             return
 
         try:
-            transcript = self._build_transcript(messages, person_name)
+            if upto > 0:
+                transcript = (
+                    f"[Earlier part of this thread ({upto} messages) was "
+                    "already extracted; only the following is new.]\n"
+                    + self._build_transcript(messages[upto:], person_name)
+                )
+            else:
+                transcript = self._build_transcript(messages, person_name)
 
             participants = [get_config().agent.name]
             if person_name:
@@ -5405,6 +5455,7 @@ class BoxBotAgent:
                     accessed_memory_ids=accessed_memory_ids,
                     injected_memories_block=injected_memories_block,
                     ctx=openai_thread_ctx,
+                    already_extracted_upto=upto,
                 )
                 if applied:
                     return
@@ -5431,6 +5482,97 @@ class BoxBotAgent:
                 conversation_id,
             )
 
+    def _idle_state(self) -> tuple[dict[str, int], dict[str, "asyncio.Task[None]"]]:
+        """The idle-extraction bookkeeping maps, created on first use.
+
+        Lazy because several code paths (and tests) reach the thread
+        extraction helpers on an agent whose __init__ never ran.
+        """
+        d = self.__dict__
+        return (
+            d.setdefault("_thread_extracted_upto", {}),
+            d.setdefault("_idle_extraction_tasks", {}),
+        )
+
+    def _arm_idle_thread_extraction(self, conv: "Conversation") -> None:
+        """(Re)start the idle timer that extracts a persistent thread early.
+
+        Only persistent text threads that ran on the OpenAI loop (a
+        request shape is stashed) qualify; transient conversations
+        extract synchronously at their end. Each new generation resets
+        the timer, so extraction runs ``thread_extraction_idle_seconds``
+        after the LAST turn — inside the provider's prompt-cache window.
+        """
+        if getattr(conv, "lifecycle_mode", "transient") != "persistent":
+            return
+        try:
+            mem_cfg = get_config().memory
+        except Exception:
+            return
+        idle = float(getattr(mem_cfg, "thread_extraction_idle_seconds", 0) or 0)
+        if idle <= 0 or not mem_cfg.thread_extraction:
+            return
+        conv_id = conv.conversation_id
+        if conv_id not in self._thread_extraction_ctx:
+            return
+        _upto, tasks = self._idle_state()
+        prev = tasks.pop(conv_id, None)
+        if prev is not None and not prev.done():
+            prev.cancel()
+        tasks[conv_id] = asyncio.create_task(
+            self._idle_thread_extraction(conv_id, idle),
+            name=f"idle-extraction-{conv_id}",
+        )
+
+    def _cancel_idle_thread_extraction(self, conv_id: str) -> None:
+        _upto, tasks = self._idle_state()
+        task = tasks.pop(conv_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _idle_thread_extraction(self, conv_id: str, idle: float) -> None:
+        """Timer body: after ``idle`` seconds of quiet, extract the thread
+        so far through the cached-prefix path and record how far it got.
+
+        Nothing is queued and no batch fallback runs here — a failed
+        pass simply leaves the close to catch up. A pass with no new
+        human turn since the last one does nothing.
+        """
+        await asyncio.sleep(idle)  # a cancel propagates: the task reads cancelled
+        upto_map, tasks = self._idle_state()
+        tasks.pop(conv_id, None)
+        async with self._index_lock:
+            conv = self._conversations.get(conv_id)
+        if conv is None or conv.is_ended:
+            return
+        ctx = self._thread_extraction_ctx.get(conv_id)
+        if ctx is None:
+            return
+        messages = list(conv.thread)
+        upto = upto_map.get(conv_id, 0)
+        if len(messages) <= upto or not _has_human_reply(messages[upto:]):
+            return
+        participants = [get_config().agent.name]
+        participants.extend(
+            p for p in sorted(conv.participants) if p not in participants
+        )
+        applied = await self._try_thread_extraction(
+            conversation_id=conv_id,
+            channel=conv.channel,
+            participants=participants,
+            started_at=conv.started_at_iso(),
+            messages=messages,
+            accessed_memory_ids=list(conv.accessed_memory_ids),
+            injected_memories_block=conv.injected_memories_block,
+            ctx=ctx,
+            already_extracted_upto=upto,
+        )
+        logger.info(
+            "Idle thread extraction for %s: %s (messages %d→%d)",
+            conv_id, "applied" if applied else "failed; close will catch up",
+            upto, len(messages),
+        )
+
     async def _try_thread_extraction(
         self,
         *,
@@ -5442,6 +5584,7 @@ class BoxBotAgent:
         accessed_memory_ids: list[str],
         injected_memories_block: str,
         ctx: dict[str, Any],
+        already_extracted_upto: int = 0,
     ) -> bool:
         """Extract by appending one call to the just-ended OpenAI thread.
 
@@ -5494,6 +5637,7 @@ class BoxBotAgent:
                     channel=channel,
                     participants=participants,
                     started_at=started_at,
+                    prior_extracted_turns=already_extracted_upto,
                 ),
             })
             completion = await client.chat.completions.create(
@@ -5514,6 +5658,7 @@ class BoxBotAgent:
                 accessed_memory_ids=accessed_memory_ids,
             )
             await self._memory_store.mark_pending_applied(conversation_id)
+            self._idle_state()[0][conversation_id] = len(messages)
         except Exception:
             logger.exception(
                 "Thread extraction failed for conv %s; falling back to batch",

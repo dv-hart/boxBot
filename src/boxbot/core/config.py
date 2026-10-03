@@ -662,6 +662,13 @@ class MemoryConfig(BaseModel):
     # any thread-call failure use the batch path regardless. False
     # forces the batch path everywhere.
     thread_extraction: bool = True
+    # Persistent text threads (WhatsApp/Signal) close hours after the
+    # last message — long after the provider prompt cache has died. When
+    # thread_extraction is on and a thread has been idle this many
+    # seconds, extraction runs over the thread so far while the cache is
+    # still warm; the close then extracts only the turns added since.
+    # Memories form in minutes instead of hours. 0 = only at close.
+    thread_extraction_idle_seconds: float = 300.0
 
     # Dream phase (PR1: deterministic clustering + dedup batch).
     # Lifecycle plan step 8: audit-only flipped OFF. The dream cycle's

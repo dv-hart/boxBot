@@ -301,6 +301,11 @@ memory:
   # model; everything else, and any thread-call failure, uses the
   # Anthropic batch path. false forces the batch path everywhere.
   thread_extraction: true
+  # Persistent text threads (WhatsApp/Signal) close hours after the last
+  # message. With thread_extraction on, a thread idle this many seconds
+  # is extracted while the provider cache is still warm; the close then
+  # extracts only what was added since. 0 = only at close.
+  thread_extraction_idle_seconds: 300
 
 # ── Photos ────────────────────────────────────────────────────────────
 photos:

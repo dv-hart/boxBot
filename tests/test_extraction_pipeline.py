@@ -1038,3 +1038,187 @@ class TestPostConversationThreadRouting:
         )
         client.chat.completions.create.assert_not_awaited()
         agent._batch_poller.submit.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Idle-window thread extraction for persistent text threads
+# ---------------------------------------------------------------------------
+
+
+def _idle_messages():
+    return [
+        {"role": "user", "content": "[Jacob]: We switched to oat milk."},
+        {"role": "assistant", "content": [{"type": "text", "text": "{}"}]},
+        {"role": "user", "content": "[Jacob]: Carina starts her new job Monday."},
+        {"role": "assistant", "content": [{"type": "text", "text": "{}"}]},
+    ]
+
+
+class _FakeConv:
+    def __init__(self, conversation_id="conv_w1", messages=None,
+                 lifecycle_mode="persistent"):
+        self.conversation_id = conversation_id
+        self.channel = "whatsapp"
+        self.lifecycle_mode = lifecycle_mode
+        self.thread = list(messages or _idle_messages())
+        self.participants = {"Jacob"}
+        self.accessed_memory_ids = []
+        self.injected_memories_block = ""
+        self.is_ended = False
+
+    def started_at_iso(self):
+        return "2026-10-03T09:00:00"
+
+
+def _idle_agent(mock_config):
+    import asyncio
+
+    agent, store, client = _agent_with_fakes(
+        completion=_FakeCompletion(_thread_reply(_MINIMAL_PAYLOAD)),
+    )
+    agent._index_lock = asyncio.Lock()
+    agent._conversations = {}
+    agent._thread_extraction_ctx = {}
+    agent._thread_extracted_upto = {}
+    agent._idle_extraction_tasks = {}
+    return agent, store, client
+
+
+def _last_extraction_message(client) -> str:
+    call = client.chat.completions.create.await_args
+    return call.kwargs["messages"][-1]["content"]
+
+
+class TestThreadExtractionMessageIncremental:
+    def test_prior_turns_note(self):
+        from boxbot.memory.extraction import build_thread_extraction_message
+
+        full = build_thread_extraction_message(
+            injected_memories_block="", channel="whatsapp",
+            participants=["BB", "Jacob"], started_at="t",
+        )
+        assert "Incremental pass" not in full
+        partial = build_thread_extraction_message(
+            injected_memories_block="", channel="whatsapp",
+            participants=["BB", "Jacob"], started_at="t",
+            prior_extracted_turns=4,
+        )
+        assert "first 4 messages" in partial
+        assert "conversation_summary still covers the whole thread" in partial
+
+
+class TestIdleThreadExtraction:
+    @pytest.mark.asyncio
+    async def test_idle_pass_extracts_then_only_the_delta(self, mock_config):
+        agent, store, client = _idle_agent(mock_config)
+        conv = _FakeConv()
+        agent._conversations[conv.conversation_id] = conv
+        agent._thread_extraction_ctx[conv.conversation_id] = _thread_ctx()
+
+        await agent._idle_thread_extraction(conv.conversation_id, 0)
+        assert client.chat.completions.create.await_count == 1
+        assert "Incremental pass" not in _last_extraction_message(client)
+        assert agent._thread_extracted_upto[conv.conversation_id] == 4
+        # Nothing queued for the batch path from an idle pass.
+        store.create_pending_extraction.assert_not_awaited()
+        agent._batch_poller.submit.assert_not_awaited()
+
+        # Only an assistant turn landed since: nothing new from a human.
+        conv.thread.append(
+            {"role": "assistant", "content": [{"type": "text", "text": "{}"}]}
+        )
+        await agent._idle_thread_extraction(conv.conversation_id, 0)
+        assert client.chat.completions.create.await_count == 1
+
+        # A human turn landed: the next pass is incremental.
+        conv.thread.append({"role": "user", "content": "[Jacob]: Also, dentist Friday."})
+        conv.thread.append(
+            {"role": "assistant", "content": [{"type": "text", "text": "{}"}]}
+        )
+        await agent._idle_thread_extraction(conv.conversation_id, 0)
+        assert client.chat.completions.create.await_count == 2
+        assert "first 4 messages" in _last_extraction_message(client)
+        assert agent._thread_extracted_upto[conv.conversation_id] == 7
+
+    @pytest.mark.asyncio
+    async def test_idle_pass_needs_a_live_conversation_and_ctx(self, mock_config):
+        agent, store, client = _idle_agent(mock_config)
+        await agent._idle_thread_extraction("ghost", 0)  # not indexed
+        conv = _FakeConv()
+        agent._conversations[conv.conversation_id] = conv
+        await agent._idle_thread_extraction(conv.conversation_id, 0)  # no ctx
+        conv.is_ended = True
+        agent._thread_extraction_ctx[conv.conversation_id] = _thread_ctx()
+        await agent._idle_thread_extraction(conv.conversation_id, 0)  # ended
+        client.chat.completions.create.assert_not_awaited()
+
+    def test_arm_only_for_persistent_openai_threads(self, mock_config):
+        import asyncio
+
+        async def _run():
+            agent, _store, _client = _idle_agent(mock_config)
+            mock_config.memory.thread_extraction_idle_seconds = 60
+            transient = _FakeConv("conv_v1", lifecycle_mode="transient")
+            agent._thread_extraction_ctx["conv_v1"] = _thread_ctx()
+            agent._arm_idle_thread_extraction(transient)
+            assert "conv_v1" not in agent._idle_extraction_tasks
+
+            persistent = _FakeConv("conv_w2")
+            agent._arm_idle_thread_extraction(persistent)  # no ctx yet
+            assert "conv_w2" not in agent._idle_extraction_tasks
+            agent._thread_extraction_ctx["conv_w2"] = _thread_ctx()
+            agent._arm_idle_thread_extraction(persistent)
+            first = agent._idle_extraction_tasks["conv_w2"]
+            agent._arm_idle_thread_extraction(persistent)  # re-arm cancels
+            second = agent._idle_extraction_tasks["conv_w2"]
+            await asyncio.sleep(0)
+            assert first is not second and first.cancelled()
+            agent._cancel_idle_thread_extraction("conv_w2")
+            await asyncio.sleep(0)
+            assert second.cancelled()
+
+        asyncio.run(_run())
+
+
+class TestCloseAfterIdleExtraction:
+    @pytest.mark.asyncio
+    async def test_fully_extracted_thread_does_nothing_at_close(self, mock_config):
+        agent, store, client = _idle_agent(mock_config)
+        msgs = _idle_messages()
+        await agent._post_conversation(
+            conversation_id="conv_w1", channel="whatsapp", person_name="Jacob",
+            messages=msgs, accessed_memory_ids=[], started_at="t",
+            openai_thread_ctx=_thread_ctx(), already_extracted_upto=len(msgs),
+        )
+        client.chat.completions.create.assert_not_awaited()
+        store.create_pending_extraction.assert_not_awaited()
+        agent._batch_poller.submit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_close_with_ctx_extracts_incrementally(self, mock_config):
+        agent, store, client = _idle_agent(mock_config)
+        msgs = _idle_messages()
+        await agent._post_conversation(
+            conversation_id="conv_w1", channel="whatsapp", person_name="Jacob",
+            messages=msgs, accessed_memory_ids=[], started_at="t",
+            openai_thread_ctx=_thread_ctx(), already_extracted_upto=2,
+        )
+        assert client.chat.completions.create.await_count == 1
+        assert "first 2 messages" in _last_extraction_message(client)
+        agent._batch_poller.submit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_close_without_ctx_batches_only_the_delta(self, mock_config):
+        agent, store, client = _idle_agent(mock_config)
+        msgs = _idle_messages()
+        await agent._post_conversation(
+            conversation_id="conv_w1", channel="whatsapp", person_name="Jacob",
+            messages=msgs, accessed_memory_ids=[], started_at="t",
+            openai_thread_ctx=None, already_extracted_upto=2,
+        )
+        client.chat.completions.create.assert_not_awaited()
+        transcript = store.create_pending_extraction.await_args.kwargs["transcript"]
+        assert "already extracted" in transcript
+        assert "oat milk" not in transcript
+        assert "new job Monday" in transcript
+        agent._batch_poller.submit.assert_awaited_once()

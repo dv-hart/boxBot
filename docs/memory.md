@@ -396,6 +396,22 @@ simultaneously:
 - Proposes system memory updates (when warranted)
 - Deduplicates against existing memories
 
+### How Extraction Runs
+
+Two transports, one policy/parser/apply path (see
+`src/boxbot/memory/extraction.py`):
+
+- **Thread-append** (conversations that ran on the OpenAI loop,
+  preferred; `memory.thread_extraction`, default on) — one live call
+  appended to the just-ended thread with its exact request shape
+  (messages, tools, response_format), so the provider prompt cache
+  covers the whole conversation (~85-95% cheaper than the batch;
+  applies in seconds).
+- **Anthropic Message Batches** (everything else, and the fallback on
+  any thread-call failure) — transcript persisted to
+  `pending_extractions`, 1-request batch submitted, `batch_poller`
+  applies the result when it lands (typically <30 min).
+
 ### When Extraction Runs
 
 The trigger differs by channel:
@@ -648,6 +664,13 @@ latency to the extraction pipeline.
 normalized and combined with configurable weights (default: 0.6 vector,
 0.4 BM25). The combined score ranks candidates before the small model
 reranking step.
+
+**No model installed:** `embed()` returns `None`, new rows are written
+with a NULL embedding, and search skips the vector branch entirely (BM25
+weight 1.0). Degraded but honest — stand-in vectors would rank noise
+above exact keyword matches. The model that produced the stored vectors
+is recorded in `store_meta.embedding_model`; swapping embedders logs a
+warning at startup, and re-embedding is an explicit ops action.
 
 ### Why Not API-Based Embeddings?
 

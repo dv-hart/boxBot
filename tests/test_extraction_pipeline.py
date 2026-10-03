@@ -697,11 +697,29 @@ class TestInjectionReturnsIds:
             tags=["food", "preference"],
         )
         block, ids = await inject_memories(
-            fresh_store, person="Jacob", utterance="what should I eat tonight?",
+            fresh_store, person="Jacob", utterance="chicken pesto pizza",
         )
         assert isinstance(block, str)
         assert isinstance(ids, list)
         assert mid in ids
+
+    @pytest.mark.asyncio
+    async def test_name_alone_does_not_inject(self, fresh_store):
+        """Nothing filters this path, so it must not fill on a shared
+        token. Without an embedder the speaker's name matched every
+        memory about them at the top of a normalized score."""
+        from boxbot.memory.retrieval import inject_memories
+
+        for content in ("Jacob's car insurance renews in March.",
+                        "Jacob keeps the spare key under the blue pot."):
+            await fresh_store.create_memory(
+                type="person", person="Jacob",
+                content=content, summary=content,
+            )
+        _block, ids = await inject_memories(
+            fresh_store, person="Jacob", utterance="what should I eat tonight?",
+        )
+        assert ids == []
 
     @pytest.mark.asyncio
     async def test_empty_when_no_results(self, fresh_store):
@@ -711,3 +729,130 @@ class TestInjectionReturnsIds:
         )
         assert block == ""
         assert ids == []
+
+
+# ---------------------------------------------------------------------------
+# Thread-append front-end (OpenAI loop)
+# ---------------------------------------------------------------------------
+
+
+def _thread_reply(payload: dict) -> str:
+    """Wrap an extraction payload the way the live model returns it:
+    internal-notes JSON with the payload as a string in ``thought``."""
+    return json.dumps({
+        "thought": json.dumps(payload),
+        "observations": [],
+        "final_turn": True,
+    })
+
+
+_MINIMAL_PAYLOAD = {
+    "conversation_summary": {
+        "topics": ["locks"],
+        "summary": "Discussed locking the front door.",
+    },
+    "extracted_memories": [],
+    "invalidations": [],
+    "system_memory_updates": [],
+}
+
+
+class TestBuildThreadExtractionMessage:
+    def test_contains_metadata_policy_and_output_contract(self):
+        from boxbot.memory.extraction import build_thread_extraction_message
+
+        msg = build_thread_extraction_message(
+            injected_memories_block="[Active Memories]\n- mem_1: Jacob likes pizza",
+            channel="voice",
+            participants=["BB", "Jacob"],
+            started_at="2026-08-29T21:00:00",
+        )
+        assert "channel=voice" in msg
+        assert "BB, Jacob" in msg
+        assert "mem_1" in msg
+        # Shared policy rode along (spot-check the earworm + todo rules)
+        assert "RECEIPT" in msg
+        assert "Todos own in-flight state" in msg
+        # Output contract: notes shape, payload in thought, no tools
+        assert "`thought`" in msg
+        assert "Do NOT call any tools" in msg
+        assert "conversation_summary" in msg
+
+    def test_no_transcript_section(self):
+        """The conversation is already in the (cached) prompt above —
+        including a transcript would double it."""
+        from boxbot.memory.extraction import build_thread_extraction_message
+
+        msg = build_thread_extraction_message(
+            injected_memories_block="",
+            channel="voice",
+            participants=[],
+            started_at="2026-08-29T21:00:00",
+        )
+        assert "[Transcript]" not in msg
+        assert "(none injected)" in msg
+
+
+class TestParseThreadExtractionContent:
+    def test_notes_wrapped_payload(self):
+        from boxbot.memory.extraction import parse_thread_extraction_content
+
+        payload = dict(_MINIMAL_PAYLOAD)
+        payload["invalidations"] = [
+            {"memory_id": "mem_0412", "reason": "lock verified working"},
+        ]
+        result = parse_thread_extraction_content(_thread_reply(payload))
+        assert result.conversation_summary.topics == ["locks"]
+        assert len(result.invalidations) == 1
+        assert result.invalidations[0].memory_id == "mem_0412"
+
+    def test_payload_directly_at_top_level(self):
+        from boxbot.memory.extraction import parse_thread_extraction_content
+
+        result = parse_thread_extraction_content(json.dumps(_MINIMAL_PAYLOAD))
+        assert result.conversation_summary.summary.startswith("Discussed")
+
+    def test_thought_already_decoded_to_object(self):
+        from boxbot.memory.extraction import parse_thread_extraction_content
+
+        content = json.dumps({
+            "thought": _MINIMAL_PAYLOAD, "observations": [], "final_turn": True,
+        })
+        result = parse_thread_extraction_content(content)
+        assert result.conversation_summary.topics == ["locks"]
+
+    def test_markdown_fenced_reply(self):
+        from boxbot.memory.extraction import parse_thread_extraction_content
+
+        fenced = "```json\n" + json.dumps(_MINIMAL_PAYLOAD) + "\n```"
+        result = parse_thread_extraction_content(fenced)
+        assert result.conversation_summary.topics == ["locks"]
+
+    @pytest.mark.parametrize("bad", [
+        "",
+        "The door is locked.",
+        json.dumps({"thought": "no json here", "observations": []}),
+        json.dumps(["not", "an", "object"]),
+        json.dumps({"observations": ["missing thought and summary"]}),
+    ])
+    def test_unparseable_replies_raise(self, bad):
+        from boxbot.memory.extraction import parse_thread_extraction_content
+
+        with pytest.raises(ValueError):
+            parse_thread_extraction_content(bad)
+
+
+
+
+
+
+
+
+_THREAD_MESSAGES = [
+    {"role": "user", "content": "[Jacob]: Can you lock the door?"},
+    {"role": "assistant", "content": [{"type": "text", "text": "{}"}]},
+]
+
+
+
+

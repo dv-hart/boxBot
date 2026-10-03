@@ -87,10 +87,12 @@ class PersonIdentified(Event):
 
 @dataclass(frozen=True)
 class SpeakerIdentified(Event):
-    """Perception pipeline identified a speaker by voice.
+    """A speaker was confidently identified by voice.
 
-    Source: Perception (voice ReID + fusion)
-    Consumers: Agent, Perception
+    Source: Voice adapter (voice-ReID cloud match or agent_identify
+    claim, in ``_resolve_speaker_identities``) — the single publisher
+    on every device class, camera or not.
+    Consumers: Agent
     """
 
     speaker_label: str = ""  # "SPEAKER_00" from diarization
@@ -235,6 +237,12 @@ class TriggerFired(Event):
     todo_id: str | None = None
     is_recurring: bool = False
     entity: str | None = None
+    # Script-execution path: when set, the agent runs this integration
+    # (or workspace script) instead of opening a conversation. See
+    # ``agent._on_trigger_fired``.
+    run_integration: str | None = None
+    run_script: str | None = None
+    run_inputs: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -331,9 +339,31 @@ class TranscriptReady(Event):
 
     conversation_id: str = ""
     transcript: str = ""  # "[Speaker A]: What's the weather?"
+    # Unattributed STT text ("What's the weather?"). Prefetch keys on
+    # this — hot-task centroids are built from bare exemplars, and it
+    # is what TranscriptDraft carried, so warm results match exactly.
+    raw_text: str = ""
     speaker_segments: list = field(default_factory=list)  # raw diarization data
     speaker_identities: dict[str, dict[str, Any]] = field(default_factory=dict)
     source: str = "voice"
+
+
+@dataclass(frozen=True)
+class TranscriptDraft(Event):
+    """Unattributed STT text, published before speaker resolution.
+
+    Streaming STT finishes ~immediately at utterance end; the speaker
+    embedding + identity resolve that gates :class:`TranscriptReady`
+    takes ~0.5s more. This event lets the agent start text-only work
+    (prefetch lookup, connection warming) inside that window. Carries
+    no speaker attribution by construction.
+
+    Source: Communication (VoiceSession)
+    Consumers: Agent (prefetch warm)
+    """
+
+    conversation_id: str = ""  # voice session id, same as TranscriptReady
+    text: str = ""             # bare STT text, no speaker labels
 
 
 @dataclass(frozen=True)
@@ -392,6 +422,27 @@ class AgentTurnEnded(Event):
 
     conversation_id: str = ""
     channel: str = ""
+
+
+@dataclass(frozen=True)
+class AgentToolCalled(Event):
+    """Agent dispatched a tool call; the result is still pending.
+
+    Published immediately before ``tool.execute`` on both generation
+    paths (raw ``_process_tool_calls`` loop and the SDK MCP wrapper),
+    only for tools with a user-facing status line — see
+    ``boxbot.core.tool_status.status_text_for``. The display manager
+    renders ``status_text`` as a transient pill over the active display
+    so the room can see what the agent is doing mid-turn.
+
+    Source: Agent (both backends)
+    Consumers: Display
+    """
+
+    conversation_id: str = ""
+    channel: str = ""
+    tool_name: str = ""
+    status_text: str = ""
 
 
 @dataclass(frozen=True)

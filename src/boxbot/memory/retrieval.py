@@ -93,6 +93,11 @@ async def inject_memories(
     # get filtered out post-search (hybrid_search has no channel-exclude
     # param) — the wider net keeps enough human conversations to fill
     # max_conversations after the trigger rows are dropped.
+    # Nothing filters this path: whatever comes back is injected. So no
+    # any-term FTS fallback either — the query leads with the speaker's
+    # name, and on a box with no embedding model BM25 is the whole score,
+    # so a single-token match would fill the budget with everything ever
+    # recorded about them.
     candidates = await hybrid_search(
         store,
         query,
@@ -101,6 +106,7 @@ async def inject_memories(
         include_archived=False,
         memory_limit=total_budget * 3,
         conversation_limit=max_conversations * 4,
+        relax_fts=False,
     )
 
     if not candidates:

@@ -98,6 +98,23 @@ def _overlay_env(data: dict[str, Any]) -> None:
         data["models"]["large"] = val
     if val := os.environ.get("BOXBOT_MODEL_SMALL"):
         data["models"]["small"] = val
+    if val := os.environ.get("BOXBOT_MODEL_FAST"):
+        data["models"]["fast"] = val
+    if val := os.environ.get("BOXBOT_MODEL_EMBEDDING"):
+        data["models"]["embedding"] = val
+    if val := os.environ.get("BOXBOT_MODEL_EMBEDDING_ONNX"):
+        data["models"]["embedding_onnx"] = val
+
+    # OpenAI endpoint shape — env only, same rule as models.
+    if "openai" not in data:
+        data["openai"] = {}
+    for env_name, field in (
+        ("OPENAI_API_TYPE", "api_type"),
+        ("OPENAI_API_BASE", "api_base"),
+        ("OPENAI_API_VERSION", "api_version"),
+    ):
+        if val := os.environ.get(env_name):
+            data["openai"][field] = val
 
     # API keys — env only, never in YAML
     if "api_keys" not in data:
@@ -781,10 +798,54 @@ class SDKConfig(BaseModel):
 
 
 class ModelsConfig(BaseModel):
-    """Claude model selection (populated from env vars)."""
+    """Model selection (populated from env vars).
+
+    Provider follows from the id — see ``boxbot.core.models``.
+    """
 
     large: str = "claude-sonnet-4-20250514"
     small: str = "claude-haiku-4-5-20251001"
+    # Fast tier — optional third model for latency-sensitive channels
+    # (voice). None = off; voice uses ``large``.
+    fast: str | None = None
+    # API text-embedding fallback (e.g. text-embedding-3-small), used
+    # only when no local backend is available. None = no API fallback
+    # (degrade to keyword-only search). On Azure this is the deployment
+    # name — see ``OpenAIConfig``.
+    embedding: str | None = None
+    # Local ONNX text embedder (path to an all-MiniLM-L6-v2 export;
+    # tokenizer.json expected alongside). Used when sentence-transformers
+    # is unavailable — hosts where torch does not fit but onnxruntime is
+    # already present. Preferred over the API fallback: local, free,
+    # ~10x faster than a network round-trip.
+    embedding_onnx: str | None = None
+
+
+class OpenAIConfig(BaseModel):
+    """OpenAI endpoint shape (populated from env vars, never from YAML).
+
+    Public OpenAI needs none of this. Azure OpenAI needs all three:
+    ``api_type == "azure"`` selects ``AsyncAzureOpenAI``, and the
+    endpoint + api_version are per-resource. On Azure the ``model``
+    argument is the **deployment name**, not the public model id — keep
+    deployments named after the model they serve so `pricing.yaml` and
+    ``provider_for_model`` keep working unchanged.
+    """
+
+    api_type: str | None = None      # OPENAI_API_TYPE — "azure" or unset
+    api_base: str | None = None      # OPENAI_API_BASE — Azure resource URL
+    api_version: str | None = None   # OPENAI_API_VERSION — Azure api-version
+
+    @property
+    def is_azure(self) -> bool:
+        """True when the endpoint is Azure-hosted.
+
+        Explicit ``api_type`` wins; otherwise infer from the base host so
+        a bare OPENAI_API_BASE still routes correctly.
+        """
+        if (self.api_type or "").lower() == "azure":
+            return True
+        return ".openai.azure.com" in (self.api_base or "")
 
 
 class PrefetchConfig(BaseModel):
@@ -954,6 +1015,7 @@ class BoxBotConfig(BaseModel):
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     sdk: SDKConfig = Field(default_factory=SDKConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     prefetch: PrefetchConfig = Field(default_factory=PrefetchConfig)
     api_keys: ApiKeysConfig = Field(default_factory=ApiKeysConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -26,7 +27,7 @@ import aiosqlite
 import numpy as np
 
 from boxbot.core.paths import MEMORY_DIR
-from boxbot.memory.embeddings import EMBEDDING_DIM, embed
+from boxbot.memory.embeddings import EMBEDDING_DIM, active_model, embed, MODEL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -308,7 +309,7 @@ CREATE TABLE IF NOT EXISTS prefetch_events (
     key                         TEXT NOT NULL,       -- conversation_id or trigger_id
     key_kind                    TEXT,                -- conversation | trigger
     channel                     TEXT,
-    mode                        TEXT NOT NULL,       -- shadow | active
+    mode                        TEXT NOT NULL,       -- shadow | active | hot
     predicted_memory_ids        TEXT,                -- JSON list
     predicted_skills            TEXT,                -- JSON list of skill names inlined
     predicted_workspace_paths   TEXT,                -- JSON list
@@ -325,6 +326,11 @@ CREATE TABLE IF NOT EXISTS prefetch_events (
 -- lookahead may straddle a deploy). TTL via expires_at; conversation_id
 -- is stamped at fire time so the offline harness can bridge
 -- trigger_id -> conversation_id.
+-- The hot-task cache (prefetch/hot.py) also rides this table: rows
+-- keyed "hot:*" hold {"fingerprint", "bundle"|"vectors"} payloads with
+-- a sentinel expires_at (validity is content-fingerprinted, not
+-- time-based). Trigger ids are never "hot:"-prefixed; read hot rows
+-- only via store.kv_get, never cache_get.
 CREATE TABLE IF NOT EXISTS prefetch_cache (
     trigger_id       TEXT PRIMARY KEY,
     bundle_json      TEXT NOT NULL,
@@ -337,6 +343,15 @@ CREATE TABLE IF NOT EXISTS prefetch_cache (
 -- watermark of the last processed memory window). Avoids a misaligned
 -- "since midnight" window that left a daily blind spot.
 CREATE TABLE IF NOT EXISTS dream_state (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
+);
+
+-- Store-level metadata. Currently one key: ``embedding_model``, the
+-- model that produced the vectors in the ``embedding`` columns. Vectors
+-- from two different models are not comparable, so a changed marker
+-- means the store needs re-embedding.
+CREATE TABLE IF NOT EXISTS store_meta (
     key     TEXT PRIMARY KEY,
     value   TEXT NOT NULL
 );
@@ -407,8 +422,14 @@ END;
 """
 
 
-def _embedding_to_blob(arr: np.ndarray) -> bytes:
-    """Convert a numpy array to bytes for SQLite BLOB storage."""
+def _embedding_to_blob(arr: np.ndarray | None) -> bytes | None:
+    """Convert a numpy array to bytes for SQLite BLOB storage.
+
+    None in, None out: with no embedding model available we store NULL
+    rather than a stand-in vector.
+    """
+    if arr is None:
+        return None
     return arr.astype(np.float32).tobytes()
 
 
@@ -490,6 +511,7 @@ class MemoryStore:
         # (where the column already exists) and an upgraded DB (where the
         # column does not yet exist) both succeed.
         await self._migrate_columns()
+        await self._check_embedding_model()
 
         # Ensure system memory file exists
         if not SYSTEM_MEMORY_PATH.exists():
@@ -544,6 +566,68 @@ class MemoryStore:
                 if "duplicate column name" not in str(e).lower():
                     raise
         await self._db.commit()
+
+    async def _check_embedding_model(self) -> None:
+        """Record which embedder produced the stored vectors; warn on a swap.
+
+        Re-embedding is an ops action, not something to do implicitly at
+        boot — a mismatch only logs. In degraded mode (no embedder) new
+        rows get NULL vectors and the marker is left describing whatever
+        wrote the existing ones.
+
+        Off-thread: this is the first call to ``active_model()``, so it
+        pays the SentenceTransformer load — seconds of blocked event loop
+        at boot if run inline.
+        """
+        active = await asyncio.to_thread(active_model)
+        if active is None:
+            return
+
+        cursor = await self._db.execute(
+            "SELECT value FROM store_meta WHERE key = 'embedding_model'"
+        )
+        row = await cursor.fetchone()
+        stored = row["value"] if row else None
+
+        if stored is None:
+            # An unmarked store that already holds vectors predates the
+            # marker. Every store written before the marker existed used
+            # the local default model, so when that is still the active
+            # backend the rows are claimed for it once (info). Any other
+            # active backend cannot be assumed to match: the marker stays
+            # absent and the warning repeats every boot until an operator
+            # re-embeds (scripts/reembed_memories.py writes it).
+            cursor = await self._db.execute(
+                "SELECT 1 FROM memories WHERE embedding IS NOT NULL LIMIT 1"
+            )
+            if await cursor.fetchone() is not None:
+                if active != MODEL_NAME:
+                    logger.warning(
+                        "Memory store holds vectors of unknown provenance "
+                        "(no embedding_model marker); re-embed with %s if "
+                        "search quality looks wrong, then set "
+                        "store_meta.embedding_model to silence this.",
+                        active,
+                    )
+                    return
+                logger.info(
+                    "Memory store predates the embedding_model marker; "
+                    "recording %s (the historical default) for its vectors.",
+                    active,
+                )
+            await self._db.execute(
+                "INSERT INTO store_meta (key, value) VALUES ('embedding_model', ?)",
+                (active,),
+            )
+            await self._db.commit()
+        elif stored != active:
+            logger.warning(
+                "Embedding model changed (%s -> %s): stored vectors are in a "
+                "different vector space and will rank badly until the store "
+                "is re-embedded.",
+                stored,
+                active,
+            )
 
     @property
     def db(self) -> aiosqlite.Connection:
@@ -1080,7 +1164,7 @@ class MemoryStore:
                 summary,
                 json.dumps(topics_list),
                 json.dumps(accessed_list),
-                _embedding_to_blob(embedding_vec) if embedding_vec is not None else None,
+                _embedding_to_blob(embedding_vec),
             ),
         )
         await self.db.commit()
@@ -1151,7 +1235,7 @@ class MemoryStore:
                 summary,
                 json.dumps(topics_list),
                 json.dumps(accessed_list),
-                _embedding_to_blob(embedding_vec) if embedding_vec is not None else None,
+                _embedding_to_blob(embedding_vec),
                 conversation_id,
             ),
         )

@@ -163,34 +163,9 @@ async def _notify_admins_of_request(request: dict[str, Any]) -> tuple[int, int]:
 
 
 async def _broadcast_to_admins(text: str) -> tuple[int, int]:
-    from boxbot.communication.auth import get_auth_manager
-    from boxbot.communication.channels import Channel, get_outbound_channel
+    from boxbot.communication.channels import send_to_admins
 
-    auth = get_auth_manager()
-    if auth is None:
-        logger.warning("Auth manager not initialised — cannot notify admins")
-        return 0, 0
-
-    admins = [u for u in await auth.list_users() if u.role == "admin"]
-    sent = 0
-    for admin in admins:
-        try:
-            channel = Channel(admin.channel)
-        except ValueError:
-            logger.warning(
-                "Admin %s has unknown channel %r; skipping notify",
-                admin.phone, admin.channel,
-            )
-            continue
-        out = get_outbound_channel(channel)
-        if out is None:
-            continue
-        try:
-            if await out.send_text(admin.phone, text):
-                sent += 1
-        except Exception:  # noqa: BLE001
-            logger.exception("notify admin %s failed", admin.phone)
-    return sent, len(admins)
+    return await send_to_admins(text)
 
 
 # ---------------------------------------------------------------------------

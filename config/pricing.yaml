@@ -12,7 +12,7 @@
 
 anthropic:
   source_url: https://platform.claude.com/docs/en/about-claude/pricing
-  verified_on: 2026-05-02
+  verified_on: 2026-09-18
   # Cache and batch multipliers are constant across models per Anthropic
   # docs and are applied in code, not configured here:
   #   cache_read       = 0.10 × input
@@ -20,6 +20,27 @@ anthropic:
   #   cache_write_1h   = 2.00 × input
   #   batch discount   = 50% off all line items
   models:
+    # Claude 5 family (added 2026-08-21; 5.x ids 2026-10-03).
+    claude-fable-5-1:
+      input_per_mtok: 10.00
+      output_per_mtok: 50.00
+    claude-fable-5:
+      input_per_mtok: 10.00
+      output_per_mtok: 50.00
+    claude-opus-5-5:
+      input_per_mtok: 4.00
+      output_per_mtok: 20.00
+    claude-sonnet-5-5:
+      input_per_mtok: 2.00
+      output_per_mtok: 10.00
+    claude-opus-5:
+      input_per_mtok: 5.00
+      output_per_mtok: 25.00
+    claude-sonnet-5:
+      # $2/$10 launched as intro pricing through 2026-08-31; Anthropic made
+      # it the standard rate (the 2026-09-01 increase to $3/$15 was cancelled).
+      input_per_mtok: 2.00
+      output_per_mtok: 10.00
     claude-opus-4-7:
       input_per_mtok: 5.00
       output_per_mtok: 25.00
@@ -39,20 +60,45 @@ anthropic:
       input_per_mtok: 1.00
       output_per_mtok: 5.00
 
+openai:
+  source_url: https://developers.openai.com/api/docs/models/gpt-6-luna
+  verified_on: 2026-09-22
+  # OpenAI's cached-input discount is per-model (not the constant 0.10×
+  # Anthropic applies), so it is an explicit optional per-model rate:
+  # ``cached_input_per_mtok``. Models without it bill cached tokens at
+  # the full input rate (over-counts, never under). No batch multiplier
+  # for the same reason.
+  models:
+    gpt-5.6-luna:
+      # Released 2026-07-09 at $1.00/$6.00; 80% cut on 2026-07-30.
+      input_per_mtok: 0.20
+      output_per_mtok: 1.20
+      # 90% cached-input discount per the model page ($0.02/Mtok). Was 0.05
+      # (a 75% operator estimate, 2026-08-28) until verified 2026-09-18.
+      cached_input_per_mtok: 0.02
+    gpt-6-luna:
+      # Released 2026-09-22 (snapshot gpt-6-luna-2026-09-22). Half the
+      # 5.6 input rate, ~40% of its output rate; cached input 90% off.
+      input_per_mtok: 0.10
+      output_per_mtok: 0.50
+      cached_input_per_mtok: 0.01
+
 elevenlabs:
   source_url: https://elevenlabs.io/pricing/api
-  verified_on: 2026-05-02
-  # TTS billed per input character. Turbo / Flash families = 0.5 cr/char,
-  # multilingual / v3 = 1 cr/char. 1 credit = $0.00005.
+  verified_on: 2026-09-18
+  # TTS billed per input character, API list price (same at every tier on
+  # the API pricing page): Flash / Turbo $0.05 per 1k chars, Multilingual v2
+  # and v3 $0.10 per 1k. Earlier values here were half this (0.5 cr/char at
+  # $0.00005/credit — a subscription-credit rate, not the API rate).
   tts:
     eleven_turbo_v2_5:
-      dollars_per_char: 0.0000250
+      dollars_per_char: 0.0000500
     eleven_flash_v2_5:
-      dollars_per_char: 0.0000250
+      dollars_per_char: 0.0000500
     eleven_multilingual_v2:
-      dollars_per_char: 0.0000500
+      dollars_per_char: 0.0001000
     eleven_v3:
-      dollars_per_char: 0.0000500
+      dollars_per_char: 0.0001000
   # STT (Scribe) billed per minute of input audio. Standard ≈ $0.22/hr,
   # realtime ≈ $0.39/hr.
   stt:

@@ -17,6 +17,7 @@ import logging
 import mimetypes
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -198,7 +199,17 @@ class Workspace:
             raise WorkspaceError("content must be str or bytes")
         self._check_quota(len(data), replace_path=abs_path)
         abs_path.parent.mkdir(parents=True, exist_ok=True)
-        abs_path.write_bytes(data)
+        # Atomic: write a temp file in the same dir, then os.replace — no torn
+        # read for a concurrent reader of a shared file (e.g. an integration's
+        # state file rewritten by unserialized cron runs).
+        fd, tmp = tempfile.mkstemp(dir=abs_path.parent, prefix=f".{abs_path.name}.")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, abs_path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
         return {
             "path": self._rel_of(abs_path),
             "size": len(data),

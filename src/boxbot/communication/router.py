@@ -323,6 +323,36 @@ class MessageRouter:
         logger.debug("Unknown number on Signal, silent drop: %s", sender_phone)
         return False
 
+    async def _send_to_user(
+        self,
+        user: "User",
+        inbound_channel: Channel,
+        text: str,
+        *,
+        what: str,
+    ) -> None:
+        """Reply to ``user`` on the channel they wrote in.
+
+        Falls back to their registered channel when there is no outbound client
+        for the inbound one. Failures are logged, never raised — this is always
+        a courtesy reply on top of work that already succeeded or failed.
+        """
+        from boxbot.communication.channels import get_outbound_channel
+
+        out = get_outbound_channel(inbound_channel)
+        if out is None:
+            try:
+                out = get_outbound_channel(Channel(user.channel))
+            except ValueError:
+                out = None
+        if out is None:
+            logger.warning("No outbound client to send %s to %s", what, user.phone)
+            return
+        try:
+            await out.send_text(user.phone, text)
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not send %s to %s", what, user.phone)
+
     async def _maybe_handle_package_reply(
         self,
         user: "User",
@@ -364,29 +394,9 @@ class MessageRouter:
             "Package %s for request %s handled from admin %s",
             verb, request_id, user.phone,
         )
-
-        from boxbot.communication.channels import get_outbound_channel
-
-        out = get_outbound_channel(inbound_channel)
-        if out is None:
-            # Fall back to the admin's registered outbound channel.
-            try:
-                out = get_outbound_channel(Channel(user.channel))
-            except ValueError:
-                out = None
-        if out is not None:
-            try:
-                await out.send_text(user.phone, reply)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "Could not confirm package %s to admin %s",
-                    verb, user.phone,
-                )
-        else:
-            logger.warning(
-                "No outbound client to confirm package %s to admin %s",
-                verb, user.phone,
-            )
+        await self._send_to_user(
+            user, inbound_channel, reply, what=f"package {verb} confirmation"
+        )
         return True
 
     async def route_outgoing(
@@ -451,12 +461,8 @@ class MessageRouter:
         Returns:
             Phone number in E.164 format, or None if not found.
         """
-        users = await self._auth.list_users()
-        name_lower = name.lower()
-        for user in users:
-            if user.name.lower() == name_lower:
-                return user.phone
-        return None
+        user = await self._auth.get_user_by_name(name)
+        return user.phone if user else None
 
     async def send_to_admins(self, message: str) -> None:
         """Send a message to all admin users. Used for security notifications.

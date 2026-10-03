@@ -17,6 +17,9 @@ from boxbot.integrations.manifest import IntegrationMeta, load_manifest_file
 
 logger = logging.getLogger(__name__)
 
+# Names already announced as disabled, so repeat discovery stays quiet.
+_logged_disabled: set[str] = set()
+
 # Repo-root ``integrations/`` directory, sibling to ``skills/``. Both
 # built-in and agent-authored integrations live here — built-ins ship
 # in git, agent-authored land at runtime via ``bb.integrations.create``
@@ -39,10 +42,40 @@ def _resolve_root(root: Path | None) -> Path:
     return (root if root is not None else _DEFAULT_INTEGRATIONS_ROOT).resolve()
 
 
+def disabled_integrations() -> set[str]:
+    """Integration names switched off for this deployment
+    (``integrations.disabled``).
+
+    Empty when config isn't loaded — discovery must work in tests and
+    during early startup. Same contract as ``skills.disabled``.
+    """
+    try:
+        from boxbot.core.config import get_config
+
+        return {
+            name.strip()
+            for name in get_config().integrations.disabled
+            if name.strip()
+        }
+    except Exception:
+        return set()
+
+
+def _log_disabled_once(name: str) -> None:
+    """Announce a skipped integration once — discovery runs often."""
+    if name in _logged_disabled:
+        return
+    _logged_disabled.add(name)
+    logger.info(
+        "Integration %r disabled by config (integrations.disabled)", name
+    )
+
+
 def discover_integrations(root: Path | None = None) -> list[IntegrationMeta]:
     """Scan an integrations root and return :class:`IntegrationMeta` records.
 
     - Returns an empty list if ``root`` does not exist.
+    - Skips names in ``integrations.disabled`` (logged once at INFO).
     - Skips symlinks (security: integrations are local-only).
     - Skips directories without both ``manifest.yaml`` and ``script.py``.
     - Skips manifests that fail validation (logged at WARNING).
@@ -59,7 +92,11 @@ def discover_integrations(root: Path | None = None) -> list[IntegrationMeta]:
         logger.warning("Cannot list integrations root %s: %s", resolved, exc)
         return []
 
+    disabled = disabled_integrations()
     for entry in entries:
+        if entry.name in disabled:
+            _log_disabled_once(entry.name)
+            continue
         if entry.is_symlink():
             logger.warning("Skipping symlinked integrations entry: %s", entry.name)
             continue

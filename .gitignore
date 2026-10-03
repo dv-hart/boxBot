@@ -91,3 +91,6 @@ data/credentials/
 data/workspace/*
 !data/workspace/.gitkeep
 .pytest-tmp/
+
+# Claude Code personal/local settings
+.claude/settings.local.json

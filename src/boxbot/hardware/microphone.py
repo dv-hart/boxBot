@@ -16,11 +16,11 @@ import asyncio
 import logging
 import struct
 import time
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from boxbot.hardware.base import (
     AudioChunk,
-    HardwareModule,
+    AudioFanout,
     HardwareUnavailableError,
     HealthStatus,
 )
@@ -90,10 +90,6 @@ _CMD_SET_BRIGHTNESS = 0x20
 
 _PARAM_DOAANGLE_ID = 21
 
-# Consumer callback type: async callable receiving AudioChunk
-AudioConsumer = Callable[[AudioChunk], Awaitable[None]]
-
-
 # ---------------------------------------------------------------------------
 # LED pattern definitions
 # ---------------------------------------------------------------------------
@@ -131,7 +127,7 @@ _PATTERN_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
-class Microphone(HardwareModule):
+class Microphone(AudioFanout):
     """ReSpeaker 4-Mic Array v2.0 via sounddevice + pyusb.
 
     Captures 6-channel 16kHz audio, extracts the configured output channel,
@@ -178,13 +174,6 @@ class Microphone(HardwareModule):
         self._stream: Any = None  # sd.InputStream
         self._device_index: int | None = None
         self._usb_device: Any = None  # usb.core.Device
-        self._loop: asyncio.AbstractEventLoop | None = None
-        # Consumers are keyed by a stable integer handle returned from
-        # add_consumer(). This avoids the bound-method identity pitfall:
-        # ``obj.method is obj.method`` is False, so using the callable
-        # itself as the key silently breaks remove_consumer().
-        self._consumers: list[tuple[int, AudioConsumer, str]] = []
-        self._next_consumer_id: int = 1
         self._animation_task: asyncio.Task[None] | None = None
         self._current_pattern: str = "off"
         self._pattern_params: dict[str, Any] = {}
@@ -452,57 +441,6 @@ class Microphone(HardwareModule):
         except asyncio.CancelledError:
             return
 
-    # ── Consumer fan-out ──────────────────────────────────────────
-
-    def add_consumer(self, callback: AudioConsumer, name: str = "") -> int:
-        """Register an async callback to receive audio chunks.
-
-        Args:
-            callback: Async callable that receives AudioChunk.
-            name: Human-readable name for logging.
-
-        Returns:
-            A handle id. Pass this to ``remove_consumer`` to unregister.
-            Callers MUST store this id — bound methods are not
-            identity-stable across accesses, so the callable itself is
-            not a reliable key.
-        """
-        handle = self._next_consumer_id
-        self._next_consumer_id += 1
-        display = name or repr(callback)
-        self._consumers.append((handle, callback, display))
-        logger.debug(
-            "Audio consumer added: %s [id=%d] (total: %d)",
-            display, handle, len(self._consumers),
-        )
-        return handle
-
-    def remove_consumer(self, handle: int) -> bool:
-        """Remove a previously registered consumer by handle.
-
-        Args:
-            handle: The integer handle returned from ``add_consumer``.
-
-        Returns:
-            True if a consumer was removed; False if the handle was
-            unknown (caller logic bug — should never happen if handles
-            are stored correctly).
-        """
-        for i, (h, _cb, name) in enumerate(self._consumers):
-            if h == handle:
-                self._consumers.pop(i)
-                logger.debug(
-                    "Audio consumer removed: %s [id=%d] (total: %d)",
-                    name, handle, len(self._consumers),
-                )
-                return True
-        logger.warning(
-            "remove_consumer called with unknown handle %d — consumer "
-            "list unchanged (total: %d)",
-            handle, len(self._consumers),
-        )
-        return False
-
     def _audio_callback(
         self,
         indata: Any,  # numpy ndarray, shape (frames, channels)
@@ -540,33 +478,7 @@ class Microphone(HardwareModule):
         )
 
         # Dispatch to async loop from the audio thread
-        self._loop.call_soon_threadsafe(
-            self._loop.create_task, self._dispatch_chunk(chunk)
-        )
-
-    async def _dispatch_chunk(self, chunk: AudioChunk) -> None:
-        """Distribute an audio chunk to all registered consumers.
-
-        Each consumer is called concurrently. Slow or failing consumers
-        do not block others.
-        """
-        if not self._consumers:
-            return
-
-        async def _safe_deliver(
-            callback: AudioConsumer, name: str, chunk: AudioChunk
-        ) -> None:
-            try:
-                await callback(chunk)
-            except Exception:
-                logger.exception("Error in audio consumer %s", name)
-
-        # Snapshot the consumer list: a consumer that unregisters itself
-        # during delivery must not mutate the iterable we're awaiting on.
-        snapshot = list(self._consumers)
-        await asyncio.gather(
-            *(_safe_deliver(cb, name, chunk) for _h, cb, name in snapshot)
-        )
+        self.deliver_chunk(chunk)
 
     # ── LED ring ──────────────────────────────────────────────────
 
@@ -825,11 +737,6 @@ class Microphone(HardwareModule):
     def chunk_frames(self) -> int:
         """Number of audio frames per chunk."""
         return self._chunk_frames
-
-    @property
-    def consumer_count(self) -> int:
-        """Number of registered audio consumers."""
-        return len(self._consumers)
 
     # ── Internal helpers ───────────────────────────────────────────
 

@@ -265,8 +265,19 @@ class SignalClient:
                 line = b""
 
             if not line:
-                # EOF — daemon closed the connection.
-                logger.warning("signal-cli daemon disconnected; will reconnect")
+                # EOF. Either the daemon dropped us, or disconnect() closed
+                # the socket under a readline() that was already pending —
+                # the loop condition is only re-checked after this branch.
+                # The latter is routine: the inbound watchdog retires the
+                # old client on every make-before-break refresh.
+                if self._stopped.is_set():
+                    logger.debug(
+                        "signal-cli connection closed during shutdown"
+                    )
+                else:
+                    logger.warning(
+                        "signal-cli daemon disconnected; will reconnect"
+                    )
                 self._reader = None
                 if self._writer is not None:
                     try:

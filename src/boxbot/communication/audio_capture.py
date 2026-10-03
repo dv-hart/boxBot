@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from boxbot.communication.utterance import Utterance
 from boxbot.communication.vad import VoiceActivityDetector
 from boxbot.core.config import TurnDetectionConfig
 
@@ -19,16 +19,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class Utterance:
-    """A finalized utterance ready for STT and diarization."""
-
-    audio: bytes  # complete PCM audio for this utterance (int16 LE mono)
-    duration: float  # seconds
-    sample_rate: int
-    timestamp_start: float
-    timestamp_end: float
+# Re-exported: Utterance moved to its own module so the push-to-talk
+# backend can produce one without importing VAD, but every existing
+# importer says ``from ...audio_capture import AudioCapture, Utterance``.
+__all__ = ["AudioCapture", "Utterance"]
 
 
 class AudioCapture:

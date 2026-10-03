@@ -803,11 +803,26 @@ def _tmp_capture_dir() -> Path:
     return _sandbox_tmp_dir()
 
 
+class NoCameraError(RuntimeError):
+    """No Camera HAL, and the dev test pattern is not enabled."""
+
+
+def _test_pattern_enabled() -> bool:
+    """Whether a camera-less capture may return the dev test pattern."""
+    try:
+        from boxbot.core.config import get_config
+
+        return bool(get_config().camera.test_pattern_without_camera)
+    except Exception:
+        return False
+
+
 def _test_pattern_frame(width: int = 640, height: int = 360):
     """A solid-color frame used when no Camera HAL is available.
 
     Lets the image-attach pipeline be exercised end-to-end on dev
-    machines without a Pi. Returns an ``(H, W, 3)`` uint8 numpy array.
+    machines without a Pi (``camera.test_pattern_without_camera``).
+    Returns an ``(H, W, 3)`` uint8 numpy array.
     """
     import numpy as np
 
@@ -841,11 +856,17 @@ def _frame_to_jpeg(frame) -> bytes:
 
 
 async def _grab_frame(full_res: bool):
-    """Grab a frame from the live camera, or fall back to a test pattern."""
+    """Grab a frame from the live camera.
+
+    Raises :class:`NoCameraError` when there is no camera — synthetic
+    pixels would be pixels the agent believes it actually saw.
+    """
     from boxbot.hardware.camera import get_camera
 
     cam = get_camera()
     if cam is None:
+        if not _test_pattern_enabled():
+            raise NoCameraError
         logger.warning("camera HAL not available — returning test pattern")
         return _test_pattern_frame(), True  # fallback=True
     frame = await (cam.capture_photo() if full_res else cam.capture_frame())
@@ -921,6 +942,8 @@ async def _handle_camera_action(
             "fallback": is_fallback,
         }
 
+    except NoCameraError:
+        return {"status": "error", "error": "No camera on this device."}
     except KeyError as e:
         return {"status": "error", "error": f"missing field: {e}"}
     except Exception as e:  # noqa: BLE001

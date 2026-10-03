@@ -24,9 +24,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, AsyncIterator, Protocol, runtime_checkable
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, AsyncIterator, Protocol, runtime_checkable
 
 from boxbot.core import latency
+
+if TYPE_CHECKING:
+    from boxbot.core.config import ApiKeysConfig, TTSConfig
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +157,7 @@ class ElevenLabsTTS:
         self,
         api_key: str,
         voice_id: str,
-        model: str = "eleven_turbo_v2_5",
+        model: str = "eleven_flash_v2_5",
         stability: float = 0.5,
         similarity_boost: float = 0.75,
         optimize_streaming_latency: int = 3,
@@ -283,6 +287,53 @@ class ElevenLabsTTS:
             headers=headers,
             conversation_id=conversation_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Provider factory
+# ---------------------------------------------------------------------------
+
+
+# ``tts.provider`` name → (ApiKeysConfig field holding the credential,
+# builder). A new provider is one row here; nothing in the voice path
+# changes.
+_TTS_PROVIDERS: dict[str, tuple[str, Callable[[str, TTSConfig], TTSProvider]]] = {
+    "elevenlabs": (
+        "elevenlabs",
+        lambda api_key, cfg: ElevenLabsTTS(
+            api_key=api_key,
+            voice_id=cfg.voice_id,
+            model=cfg.model,
+            stability=cfg.stability,
+            similarity_boost=cfg.similarity_boost,
+            optimize_streaming_latency=cfg.optimize_streaming_latency,
+        ),
+    ),
+}
+
+
+def create_tts(cfg: TTSConfig, api_keys: ApiKeysConfig) -> TTSProvider | None:
+    """Build the TTS provider named by ``cfg.provider``.
+
+    Returns None when that provider's credential is unset — voice
+    degrades to a mute box rather than refusing to boot. An *unknown*
+    provider name raises: a typo silently running a different engine is
+    the worse failure.
+    """
+    entry = _TTS_PROVIDERS.get(cfg.provider)
+    if entry is None:
+        raise ValueError(
+            f"tts.provider must be one of {'/'.join(sorted(_TTS_PROVIDERS))}, "
+            f"got {cfg.provider!r}"
+        )
+    key_field, build = entry
+    api_key = getattr(api_keys, key_field)
+    if not api_key:
+        logger.warning(
+            "%s API key not configured — TTS disabled", cfg.provider
+        )
+        return None
+    return build(api_key, cfg)
 
 
 # ---------------------------------------------------------------------------

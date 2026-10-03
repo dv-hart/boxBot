@@ -244,6 +244,10 @@ class CameraConfig(BaseModel):
     resolution: list[int] = Field(default_factory=lambda: [1280, 720])
     scan_fps: int = 5
     active_fps: int = 15
+    # Dev only: return a synthetic test frame instead of an error when
+    # there is no camera. Off everywhere real — the agent treats attached
+    # pixels as something it saw.
+    test_pattern_without_camera: bool = False
 
     @model_validator(mode="after")
     def validate_resolution(self) -> CameraConfig:
@@ -417,7 +421,10 @@ class TTSConfig(BaseModel):
 
     provider: str = "elevenlabs"
     voice_id: str = ""  # must be configured
-    model: str = "eleven_turbo_v2_5"
+    # Flash, not Turbo: ElevenLabs deprecated the turbo models; Flash is
+    # functionally equivalent at lower latency (~75 ms). Same price per
+    # character in config/pricing.yaml.
+    model: str = "eleven_flash_v2_5"
     stability: float = 0.5
     similarity_boost: float = 0.75
     optimize_streaming_latency: int = 3
@@ -728,6 +735,23 @@ class SandboxConfig(BaseModel):
         return f"{self.runtime_dir.rstrip('/')}/tmp"
 
 
+class SkillsConfig(BaseModel):
+    """Skill availability controls."""
+
+    # Skill directory names to hide from this deployment: no Level-1
+    # metadata in the system prompt, not loadable via load_skill.
+    disabled: list[str] = Field(default_factory=list)
+
+
+class IntegrationsConfig(BaseModel):
+    """Integration availability controls."""
+
+    # Integration directory names to hide from this deployment: not
+    # listable or callable via bb.integrations. Same contract as
+    # skills.disabled.
+    disabled: list[str] = Field(default_factory=list)
+
+
 class SDKConfig(BaseModel):
     """SDK authoring controls."""
 
@@ -905,6 +929,8 @@ class BoxBotConfig(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     photos: PhotosConfig = Field(default_factory=PhotosConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     sdk: SDKConfig = Field(default_factory=SDKConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     prefetch: PrefetchConfig = Field(default_factory=PrefetchConfig)

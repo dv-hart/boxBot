@@ -21,8 +21,14 @@ identifier.
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from boxbot.communication.auth import User
+
+logger = logging.getLogger(__name__)
 
 
 class Channel(Enum):
@@ -80,3 +86,48 @@ def get_outbound_channel(channel: Channel) -> OutboundChannel | None:
 def registered_channels() -> dict[Channel, OutboundChannel]:
     """Return a copy of the live registry. Primarily for diagnostics/tests."""
     return dict(_registry)
+
+
+async def send_to_admins(
+    text: str,
+    *,
+    skip: Callable[["User"], bool] | None = None,
+    on_sent: Callable[["User"], None] | None = None,
+) -> tuple[int, int]:
+    """Send ``text`` to every registered admin on their channel.
+
+    For each admin, unless ``skip(admin)`` is true: resolve its channel, send,
+    and on successful delivery call ``on_sent(admin)``. Returns
+    ``(delivered, total_admins)``. Never raises — a per-admin failure is logged
+    and skipped. Shared by every admin-approval prompt (package install, etc.).
+    """
+    from boxbot.communication.auth import get_auth_manager
+
+    auth = get_auth_manager()
+    if auth is None:
+        logger.warning("Auth manager not initialised — cannot reach admins")
+        return 0, 0
+
+    admins = [u for u in await auth.list_users() if u.role == "admin"]
+    delivered = 0
+    for admin in admins:
+        if skip is not None and skip(admin):
+            continue
+        try:
+            channel = Channel(admin.channel)
+        except ValueError:
+            logger.warning("Admin %s has unknown channel %r; skipping", admin.phone, admin.channel)
+            continue
+        out = get_outbound_channel(channel)
+        if out is None:
+            continue
+        try:
+            sent = await out.send_text(admin.phone, text)
+        except Exception:  # noqa: BLE001
+            logger.exception("send to admin %s failed", admin.phone)
+            continue
+        if sent:
+            delivered += 1
+            if on_sent is not None:
+                on_sent(admin)
+    return delivered, len(admins)

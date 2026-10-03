@@ -12,6 +12,7 @@ Public surface:
     CostEvent                       # dataclass holding one row's worth
     record(store, event)            # append to cost_log
     from_anthropic_usage(...)       # raw messages.create response
+    from_openai_usage(...)          # OpenAI Responses / Chat Completions
     from_agent_sdk_result(...)      # claude_agent_sdk ResultMessage
     from_elevenlabs_tts(...)        # billed chars from x-character-count
     from_elevenlabs_stt(...)        # measured input audio seconds
@@ -26,6 +27,7 @@ from boxbot.cost.compute import (
     from_anthropic_usage,
     from_elevenlabs_stt,
     from_elevenlabs_tts,
+    from_openai_usage,
 )
 from boxbot.cost.event import CostEvent
 from boxbot.cost.pricing import Pricing, get_pricing, reload_pricing
@@ -38,6 +40,7 @@ __all__ = [
     "from_anthropic_usage",
     "from_elevenlabs_stt",
     "from_elevenlabs_tts",
+    "from_openai_usage",
     "get_pricing",
     "record",
     "reload_pricing",

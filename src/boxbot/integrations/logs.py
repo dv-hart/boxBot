@@ -40,12 +40,14 @@ MAX_LOGGED_BYTES = 32 * 1024
 HEAD_LOGGED_BYTES = 8 * 1024
 TAIL_LOGGED_BYTES = 24 * 1024
 
-# Input keys whose values get redacted before logging. Inputs are
-# logged verbatim otherwise; an agent that passes an API key as an
-# input (instead of via bb.secrets) must not leak it into a log it
-# can later read back via list_runs.
+# Keys whose values get redacted before logging — applied to inputs
+# AND outputs. An agent that passes an API key as an input (instead of
+# via bb.secrets) must not leak it into a log it can later read back
+# via list_runs; likewise an integration whose output carries
+# credentials for the main process (a session cookie jar, a websocket
+# JWT) must not hand them back down to the sandbox through the run log.
 _SENSITIVE_KEY_RE = re.compile(
-    r"token|key|secret|password|auth|credential", re.IGNORECASE
+    r"token|key|secret|password|auth|credential|cookie", re.IGNORECASE
 )
 _REDACTED = "***redacted***"
 
@@ -152,7 +154,9 @@ def record_run(
         else None
     )
     output_json = (
-        _truncate_for_log(json.dumps(output, default=str)) if output is not None else None
+        _truncate_for_log(json.dumps(_redact_sensitive(output), default=str))
+        if output is not None
+        else None
     )
     error_text = _truncate_for_log(error) if error else None
 

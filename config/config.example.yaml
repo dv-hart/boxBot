@@ -155,6 +155,10 @@ camera:
   scan_fps: 5
   # Framerate during active interaction
   active_fps: 15
+  # Dev machines only: bb.camera.capture() returns a teal test frame
+  # instead of an error when no camera is attached. Never enable on a
+  # real device — the agent believes the pixels it is shown.
+  test_pattern_without_camera: false
 
 # ── Voice ─────────────────────────────────────────────────────────────
 voice:
@@ -208,7 +212,7 @@ voice:
   tts:
     provider: "elevenlabs"
     voice_id: ""                  # must be configured
-    model: "eleven_turbo_v2_5"
+    model: "eleven_flash_v2_5"    # turbo is deprecated; flash is ~75ms
     stability: 0.5
     similarity_boost: 0.75
     optimize_streaming_latency: 3
@@ -319,6 +323,22 @@ sandbox:
   install_approval_channels:
     - "display"          # tap YES on touchscreen
     - "whatsapp"         # admin replies YES via WhatsApp
+
+# ── Skills ────────────────────────────────────────────────────────────
+# Skills whose metadata should not be injected into the system prompt and
+# that load_skill must refuse. Names are the directory names under
+# skills/. Use this where a skill's backing service doesn't exist on the
+# device — e.g. "home" on a box with no Home Assistant.
+skills:
+  disabled: []
+
+# ── Integrations ──────────────────────────────────────────────────────
+# Integrations hidden from this deployment: not listable or callable via
+# bb.integrations. Names are the directory names under integrations/.
+# Same idea as skills.disabled — e.g. "home_assistant" on a box that
+# has no Home Assistant instance to talk to.
+integrations:
+  disabled: []
 
 # ── SDK Authoring ────────────────────────────────────────────────────
 # Controls how agent-created skills/displays are handled.

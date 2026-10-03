@@ -260,8 +260,8 @@ class TestIdentityFusion:
         fusion, cloud = self._make_fusion()
         emb = _unit_vec(192, seed=42)
         centroid = _similar_vec(emb, noise=0.01)
-        cloud.get_voice_centroids = AsyncMock(
-            return_value={"p1": ("Jacob", centroid)}
+        cloud.get_voice_clouds = AsyncMock(
+            return_value={"p1": ("Jacob", np.stack([centroid]))}
         )
 
         result = await fusion.fuse_speaker(
@@ -281,8 +281,8 @@ class TestIdentityFusion:
         fusion, cloud = self._make_fusion()
         emb = _unit_vec(192, seed=42)
         centroid = _similar_vec(emb, noise=0.01)
-        cloud.get_voice_centroids = AsyncMock(
-            return_value={"p1": ("Jacob", centroid)}
+        cloud.get_voice_clouds = AsyncMock(
+            return_value={"p1": ("Jacob", np.stack([centroid]))}
         )
 
         person = self._active_person(
@@ -307,8 +307,8 @@ class TestIdentityFusion:
         fusion, cloud = self._make_fusion()
         emb = _unit_vec(192, seed=42)
         centroid = _similar_vec(emb, noise=0.01)
-        cloud.get_voice_centroids = AsyncMock(
-            return_value={"p1": ("Jacob", centroid)}
+        cloud.get_voice_clouds = AsyncMock(
+            return_value={"p1": ("Jacob", np.stack([centroid]))}
         )
 
         person = self._active_person(
@@ -332,8 +332,8 @@ class TestIdentityFusion:
         fusion, cloud = self._make_fusion()
         emb = _unit_vec(192, seed=42)
         centroid = _similar_vec(emb, noise=0.01)
-        cloud.get_voice_centroids = AsyncMock(
-            return_value={"p1": ("Jacob", centroid)}
+        cloud.get_voice_clouds = AsyncMock(
+            return_value={"p1": ("Jacob", np.stack([centroid]))}
         )
 
         person = self._active_person(
@@ -358,8 +358,8 @@ class TestIdentityFusion:
         fusion, cloud = self._make_fusion()
         emb = _unit_vec(192, seed=1)
         centroid = -emb  # opposite
-        cloud.get_voice_centroids = AsyncMock(
-            return_value={"p1": ("Jacob", centroid)}
+        cloud.get_voice_clouds = AsyncMock(
+            return_value={"p1": ("Jacob", np.stack([centroid]))}
         )
 
         result = await fusion.fuse_speaker(
@@ -374,7 +374,7 @@ class TestIdentityFusion:
     async def test_no_centroids_returns_unknown(self):
         """No voice centroids in database → unknown speaker."""
         fusion, cloud = self._make_fusion()
-        cloud.get_voice_centroids = AsyncMock(return_value={})
+        cloud.get_voice_clouds = AsyncMock(return_value={})
 
         result = await fusion.fuse_speaker(
             speaker_label="SPEAKER_00",
@@ -805,7 +805,6 @@ class TestPipelineConversationHandlers:
         event = ConversationStarted(conversation_id="test-conv-1", channel="voice")
         await pipeline._on_conversation_started(event)
         assert pipeline.state == PerceptionState.CONVERSATION
-        assert pipeline._conversation_active is True
 
     @pytest.mark.asyncio
     async def test_conversation_ended_triggers_post(self, pipeline_setup):
@@ -827,7 +826,6 @@ class TestPipelineConversationHandlers:
         await pipeline._on_conversation_ended(
             ConversationEnded(conversation_id="c1", channel="voice")
         )
-        assert pipeline._conversation_active is False
         # Post-conversation done → should be DETECTED or DORMANT
         assert pipeline.state in (
             PerceptionState.DETECTED, PerceptionState.DORMANT,

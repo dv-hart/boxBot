@@ -220,6 +220,11 @@ class ScheduleConfig(BaseModel):
     ])
     idle_timeout: int = 300
     person_trigger_expiry_days: int = 7
+    # Recurring (cron) triggers overdue by more than this are re-anchored to
+    # their next occurrence WITHOUT firing — prevents a boot after a scheduled
+    # slot (or after downtime) from replaying every missed wake cycle at once.
+    # One-shot (fire_at) triggers are unaffected: they still fire once.
+    catch_up_grace_seconds: int = 600
 
 
 class HomeAssistantConfig(BaseModel):

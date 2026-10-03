@@ -146,9 +146,25 @@ class ActionContext:
     # Every action processed, mirrored into the final tool result so the
     # agent can observe side effects (e.g. "photos.set_tags: ok").
     action_log: list[dict[str, Any]] = field(default_factory=list)
+    # Who is driving this action stream. "agent" = an execute_script turn,
+    # a human in the loop deciding each call. "integration" = ANY integration
+    # run — unattended, no model in the loop (whether a trigger fired it or an
+    # agent turn called it). Handlers use this to structurally deny the
+    # privileged surfaces — see ``_handle_tasks_action``.
+    origin: str = "agent"
     # Conversation this run belongs to (the runner's label). None for
     # one-off runs.
     conversation_id: str | None = None
+
+
+def _from_integration(ctx: "ActionContext | None") -> bool:
+    """True when this action stream belongs to an integration script.
+
+    Tolerates ``ctx=None`` — in-process callers that skip the context
+    entirely are trusted by construction; only the runner ever hands out
+    an ``origin="integration"`` context.
+    """
+    return ctx is not None and ctx.origin == "integration"
 
 
 # ---------------------------------------------------------------------------
@@ -1615,7 +1631,7 @@ async def _handle_memory_action(
 async def _handle_tasks_action(
     action_type: str,
     payload: dict[str, Any],
-    ctx: ActionContext,  # unused; kept for uniform handler signature
+    ctx: ActionContext,  # threaded for the origin check
 ) -> dict[str, Any]:
     """Dispatch ``tasks.*`` — create_trigger, create_todo, list_*, get,
     complete, cancel.
@@ -1623,8 +1639,22 @@ async def _handle_tasks_action(
     Mirrors the manage_tasks core tool's surface, reachable from inside
     sandbox scripts so they can compose task management with other SDK
     calls in one turn.
+
+    Denied entirely for ``origin="integration"``: a script that creates
+    triggers that run scripts is a self-replication loop with no human in
+    it. Cron recurrence already covers re-arming.
     """
     sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+
+    if _from_integration(ctx):
+        return {
+            "status": "error",
+            "message": (
+                f"tasks.{sub} is not available to unattended scripts "
+                "(integration or trigger-run). Return an 'escalate' key so "
+                "the agent can decide."
+            ),
+        }
 
     try:
         from boxbot.core import scheduler
@@ -1654,6 +1684,10 @@ async def _handle_tasks_action(
                     entity_state=payload.get("entity_state"),
                     for_person=payload.get("for_person"),
                     todo_id=payload.get("todo_id"),
+                    run_integration=payload.get("run_integration"),
+                    run_script=payload.get("run_script"),
+                    run_inputs=payload.get("run_inputs"),
+                    rearm_after_s=payload.get("rearm_after_s"),
                     source="agent",
                 )
             except ValueError as e:

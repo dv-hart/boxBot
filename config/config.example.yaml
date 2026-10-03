@@ -34,6 +34,11 @@ agent:
 # The agent's internal planning system (triggers + to-do list).
 # NOT the family calendar — calendar events are managed by skills.
 schedule:
+  # Recurring (cron) triggers overdue by more than this many seconds at
+  # scan time are re-anchored to their next occurrence WITHOUT firing —
+  # a boot after a scheduled slot must not replay every missed wake cycle.
+  # One-shot fire_at triggers still fire once.
+  catch_up_grace_seconds: 600
   # Wake cycle — recurring triggers seeded into the database on first
   # boot. After first boot, runtime state in data/scheduler/scheduler.db
   # is authoritative. The agent can modify these at runtime.

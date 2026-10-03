@@ -526,3 +526,264 @@ class TestPersonTriggerFiring:
         await sched._on_person_detected(PersonDetected(person_ref="A"))
         await sched._on_person_detected(PersonDetected(person_ref="A"))
         assert sched._check_person_triggers.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Re-arming condition triggers (rearm_after_s)
+# ---------------------------------------------------------------------------
+
+
+class TestRearmingTriggers:
+    """rearm_after_s: "whenever X", not "next time X"."""
+
+    def _entity_on(self, entity="binary_sensor.front_door_person"):
+        from boxbot.core.events import EntityStateChanged
+
+        return EntityStateChanged(
+            entity_id=entity, new_state="on", old_state="off",
+            friendly_name="Front Door person", snapshot=False,
+        )
+
+    def _entity_off(self, entity="binary_sensor.front_door_person"):
+        from boxbot.core.events import EntityStateChanged
+
+        return EntityStateChanged(
+            entity_id=entity, new_state="off", old_state="on",
+            friendly_name="Front Door person", snapshot=False,
+        )
+
+    async def _rearm_trigger(self, **kwargs):
+        return await create_trigger(
+            description="Front door person alert",
+            instructions="Text Jacob",
+            entity="binary_sensor.front_door_person",
+            rearm_after_s=0,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stays_active_and_refires_after_cooldown(self):
+        tid = await self._rearm_trigger()
+        sched = Scheduler()
+        await sched._on_entity_state(self._entity_on())
+        trigger = await get_trigger(tid)
+        assert trigger["status"] == "active"
+        assert trigger["fire_count"] == 1
+
+        # Age the first firing past the refractory floor, then a fresh
+        # off->on edge must fire again.
+        old = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        await update_trigger(tid, last_fired=old)
+        await sched._on_entity_state(self._entity_off())
+        await sched._on_entity_state(self._entity_on())
+        trigger = await get_trigger(tid)
+        assert trigger["status"] == "active"
+        assert trigger["fire_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_refractory_floor_blocks_immediate_refire(self):
+        tid = await self._rearm_trigger()
+        sched = Scheduler()
+        await sched._on_entity_state(self._entity_on())
+        await sched._on_entity_state(self._entity_off())
+        await sched._on_entity_state(self._entity_on())
+        trigger = await get_trigger(tid)
+        assert trigger["fire_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_time_scan_does_not_double_fire_while_condition_holds(self):
+        # The 60s scan evaluates entity conditions against the live
+        # mirror; while the momentary "on" is still held it must not
+        # re-fire an edge that already fired.
+        tid = await self._rearm_trigger()
+        sched = Scheduler()
+        await sched._on_entity_state(self._entity_on())
+        await sched._check_time_triggers()
+        trigger = await get_trigger(tid)
+        assert trigger["fire_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_cooldown_longer_than_floor_is_honoured(self):
+        tid = await create_trigger(
+            description="Front door person alert",
+            instructions="Text Jacob",
+            entity="binary_sensor.front_door_person",
+            rearm_after_s=3600,
+        )
+        sched = Scheduler()
+        await sched._on_entity_state(self._entity_on())
+        # Aged past the floor but inside the requested cooldown: no refire.
+        old = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        await update_trigger(tid, last_fired=old)
+        await sched._on_entity_state(self._entity_off())
+        await sched._on_entity_state(self._entity_on())
+        trigger = await get_trigger(tid)
+        assert trigger["fire_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_fired_event_reports_recurring(self):
+        from boxbot.core.events import TriggerFired, get_event_bus
+
+        received = []
+
+        async def handler(event):
+            received.append(event)
+
+        bus = get_event_bus()
+        bus.subscribe(TriggerFired, handler)
+        try:
+            await self._rearm_trigger()
+            sched = Scheduler()
+            await sched._on_entity_state(self._entity_on())
+        finally:
+            bus.unsubscribe(TriggerFired, handler)
+        assert len(received) == 1
+        assert received[0].is_recurring is True
+
+    @pytest.mark.asyncio
+    async def test_person_rearm_is_edge_triggered(self):
+        """A person who stays in the room fires a "whenever Jacob" trigger
+        once, not every presence scan; leaving and coming back fires it
+        again."""
+        tid = await create_trigger(
+            description="Greet Jacob whenever he comes in",
+            instructions="Say hi",
+            person="Jacob",
+            rearm_after_s=0,
+        )
+        sched = Scheduler()
+        await sched._on_person_identified(PersonIdentified(person_name="Jacob"))
+        assert (await get_trigger(tid))["fire_count"] == 1
+
+        # Still present: repeated identifications and time scans must not
+        # refire even once the refractory floor has passed.
+        old = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        await update_trigger(tid, last_fired=old)
+        await sched._on_person_identified(PersonIdentified(person_name="Jacob"))
+        await sched._check_time_triggers()
+        assert (await get_trigger(tid))["fire_count"] == 1
+
+        # Leaves (presence window lapses) → scan reads false → latch
+        # released; the next arrival is a fresh edge.
+        sched._present_people.clear()
+        sched._person_last_seen.clear()
+        await sched._check_time_triggers()
+        await sched._on_person_identified(PersonIdentified(person_name="Jacob"))
+        assert (await get_trigger(tid))["fire_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_entity_rearm_held_on_does_not_refire_on_scan(self):
+        """A sensor left "on" (door propped open) fires once per on-period."""
+        tid = await self._rearm_trigger()
+        sched = Scheduler()
+        await sched._on_entity_state(self._entity_on())
+        old = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        await update_trigger(tid, last_fired=old)
+        await sched._check_time_triggers()
+        await sched._check_time_triggers()
+        assert (await get_trigger(tid))["fire_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_requires_person_or_entity_condition(self):
+        with pytest.raises(ValueError, match="person or entity"):
+            await create_trigger(
+                description="x", instructions="y",
+                fire_at="2027-01-01T00:00:00", rearm_after_s=60,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejected_with_cron(self):
+        with pytest.raises(ValueError, match="mutually exclusive with cron"):
+            await create_trigger(
+                description="x", instructions="y",
+                cron="0 8 * * *", person="Jacob", rearm_after_s=60,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_negative_or_non_int(self):
+        with pytest.raises(ValueError, match="non-negative integer"):
+            await create_trigger(
+                description="x", instructions="y",
+                person="Jacob", rearm_after_s=-1,
+            )
+
+    @pytest.mark.asyncio
+    async def test_default_expiry_extends_to_30_days(self):
+        tid = await self._rearm_trigger()
+        trigger = await get_trigger(tid)
+        expires = datetime.fromisoformat(trigger["expires"])
+        delta = expires - datetime.now(timezone.utc)
+        assert timedelta(days=29) < delta <= timedelta(days=30)
+
+
+# ---------------------------------------------------------------------------
+# Stale cron re-anchor (schedule.catch_up_grace_seconds)
+# ---------------------------------------------------------------------------
+
+
+class TestStaleCronReanchor:
+    """A cron slot missed by more than the grace window is skipped, not
+    replayed; fresh slots and one-shot fire_at triggers are untouched."""
+
+    async def _cron_trigger(self, fire_at: datetime) -> str:
+        tid = await create_trigger(
+            description="Morning brief",
+            instructions="Brief the house",
+            cron="0 8 * * *",
+        )
+        await update_trigger(tid, fire_at=fire_at.isoformat())
+        return tid
+
+    @pytest.mark.asyncio
+    async def test_overdue_cron_is_reanchored_without_firing(self, caplog):
+        stale = datetime.now(timezone.utc) - timedelta(hours=3)
+        tid = await self._cron_trigger(stale)
+        sched = Scheduler()
+        with caplog.at_level("WARNING"):
+            await sched._check_time_triggers()
+        trigger = await get_trigger(tid)
+        assert trigger["fire_count"] == 0
+        assert trigger["status"] == "active"
+        assert datetime.fromisoformat(trigger["fire_at"]) > datetime.now(timezone.utc)
+        assert "re-anchored" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_cron_inside_grace_fires_normally(self):
+        recent = datetime.now(timezone.utc) - timedelta(seconds=30)
+        tid = await self._cron_trigger(recent)
+        sched = Scheduler()
+        await sched._check_time_triggers()
+        trigger = await get_trigger(tid)
+        assert trigger["fire_count"] == 1
+        assert trigger["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_overdue_one_shot_still_fires(self):
+        stale = datetime.now(timezone.utc) - timedelta(hours=3)
+        tid = await create_trigger(
+            description="Remind Jacob",
+            instructions="Remind",
+            fire_at=stale.isoformat(),
+        )
+        sched = Scheduler()
+        await sched._check_time_triggers()
+        trigger = await get_trigger(tid)
+        assert trigger["fire_count"] == 1
+        assert trigger["status"] == "fired"
+
+    @pytest.mark.asyncio
+    async def test_overdue_compound_cron_is_not_reanchored(self):
+        """A cron gated on presence is event-driven; leave it alone."""
+        stale = datetime.now(timezone.utc) - timedelta(hours=3)
+        tid = await create_trigger(
+            description="Evening check-in when Jacob is home",
+            instructions="Check in",
+            cron="0 18 * * *",
+            person="Jacob",
+        )
+        await update_trigger(tid, fire_at=stale.isoformat())
+        sched = Scheduler()
+        await sched._check_time_triggers()
+        trigger = await get_trigger(tid)
+        assert trigger["fire_at"] == stale.isoformat()
+        assert trigger["fire_count"] == 0

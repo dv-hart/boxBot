@@ -85,6 +85,25 @@ class TestUpcoming:
         await s._check_upcoming_triggers()
         assert bus.published == []
 
+    async def test_skips_run_integration_trigger(self, monkeypatch):
+        """A script trigger never wakes the model — nothing to prefetch."""
+        from datetime import timedelta
+
+        now = _now_utc()
+        _prefetch_cfg(monkeypatch)
+        _install_triggers(monkeypatch, [
+            {"id": "scene", "description": "d", "instructions": "i",
+             "person": None, "for_person": None, "todo_id": None,
+             "cron": None, "fire_at": _iso(now + timedelta(minutes=2)),
+             "run_integration": "porch_light"},
+        ])
+        bus = _FakeBus()
+        monkeypatch.setattr(sched_mod, "get_event_bus", lambda: bus)
+
+        s = Scheduler()
+        await s._check_upcoming_triggers()
+        assert bus.published == []
+
     async def test_noop_when_prefetch_disabled(self, monkeypatch):
         from datetime import timedelta
 

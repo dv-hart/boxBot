@@ -80,11 +80,12 @@ class ManageTasksTool(Tool):
             "entity": {
                 "type": "string",
                 "description": (
-                    "Home Assistant entity_id, e.g. "
+                    "Sensor id from the events bridge, e.g. "
                     "'binary_sensor.front_door_person'. Fires when the "
                     "entity enters entity_state. Covers camera "
-                    "person/vehicle/animal/package, doors, motion. Needs "
-                    "the HA events bridge."
+                    "person/vehicle/animal/package, doors, motion. Only "
+                    "ids the bridge actually publishes — no bridge, no "
+                    "entity triggers."
                 ),
             },
             "entity_state": {
@@ -102,6 +103,47 @@ class ManageTasksTool(Tool):
             "todo_id": {
                 "type": "string",
                 "description": "Link to an existing to-do. Does not auto-complete it.",
+            },
+            "run_integration": {
+                "type": "string",
+                "description": (
+                    "Run this integration when the trigger fires instead of "
+                    "waking me. No model call, no tokens. Must already exist. "
+                    "Silent on success; escalates to a conversation (seeded "
+                    "with `instructions` + script output) if the run fails or "
+                    "the script returns an 'escalate' key. Scripts cannot "
+                    "message people or touch tasks."
+                ),
+            },
+            "run_script": {
+                "type": "string",
+                "description": (
+                    "Workspace-relative .py to run when the trigger fires "
+                    "instead of waking me — same unattended sandbox and "
+                    "escalate contract as run_integration, no manifest. "
+                    "Write via bb.workspace, test via execute_script, then "
+                    "schedule. Path validated now. Mutually exclusive with "
+                    "run_integration."
+                ),
+            },
+            "run_inputs": {
+                "type": "object",
+                "description": (
+                    "Inputs for run_integration (validated against its "
+                    "manifest now, so bad wiring fails here, not at fire "
+                    "time) or run_script (passed through; read via "
+                    "bb.integration.inputs())."
+                ),
+            },
+            "rearm_after_s": {
+                "type": "integer",
+                "description": (
+                    "Re-arm instead of completing on first fire — 'whenever "
+                    "X', not 'next time X'. Fires again each time the "
+                    "condition is met after this cooldown (seconds; 0 = "
+                    "minimum floor). Requires person/entity; invalid with "
+                    "cron. Default expiry extends 7d -> 30d."
+                ),
             },
             # create_todo fields
             "notes": {
@@ -181,6 +223,10 @@ class ManageTasksTool(Tool):
             for_person=kwargs.get("for_person"),
             expires=kwargs.get("expires"),
             todo_id=kwargs.get("todo_id"),
+            run_integration=kwargs.get("run_integration"),
+            run_script=kwargs.get("run_script"),
+            run_inputs=kwargs.get("run_inputs"),
+            rearm_after_s=kwargs.get("rearm_after_s"),
         )
 
         logger.info("Created trigger: %s (%s)", trigger_id, description)
@@ -242,6 +288,7 @@ class ManageTasksTool(Tool):
                     "entity": t.get("entity"),
                     "entity_state": t.get("entity_state"),
                     "for_person": t.get("for_person"),
+                    "rearm_after_s": t.get("rearm_after_s"),
                     "status": t["status"],
                 }
                 for t in triggers
@@ -288,6 +335,10 @@ class ManageTasksTool(Tool):
                 "entity_state": trigger.get("entity_state"),
                 "for_person": trigger.get("for_person"),
                 "todo_id": trigger.get("todo_id"),
+                "run_integration": trigger.get("run_integration"),
+                "run_script": trigger.get("run_script"),
+                "run_inputs": trigger.get("run_inputs"),
+                "rearm_after_s": trigger.get("rearm_after_s"),
                 "status": trigger["status"],
                 "created_at": trigger["created_at"],
                 "expires": trigger.get("expires"),

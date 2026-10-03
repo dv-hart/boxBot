@@ -457,3 +457,90 @@ async def test_invalid_json_output_is_error(tmp_path, monkeypatch, isolated_logs
     result = await run_mod.run("garbled", {})
     assert result["status"] == "error"
     assert "invalid JSON" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# run_workspace_script — trigger-run chore scripts
+# ---------------------------------------------------------------------------
+
+
+def _make_workspace_script(monkeypatch, tmp_path: Path, rel: str, script: str) -> None:
+    ws_root = tmp_path / "workspace"
+    p = ws_root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(script, encoding="utf-8")
+    monkeypatch.setattr("boxbot.workspace.store.DEFAULT_ROOT", ws_root)
+
+
+@pytest.mark.asyncio
+async def test_workspace_script_silent_success(tmp_path, monkeypatch, isolated_logs):
+    """A chore that just exits 0 is a silent success — no return_output
+    ceremony required (integrations still require it)."""
+    _make_workspace_script(
+        monkeypatch, tmp_path, "scripts/lockup.py", "x = 1 + 1\n"
+    )
+    result = await run_mod.run_workspace_script("scripts/lockup.py")
+    assert result == {"status": "ok", "output": None}
+
+
+@pytest.mark.asyncio
+async def test_workspace_script_escalate(tmp_path, monkeypatch, isolated_logs):
+    _make_workspace_script(
+        monkeypatch, tmp_path, "scripts/lockup.py",
+        "from boxbot_sdk.integration import escalate\n"
+        "escalate('garage stuck open')\n",
+    )
+    result = await run_mod.run_workspace_script("scripts/lockup.py")
+    assert result["status"] == "ok"
+    assert result["output"]["escalate"] == "garage stuck open"
+
+
+@pytest.mark.asyncio
+async def test_workspace_script_reads_inputs(tmp_path, monkeypatch, isolated_logs):
+    _make_workspace_script(
+        monkeypatch, tmp_path, "scripts/echo.py",
+        "from boxbot_sdk.integration import inputs, return_output\n"
+        "return_output({'echo': inputs().get('msg')})\n",
+    )
+    result = await run_mod.run_workspace_script(
+        "scripts/echo.py", {"msg": "hello"}
+    )
+    assert result["status"] == "ok"
+    assert result["output"] == {"echo": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_script_failure_reports_error(tmp_path, monkeypatch, isolated_logs):
+    _make_workspace_script(
+        monkeypatch, tmp_path, "scripts/bad.py",
+        "raise RuntimeError('lock jammed')\n",
+    )
+    result = await run_mod.run_workspace_script("scripts/bad.py")
+    assert result["status"] == "error"
+    assert "lock jammed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_script_logs_under_script_name(tmp_path, monkeypatch, isolated_logs):
+    _make_workspace_script(
+        monkeypatch, tmp_path, "scripts/lockup.py", "pass\n"
+    )
+    await run_mod.run_workspace_script("scripts/lockup.py")
+    runs = run_logs.list_runs("script:scripts/lockup.py")
+    assert len(runs) == 1
+    assert runs[0]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_workspace_script_bad_path_raises(tmp_path, monkeypatch, isolated_logs):
+    _make_workspace_script(monkeypatch, tmp_path, "scripts/real.py", "pass\n")
+    with pytest.raises(run_mod.IntegrationRunError, match="run_script"):
+        await run_mod.run_workspace_script("../escape.py")
+    with pytest.raises(run_mod.IntegrationRunError):
+        await run_mod.run_workspace_script("scripts/missing.py")
+
+
+def test_escalate_exported_at_sdk_root():
+    from boxbot.sdk import escalate, integration
+
+    assert escalate is integration.escalate

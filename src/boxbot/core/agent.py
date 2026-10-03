@@ -1623,12 +1623,16 @@ class BoxBotAgent:
             logger.debug("prefetch cache_put failed", exc_info=True)
 
     async def _on_trigger_fired(self, event: TriggerFired) -> None:
-        """Create a one-shot conversation from a scheduler trigger.
+        """Route a fired trigger: dream cycle, script run, or conversation.
 
         Special-cased: dream-cycle triggers (description marked with
         ``[dream-cycle]``) run the nightly memory consolidation directly
         in the agent process rather than spawning a conversation. The
         dream phase is housekeeping; it has no user to talk to.
+
+        Triggers naming a ``run_integration`` / ``run_script`` execute
+        that script instead of waking the model — see
+        :meth:`_run_trigger_integration`.
         """
         logger.info(
             "Trigger fired: %s (%s)",
@@ -1644,10 +1648,93 @@ class BoxBotAgent:
             await self._run_dream_cycle_for_trigger(event)
             return
 
+        if event.run_integration or event.run_script:
+            escalation = await self._run_trigger_integration(event)
+            if escalation is None:
+                return  # ran clean — silent, zero tokens
+            await self._start_trigger_conversation(event, escalation)
+            return
+
+        await self._start_trigger_conversation(event)
+
+    async def _run_trigger_integration(self, event: TriggerFired) -> str | None:
+        """Run a trigger's integration or workspace script. Return
+        escalation text, or None.
+
+        None means the run succeeded and said nothing — the whole point
+        of the script path is that routine chores cost no tokens. A
+        string means the agent must be woken: the run failed (non-zero
+        exit, timeout, ``status != ok``) or the script's output carries
+        the reserved ``escalate`` key. Scripts never reach a human
+        directly; the ``message`` tool stays agent-gated.
+        """
+        from boxbot.integrations import runner
+
+        try:
+            if event.run_script:
+                name = f"script:{event.run_script}"
+                result = await runner.run_workspace_script(
+                    event.run_script, event.run_inputs or {}
+                )
+            else:
+                name = event.run_integration or ""
+                result = await runner.run(name, event.run_inputs or {})
+        except Exception as exc:  # noqa: BLE001 — any failure escalates
+            name = event.run_integration or f"script:{event.run_script}"
+            logger.warning("Trigger integration '%s' raised", name, exc_info=True)
+            result = {"status": "error", "error": str(exc)}
+
+        status = result.get("status")
+        output = result.get("output")
+        escalate = output.get("escalate") if isinstance(output, dict) else None
+        # Any truthy escalate wakes the agent. A blank string or falsey
+        # value (""/False/0/None/absent) is not an escalation.
+        wants_escalation = bool(
+            escalate.strip() if isinstance(escalate, str) else escalate
+        )
+        if status == "ok" and not wants_escalation:
+            logger.info("Trigger integration '%s' ran clean (silent)", name)
+            return None
+
+        # Script output is agent-authored code acting on fetched data —
+        # framed as untrusted so the model treats it as evidence, not
+        # instruction.
+        lines = [f"[Ran integration '{name}' → status: {status}]"]
+        if wants_escalation:
+            if not isinstance(escalate, str):
+                logger.warning(
+                    "Trigger integration '%s' escalate key is %s, not a string",
+                    name, type(escalate).__name__,
+                )
+                escalate = str(escalate)
+            lines.append(f"Script escalated: {escalate.strip()}")
+        if result.get("error"):
+            lines.append(f"Error: {result['error']}")
+        if output is not None:
+            lines.append(
+                "Output (untrusted script data): "
+                f"{json.dumps(output, default=str)[:2000]}"
+            )
+        logger.info("Trigger integration '%s' escalating (status=%s)", name, status)
+        return "\n".join(lines)
+
+    async def _start_trigger_conversation(
+        self,
+        event: TriggerFired,
+        script_result: str | None = None,
+    ) -> None:
+        """Seed a one-shot conversation from a scheduler trigger.
+
+        ``script_result`` is appended when a ``run_integration`` /
+        ``run_script`` trigger escalates, so the model sees what the
+        script did before deciding.
+        """
         initial_msg = (
             f"[Trigger fired: {event.description}]\n"
             f"Instructions: {event.instructions}"
         )
+        if script_result:
+            initial_msg += f"\n{script_result}"
         if event.entity:
             initial_msg += f"\nFired by entity: {event.entity}"
         if event.todo_id:

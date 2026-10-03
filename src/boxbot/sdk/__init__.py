@@ -41,6 +41,7 @@ from . import (
     auth,
     camera,
     display,
+    integration,
     integrations,
     memory,
     packages,
@@ -50,6 +51,7 @@ from . import (
     tasks,
     workspace,
 )
+from .integration import escalate
 
 __all__ = [
     "ActionError",
@@ -57,6 +59,8 @@ __all__ = [
     "auth",
     "camera",
     "display",
+    "escalate",
+    "integration",
     "integrations",
     "memory",
     "packages",

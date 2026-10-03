@@ -443,7 +443,11 @@ async def _init_display_manager() -> Any:
     """Initialise and start the DisplayManager."""
     from boxbot.displays.manager import DisplayManager, set_display_manager
 
-    manager = DisplayManager()
+    cfg = get_config()
+    manager = DisplayManager(
+        width=cfg.display.width,
+        height=cfg.display.height,
+    )
     await manager.start()
     # Publish for sandbox action handlers (bb.photos.show_on_screen, …)
     # and the switch_display tool.
@@ -1053,20 +1057,28 @@ async def _async_main() -> None:
         # Start idle display rotation
         display_manager.start_rotation()
 
-        # Screen HAL — renders display frames to HDMI via pygame
-        try:
-            from boxbot.hardware.screen import Screen
+        # Screen HAL — backend selected by config. "pygame" blits frames to
+        # HDMI (default); "none" skips screen output entirely.
+        screen_backend = config.display.backend
+        if screen_backend == "none":
+            logger.info("Screen backend 'none' — no screen output")
+        else:
+            try:
+                from boxbot.hardware.screen import Screen
 
-            screen = Screen(
-                display_manager=display_manager,
-                brightness=config.display.brightness,
-            )
-            await screen.start()
-            hal_modules.get("system") and hal_modules["system"].register_module(screen)
-            subsystems["screen"] = screen
-            logger.info("Screen started")
-        except Exception:
-            logger.warning("Screen not available — display will not render to HDMI", exc_info=True)
+                screen = Screen(
+                    display_manager=display_manager,
+                    brightness=config.display.brightness,
+                )
+                await screen.start()
+                hal_modules.get("system") and hal_modules["system"].register_module(screen)
+                subsystems["screen"] = screen
+                logger.info("Screen started (backend=%s)", screen_backend)
+            except Exception:
+                logger.warning(
+                    "Screen not available (backend=%s) — display will not render",
+                    screen_backend, exc_info=True,
+                )
 
         # Perception pipeline — visual detection and re-identification
         perception = await _init_perception(hal_modules, config)

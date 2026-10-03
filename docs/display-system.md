@@ -63,10 +63,10 @@ pixel coordinates — containers handle all positioning.
 
 | Block | Parameters | Purpose |
 |-------|-----------|---------|
-| `row` | `gap`, `align`, `padding` | Horizontal flow — children side by side |
-| `column` / `stack` | `gap`, `align`, `padding` | Vertical flow — children stacked |
+| `row` | `gap`, `align`, `valign`, `padding` | Horizontal flow — children side by side |
+| `column` / `stack` | `gap`, `align`, `item_align`, `padding` | Vertical flow — children stacked |
 | `columns` | `ratios`, `gap`, `padding` | Multi-column layout with weight ratios |
-| `card` | `color`, `radius`, `padding` | Surface with background, rounded corners, shadow |
+| `card` | `color`, `radius`, `padding`, `align` | Surface with background, rounded corners, shadow |
 | `spacer` | `size` | Fixed or flexible space between elements |
 | `divider` | `color`, `thickness`, `orientation` | Separator line (horizontal or vertical) |
 | `repeat` | `source`, `max` | Iterate over data array, stamp template per item |
@@ -87,11 +87,25 @@ space minus gaps and padding. The agent never thinks in pixels.
 
 #### Alignment
 
-All containers support `align`:
-- `start` — pack children to the start (left for row, top for column)
+`align` packs children along the container's **main axis** (horizontal
+for `row`, vertical for `column`):
+- `start` — pack to the start (left for row, top for column)
 - `center` — center children
 - `end` — pack to end
-- `spread` — distribute evenly with space between
+- `spread` — distribute evenly with space between (`row` only)
+
+Cross-axis control:
+- `row.valign` — `center` (default) / `top` / `bottom`. Children sit on
+  a shared optical centerline by default.
+- `column.item_align` — `stretch` (default) / `start` / `center` /
+  `end`. Non-stretch shrinks each child to its natural width.
+
+Space distribution in a column:
+- A `spacer` with no `size` is a **flex spacer** — it absorbs leftover
+  height (and leftover width in a row). Use flex spacers to center a
+  hero or anchor a footer.
+- `grow: true` on any child makes it absorb leftover height itself —
+  the way to let a card's interior fill a stretched card.
 
 #### Padding
 

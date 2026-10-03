@@ -25,6 +25,12 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Bounds for numeric text sizes: below the smaller one nothing is
+# legible on a 7" display, above the larger one a single glyph is taller
+# than the screen.
+_MIN_FONT_PX = 8
+_MAX_FONT_PX = 240
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -52,9 +58,25 @@ class ThemeFonts:
     caption: FontStyle
     small: FontStyle
 
-    def get_style(self, name: str) -> FontStyle:
-        """Get a font style by name, falling back to body."""
-        return getattr(self, name, self.body)
+    def get_style(self, name: str | int) -> FontStyle:
+        """Get a font style by ramp name, or build one at a pixel size.
+
+        The ramp stops at ``title`` (42px), so a hero readout asks for a
+        number instead. Numeric styles are ``body`` resized: weight and
+        tracking carry over (tracking is em-relative, so it scales).
+        Out-of-range or unusable values degrade to a clamped size or
+        ``body`` — a bad size must never kill a render.
+        """
+        if isinstance(name, str):
+            return getattr(self, name, self.body)
+        if isinstance(name, bool) or not isinstance(name, (int, float)):
+            return self.body
+        size = max(_MIN_FONT_PX, min(int(name), _MAX_FONT_PX))
+        return FontStyle(
+            size=size,
+            weight=self.body.weight,
+            tracking=self.body.tracking,
+        )
 
 
 @dataclass(frozen=True)
@@ -195,7 +217,7 @@ _INTER_FONTS = ThemeFonts(
     subtitle=FontStyle(size=22, weight=500),
     body=FontStyle(size=18, weight=400),
     caption=FontStyle(size=15, weight=400),
-    small=FontStyle(size=13, weight=400),
+    small=FontStyle(size=13, weight=500, tracking=0.06),
 )
 
 _DEFAULT_SPACING = ThemeSpacing(xs=4, sm=8, md=16, lg=24, xl=32)

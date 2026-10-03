@@ -43,7 +43,10 @@ DEFAULT_HEIGHT = 600
 ICON_SIZES: dict[str, int] = {"sm": 16, "md": 24, "lg": 32, "xl": 48}
 
 # Clock size mapping (font sizes for the time display)
-CLOCK_SIZES: dict[str, int] = {"md": 36, "lg": 56, "xl": 80}
+CLOCK_SIZES: dict[str, int] = {"md": 40, "lg": 64, "xl": 112}
+
+# Letter tracking for clock numerals (em-relative, tight and modern)
+CLOCK_TRACKING = -0.03
 
 # Font weight to PIL weight name mapping
 WEIGHT_MAP: dict[int, str] = {
@@ -483,18 +486,79 @@ def _inner_rect(rect: Rect, padding: tuple[int, int, int, int]) -> Rect:
     )
 
 
-def _measure_text(text: str, font: ImageFont.FreeTypeFont) -> tuple[int, int]:
-    """Measure text dimensions using the font's bounding box.
+def _measure_text(
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    tracking_px: float = 0.0,
+) -> tuple[int, int]:
+    """Measure text dimensions for layout purposes.
+
+    Width is the ink width (plus accumulated tracking). Height is the
+    distance from the draw anchor (``draw.text`` anchors at the
+    ascender top) to the lowest ink pixel — NOT the tight bbox height.
+    Stacking layout with this height guarantees the next element
+    clears descenders; the old tight-bbox height caused overlapping
+    text (date drawn inside the clock's descender space).
 
     Args:
         text: The text string to measure.
         font: The PIL font to measure with.
+        tracking_px: Extra pixels inserted between characters.
 
     Returns:
         (width, height) tuple in pixels.
     """
     bbox = font.getbbox(text)
-    return (bbox[2] - bbox[0], bbox[3] - bbox[1])
+    w = bbox[2] - bbox[0]
+    if tracking_px and len(text) > 1:
+        w += int(tracking_px * (len(text) - 1))
+    return (w, bbox[3])
+
+
+def _line_height(font: ImageFont.FreeTypeFont) -> int:
+    """Full line height (ascent + descent) for multi-line layout."""
+    try:
+        ascent, descent = font.getmetrics()
+        return ascent + descent
+    except AttributeError:  # PIL default bitmap font
+        return _measure_text("Ag", font)[1] + 2
+
+
+def _tracking_px(font_style, size: int) -> float:
+    """Convert a FontStyle's em-relative tracking to pixels."""
+    tracking = getattr(font_style, "tracking", 0.0) or 0.0
+    return tracking * size
+
+
+def _draw_text(
+    ctx: RenderContext,
+    xy: tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: tuple[int, int, int],
+    tracking_px: float = 0.0,
+) -> None:
+    """Draw text with optional letter tracking.
+
+    PIL has no native letter-spacing; when tracking is non-zero each
+    character is drawn individually with an adjusted advance.
+    """
+    if not tracking_px:
+        ctx.draw.text(xy, text, fill=fill, font=font)
+        return
+    x, y = xy
+    for ch in text:
+        ctx.draw.text((x, y), ch, fill=fill, font=font)
+        x += ctx.draw.textlength(ch, font=font) + tracking_px
+
+
+def _blend(
+    a: tuple[int, int, int],
+    b: tuple[int, int, int],
+    t: float,
+) -> tuple[int, int, int]:
+    """Linear blend between two RGB colors (t=0 → a, t=1 → b)."""
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
 def _wrap_text(
@@ -589,10 +653,20 @@ def _render_row(ctx: RenderContext, block: Block, rect: Rect) -> None:
     inner = _inner_rect(rect, padding)
     gap = block.params.get("gap", 0)
     align = block.params.get("align", "start")
+    valign = block.params.get("valign", "center")
 
     children = block.children
     if not children:
         return
+
+    def _child_rect(x: int, w: int, child: Block) -> Rect:
+        """Cross-axis placement: center/end children on the row's height."""
+        if valign in ("top", "start"):
+            return Rect(x, inner.y, w, inner.h)
+        ch = min(inner.h, _estimate_block_height(ctx, child, w))
+        if valign in ("bottom", "end"):
+            return Rect(x, inner.y + inner.h - ch, w, ch)
+        return Rect(x, inner.y + max(0, (inner.h - ch)) // 2, w, ch)
 
     # Count non-spacer children for width calculation
     non_spacer = [c for c in children if c.block_type != "spacer"]
@@ -621,8 +695,7 @@ def _render_row(ctx: RenderContext, block: Block, rect: Rect) -> None:
                 size = child.params.get("size")
                 x += size if size else 0
                 continue
-            child_rect = Rect(x, inner.y, child_width, inner.h)
-            _render_block(ctx, child, child_rect)
+            _render_block(ctx, child, _child_rect(x, child_width, child))
             x += child_width + spread_gap
     else:
         # start / center / end: pack children at their natural widths. Flex
@@ -653,7 +726,7 @@ def _render_row(ctx: RenderContext, block: Block, rect: Rect) -> None:
                     x += flex_space
                 continue
             cw = next(nw_iter)
-            _render_block(ctx, child, Rect(x, inner.y, cw, inner.h))
+            _render_block(ctx, child, _child_rect(x, cw, child))
             x += cw + gap
 
 
@@ -669,8 +742,9 @@ def _render_column(ctx: RenderContext, block: Block, rect: Rect) -> None:
     inner = _inner_rect(rect, padding)
     gap = block.params.get("gap", 0)
     item_align = block.params.get("item_align", "stretch")
+    align = block.params.get("align", "start")
 
-    _render_children_vertical(ctx, block.children, inner, gap, item_align)
+    _render_children_vertical(ctx, block.children, inner, gap, item_align, align)
 
 
 def _render_children_vertical(
@@ -679,6 +753,7 @@ def _render_children_vertical(
     rect: Rect,
     gap: int,
     item_align: str = "stretch",
+    align: str = "start",
 ) -> None:
     """Render a list of children in vertical flow with gap spacing.
 
@@ -691,15 +766,65 @@ def _render_children_vertical(
             ``stretch`` gives every child the full container width
             (historical behavior). ``start``/``center``/``end`` shrink
             each child to its natural width and pin left/center/right.
+        align: Main-axis (vertical) packing: ``start``/``center``/``end``.
+            Flex spacers (``spacer`` with no size) absorb leftover height,
+            so footers can be anchored and heroes centered without
+            hardcoded pixel offsets.
     """
-    y = rect.y
-    for child in children:
+    if not children:
+        return
+
+    # Measure pass: content height, fixed spacers, flex spacer count.
+    heights: list[int | None] = []  # None marks a flex spacer
+    content_h = 0
+    flex_count = 0
+    grow_indices: list[int] = []
+    prev_real = False
+    for i, child in enumerate(children):
         if child.block_type == "spacer":
             size = child.params.get("size")
-            y += size if size else gap
+            if size:
+                heights.append(size)
+                content_h += size
+            else:
+                heights.append(None)
+                flex_count += 1
             continue
+        if prev_real:
+            content_h += gap
+        h = _estimate_block_height(ctx, child, rect.w)
+        heights.append(h)
+        content_h += h
+        if child.params.get("grow"):
+            grow_indices.append(i)
+        prev_real = True
 
-        child_h = _estimate_block_height(ctx, child, rect.w)
+    leftover = max(0, rect.h - content_h)
+
+    # grow: true children absorb leftover height before flex spacers,
+    # letting a container fill a stretched parent (e.g. card interior).
+    if leftover and grow_indices:
+        share = leftover // len(grow_indices)
+        for i in grow_indices:
+            heights[i] += share  # type: ignore[operator]
+        leftover -= share * len(grow_indices)
+
+    flex_each = leftover // flex_count if flex_count else 0
+
+    y = rect.y
+    if not flex_count:
+        if align == "center":
+            y += leftover // 2
+        elif align == "end":
+            y += leftover
+
+    prev_real = False
+    for child, child_h in zip(children, heights):
+        if child.block_type == "spacer":
+            y += child_h if child_h is not None else flex_each
+            continue
+        if prev_real:
+            y += gap
         if item_align == "stretch":
             child_rect = Rect(rect.x, y, rect.w, child_h)
         else:
@@ -712,7 +837,8 @@ def _render_children_vertical(
                 cx = rect.x
             child_rect = Rect(cx, y, cw, child_h)
         _render_block(ctx, child, child_rect)
-        y += child_h + gap
+        y += child_h
+        prev_real = True
 
 
 def _render_columns(ctx: RenderContext, block: Block, rect: Rect) -> None:
@@ -759,27 +885,39 @@ def _render_card(ctx: RenderContext, block: Block, rect: Rect) -> None:
     radius = block.params.get("radius", ctx.theme.radius)
     padding = _parse_padding(block.params.get("padding", 16))
 
-    # Draw shadow if theme supports it
+    # Soft drop shadow: blurred low-alpha shape composited under the
+    # card. (The old implementation drew a hard-edged solid black
+    # offset rectangle — visible as a dark rim on every card.)
     if ctx.theme.shadow:
-        shadow_offset = 2
-        shadow_color = (0, 0, 0, 40)
-        # Draw shadow as a slightly offset darker rectangle
-        ctx.draw.rounded_rectangle(
-            [rect.x + shadow_offset, rect.y + shadow_offset,
-             rect.x + rect.w + shadow_offset, rect.y + rect.h + shadow_offset],
-            radius=radius,
-            fill=(0, 0, 0),
-        )
+        from PIL import ImageFilter
 
-    # Draw card background
+        blur = 10
+        offset_y = 5
+        shadow_layer = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+        sdraw = ImageDraw.Draw(shadow_layer)
+        sdraw.rounded_rectangle(
+            [rect.x, rect.y + offset_y,
+             rect.x + rect.w, rect.y + rect.h + offset_y],
+            radius=radius,
+            fill=(0, 0, 0, 70),
+        )
+        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(blur))
+        ctx.image.alpha_composite(shadow_layer)
+
+    # Card background with a hairline edge one step lighter than the
+    # surface — defines the card without a heavy border.
+    edge = _blend(bg, ctx.theme.color_rgb("text"), 0.07)
     ctx.draw.rounded_rectangle(
         [rect.x, rect.y, rect.x + rect.w, rect.y + rect.h],
         radius=radius,
         fill=bg,
+        outline=edge,
+        width=1,
     )
 
     inner = _inner_rect(rect, padding)
-    _render_children_vertical(ctx, block.children, inner, gap=8)
+    align = block.params.get("align", "start")
+    _render_children_vertical(ctx, block.children, inner, gap=8, align=align)
 
 
 def _render_spacer(ctx: RenderContext, block: Block, rect: Rect) -> None:
@@ -844,12 +982,14 @@ def _render_text(ctx: RenderContext, block: Block, rect: Rect) -> None:
     weight = _resolve_weight(weight_override, font_style.weight)
     font = _get_font(ctx.theme.fonts.family, font_style.size, weight)
     color = _resolve_block_color(color_token, ctx)
+    tracking = _tracking_px(font_style, font_style.size)
 
     lines = _wrap_text(content, font, rect.w, max_lines)
+    advance = _line_height(font) + 2
 
     y = rect.y
     for line in lines:
-        lw, lh = _measure_text(line, font)
+        lw, _ = _measure_text(line, font, tracking)
 
         if text_align == "center":
             x = rect.x + (rect.w - lw) // 2
@@ -858,8 +998,8 @@ def _render_text(ctx: RenderContext, block: Block, rect: Rect) -> None:
         else:
             x = rect.x
 
-        ctx.draw.text((x, y), line, fill=color, font=font)
-        y += lh + 4  # Line spacing
+        _draw_text(ctx, (x, y), line, font, color, tracking)
+        y += advance
 
 
 def _render_metric(ctx: RenderContext, block: Block, rect: Rect) -> None:
@@ -875,13 +1015,13 @@ def _render_metric(ctx: RenderContext, block: Block, rect: Rect) -> None:
 
     # Value (large heading font)
     font_style = ctx.theme.font_style("heading")
-    font = _get_font(ctx.theme.fonts.family, font_style.size, font_style.weight)
+    font = _get_font(ctx.theme.fonts.family, font_style.size, 700)
     color = ctx.theme.color_rgb("text")
 
     y = rect.y
     ctx.draw.text((rect.x, y), value, fill=color, font=font)
     _, vh = _measure_text(value, font)
-    y += vh + 4
+    y += vh + 6
 
     # Change indicator (auto-colored: green for positive, red for negative)
     if change:
@@ -920,25 +1060,31 @@ def _render_badge(ctx: RenderContext, block: Block, rect: Rect) -> None:
     text = str(block.params.get("text", ""))
     color_token = block.params.get("color", "accent")
 
-    font = _get_font(ctx.theme.fonts.family, ctx.theme.fonts.small.size)
-    tw, th = _measure_text(text, font)
+    font = _get_font(ctx.theme.fonts.family, ctx.theme.fonts.small.size, 600)
+    bbox = font.getbbox(text)
+    tw = bbox[2] - bbox[0]
+    ink_h = bbox[3] - bbox[1]
 
-    pad = 8
-    badge_w = tw + pad * 2
-    badge_h = th + pad
+    pad_x = 10
+    badge_h = ink_h + 12
+    badge_w = tw + pad_x * 2
 
-    bg_color = _resolve_block_color(color_token, ctx, default="accent")
-    # Create a tinted background (dimmed version of the badge color)
-    bg_tint = tuple(max(0, c // 3) for c in bg_color)
+    color = _resolve_block_color(color_token, ctx, default="accent")
+    # Tinted pill: badge color washed toward the surface, text in the
+    # full color on top. (The old c//3 tint went muddy on dark themes.)
+    surface = ctx.theme.color_rgb("surface")
+    pill = _blend(surface, color, 0.18)
 
+    # Center the pill vertically within the given rect.
+    py = rect.y + max(0, (rect.h - badge_h) // 2)
     ctx.draw.rounded_rectangle(
-        [rect.x, rect.y, rect.x + badge_w, rect.y + badge_h],
+        [rect.x, py, rect.x + badge_w, py + badge_h],
         radius=badge_h // 2,
-        fill=bg_tint,
+        fill=pill,
     )
     ctx.draw.text(
-        (rect.x + pad, rect.y + pad // 2),
-        text, fill=bg_color, font=font,
+        (rect.x + pad_x - bbox[0], py + (badge_h - ink_h) // 2 - bbox[1]),
+        text, fill=color, font=font,
     )
 
 
@@ -1088,6 +1234,7 @@ def _render_key_value(ctx: RenderContext, block: Block, rect: Rect) -> None:
 
 
 _icon_cache: dict[tuple[str, int, tuple[int, int, int]], Image.Image | None] = {}
+_warned_no_cairosvg = False
 
 
 def _load_lucide_icon(name: str, px: int, color: tuple[int, int, int]) -> Image.Image | None:
@@ -1108,6 +1255,14 @@ def _load_lucide_icon(name: str, px: int, color: tuple[int, int, int]) -> Image.
     try:
         import cairosvg
     except ImportError:
+        global _warned_no_cairosvg
+        if not _warned_no_cairosvg:
+            _warned_no_cairosvg = True
+            logger.warning(
+                "cairosvg is not installed — every Lucide icon will render "
+                "as a circled-letter placeholder. Install the display "
+                "dependencies to get real icons.",
+            )
         _icon_cache[key] = None
         return None
 
@@ -1323,8 +1478,18 @@ def _render_chart(ctx: RenderContext, block: Block, rect: Rect) -> None:
     fill_opacity = block.params.get("fill_opacity", 0.15)
     show_dots = block.params.get("show_dots", False)
     show_legend = block.params.get("show_legend", False)
+    x_labels = block.params.get("x_labels")
 
     chart_rect = Rect(rect.x, rect.y, rect.w, min(height, rect.h))
+
+    # Reserve a strip at the bottom for x-axis labels.
+    labels_h = 0
+    if isinstance(x_labels, list) and x_labels:
+        labels_h = ctx.theme.fonts.caption.size + 10
+        chart_rect = Rect(
+            chart_rect.x, chart_rect.y,
+            chart_rect.w, max(20, chart_rect.h - labels_h),
+        )
 
     # Collect all data series as (values, color) tuples
     all_series: list[tuple[list[float], tuple[int, int, int], str | None]] = []
@@ -1357,10 +1522,11 @@ def _render_chart(ctx: RenderContext, block: Block, rect: Rect) -> None:
             chart_rect.w, max(20, chart_rect.h - legend_h),
         )
 
-    # Grid lines
+    # Grid: three hairlines in the nested-surface tone — quiet
+    # reference lines, not a cage.
     if show_grid:
-        grid_color = ctx.theme.color_rgb("dim")
-        for i in range(5):
+        grid_color = ctx.theme.color_rgb("surface_alt")
+        for i in range(1, 4):
             gy = chart_rect.y + int(chart_rect.h * i / 4)
             ctx.draw.line(
                 [(chart_rect.x, gy), (chart_rect.x + chart_rect.w, gy)],
@@ -1423,16 +1589,38 @@ def _render_chart(ctx: RenderContext, block: Block, rect: Rect) -> None:
                     ctx.draw.polygon(fill_points, fill=muted_fill)
 
                 # Draw the line
-                ctx.draw.line(points, fill=color, width=2)
+                ctx.draw.line(points, fill=color, width=3, joint="curve")
 
-                # Draw data point dots if enabled
+                # Data point dots: color dot with a background-toned ring
+                # so points read cleanly over the line and fill.
                 if show_dots:
+                    ring = ctx.theme.color_rgb("surface")
                     for px, py in points:
-                        dot_r = 3
                         ctx.draw.ellipse(
-                            [px - dot_r, py - dot_r, px + dot_r, py + dot_r],
-                            fill=color,
+                            [px - 6, py - 6, px + 6, py + 6], fill=ring,
                         )
+                        ctx.draw.ellipse(
+                            [px - 4, py - 4, px + 4, py + 4], fill=color,
+                        )
+
+    # X-axis labels: first label left-aligned, last right-aligned,
+    # the rest centered on their data point.
+    if labels_h:
+        lfont = _get_font(ctx.theme.fonts.family, ctx.theme.fonts.caption.size)
+        lcolor = ctx.theme.color_rgb("dim")
+        ly = chart_rect.y + chart_rect.h + 8
+        n_labels = len(x_labels)
+        for i, label in enumerate(x_labels):
+            label = str(label)
+            lx = chart_rect.x + int(chart_rect.w * i / max(n_labels - 1, 1))
+            lw, _ = _measure_text(label, lfont)
+            if i == 0:
+                tx = lx
+            elif i == n_labels - 1:
+                tx = lx - lw
+            else:
+                tx = lx - lw // 2
+            ctx.draw.text((tx, ly), label, fill=lcolor, font=lfont)
 
     # Legend
     if show_legend and legend_h > 0:
@@ -1550,24 +1738,42 @@ def _render_clock(ctx: RenderContext, block: Block, rect: Rect) -> None:
         time_str += f":{now.second:02d}"
     time_str += ampm
 
-    font_size = CLOCK_SIZES.get(size_name, 56)
-    font = _get_font(ctx.theme.fonts.family, font_size, 700)
+    font_size = CLOCK_SIZES.get(size_name, CLOCK_SIZES["lg"])
+    font = _get_font(ctx.theme.fonts.family, font_size, 600)
     color = ctx.theme.color_rgb("text")
+    tracking = CLOCK_TRACKING * font_size
 
-    tw, th = _measure_text(time_str, font)
-    # Center horizontally, slightly above vertical center
-    x = rect.x + (rect.w - tw) // 2
-    y = rect.y + (rect.h - th) // 3
+    # Exact ink geometry so the time/date group centers as a unit and
+    # the date can never collide with the time's descender space.
+    t_bbox = font.getbbox(time_str)
+    time_ink_h = t_bbox[3] - t_bbox[1]
+    tw, _ = _measure_text(time_str, font, tracking)
 
-    ctx.draw.text((x, y), time_str, fill=color, font=font)
-
+    date_gap = 26 if size_name == "xl" else 12
+    date_ink_h = 0
+    dfont = None
+    d_bbox = (0, 0, 0, 0)
+    date_str = ""
     if show_date:
-        date_str = now.strftime("%A, %B %d")
-        dfont = _get_font(ctx.theme.fonts.family, ctx.theme.fonts.subtitle.size)
+        date_str = f"{now:%A}, {now:%B} {now.day}"
+        dfont = _get_font(
+            ctx.theme.fonts.family, ctx.theme.fonts.subtitle.size, 500,
+        )
+        d_bbox = dfont.getbbox(date_str)
+        date_ink_h = d_bbox[3] - d_bbox[1]
+
+    group_h = time_ink_h + (date_gap + date_ink_h if show_date else 0)
+    ink_top = rect.y + max(0, (rect.h - group_h) // 2)
+
+    x = rect.x + (rect.w - tw) // 2
+    _draw_text(ctx, (x, ink_top - t_bbox[1]), time_str, font, color, tracking)
+
+    if show_date and dfont is not None:
         dcolor = ctx.theme.color_rgb("muted")
-        dw, dh = _measure_text(date_str, dfont)
+        dw, _ = _measure_text(date_str, dfont)
+        date_ink_top = ink_top + time_ink_h + date_gap
         ctx.draw.text(
-            (rect.x + (rect.w - dw) // 2, y + th + 12),
+            (rect.x + (rect.w - dw) // 2, date_ink_top - d_bbox[1]),
             date_str, fill=dcolor, font=dfont,
         )
 
@@ -1821,10 +2027,11 @@ def _estimate_block_height(
         content_raw = block.params.get("content", "")
         content = "" if content_raw is None else str(content_raw)
         font_style = ctx.theme.font_style(size_name)
-        font = _get_font(ctx.theme.fonts.family, font_style.size)
+        weight = _resolve_weight(block.params.get("weight"), font_style.weight)
+        font = _get_font(ctx.theme.fonts.family, font_style.size, weight)
         max_lines = block.params.get("max_lines")
         lines = _wrap_text(content, font, available_width, max_lines)
-        return len(lines) * (font_style.size + 4) + 4
+        return len(lines) * (_line_height(font) + 2)
 
     if bt == "metric":
         h = ctx.theme.fonts.heading.size + 8
@@ -1873,10 +2080,17 @@ def _estimate_block_height(
 
     if bt == "clock":
         size_name = block.params.get("size", "lg")
-        base = CLOCK_SIZES.get(size_name, 56)
+        fs = CLOCK_SIZES.get(size_name, CLOCK_SIZES["lg"])
+        font = _get_font(ctx.theme.fonts.family, fs, 600)
+        bbox = font.getbbox("12:34 PM")
+        h = bbox[3] - bbox[1]
         if block.params.get("show_date", True):
-            base += ctx.theme.fonts.subtitle.size + 16
-        return base + 20
+            dfont = _get_font(
+                ctx.theme.fonts.family, ctx.theme.fonts.subtitle.size, 500,
+            )
+            dbox = dfont.getbbox("Wednesday, September 30")
+            h += (26 if size_name == "xl" else 12) + (dbox[3] - dbox[1])
+        return h + 8
 
     if bt == "countdown":
         h = ctx.theme.fonts.title.size + 8
@@ -1901,14 +2115,19 @@ def _estimate_block_height(
         # Estimate from children plus padding
         padding = _parse_padding(block.params.get("padding", 16))
         inner_w = available_width - padding[1] - padding[3]
-        children_h = sum(
-            _estimate_block_height(ctx, c, inner_w) + 8
-            for c in block.children
-        )
+        children_h = 0
+        real_count = 0
+        for c in block.children:
+            if c.block_type == "spacer":
+                children_h += c.params.get("size") or 0
+                continue
+            children_h += _estimate_block_height(ctx, c, inner_w)
+            real_count += 1
+        children_h += 8 * max(0, real_count - 1)
         # For weather/calendar widgets without children, provide a minimum
         if not block.children and bt in ("weather_widget", "calendar_widget"):
             children_h = 120
-        return children_h + padding[0] + padding[2] + 16
+        return children_h + padding[0] + padding[2]
 
     if bt in ("row", "columns"):
         # Height is the max of children heights
@@ -1997,9 +2216,19 @@ def _estimate_block_width(
 
     if bt == "clock":
         size_name = block.params.get("size", "lg")
-        base = CLOCK_SIZES.get(size_name, 56)
-        # Approximate width of "12:34 PM" at that size
-        return int(base * 4.2)
+        fs = CLOCK_SIZES.get(size_name, CLOCK_SIZES["lg"])
+        font = _get_font(ctx.theme.fonts.family, fs, 600)
+        w, _ = _measure_text("12:34 PM", font, CLOCK_TRACKING * fs)
+        if block.params.get("show_date", True):
+            # The date line is usually the wider of the two; ignoring it
+            # let the date spill past the container and get clipped.
+            dfont = _get_font(
+                ctx.theme.fonts.family, ctx.theme.fonts.subtitle.size, 500,
+            )
+            now = datetime.now()
+            dw, _ = _measure_text(f"{now:%A}, {now:%B} {now.day}", dfont)
+            w = max(w, dw)
+        return w + 4
 
     if bt == "metric":
         value = str(block.params.get("value", ""))
@@ -2020,6 +2249,40 @@ def _estimate_block_width(
     if bt == "divider":
         # Mostly used horizontally — tiny when inline
         return block.params.get("thickness", 1) + 8
+
+    if bt == "card":
+        padding = _parse_padding(block.params.get("padding", 16))
+        inner_w = max(0, available_width - padding[1] - padding[3])
+        if not block.children:
+            return min(available_width, 200)
+        cw = max(
+            _estimate_block_width(ctx, c, inner_w) for c in block.children
+        )
+        return min(available_width, cw + padding[1] + padding[3])
+
+    if bt in ("column", "stack"):
+        padding = _parse_padding(block.params.get("padding"))
+        inner_w = max(0, available_width - padding[1] - padding[3])
+        real = [c for c in block.children if c.block_type != "spacer"]
+        if not real:
+            return padding[1] + padding[3]
+        cw = max(_estimate_block_width(ctx, c, inner_w) for c in real)
+        return min(available_width, cw + padding[1] + padding[3])
+
+    if bt == "row":
+        padding = _parse_padding(block.params.get("padding"))
+        inner_w = max(0, available_width - padding[1] - padding[3])
+        gap = block.params.get("gap", 0)
+        total = padding[1] + padding[3]
+        real_count = 0
+        for c in block.children:
+            if c.block_type == "spacer":
+                total += c.params.get("size") or 0
+                continue
+            total += _estimate_block_width(ctx, c, inner_w)
+            real_count += 1
+        total += gap * max(0, real_count - 1)
+        return min(available_width, total)
 
     # Complex blocks: give them a sensible share of available width
     return min(available_width, max(80, available_width // 3))

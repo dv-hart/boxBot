@@ -197,6 +197,189 @@ class TestSetRotationPersists:
         assert _load_rotation_state() is None
 
 
+class TestRotationChurn:
+    """Re-switching to the display already on screen must do nothing.
+
+    The rotation loop fired every interval regardless of the list
+    length, so a one-entry list (``['clock']``) tore down and rebuilt
+    every data source and pushed a fresh frame every 30s — 1,850
+    redundant switches in one device log.
+    """
+
+    @staticmethod
+    def _spec(name: str):
+        from boxbot.displays.blocks import TextBlock
+        from boxbot.displays.spec import DataSourceSpec, DisplaySpec
+
+        return DisplaySpec(
+            name=name,
+            theme="boxbot",
+            data_sources=[
+                DataSourceSpec(name="climate", source_type="static",
+                               value={"temp": 71}),
+            ],
+            root_block=TextBlock(content="{climate.temp}"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_display_switch_keeps_sources(self, isolated_data_dir):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._spec("weather"))
+        await mgr.switch("weather", pin=False)
+        try:
+            source = mgr._data_manager.get_source("climate")
+            with patch.object(
+                mgr._data_manager, "stop_all", side_effect=AssertionError,
+            ):
+                assert await mgr.switch("weather", pin=False) is True
+            assert mgr._data_manager.get_source("climate") is source
+        finally:
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_no_op_switch_still_pins(self, isolated_data_dir):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._spec("weather"))
+        await mgr.switch("weather", pin=False)
+        try:
+            assert mgr.is_pinned() is False
+            with patch.object(
+                mgr._data_manager, "stop_all", side_effect=AssertionError,
+            ):
+                await mgr.switch("weather", pin=True)
+            assert mgr.is_pinned() is True
+        finally:
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_new_args_still_rebuild(self, isolated_data_dir):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._spec("weather"))
+        await mgr.switch("weather", args={"unit": "F"})
+        try:
+            source = mgr._data_manager.get_source("climate")
+            await mgr.switch("weather", args={"unit": "C"})
+            assert mgr._data_manager.get_source("climate") is not source
+            assert mgr.get_active_args() == {"unit": "C"}
+        finally:
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_resaved_spec_rebuilds(self, isolated_data_dir):
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._spec("weather"))
+        await mgr.switch("weather")
+        try:
+            source = mgr._data_manager.get_source("climate")
+            mgr.register_spec(self._spec("weather"))  # agent re-saved it
+            await mgr.switch("weather")
+            assert mgr._data_manager.get_source("climate") is not source
+        finally:
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_single_entry_rotation_stops_after_one_switch(
+        self, isolated_data_dir,
+    ):
+        import asyncio
+
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._spec("clock"))
+        mgr._running = True
+        mgr._rotation_active = True
+        mgr._rotation_displays = ["clock"]
+        mgr._rotation_interval = 30
+
+        switches = []
+
+        async def fake_switch(name, args=None, pin=True):
+            switches.append(name)
+            return True
+
+        with patch.object(mgr, "switch", side_effect=fake_switch):
+            # Returns immediately: a sleeping loop would blow the timeout.
+            await asyncio.wait_for(mgr._rotation_loop(), timeout=1.0)
+
+        assert switches == ["clock"]
+        assert mgr.is_rotating() is False
+
+    @pytest.mark.asyncio
+    async def test_source_change_repaints_the_active_display(
+        self, isolated_data_dir,
+    ):
+        """With no re-switch timer, fresh data is the only thing that can
+        repaint a data-bound display. The tick pump does the painting."""
+        import asyncio
+
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._spec("weather"))
+        await mgr.switch("weather", pin=False)
+        mgr._running = True
+        tick = asyncio.create_task(mgr._live_tick_loop())
+        try:
+            source = mgr._data_manager.get_source("climate")
+            generation = mgr._frame_generation
+
+            source.update({"temp": 68})
+            mgr._data_manager._notify("climate")  # what a changed fetch does
+            await asyncio.sleep(1.4)
+
+            assert mgr._frame_generation == generation + 1  # exactly once
+            assert mgr._source_dirty is False
+            assert mgr._data_manager.get_source("climate") is source
+
+            # Nothing else asked for a repaint, so nothing else happens.
+            await asyncio.sleep(1.2)
+            assert mgr._frame_generation == generation + 1
+        finally:
+            mgr._running = False
+            tick.cancel()
+            await mgr._data_manager.stop_all()
+
+    @pytest.mark.asyncio
+    async def test_a_one_hz_source_cannot_drive_a_one_hz_render(
+        self, isolated_data_dir,
+    ):
+        """morning_brief declares the 1 Hz ClockSource, whose payload
+        changes every tick. Repainting per changed fetch would mean a full
+        render and a ~3 MB frame push every second."""
+        import asyncio
+
+        from boxbot.displays.manager import DisplayManager
+
+        mgr = DisplayManager()
+        mgr.register_spec(self._spec("brief"))
+        await mgr.switch("brief", pin=False)
+        mgr._running = True
+        tick = asyncio.create_task(mgr._live_tick_loop())
+        try:
+            generation = mgr._frame_generation
+            # 20 changed fetches inside one tick, as a 1 Hz source in a
+            # busy loop would look.
+            for _ in range(20):
+                mgr._data_manager._notify("climate")
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(1.1)
+            renders = mgr._frame_generation - generation
+        finally:
+            mgr._running = False
+            tick.cancel()
+            await mgr._data_manager.stop_all()
+        assert 1 <= renders <= 3, renders
+
+
 class TestUnpinPreservesRotation:
     """``unpin`` must restart rotation from the *current* in-memory
     list, not re-read config defaults. Otherwise it silently undoes

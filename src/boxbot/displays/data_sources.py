@@ -32,12 +32,31 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+# Ceiling for the failing-source backoff, so a flaky source still
+# retries a few times an hour without spinning at its refresh interval.
+_MAX_BACKOFF_SECONDS = 300
+
+
+def _is_permanent_failure(exc: Exception) -> bool:
+    """True when retrying cannot help until the process restarts.
+
+    A missing Python module (perception's cv2 on a host with no camera)
+    or a caller-correctable integration error (unknown integration, bad
+    inputs) fails identically every time.
+    """
+    if isinstance(exc, ImportError):
+        return True
+    from boxbot.integrations.runner import IntegrationRunError
+
+    return isinstance(exc, IntegrationRunError)
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +73,9 @@ class DataSource(ABC):
         self._cached_data: dict[str, Any] = {}
         self._last_fetch: float = 0.0
         self._fetch_error: str | None = None
+        self._consecutive_failures: int = 0
+        self._last_error_signature: str | None = None
+        self.unavailable_reason: str | None = None
 
     @abstractmethod
     async def fetch(self) -> dict[str, Any]:
@@ -83,20 +105,65 @@ class DataSource(ABC):
             return True
         return (time.monotonic() - self._last_fetch) > (self.refresh_interval * 2)
 
+    @property
+    def next_fetch_delay(self) -> float:
+        """Seconds until the next fetch — exponential backoff while failing."""
+        if not self._consecutive_failures:
+            return self.refresh_interval
+        return min(
+            self.refresh_interval * 2 ** self._consecutive_failures,
+            _MAX_BACKOFF_SECONDS,
+        )
+
     async def do_fetch(self) -> dict[str, Any]:
         """Fetch data, apply field transforms, and cache the result."""
         try:
             raw = await self.fetch()
             transformed = _apply_field_transforms(raw, self.config.get("fields", {}))
+            if self._consecutive_failures:
+                logger.warning(
+                    "Source '%s' recovered after %d failures",
+                    self.name, self._consecutive_failures,
+                )
             self._cached_data = transformed
             self._last_fetch = time.monotonic()
             self._fetch_error = None
+            self._consecutive_failures = 0
+            self._last_error_signature = None
             return transformed
         except Exception as e:
-            self._fetch_error = str(e)
-            logger.warning("Fetch failed for source '%s': %s", self.name, e)
+            self._record_failure(e)
             # Return stale data rather than empty
             return self._cached_data
+
+    def _record_failure(self, exc: Exception) -> None:
+        """Record a failed fetch, logging at most once per distinct error.
+
+        A source that cannot succeed until the process restarts (missing
+        Python module, unregistered integration) is marked unavailable so
+        the fetch loop stops instead of re-reporting forever: one boxbot
+        log held 15,747 copies of a single "No module named 'cv2'".
+        """
+        signature = f"{type(exc).__name__}: {exc}"
+        is_new = signature != self._last_error_signature
+        self._fetch_error = str(exc)
+        self._last_error_signature = signature
+        self._consecutive_failures += 1
+
+        if _is_permanent_failure(exc):
+            if self.unavailable_reason is None:
+                self.unavailable_reason = signature
+                logger.warning(
+                    "Source '%s' unavailable (%s) — disabled until restart",
+                    self.name, signature,
+                )
+        elif is_new:
+            logger.warning("Fetch failed for source '%s': %s", self.name, exc)
+        else:
+            logger.debug(
+                "Fetch failed for source '%s' (%d consecutive): %s",
+                self.name, self._consecutive_failures, exc,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +191,7 @@ class ClockSource(DataSource):
             "second": now.second,
             "display": f"{hour_12}:{now.minute:02d}",
             "date": now.strftime("%B %d, %Y"),
+            "date_short": f"{now:%B} {now.day}",
             "day_of_week": now.strftime("%A"),
         }
 
@@ -249,8 +317,9 @@ class PeopleSource(DataSource):
             pipeline = get_pipeline()
             present = pipeline.get_present_people()
             return {"present": present, "count": len(present)}
-        except RuntimeError:
-            # Pipeline not running
+        except (RuntimeError, ImportError):
+            # Pipeline not running, or perception's native deps (cv2)
+            # aren't installed on this device at all.
             return {"present": [], "count": 0}
 
 
@@ -420,10 +489,7 @@ class MemoryQuerySource(DataSource):
 
     @property
     def refresh_interval(self) -> int:
-        # The manager passes refresh=None when the spec omits it, so a
-        # plain .get("refresh", 300) would leak None into the fetch loop.
-        refresh = self.config.get("refresh")
-        return 300 if refresh is None else refresh
+        return _refresh_seconds(self.config.get("refresh"), 300)
 
     async def fetch(self) -> dict[str, Any]:
         query = (self.config.get("query") or "").strip()
@@ -508,6 +574,15 @@ def _format_age(timestamp: str | None) -> str:
     return f"{days // 365}y"
 
 
+def _refresh_seconds(refresh: Any, default: int) -> int:
+    """Refresh interval, with the manager's ``refresh=None`` guarded to default.
+
+    The display manager passes ``refresh=None`` when a spec omits it, so a bare
+    ``.get("refresh", default)`` would leak None into the fetch loop.
+    """
+    return default if refresh is None else refresh
+
+
 # ---------------------------------------------------------------------------
 # Source registry and factory
 # ---------------------------------------------------------------------------
@@ -526,6 +601,21 @@ _CUSTOM_SOURCE_TYPES: dict[str, type[DataSource]] = {
     "static": StaticSource,
     "memory_query": MemoryQuerySource,
 }
+
+
+def integration_for_source(name: str, source_type: str = "builtin",
+                           integration: str | None = None) -> str | None:
+    """Which integration :func:`create_source` would call, if any.
+
+    Mirrors the routing below (including the builtin→integration
+    promotion) so callers can check a declared source against the
+    integration registry without instantiating it.
+    """
+    if source_type == "integration":
+        return integration or name
+    if source_type in ("builtin", "") and name not in _BUILTIN_SOURCES:
+        return name
+    return None
 
 
 def create_source(name: str, source_type: str = "builtin",
@@ -595,12 +685,21 @@ class DataSourceManager:
 
     Registers sources, starts/stops async fetch loops, and provides
     unified data access for the renderer.
+
+    ``on_update`` is called with a source name whenever a periodic fetch
+    changes that source's data. The manager only ever holds the *active*
+    display's sources, so that is the display manager's cue to repaint —
+    the only thing keeping a data-bound display fresh once it is on
+    screen (the live tick loop covers clock/countdown blocks only).
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, on_update: Callable[[str], None] | None = None,
+    ) -> None:
         self._sources: dict[str, DataSource] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._running = False
+        self.on_update = on_update
 
     def register(self, source: DataSource) -> None:
         """Register a data source."""
@@ -634,8 +733,11 @@ class DataSourceManager:
         if fetch_tasks:
             await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-        # Start periodic fetch loops
+        # Start periodic fetch loops. A source that already failed
+        # permanently on the initial fetch never gets one.
         for name, source in self._sources.items():
+            if source.unavailable_reason:
+                continue
             if name not in self._tasks:
                 self._tasks[name] = asyncio.create_task(
                     self._fetch_loop(source),
@@ -658,17 +760,35 @@ class DataSourceManager:
             task.cancel()
 
     async def _fetch_loop(self, source: DataSource) -> None:
-        """Periodically fetch data for a source."""
+        """Periodically fetch data for a source.
+
+        Backs off while the source is failing and exits once it is
+        permanently unavailable.
+        """
         try:
             while self._running:
-                await asyncio.sleep(source.refresh_interval)
+                await asyncio.sleep(source.next_fetch_delay)
                 if not self._running:
                     break
-                await source.do_fetch()
+                before = source.cached_data
+                if await source.do_fetch() != before:
+                    self._notify(source.name)
+                if source.unavailable_reason:
+                    return
         except asyncio.CancelledError:
             pass
         except Exception:
             logger.exception("Fetch loop error for source '%s'", source.name)
+
+    def _notify(self, name: str) -> None:
+        """Announce a changed source. A raising listener must not take
+        the fetch loop down with it."""
+        if self.on_update is None:
+            return
+        try:
+            self.on_update(name)
+        except Exception:
+            logger.exception("on_update failed for source '%s'", name)
 
     def clear(self) -> None:
         """Remove all sources. For testing."""
@@ -751,10 +871,25 @@ def _dotted_get(data: Any, path: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def placeholder_for_source(
+    name: str,
+    source_type: str = "builtin",
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Sample data for preview — keyed by source *type* first, then by name.
+
+    Typed sources whose names are author-chosen can hook in here with a
+    type-keyed sample; everything else falls back to the per-name table.
+    """
+    return get_placeholder_data(name)
+
+
 def get_placeholder_data(source_name: str) -> dict[str, Any]:
     """Get plausible sample data for preview rendering.
 
     Used when data sources aren't live yet (e.g. during agent preview workflow).
+    Prefer :func:`placeholder_for_source` when the source's declared type is at
+    hand — this table only covers the built-ins, keyed by name.
 
     Args:
         source_name: The source name to generate placeholders for.
@@ -821,5 +956,6 @@ def _clock_placeholder() -> dict[str, Any]:
         "second": now.second,
         "display": f"{hour_12}:{now.minute:02d}",
         "date": now.strftime("%B %d, %Y"),
+        "date_short": f"{now:%B} {now.day}",
         "day_of_week": now.strftime("%A"),
     }

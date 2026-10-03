@@ -54,6 +54,9 @@ dependencies = [
     # Display
     "pillow",
     "pygame",
+    # Rasterizes the bundled Lucide SVGs; without it every icon
+    # degrades to a circled letter.
+    "cairosvg",
 
     # Storage
     "aiosqlite",

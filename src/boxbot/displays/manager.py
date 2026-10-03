@@ -107,6 +107,7 @@ def _persist_rotation_state(state: dict | None) -> None:
     except OSError as exc:
         logger.warning("Could not persist rotation state to %s: %s", path, exc)
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -117,7 +118,8 @@ from boxbot.displays.data_sources import (
     DataSourceManager,
     StaticSource,
     create_source,
-    get_placeholder_data,
+    placeholder_for_source,
+    integration_for_source,
 )
 from boxbot.displays.renderer import DisplayRenderer
 from boxbot.displays.spec import (
@@ -131,10 +133,88 @@ from boxbot.displays.themes import Theme, get_theme
 
 logger = logging.getLogger(__name__)
 
+# Repaint pump cadence — see _live_tick_loop. The tick is the floor on
+# how often anything re-renders; _SLOW_LIVE_SECONDS is the cadence for a
+# live block that shows no seconds (a minute clock).
+_TICK_SECONDS = 1.0
+_SLOW_LIVE_SECONDS = 60.0
+
+# Status pill watchdog: a crashed turn must not strand "Searching the
+# web…" on screen forever. Every AgentToolCalled refreshes the deadline;
+# 90s outlives any sane single tool call (sandbox scripts included).
+_STATUS_TTL_SECONDS = 90.0
+
 # Default paths
 _BUILTINS_DIR = Path(__file__).parent / "builtins"
 _USER_DISPLAYS_DIR = PROJECT_ROOT / "displays"
 _AGENT_DISPLAYS_DIR = DISPLAYS_DIR
+
+
+def _draw_status_pill(
+    base: Image.Image, text: str, theme: Theme | None = None,
+) -> Image.Image:
+    """Composite the transient agent-status pill onto a rendered frame.
+
+    Bottom-center rounded pill — theme surface, theme accent dot, theme
+    text — sized relative to frame width so it reads the same at any
+    canvas size. ``theme`` defaults to the shipped ``boxbot`` theme so
+    the pill follows whichever palette is active (midnight stays dim,
+    daylight stays light). Returns a new RGB image; ``base`` is untouched.
+    """
+    if theme is None:
+        theme = get_theme("boxbot")
+    surface = (*theme.color_rgb("surface"), 224)
+    accent = (*theme.color_rgb("accent"), 255)
+    text_fill = (*theme.color_rgb("text"), 245)
+    from PIL import ImageDraw
+
+    from boxbot.displays.renderer import _get_font
+
+    w, h = base.size
+    font_size = max(16, round(w * 0.020))
+    pad_x = round(font_size * 1.2)
+    pad_y = round(font_size * 0.65)
+    dot_r = max(3, round(font_size * 0.22))
+    dot_gap = round(font_size * 0.6)
+
+    font = _get_font("Inter", font_size, 500)
+    frame = base.convert("RGBA")
+    overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    pill_w = text_w + dot_r * 2 + dot_gap + pad_x * 2
+    pill_h = text_h + pad_y * 2
+    x0 = (w - pill_w) // 2
+    y1 = h - round(h * 0.04)
+    y0 = y1 - pill_h
+
+    # Theme surface at ~88%, hairline highlight, accent dot, theme text.
+    draw.rounded_rectangle(
+        (x0, y0, x0 + pill_w, y1),
+        radius=pill_h // 2,
+        fill=surface,
+        outline=(255, 255, 255, 28),
+        width=1,
+    )
+    cy = (y0 + y1) // 2
+    dot_x = x0 + pad_x + dot_r
+    draw.ellipse(
+        (dot_x - dot_r, cy - dot_r, dot_x + dot_r, cy + dot_r),
+        fill=accent,
+    )
+    draw.text(
+        (dot_x + dot_r + dot_gap, cy - text_h // 2 - bbox[1]),
+        text,
+        font=font,
+        fill=text_fill,
+    )
+
+    frame.alpha_composite(overlay)
+    return frame.convert("RGB")
 
 
 class DisplayManager:
@@ -180,6 +260,7 @@ class DisplayManager:
         self._active_display: str | None = None
         self._active_args: dict[str, Any] = {}
         self._active_theme: Theme | None = None
+        self._active_spec: DisplaySpec | None = None
 
         # Pin flag: when True, the active display was chosen explicitly
         # by the agent (or another caller) and idle rotation is paused.
@@ -192,8 +273,10 @@ class DisplayManager:
         # per-active-display behavior, not a global rotation.
         self._slideshow_task: asyncio.Task[None] | None = None
 
-        # Data source management
-        self._data_manager = DataSourceManager()
+        # Data source management. Fresh data marks the screen dirty and
+        # _live_tick_loop repaints it — see _on_source_update.
+        self._data_manager = DataSourceManager(on_update=self._on_source_update)
+        self._source_dirty = False
 
         # Rendering
         self._renderer = DisplayRenderer(width=width, height=height)
@@ -204,6 +287,16 @@ class DisplayManager:
         self._frame_lock = threading.Lock()
         self._current_frame: Image.Image | None = None
         self._frame_generation: int = 0  # Incremented on each new frame
+
+        # Transient agent-status pill ("Searching the web…") composited
+        # over whatever is on screen while the agent works a turn.
+        # _base_frame is the un-overlaid render so the pill can change
+        # or clear without re-rendering the display. Driven by
+        # AgentToolCalled events; cleared on AgentSpeaking /
+        # AgentTurnEnded / ConversationEnded and by the TTL watchdog.
+        self._base_frame: Image.Image | None = None
+        self._status_text: str | None = None
+        self._status_deadline: float = 0.0
 
         # Rotation state
         self._rotation_task: asyncio.Task[None] | None = None
@@ -299,12 +392,23 @@ class DisplayManager:
             return
 
         try:
-            from boxbot.core.events import DisplaySwitch, get_event_bus
+            from boxbot.core.events import (
+                AgentSpeaking,
+                AgentToolCalled,
+                AgentTurnEnded,
+                ConversationEnded,
+                DisplaySwitch,
+                get_event_bus,
+            )
 
             bus = get_event_bus()
             bus.subscribe(DisplaySwitch, self._on_display_switch)
+            bus.subscribe(AgentToolCalled, self._on_agent_tool_called)
+            bus.subscribe(AgentSpeaking, self._on_status_clear)
+            bus.subscribe(AgentTurnEnded, self._on_status_clear)
+            bus.subscribe(ConversationEnded, self._on_status_clear)
             self._event_subscribed = True
-            logger.debug("Subscribed to DisplaySwitch events")
+            logger.debug("Subscribed to display events")
         except ImportError:
             logger.debug("Event bus not available, skipping subscription")
         except Exception:
@@ -316,12 +420,23 @@ class DisplayManager:
             return
 
         try:
-            from boxbot.core.events import DisplaySwitch, get_event_bus
+            from boxbot.core.events import (
+                AgentSpeaking,
+                AgentToolCalled,
+                AgentTurnEnded,
+                ConversationEnded,
+                DisplaySwitch,
+                get_event_bus,
+            )
 
             bus = get_event_bus()
             bus.unsubscribe(DisplaySwitch, self._on_display_switch)
+            bus.unsubscribe(AgentToolCalled, self._on_agent_tool_called)
+            bus.unsubscribe(AgentSpeaking, self._on_status_clear)
+            bus.unsubscribe(AgentTurnEnded, self._on_status_clear)
+            bus.unsubscribe(ConversationEnded, self._on_status_clear)
             self._event_subscribed = False
-            logger.debug("Unsubscribed from DisplaySwitch events")
+            logger.debug("Unsubscribed from display events")
         except Exception:
             logger.debug("Failed to unsubscribe from event bus")
 
@@ -340,6 +455,24 @@ class DisplayManager:
                 display_name, args,
             )
             await self.switch(display_name, args)
+
+    async def _on_agent_tool_called(self, event: Any) -> None:
+        """Show/refresh the status pill for a room-facing tool call.
+
+        Voice-channel only: the screen is in the room with the person
+        who is waiting. WhatsApp/Signal turns run for someone who isn't
+        looking at the box.
+        """
+        if getattr(event, "channel", "") != "voice":
+            return
+        text = getattr(event, "status_text", "")
+        if text:
+            self.set_status_text(text)
+
+    async def _on_status_clear(self, event: Any) -> None:
+        """Drop the status pill — the turn resolved (speech started,
+        turn ended, or the conversation closed)."""
+        self.clear_status_text()
 
     # ------------------------------------------------------------------
     # Discovery & loading
@@ -383,6 +516,36 @@ class DisplayManager:
             len(self._specs),
             list(self._specs.keys()),
         )
+        self._warn_unknown_integrations()
+
+    def _warn_unknown_integrations(self) -> None:
+        """Report integration sources that have no registered integration.
+
+        Without this the source is still created and rediscovers the same
+        "unknown integration 'calendar'" on every refresh for the life of
+        the process. Once at startup is enough.
+        """
+        try:
+            from boxbot.integrations.loader import discover_integrations
+
+            known = {meta.name for meta in discover_integrations()}
+        except Exception:
+            logger.debug("Integration registry unavailable; skipping source check")
+            return
+
+        for spec in self._specs.values():
+            for src in spec.data_sources:
+                target = integration_for_source(
+                    src.name, src.source_type, src.integration,
+                )
+                if target is not None and target not in known:
+                    logger.warning(
+                        "Display '%s' binds source '%s' to unknown "
+                        "integration '%s' — it will never have data. "
+                        "Registered: %s",
+                        spec.name, src.name, target,
+                        ", ".join(sorted(known)) or "(none)",
+                    )
 
     def _load_specs_from_dir(self, directory: Path) -> None:
         """Load display specs from a directory.
@@ -519,6 +682,18 @@ class DisplayManager:
                         "lines": ["Send me a photo and it'll show up here."],
                     }
 
+        # Already on screen with the same spec and args: only the pin
+        # state can change. Tearing every data source down and rebuilding
+        # it to render an identical frame is pure churn — the rotation
+        # loop did exactly that 1,850 times in one boxbot log.
+        if (name == self._active_display
+                and spec is self._active_spec
+                and args == self._active_args):
+            if pin and not self._pinned:
+                self._pinned = True
+                self.stop_rotation()
+            return True
+
         # Explicit pin: stop rotation and mark pinned. Internal calls
         # from the rotation loop pass pin=False to avoid stopping
         # themselves.
@@ -543,15 +718,16 @@ class DisplayManager:
         # Set up new data sources
         await self._setup_data_sources(spec)
 
-        # Update active state
+        # Update active state. The spec object is kept so a re-save of
+        # the same display still rebuilds rather than hitting the no-op.
         self._active_display = name
+        self._active_spec = spec
         self._active_args = args
 
         # Render the initial frame
         self._render_and_update_frame()
 
-        import time as _time
-        self._last_switch_ts = _time.monotonic()
+        self._last_switch_ts = time.monotonic()
 
         # If the new display is a multi-photo picture slideshow,
         # start the per-photo tick. Always tear down any prior
@@ -560,7 +736,10 @@ class DisplayManager:
         self._stop_slideshow()
         self._maybe_start_slideshow()
 
-        logger.info(
+        # Rotation-driven switches are routine; only explicit ones are
+        # worth a line in the log.
+        logger.log(
+            logging.INFO if pin else logging.DEBUG,
             "Switched to display '%s' (args=%s, pinned=%s)",
             name, self._active_args, self._pinned,
         )
@@ -766,6 +945,26 @@ class DisplayManager:
 
         await self._data_manager.start_all()
 
+    def _on_source_update(self, name: str) -> None:
+        """Mark the screen dirty after a fetch changed the data behind it.
+
+        The data manager only holds the active display's sources, so a
+        changed fetch is by definition on screen. Without this a
+        data-bound display renders once and freezes: the live tick loop
+        only ticks clock and countdown blocks, and a single-entry
+        rotation has no re-switch timer to hide the staleness.
+
+        A flag, not a render: ``ClockSource`` refreshes once a second and
+        its payload changes every tick, so rendering here would put a
+        full render + frame push per second behind any display that
+        declares it. ``_live_tick_loop`` owns the repaint budget.
+        """
+        logger.debug(
+            "Source '%s' changed; queuing a repaint of '%s'",
+            name, self._active_display,
+        )
+        self._source_dirty = True
+
     # ------------------------------------------------------------------
     # Rotation
     # ------------------------------------------------------------------
@@ -842,6 +1041,17 @@ class DisplayManager:
                 if self._rotation_displays:
                     name = self._rotation_displays[self._rotation_index]
                     await self.switch(name, pin=False)
+                    if len(self._rotation_displays) == 1:
+                        # Nothing to rotate between. Live blocks stay
+                        # current through _live_tick_loop and data-bound
+                        # ones through _on_source_update, so a timer
+                        # here would only re-switch clock→clock.
+                        self._rotation_active = False
+                        logger.debug(
+                            "Rotation list holds only '%s'; no timer needed",
+                            name,
+                        )
+                        return
                     self._rotation_index = (
                         (self._rotation_index + 1) % len(self._rotation_displays)
                     )
@@ -928,8 +1138,7 @@ class DisplayManager:
         active = self.is_rotating()
         next_in: float | None = None
         if active and self._last_switch_ts > 0:
-            import time as _time
-            elapsed = _time.monotonic() - self._last_switch_ts
+            elapsed = time.monotonic() - self._last_switch_ts
             next_in = max(0.0, self._rotation_interval - elapsed)
         return {
             "active": active,
@@ -1070,17 +1279,87 @@ class DisplayManager:
         with self._frame_lock:
             return self._frame_generation
 
+    @property
+    def active_display(self) -> str | None:
+        """Name of the display currently on screen, or None."""
+        return self._active_display
+
+    @property
+    def size(self) -> tuple[int, int]:
+        """The render canvas size as ``(width, height)``."""
+        return (self._width, self._height)
+
+    def push_frame(self, frame: Image.Image) -> None:
+        """Push an externally rendered frame straight to the screen.
+
+        An external frame pump (e.g. a camera live-view source) uses
+        this to put decoded video on screen without going through the
+        block renderer. The pusher owns the screen only while its placeholder
+        display stays active and static — it must check
+        :attr:`active_display` each frame and stop when the display
+        changes, because any block render (switch, tick repaint) will
+        overwrite pushed frames without notice.
+
+        Thread-safe; same contract as the internal render path.
+        """
+        self._update_frame(frame)
+
     def _update_frame(self, frame: Image.Image) -> None:
         """Update the frame buffer with a new rendered frame.
 
-        Thread-safe. Called after each render cycle.
+        Thread-safe. Called after each render cycle. Keeps the
+        un-overlaid render in ``_base_frame`` and re-applies the status
+        pill when one is active, so the pill survives live-tick
+        repaints and mid-turn display switches.
 
         Args:
             frame: The new frame image (RGB, 1024x600).
         """
         with self._frame_lock:
-            self._current_frame = frame
+            self._base_frame = frame
+            self._current_frame = self._composite_status(frame)
             self._frame_generation += 1
+
+    def set_status_text(self, text: str) -> None:
+        """Show (or update) the transient agent-status pill.
+
+        Composites over the cached base frame and bumps the generation
+        counter — the screen HAL picks it up within one poll (~33 ms).
+        No display re-render happens. Refreshes the TTL watchdog even
+        when the text is unchanged.
+        """
+        with self._frame_lock:
+            self._status_deadline = time.monotonic() + _STATUS_TTL_SECONDS
+            if text == self._status_text:
+                return
+            self._status_text = text
+            if self._base_frame is not None:
+                self._current_frame = self._composite_status(self._base_frame)
+                self._frame_generation += 1
+
+    def clear_status_text(self) -> None:
+        """Remove the status pill and restore the un-overlaid frame."""
+        with self._frame_lock:
+            if self._status_text is None:
+                return
+            self._status_text = None
+            if self._base_frame is not None:
+                self._current_frame = self._base_frame
+                self._frame_generation += 1
+
+    def _composite_status(self, base: Image.Image) -> Image.Image:
+        """Apply the status pill to ``base`` if one is active.
+
+        Caller must hold ``_frame_lock``. Never raises — a drawing
+        failure falls back to the clean frame.
+        """
+        if not self._status_text:
+            return base
+        try:
+            return _draw_status_pill(base, self._status_text, self._active_theme)
+        except Exception:
+            logger.exception("Status pill compositing failed")
+            return base
 
     # ------------------------------------------------------------------
     # Rendering
@@ -1136,38 +1415,56 @@ class DisplayManager:
 
         Resolution order, per source declared on the spec:
 
-        1. ``data`` override, if the caller passed one.
-        2. Live cached data from the running data manager.
-        3. The source's own declared payload — for ``static`` sources,
+        1. ``data`` override, if the caller passed the key at all —
+           ``{}``/``0``/``False`` is a value the caller chose, not an
+           absence. Live and static payloads use truthiness instead:
+           there, empty means "nothing fetched yet", and a placeholder
+           previews better than a blank block.
+        2. The source's own declared payload — for ``static`` sources,
            this is the ``value=`` the agent set when authoring. Critical
            for previewing a fresh spec before save/switch, since static
            sources are inert until they're registered with a manager.
+        3. Live cached data from the running data manager, but only when
+           this spec *is* the active display. Source names are a global
+           namespace: another spec's ``climate`` source is not the
+           on-screen display's ``climate`` source, and letting live data
+           win there silently renders values the spec never declared.
         4. Built-in placeholder data (``weather``, ``calendar``, …).
+
+        Self-preview of the active display still sees pushed values —
+        ``update_static_data`` writes them back onto the spec, so step 2
+        and the live cache agree.
 
         ``args`` are exposed to bindings as ``{args.<field>}``.
         """
-        if data:
-            preview_data: dict[str, Any] = dict(data)
-        else:
-            preview_data = dict(self._data_manager.get_all_data())
+        override = dict(data) if data else {}
+        live = (
+            self._data_manager.get_all_data()
+            if spec.name == self._active_display
+            else {}
+        )
 
+        preview_data: dict[str, Any] = {}
         for src_spec in spec.data_sources:
-            if (src_spec.name in preview_data
-                    and preview_data[src_spec.name]):
-                continue
-            if src_spec.source_type == "static" and src_spec.value is not None:
+            name = src_spec.name
+            if name in override:
+                preview_data[name] = override[name]
+            elif src_spec.source_type == "static" and src_spec.value is not None:
                 v = src_spec.value
-                preview_data[src_spec.name] = (
-                    v if isinstance(v, dict) else {"value": v}
+                preview_data[name] = v if isinstance(v, dict) else {"value": v}
+            elif live.get(name):
+                preview_data[name] = live[name]
+            else:
+                preview_data[name] = placeholder_for_source(
+                    name, src_spec.source_type,
                 )
-                continue
-            preview_data[src_spec.name] = get_placeholder_data(src_spec.name)
 
-        if args:
-            preview_data["args"] = dict(args)
-        elif "args" not in preview_data:
-            preview_data["args"] = {}
+        # Undeclared override keys still pass through — callers preview
+        # data for sources the spec hasn't declared yet.
+        for key, value in override.items():
+            preview_data.setdefault(key, value)
 
+        preview_data["args"] = dict(args) if args else override.get("args") or {}
         return preview_data
 
     def render_preview(
@@ -1222,33 +1519,56 @@ class DisplayManager:
     # ------------------------------------------------------------------
 
     async def _live_tick_loop(self) -> None:
-        """Background task that re-renders live blocks (clock, countdown).
+        """The repaint pump: at most one render per tick, whoever asked.
 
-        Runs every second to keep live blocks updated. Only re-renders
-        if the active display contains live blocks, otherwise sleeps
-        longer to conserve resources.
+        Two things ask for a repaint, and both come through here so they
+        cannot stack:
+        - live blocks (clock, countdown), which re-render on their own
+          cadence — 1 fps with seconds showing, 1/60 fps without;
+        - a data source whose fetch changed what is on screen, which sets
+          ``_source_dirty`` (see :meth:`_on_source_update`).
 
-        Frame rate management:
-        - 1 fps when clock with seconds is showing
-        - 1/60 fps when clock without seconds is showing
-        - 0 fps when no live blocks (sleep until data change)
+        The tick is the floor on both: a source that refreshes faster than
+        ``_TICK_SECONDS`` (``ClockSource`` is 1 Hz, and its payload changes
+        every tick) coalesces into one render, and the flag is only cleared
+        by a render, so the last change always lands.
         """
+        last_live_render = 0.0
         try:
             while self._running:
-                if self._active_display:
-                    spec = self._specs.get(self._active_display)
-                    if spec and spec.root_block:
-                        has_live, has_seconds = self._detect_live_blocks(spec.root_block)
-                        if has_live:
-                            self._render_and_update_frame()
-                            if has_seconds:
-                                await asyncio.sleep(1.0)
-                            else:
-                                await asyncio.sleep(60.0)
-                            continue
+                await asyncio.sleep(_TICK_SECONDS)
 
-                # No live blocks or no active display -- sleep longer
-                await asyncio.sleep(5.0)
+                # Status-pill watchdog: lazy expiry so a crashed turn
+                # (no clearing event ever fires) can't strand the pill.
+                if (
+                    self._status_text is not None
+                    and time.monotonic() > self._status_deadline
+                ):
+                    logger.warning(
+                        "Status pill expired without a clearing event "
+                        "(%r) — clearing", self._status_text,
+                    )
+                    self.clear_status_text()
+
+                if not self._active_display:
+                    continue
+
+                spec = self._specs.get(self._active_display)
+                has_live = has_seconds = False
+                if spec and spec.root_block:
+                    has_live, has_seconds = self._detect_live_blocks(spec.root_block)
+
+                now = time.monotonic()
+                live_due = has_live and (
+                    has_seconds or now - last_live_render >= _SLOW_LIVE_SECONDS
+                )
+                if not (live_due or self._source_dirty):
+                    continue
+
+                if live_due:
+                    last_live_render = now
+                self._source_dirty = False
+                self._render_and_update_frame()
 
         except asyncio.CancelledError:
             pass
@@ -1357,60 +1677,96 @@ class DisplayManager:
 
 
 def _resolve_photo_sources(block: "Block") -> None:
-    """Walk a resolved block tree and rewrite ``photo:<id>`` image sources.
+    """Walk a resolved block tree and rewrite ``photo:<ref>`` image sources.
 
     After :func:`boxbot.displays.spec.resolve_bindings` runs, ImageBlock
-    sources like ``photo:{args.image_ids[0]}`` are now ``photo:<id>``.
-    The renderer doesn't know how to talk to the photo library, so we
-    resolve each photo id to an absolute file path here and rewrite the
-    block in place. Misses fall through to the renderer's placeholder.
+    sources like ``photo:{args.image_ids[0]}`` are now ``photo:<ref>``.
+    A ``<ref>`` is either a photo-library id or an absolute file path
+    (the `picture` display renders both — camera snapshots and other
+    workspace images arrive as paths). We resolve each ref to an absolute
+    file path here and rewrite the block in place; the renderer only
+    knows how to open a plain file path. Misses fall through to the
+    renderer's placeholder.
     """
     from boxbot.displays.blocks import Block as _Block  # avoid circular
 
-    # Lazy + best-effort: the photo DB may not exist yet on a fresh
-    # install; swallow errors rather than break the whole render.
-    try:
-        from boxbot.core.config import get_config
-        from boxbot.photos.store import PhotoStore
-    except Exception:
-        return
-
-    try:
-        config = get_config()
-    except Exception:
-        return
-
-    storage_path = Path(config.photos.storage_path)
-    db_path = storage_path / "photos.db"
-    if not db_path.exists():
-        return
-
-    # Walk once to collect all photo: ids
-    ids: list[str] = []
+    # Walk once to collect all photo: refs.
+    refs: list[str] = []
 
     def _collect(b: _Block) -> None:
         if b.block_type == "image":
             src = str(b.params.get("source", ""))
             if src.startswith("photo:"):
-                ids.append(src.split(":", 1)[1])
+                refs.append(src.split(":", 1)[1])
         for child in b.children:
             _collect(child)
 
     _collect(block)
-    if not ids:
+    if not refs:
         return
+
+    paths = _resolve_photo_refs(refs)
+
+    def _rewrite(b: _Block) -> None:
+        if b.block_type == "image":
+            src = str(b.params.get("source", ""))
+            if src.startswith("photo:"):
+                ref = src.split(":", 1)[1]
+                if ref in paths:
+                    b.params["source"] = paths[ref]
+        for child in b.children:
+            _rewrite(child)
+
+    _rewrite(block)
+
+
+def _resolve_photo_refs(refs: list[str]) -> dict[str, str]:
+    """Map each ``photo:`` ref to an absolute file path it renders from.
+
+    A ref is either a photo-library id (looked up in the photos DB) or a
+    direct file path under an allowed root (workspace / photos / crops /
+    previews / sandbox tmp — same roots that gate image attachment). Refs
+    that resolve to neither are left out; the caller renders a placeholder.
+    """
+    paths: dict[str, str] = {}
+
+    # Direct file paths (camera snapshots, workspace images). Validated
+    # against the shared attach roots so a display can never be pointed at
+    # an arbitrary file on disk.
+    remaining: list[str] = []
+    for ref in refs:
+        direct = _resolve_direct_image_path(ref)
+        if direct is not None:
+            paths[ref] = direct
+        else:
+            remaining.append(ref)
+    if not remaining:
+        return paths
+
+    # Photo-library ids. Best-effort: the DB may not exist yet on a fresh
+    # install; swallow errors rather than break the whole render.
+    try:
+        from boxbot.core.config import get_config
+
+        config = get_config()
+    except Exception:
+        return paths
+
+    storage_path = Path(config.photos.storage_path)
+    db_path = storage_path / "photos.db"
+    if not db_path.exists():
+        return paths
 
     import sqlite3
 
-    paths: dict[str, str] = {}
     try:
         with sqlite3.connect(str(db_path)) as conn:
             conn.row_factory = sqlite3.Row
-            placeholders = ",".join("?" for _ in ids)
+            placeholders = ",".join("?" for _ in remaining)
             rows = conn.execute(
                 f"SELECT id, filename FROM photos "
                 f"WHERE id IN ({placeholders}) AND deleted_at IS NULL",
-                ids,
+                remaining,
             ).fetchall()
             for r in rows:
                 abs_path = (storage_path / r["filename"]).resolve()
@@ -1418,16 +1774,24 @@ def _resolve_photo_sources(block: "Block") -> None:
                     paths[r["id"]] = str(abs_path)
     except sqlite3.Error as e:
         logger.warning("photo source resolution failed: %s", e)
-        return
 
-    def _rewrite(b: _Block) -> None:
-        if b.block_type == "image":
-            src = str(b.params.get("source", ""))
-            if src.startswith("photo:"):
-                pid = src.split(":", 1)[1]
-                if pid in paths:
-                    b.params["source"] = paths[pid]
-        for child in b.children:
-            _rewrite(child)
+    return paths
 
-    _rewrite(block)
+
+def _resolve_direct_image_path(ref: str) -> str | None:
+    """Return ``ref`` as an absolute path iff it is an allowed image file.
+
+    Reuses the sandbox attach-root allowlist so display sources are held
+    to the same boundary as tool-result attachments.
+    """
+    if not ref or not Path(ref).is_absolute():
+        return None
+    try:
+        from boxbot.tools._sandbox_actions import _is_attach_allowed
+
+        abs_path = Path(ref).resolve()
+    except Exception:
+        return None
+    if not abs_path.is_file() or not _is_attach_allowed(abs_path):
+        return None
+    return str(abs_path)

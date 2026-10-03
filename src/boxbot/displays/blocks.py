@@ -58,11 +58,18 @@ class Block:
 
 @dataclass
 class RowBlock(Block):
-    """Horizontal flow — children side by side."""
+    """Horizontal flow — children side by side.
+
+    ``align`` packs children on the main (horizontal) axis:
+    ``start``/``center``/``end``/``spread``. ``valign`` places each
+    child on the cross (vertical) axis: ``center`` (default) sits
+    children on a shared optical centerline; ``top``/``bottom`` pin.
+    """
 
     block_type: str = field(default="row", init=False)
     gap: int = 0
     align: str = "start"  # start, center, end, spread
+    valign: str = "center"  # center, top, bottom
     padding: int | list[int] = 0
 
     def __post_init__(self) -> None:
@@ -73,13 +80,18 @@ class RowBlock(Block):
                 "padding": self.padding,
             }.items() if v != (0 if k != "align" else "start")
         }
+        if self.valign != "center":
+            self.params["valign"] = self.valign
 
 
 @dataclass
 class ColumnBlock(Block):
     """Vertical flow — children stacked.
 
-    ``align`` is the main-axis (vertical) packing — currently reserved.
+    ``align`` is the main-axis (vertical) packing:
+    ``start``/``center``/``end``. Flex spacers (``spacer`` with no
+    size) absorb leftover height, so footers can be anchored and
+    heroes centered without pixel offsets.
     ``item_align`` is the cross-axis (horizontal) alignment of each child:
     ``stretch`` (default) gives every child the full column width,
     matching the historical behavior; ``start``/``center``/``end`` shrink
@@ -207,7 +219,8 @@ class TextBlock(Block):
 
     block_type: str = field(default="text", init=False)
     content: str = ""
-    size: str = "body"
+    # Ramp name, or a pixel size for hero readouts the ramp can't reach.
+    size: str | int = "body"
     color: str = "default"
     weight: str | None = None
     align: str = "left"

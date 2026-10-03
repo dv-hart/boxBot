@@ -8,7 +8,7 @@
   ],
   "layout": {
     "type": "column",
-    "padding": [36, 48, 36, 48],
+    "padding": [36, 48, 40, 48],
     "gap": 0,
     "children": [
       {
@@ -29,26 +29,25 @@
           { "type": "clock", "size": "md", "show_date": false, "show_seconds": false }
         ]
       },
-      { "type": "spacer", "size": 80 },
+      { "type": "spacer" },
       {
         "type": "column",
-        "gap": 8,
-        "align": "center",
+        "gap": 10,
         "children": [
           { "type": "text", "content": "{people.present[0].name}", "size": "title", "weight": "bold", "align": "center" },
           { "type": "text", "content": "present · {people.present[0].since}", "size": "body", "color": "muted", "align": "center" }
         ]
       },
-      { "type": "spacer", "size": 48 },
-      { "type": "divider", "color": "dim" },
-      { "type": "spacer", "size": 20 },
+      { "type": "spacer" },
+      { "type": "divider", "color": "surface_alt" },
+      { "type": "spacer", "size": 24 },
       {
         "type": "row",
         "align": "spread",
         "children": [
           {
             "type": "column",
-            "gap": 4,
+            "gap": 6,
             "children": [
               { "type": "text", "content": "LAST HEARD", "size": "small", "color": "muted", "weight": "semibold" },
               { "type": "text", "content": "{agent_status.last_active}", "size": "body" }
@@ -56,8 +55,7 @@
           },
           {
             "type": "column",
-            "gap": 4,
-            "align": "center",
+            "gap": 6,
             "children": [
               { "type": "text", "content": "IN THE ROOM", "size": "small", "color": "muted", "weight": "semibold", "align": "center" },
               {
@@ -65,7 +63,7 @@
                 "gap": 8,
                 "align": "center",
                 "children": [
-                  { "type": "icon", "name": "users", "size": "sm", "color": "text" },
+                  { "type": "icon", "name": "users", "size": "sm", "color": "muted" },
                   { "type": "text", "content": "{people.count}", "size": "body", "weight": "medium" }
                 ]
               }
@@ -73,8 +71,7 @@
           },
           {
             "type": "column",
-            "gap": 4,
-            "align": "end",
+            "gap": 6,
             "children": [
               { "type": "text", "content": "NEXT WAKE", "size": "small", "color": "muted", "weight": "semibold", "align": "right" },
               { "type": "text", "content": "{agent_status.next_wake}", "size": "body", "align": "right" }

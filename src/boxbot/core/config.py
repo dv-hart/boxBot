@@ -254,6 +254,13 @@ class DisplayConfig(BaseModel):
     brightness: float = 0.8
     night_mode: NightModeConfig = Field(default_factory=NightModeConfig)
 
+    # Screen HAL backend + canvas geometry. "pygame" (HDMI, default) or
+    # "none" (headless, no screen). width/height drive both the renderer
+    # (DisplayManager canvas) and the backend.
+    backend: Literal["pygame", "none"] = "pygame"
+    width: int = 1024
+    height: int = 600
+
 
 class CameraConfig(BaseModel):
     """Camera hardware settings."""

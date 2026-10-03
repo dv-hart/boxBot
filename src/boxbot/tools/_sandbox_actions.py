@@ -1856,6 +1856,21 @@ def _classify_display_source(name: str, agent_dir: Path) -> str:
     return "builtin"
 
 
+_MAX_HINT_FIELDS = 12
+
+
+def _available_fields_hint(source: str, sample: dict[str, Any]) -> str:
+    """Name the fields a source actually exposed, for a failed binding."""
+    data = sample.get(source)
+    if not isinstance(data, dict) or not data:
+        return f"Source '{source}' supplied no data."
+    names = sorted(data)
+    shown = ", ".join(names[:_MAX_HINT_FIELDS])
+    if len(names) > _MAX_HINT_FIELDS:
+        shown += f", … (+{len(names) - _MAX_HINT_FIELDS} more)"
+    return f"Available fields on '{source}': {shown}."
+
+
 def _collect_unresolved_bindings(
     spec_dict: dict[str, Any],
     render_data: dict[str, Any] | None = None,
@@ -1871,13 +1886,15 @@ def _collect_unresolved_bindings(
     sources whose declared ``value=`` populated the renderer's view but
     not any standalone placeholder pass.
     """
-    from boxbot.displays.data_sources import get_placeholder_data
+    from boxbot.displays.data_sources import placeholder_for_source
     from boxbot.displays.spec import _BINDING_PATTERN, _lookup_binding
 
     declared: set[str] = {"args", "current"}
+    declared_specs: dict[str, dict[str, Any]] = {}
     for src in spec_dict.get("data_sources", []) or []:
         if isinstance(src, dict) and src.get("name"):
             declared.add(src["name"])
+            declared_specs[src["name"]] = src
 
     if render_data is not None:
         sample = dict(render_data)
@@ -1890,7 +1907,10 @@ def _collect_unresolved_bindings(
         for name in declared:
             if name in ("args", "current"):
                 continue
-            sample[name] = get_placeholder_data(name) or {}
+            src = declared_specs.get(name) or {}
+            sample[name] = placeholder_for_source(
+                name, src.get("type") or "builtin", src,
+            ) or {}
         sample["args"] = {}
 
     from boxbot.displays.renderer import lucide_icon_exists
@@ -1949,7 +1969,7 @@ def _collect_unresolved_bindings(
                 if value is None:
                     warnings.append(
                         f"binding '{{{path}}}' did not resolve at render "
-                        f"time. Check the field name on '{source}'."
+                        f"time. {_available_fields_hint(source, sample)}"
                     )
 
     _walk(spec_dict.get("layout"))
@@ -2164,6 +2184,8 @@ async def _handle_display_action(
                 "status": "ok",
                 "path": str(out_path),
                 "attached": attached,
+                "width": image.width,
+                "height": image.height,
                 "warnings": _collect_unresolved_bindings(
                     spec_dict, render_data=render_data,
                 ),
@@ -2431,6 +2453,10 @@ async def _handle_display_action(
                 "path": str(out_path),
                 "attached": attached,
                 "name": active,
+                # Surface size is config-driven; reporting it stops the
+                # agent guessing.
+                "width": frame.width,
+                "height": frame.height,
             }
 
         return {"status": "error", "error": f"unknown display action: {action_type}"}
@@ -2564,6 +2590,13 @@ def _build_display_schema() -> dict[str, Any]:
                 )
             if f.name in enums:
                 field_info["valid_values"] = enum_sets[enums[f.name]]
+            if block_type == "text" and f.name == "size":
+                # Not a closed set — a pixel number is valid too. The ramp
+                # moves out of valid_values rather than contradicting it.
+                field_info["ramp_names"] = field_info.pop("valid_values")
+                field_info["describe"] = (
+                    "a ramp name, or a pixel number 8-240 for a hero readout"
+                )
             fields[f.name] = field_info
         blocks[block_type] = {
             "kind": "container" if block_type in container_types else "content",

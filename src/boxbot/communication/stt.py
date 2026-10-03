@@ -26,11 +26,14 @@ import re
 import time
 import wave
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from boxbot.core import latency
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from boxbot.core.config import ApiKeysConfig, STTConfig
 
 # Scribe emits bracketed annotations for non-speech audio:
 # "[background noise]", "[silence]", "[music]", "[laughter]", etc.
@@ -295,3 +298,29 @@ async def _record_stt_cost(
             model,
             audio_seconds,
         )
+
+
+# ---------------------------------------------------------------------------
+# Provider factory
+# ---------------------------------------------------------------------------
+
+
+def create_stt(cfg: "STTConfig", api_keys: "ApiKeysConfig") -> STTProvider | None:
+    """Build the STT provider named by ``cfg.provider``.
+
+    Returns None when that provider's credential is unset — voice
+    degrades to no-STT rather than refusing to boot. An *unknown*
+    provider name raises: a typo silently running a different engine is
+    the worse failure.
+    """
+    if cfg.provider == "elevenlabs":
+        if not api_keys.elevenlabs:
+            logger.warning("ElevenLabs API key not configured — STT disabled")
+            return None
+        return ElevenLabsSTT(
+            api_key=api_keys.elevenlabs,
+            model=cfg.model,
+        )
+    raise ValueError(
+        f"stt.provider must be one of elevenlabs, got {cfg.provider!r}"
+    )

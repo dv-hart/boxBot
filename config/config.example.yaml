@@ -167,6 +167,13 @@ camera:
 
 # ── Voice ─────────────────────────────────────────────────────────────
 voice:
+  # Audio HAL backend: "portaudio" (ReSpeaker + HDMI, the Pi) or "none".
+  audio_backend: "portaudio"
+  # Seconds after BB's turn settles before the mic goes dormant (ring off,
+  # wake word needed to continue; the conversation thread is kept).
+  # 0 keeps the mic hot until the conversation silence timeout.
+  post_response_idle_seconds: 15
+
   # Wake word detection
   wake_word:
     engine: "openwakeword"

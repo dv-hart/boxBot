@@ -876,11 +876,10 @@ class TestPipelineConversationHandlers:
             )
             await pipeline._on_transcript_ready(event)
 
-            # Should have published SpeakerIdentified
-            assert len(published) == 1
-            assert published[0].person_name == "Jacob"
-            assert published[0].person_id == pid
-            assert published[0].speaker_label == "SPEAKER_00"
+            # The voice adapter is the single SpeakerIdentified
+            # publisher — the pipeline's transcript handler only drives
+            # fusion admissions and must publish nothing.
+            assert published == []
         finally:
             bus.unsubscribe(SpeakerIdentified, capture_speaker)
 

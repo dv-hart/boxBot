@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from boxbot.tools.base import Tool
@@ -69,7 +71,10 @@ class IdentifyPersonTool(Tool):
         "UNDOABLE — ask the humans first (\"Are Eric and Erik the same "
         "person?\").\n"
         "- list_flags: read the nightly duplicate-audit findings. Use on "
-        "an [id-reconcile] to-do."
+        "an [id-reconcile] to-do.\n"
+        "Scope: perception person records. Memory `person`/`people` "
+        "fields are a separate namespace — rename/merge re-point them, "
+        "nothing else here touches them."
     )
     parameters = {
         "type": "object",
@@ -135,23 +140,18 @@ class IdentifyPersonTool(Tool):
 
         logger.info("identify_person: name=%s ref=%s", name, ref)
 
-        pipeline, err = _get_running_pipeline()
-        if pipeline is None:
-            if err is not None:
-                return err
+        identity = _get_identity_service()
+        enrollment = getattr(identity, "enrollment", None)
+        if enrollment is None:
             return json.dumps({
                 "status": "acknowledged",
                 "name": name,
                 "ref": ref,
                 "message": (
-                    f"Noted: '{ref}' is '{name}'. Perception pipeline is "
+                    f"Noted: '{ref}' is '{name}'. Identity service is "
                     f"not active — identity will not be persisted."
                 ),
             })
-
-        enrollment = pipeline.enrollment
-        if enrollment is None:
-            return _error("Enrollment manager not available.")
 
         try:
             result = await enrollment.identify(name, ref)
@@ -186,7 +186,7 @@ class IdentifyPersonTool(Tool):
         # appearance notes into person memory. The crop is already on
         # disk under data/perception/crops/ (allowlisted for attach).
         if outcome in ("create", "correct", "rename"):
-            crop_path = _find_latest_crop_for_ref(pipeline, ref)
+            crop_path = _find_latest_crop_for_ref(_get_running_pipeline(), ref)
             if crop_path is not None:
                 from boxbot.tools._sandbox_actions import build_image_block
 
@@ -216,34 +216,29 @@ class IdentifyPersonTool(Tool):
         if name == new_name:
             return _error("name and new_name are identical; nothing to do.")
 
-        pipeline, err = _get_running_pipeline()
-        if pipeline is None:
-            return err or _error(
-                "Perception pipeline is not active; cannot rename."
+        async with _person_store() as (store, identity):
+            if store is None:
+                return _error("Person store not available.")
+
+            person = await store.get_person_by_name(name)
+            if person is None:
+                return _error(
+                    f"No person named {name!r} on record. Use search via "
+                    f"list_flags or check the spelling."
+                )
+
+            try:
+                result = await store.rename_person(person["id"], new_name)
+            except ValueError as exc:
+                return _error(str(exc))
+
+            repointed = await _repoint_references(
+                identity,
+                old_person_id=person["id"],
+                new_person_id=person["id"],
+                old_name=result["old_name"],
+                new_name=new_name,
             )
-        store = pipeline.cloud_store
-        if store is None:
-            return _error("Person store not available.")
-
-        person = await store.get_person_by_name(name)
-        if person is None:
-            return _error(
-                f"No person named {name!r} on record. Use search via "
-                f"list_flags or check the spelling."
-            )
-
-        try:
-            result = await store.rename_person(person["id"], new_name)
-        except ValueError as exc:
-            return _error(str(exc))
-
-        repointed = await _repoint_references(
-            pipeline,
-            old_person_id=person["id"],
-            new_person_id=person["id"],
-            old_name=result["old_name"],
-            new_name=new_name,
-        )
 
         logger.info(
             "identify_person rename: %r -> %r (%s)",
@@ -279,39 +274,34 @@ class IdentifyPersonTool(Tool):
                 "humans involved before merging."
             )
 
-        pipeline, err = _get_running_pipeline()
-        if pipeline is None:
-            return err or _error(
-                "Perception pipeline is not active; cannot merge."
+        async with _person_store() as (store, identity):
+            if store is None:
+                return _error("Person store not available.")
+
+            winner = await store.get_person_by_name(name)
+            loser = await store.get_person_by_name(duplicate_name)
+            if winner is None:
+                return _error(f"No person named {name!r} on record.")
+            if loser is None:
+                return _error(f"No person named {duplicate_name!r} on record.")
+            if winner["id"] == loser["id"]:
+                return _error(
+                    f"{name!r} and {duplicate_name!r} already resolve to the "
+                    f"same person record; nothing to merge."
+                )
+
+            try:
+                result = await store.merge_persons(loser["id"], winner["id"])
+            except ValueError as exc:
+                return _error(str(exc))
+
+            repointed = await _repoint_references(
+                identity,
+                old_person_id=loser["id"],
+                new_person_id=winner["id"],
+                old_name=result["loser_name"],
+                new_name=result["winner_name"],
             )
-        store = pipeline.cloud_store
-        if store is None:
-            return _error("Person store not available.")
-
-        winner = await store.get_person_by_name(name)
-        loser = await store.get_person_by_name(duplicate_name)
-        if winner is None:
-            return _error(f"No person named {name!r} on record.")
-        if loser is None:
-            return _error(f"No person named {duplicate_name!r} on record.")
-        if winner["id"] == loser["id"]:
-            return _error(
-                f"{name!r} and {duplicate_name!r} already resolve to the "
-                f"same person record; nothing to merge."
-            )
-
-        try:
-            result = await store.merge_persons(loser["id"], winner["id"])
-        except ValueError as exc:
-            return _error(str(exc))
-
-        repointed = await _repoint_references(
-            pipeline,
-            old_person_id=loser["id"],
-            new_person_id=winner["id"],
-            old_name=result["loser_name"],
-            new_name=result["winner_name"],
-        )
 
         logger.info(
             "identify_person merge: %r (%s) -> %r (%s)",
@@ -342,6 +332,21 @@ class IdentifyPersonTool(Tool):
     # ------------------------------------------------------------------
 
     async def _list_flags(self) -> str:
+        async with _person_store() as (store, _identity):
+            persons = await store.list_persons() if store is not None else []
+        if not persons:
+            return json.dumps({
+                "status": "ok",
+                "action": "list_flags",
+                "persons": 0,
+                "message": (
+                    "No person records are enrolled on this device — "
+                    "nothing to audit, and rename/merge have nothing to "
+                    "act on. Records appear once someone is identified "
+                    "from a voice session."
+                ),
+            })
+
         from boxbot.perception.reconcile import load_latest_report
 
         report = load_latest_report()
@@ -384,26 +389,72 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message})
 
 
-def _get_running_pipeline() -> tuple[Any | None, str | None]:
-    """Return (pipeline, None) or (None, error_json | None).
+def _get_identity_service() -> Any | None:
+    """Return the running IdentityService, or None.
 
-    ``(None, None)`` means the perception module imported fine but the
-    pipeline isn't running (identify degrades to an acknowledgement;
-    rename/merge return their own error).
+    The identity core is camera-free and runs on every device class;
+    ``identify`` needs only it. None means very early boot (service
+    not started yet) — identify degrades to an acknowledgement.
+    """
+    try:
+        from boxbot.perception.identity import get_identity
+
+        return get_identity()
+    except Exception:
+        logger.debug("Identity service not available", exc_info=True)
+        return None
+
+
+def _get_running_pipeline() -> Any | None:
+    """Return the running visual PerceptionPipeline, or None.
+
+    None on camera-less devices (the module itself fails to import on
+    cv2) or when the pipeline isn't started. Only the best-effort crop
+    attach needs it.
     """
     try:
         from boxbot.perception.pipeline import get_pipeline
+
+        return get_pipeline()
     except Exception:
-        return None, _error("Perception module unavailable.")
+        logger.debug("Perception pipeline not running", exc_info=True)
+        return None
+
+
+@asynccontextmanager
+async def _person_store() -> AsyncIterator[tuple[Any | None, Any | None]]:
+    """Yield ``(store, identity)`` for record-only person work.
+
+    Prefers the live identity service's store; otherwise opens a
+    standalone CloudStore (very early boot). Person records are plain
+    SQLite — rename/merge/list work on every device class. ``store`` is
+    None only if even the store module can't load; ``identity`` is None
+    when the service isn't live.
+    """
+    identity = _get_identity_service()
+    store = getattr(identity, "cloud_store", None)
+    if store is not None:
+        yield store, identity
+        return
+
     try:
-        return get_pipeline(), None
-    except RuntimeError:
-        logger.debug("Perception pipeline not running")
-        return None, None
+        from boxbot.perception.clouds import CloudStore
+
+        standalone = CloudStore()
+        await standalone.initialize()
+    except Exception:
+        logger.exception("identify_person: cannot open the person store")
+        yield None, identity
+        return
+
+    try:
+        yield standalone, identity
+    finally:
+        await standalone.close()
 
 
 async def _repoint_references(
-    pipeline: Any,
+    identity: Any | None,
     *,
     old_person_id: str,
     new_person_id: str,
@@ -461,9 +512,10 @@ async def _repoint_references(
         logger.exception("identify_person: memory repoint failed")
 
     # In-session enrollment claims (so commit_session at voice-session
-    # end doesn't write embeddings to a stale/merged-away person).
+    # end doesn't write embeddings to a stale/merged-away person). No
+    # identity service (very early boot) means no live claims to re-point.
     try:
-        enrollment = pipeline.enrollment
+        enrollment = getattr(identity, "enrollment", None)
         if enrollment is not None:
             counts["session_claims_repointed"] = enrollment.repoint_person(
                 old_person_id, new_person_id, new_name,

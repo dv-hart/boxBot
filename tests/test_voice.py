@@ -1057,6 +1057,38 @@ class TestSTT:
         assert result.words == []
 
 
+    @patch("boxbot.communication.stt.AsyncElevenLabs")
+    def test_create_stt_selects_configured_provider(self, mock_client_cls):
+        from boxbot.communication.stt import ElevenLabsSTT, create_stt
+        from boxbot.core.config import ApiKeysConfig, STTConfig
+
+        stt = create_stt(
+            STTConfig(provider="elevenlabs", model="scribe_v2"),
+            ApiKeysConfig(elevenlabs="key"),
+        )
+
+        assert isinstance(stt, ElevenLabsSTT)
+        assert stt._model == "scribe_v2"
+
+    def test_create_stt_unknown_provider_raises(self):
+        """A typo'd provider must fail at boot, not fall back silently."""
+        from boxbot.communication.stt import create_stt
+        from boxbot.core.config import ApiKeysConfig, STTConfig
+
+        with pytest.raises(ValueError, match="stt.provider must be one of"):
+            create_stt(
+                STTConfig(provider="elevenlab"),
+                ApiKeysConfig(elevenlabs="key"),
+            )
+
+    def test_create_stt_missing_key_returns_none(self):
+        """No credential degrades voice; it must not crash the box."""
+        from boxbot.communication.stt import create_stt
+        from boxbot.core.config import ApiKeysConfig, STTConfig
+
+        assert create_stt(STTConfig(), ApiKeysConfig()) is None
+
+
 # ---------------------------------------------------------------------------
 # TestTTS
 # ---------------------------------------------------------------------------
@@ -1163,6 +1195,38 @@ class TestTTS:
         assert stream.is_playing is False
 
 
+    @patch("boxbot.communication.tts.AsyncElevenLabs")
+    @patch("boxbot.communication.tts.VoiceSettings")
+    def test_create_tts_selects_configured_provider(self, mock_vs, mock_cls):
+        from boxbot.communication.tts import ElevenLabsTTS, create_tts
+        from boxbot.core.config import ApiKeysConfig, TTSConfig
+
+        tts = create_tts(
+            TTSConfig(provider="elevenlabs", voice_id="vid"),
+            ApiKeysConfig(elevenlabs="key"),
+        )
+
+        assert isinstance(tts, ElevenLabsTTS)
+        assert tts._voice_id == "vid"
+
+    def test_create_tts_unknown_provider_raises(self):
+        """A typo'd provider must fail at boot, not fall back silently."""
+        from boxbot.communication.tts import create_tts
+        from boxbot.core.config import ApiKeysConfig, TTSConfig
+
+        with pytest.raises(ValueError, match="tts.provider must be one of"):
+            create_tts(
+                TTSConfig(provider="11labs"), ApiKeysConfig(elevenlabs="key")
+            )
+
+    def test_create_tts_missing_key_returns_none(self):
+        """No credential degrades voice; it must not crash the box."""
+        from boxbot.communication.tts import create_tts
+        from boxbot.core.config import ApiKeysConfig, TTSConfig
+
+        assert create_tts(TTSConfig(), ApiKeysConfig()) is None
+
+
 # ---------------------------------------------------------------------------
 # TestDiarization
 # ---------------------------------------------------------------------------
@@ -1175,6 +1239,10 @@ class TestDiarization:
         from boxbot.core.config import DiarizationConfig
 
         defaults = dict(
+            # Every test here exercises the segmentation pipeline, which
+            # only loads when diarization is enabled. The config default is
+            # False (embed-only single-speaker mode), so opt in explicitly.
+            enabled=True,
             engine="pyannote",
             model="pyannote/speaker-diarization-3.1",
             embedding_model="pyannote/wespeaker-voxceleb-resnet34-LM",
@@ -1307,6 +1375,94 @@ class TestDiarization:
         assert result.segments[0].embedding is not None
 
 
+class TestDiarizerLazyLoad:
+    """The lazy-load path must not retry a permanently missing dependency."""
+
+    def _session(self, start_effect):
+        """A VoiceSession with only the diarizer attributes populated."""
+        from boxbot.communication.voice import VoiceSession
+
+        session = VoiceSession.__new__(VoiceSession)
+        session._diarizer = MagicMock()
+        session._diarizer.start = AsyncMock(side_effect=start_effect)
+        session._diarizer_loaded = False
+        session._diarizer_unload_task = None
+        session._diarizer_load_lock = asyncio.Lock()
+        return session
+
+    @pytest.mark.asyncio
+    async def test_import_error_disables_diarizer_permanently(self):
+        session = self._session(
+            ImportError("pyannote.audio is required for SpeakerDiarizer.")
+        )
+        diarizer = session._diarizer
+
+        await session._ensure_diarizer_loaded()
+
+        # Dropped, so no call site can retry it (this is a camera-less host:
+        # no pyannote.audio in the chroot).
+        assert session._diarizer is None
+        assert session._diarizer_loaded is False
+        assert diarizer.start.await_count == 1
+
+        # A second utterance must not touch the dependency again.
+        await session._ensure_diarizer_loaded()
+        assert diarizer.start.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_error_keeps_diarizer_for_retry(self):
+        session = self._session(RuntimeError("model download timed out"))
+        diarizer = session._diarizer
+
+        await session._ensure_diarizer_loaded()
+
+        # A transient failure may succeed later — keep it.
+        assert session._diarizer is diarizer
+        assert session._diarizer_loaded is False
+
+        await session._ensure_diarizer_loaded()
+        assert diarizer.start.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_warm_call_cancels_pending_unload(self):
+        """Activity on an already-loaded model must refresh the idle
+        window — the early return used to skip the cancel, leaving
+        orphan timers that fired mid-session."""
+        session = self._session(None)
+        session._diarizer_loaded = True
+        session._diarizer_unload_task = asyncio.create_task(asyncio.sleep(60))
+        pending = session._diarizer_unload_task
+
+        await session._ensure_diarizer_loaded()
+
+        await asyncio.sleep(0)
+        assert pending.cancelled()
+        assert session._diarizer_unload_task is None
+        assert session._diarizer.start.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unload_serialises_with_load_on_the_lock(self):
+        """An unload firing mid-load must wait for the lock — otherwise
+        stop() races start() and _diarizer_loaded ends True on a
+        stopped model (voice ID silently dead)."""
+        session = self._session(None)
+        session._diarizer_loaded = True
+        session._diarizer.stop = AsyncMock()
+
+        async with session._diarizer_load_lock:
+            unload = asyncio.create_task(
+                session._unload_diarizer_after_timeout(0.0)
+            )
+            await asyncio.sleep(0.01)
+            # Blocked on the lock: nothing stopped yet.
+            assert session._diarizer.stop.await_count == 0
+            assert session._diarizer_loaded is True
+
+        await unload
+        assert session._diarizer.stop.await_count == 1
+        assert session._diarizer_loaded is False
+
+
 # ---------------------------------------------------------------------------
 # TestVoiceSession
 # ---------------------------------------------------------------------------
@@ -1342,8 +1498,6 @@ class TestVoiceSession:
     @pytest.mark.asyncio
     @patch("boxbot.communication.voice.WakeWordDetector")
     @patch("boxbot.communication.voice.VoiceActivityDetector")
-    @patch("boxbot.communication.voice.ElevenLabsSTT", None)
-    @patch("boxbot.communication.voice.ElevenLabsTTS", None)
     async def test_start_enters_idle_state(self, mock_vad_cls, mock_ww_cls):
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
 
@@ -1376,6 +1530,10 @@ class TestVoiceSession:
                     await session.start()
 
         assert session.state == VoiceSessionState.IDLE
+        # No ElevenLabs key: the factories return None and voice comes
+        # up mute rather than failing to boot.
+        assert session._stt is None
+        assert session._tts is None
 
         await session.stop()
 
@@ -1415,6 +1573,25 @@ class TestVoiceSession:
         assert session._conversation_id == ""
         session._audio_capture.stop.assert_awaited_once()
         session._vad.reset.assert_called_once()
+
+
+    @pytest.mark.asyncio
+    async def test_deactivate_clears_agent_mute(self):
+        """``mute_mic`` promises "auto-unmute … when the conversation
+        ends" — the mute is scoped to the conversation it was made in, so
+        teardown must not leave the next session deaf."""
+        from boxbot.communication.voice import VoiceSessionState
+
+        session, _mic, _speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        capture = MagicMock()
+        capture.is_muted = True
+        capture.stop = AsyncMock()
+        session._audio_capture = capture
+
+        await session._deactivate_session(reason="silence_timeout")
+
+        capture.unmute.assert_called()
 
     @pytest.mark.asyncio
     async def test_activate_session_starts_audio_capture(self):
@@ -1892,8 +2069,11 @@ class TestVoiceSession:
 
     @pytest.mark.asyncio
     async def test_agent_turn_ended_arms_post_response_timer(self):
-        """AgentTurnEnded for the matching session arms the post-response
-        idle timer so a silent turn doesn't leave the mic hot."""
+        """A voice-channel AgentTurnEnded arms the post-response idle
+        timer so a silent turn doesn't leave the mic hot. The event
+        carries the agent's Conversation id (conv_…), which never
+        matches the adapter's voice session id — matching is by
+        channel only."""
         from boxbot.communication.voice import VoiceSession, VoiceSessionState
         from boxbot.core.events import AgentTurnEnded
 
@@ -1902,12 +2082,32 @@ class TestVoiceSession:
         session._conversation_id = "voice_t"
 
         await session._on_agent_turn_ended(
-            AgentTurnEnded(conversation_id="voice_t", channel="voice")
+            AgentTurnEnded(conversation_id="conv_abc123", channel="voice")
         )
 
         assert session._active_timeout_task is not None
         # Cancel so the test doesn't leak a pending sleep.
         session._active_timeout_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_agent_turn_ended_restores_listening_ring(self):
+        """The "thinking" ring set at utterance-finalize is held through
+        generation; AgentTurnEnded is the clear point — including silent
+        turns where no SPEAKING ceremony ran."""
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+        from boxbot.core.events import AgentTurnEnded
+
+        session, mic, speaker = self._make_session()
+        session._state = VoiceSessionState.ACTIVE
+        session._conversation_id = "voice_t"
+
+        await session._on_agent_turn_ended(
+            AgentTurnEnded(conversation_id="conv_abc123", channel="voice")
+        )
+
+        mic.set_led_pattern.assert_awaited_with("listening")
+        if session._active_timeout_task is not None:
+            session._active_timeout_task.cancel()
 
     @pytest.mark.asyncio
     async def test_agent_turn_ended_ignored_for_other_channel(self):
@@ -1966,6 +2166,62 @@ class TestVoiceSession:
         assert "you" in transcript
 
 
+
+
+    @pytest.mark.asyncio
+    @patch("boxbot.communication.voice.WakeWordDetector")
+    @patch("boxbot.communication.voice.VoiceActivityDetector")
+    async def test_wake_word_mode_still_builds_both(
+        self, mock_vad_cls, mock_ww_cls
+    ):
+        """Default mode is unchanged — the Pi path must not regress."""
+        from boxbot.communication.audio_capture import AudioCapture
+
+        mock_ww_cls.return_value = MagicMock(
+            start=AsyncMock(), stop=AsyncMock()
+        )
+        mock_vad_cls.return_value = MagicMock(
+            start=AsyncMock(), stop=AsyncMock()
+        )
+
+        session, _mic, _speaker = self._make_session()
+        await self._start(session)
+
+        assert isinstance(session._audio_capture, AudioCapture)
+        mock_ww_cls.assert_called_once()
+        mock_vad_cls.assert_called_once()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    async def _start(self, session):
+        """Run VoiceSession.start() with the singletons stubbed out."""
+        with patch("boxbot.communication.voice.get_event_bus") as bus_fn:
+            bus_fn.return_value = MagicMock()
+            with patch(
+                "boxbot.communication.voice.SpeakerDiarizer",
+                side_effect=ImportError,
+                create=True,
+            ):
+                with patch("boxbot.core.config.get_config") as get_cfg:
+                    cfg = MagicMock()
+                    cfg.api_keys.elevenlabs = None
+                    get_cfg.return_value = cfg
+                    await session.start()
+
+
+
 # ---------------------------------------------------------------------------
 # Config integration for voice pipeline
 # ---------------------------------------------------------------------------
@@ -1992,3 +2248,202 @@ class TestVoiceConfig:
         cfg = BoxBotConfig()
         assert hasattr(cfg, "voice")
         assert cfg.voice.wake_word.word == "hey_jarvis"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_speaker_identities — voice ReID + enrollment via IdentityService
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSpeakerIdentities:
+    """First coverage of the transcript-attribution path.
+
+    The panel incident: with no identity backend this method silently
+    degraded to label-only and every session restarted at "Speaker A".
+    """
+
+    def _make_session(self):
+        from boxbot.communication.voice import VoiceSession
+        from boxbot.core.config import VoiceConfig
+
+        mic = MagicMock()
+        speaker = MagicMock()
+        speaker.is_playing = False
+        return VoiceSession(mic, speaker, VoiceConfig())
+
+    def _diar_result(self, embedding):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            segments=[
+                SimpleNamespace(speaker_label="SPEAKER_00",
+                                embedding=embedding),
+            ],
+        )
+
+    def _unit(self, seed=0, dim=192):
+        rng = np.random.default_rng(seed)
+        v = rng.standard_normal(dim).astype(np.float32)
+        return v / np.linalg.norm(v)
+
+    @pytest_asyncio.fixture
+    async def identity(self, tmp_path):
+        from boxbot.perception.clouds import CloudStore
+        from boxbot.perception.identity import IdentityService
+
+        store = CloudStore(db_path=tmp_path / "resolve.db")
+        await store.initialize()
+        svc = IdentityService(cloud_store=store)
+        await svc.start()
+        yield svc
+        await svc.stop()
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_label_only_without_identity_and_logs_once(self, caplog):
+        session = self._make_session()
+
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="boxbot.communication.voice"):
+            label_map, block = await session._resolve_speaker_identities(
+                self._diar_result(self._unit())
+            )
+            await session._resolve_speaker_identities(
+                self._diar_result(self._unit())
+            )
+
+        assert label_map == {"SPEAKER_00": "Speaker A"}
+        assert block["Speaker A"]["voice_tier"] == "unknown"
+        infos = [
+            r for r in caplog.records
+            if "Voice identity unavailable" in r.message
+            and r.levelno == logging.INFO
+        ]
+        assert len(infos) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_match_buffers_under_display_label(
+        self, identity, mock_config,
+    ):
+        session = self._make_session()
+        emb = self._unit(seed=3)
+
+        label_map, block = await session._resolve_speaker_identities(
+            self._diar_result(emb)
+        )
+
+        assert label_map == {"SPEAKER_00": "Speaker A"}
+        person = identity.enrollment.get_session_person("Speaker A")
+        assert person is not None
+        assert len(person.voice_embeddings) == 1
+
+    @pytest.mark.asyncio
+    async def test_cloud_match_attributes_by_name(
+        self, identity, mock_config,
+    ):
+        emb = self._unit(seed=5)
+        store = identity.cloud_store
+        pid = await store.create_person("Jacob")
+        # Identical vector in the cloud → cosine 1.0 ≥ confirmed (0.55).
+        await store.add_voice_embedding(pid, emb)
+
+        session = self._make_session()
+        label_map, block = await session._resolve_speaker_identities(
+            self._diar_result(emb)
+        )
+
+        assert label_map == {"SPEAKER_00": "Jacob"}
+        assert block["Jacob"]["voice_tier"] == "high"
+        assert block["Jacob"]["person_id"] == pid
+        # Reinforcement buffered under the display name + non-admitting claim.
+        assert identity.enrollment.get_session_person("Jacob") is not None
+        claim = identity.enrollment.get_claim("Jacob")
+        assert claim is not None
+        assert claim.source == "voice_reid_match"
+
+    @pytest.mark.asyncio
+    async def test_agent_identify_claim_overrides_label(
+        self, identity, mock_config,
+    ):
+        session = self._make_session()
+        emb = self._unit(seed=8)
+
+        # First utterance: unknown speaker, buffered as "Speaker A".
+        await session._resolve_speaker_identities(self._diar_result(emb))
+        # Agent then identifies them mid-session.
+        await identity.enrollment.identify("Jacob", "Speaker A")
+
+        label_map, block = await session._resolve_speaker_identities(
+            self._diar_result(emb)
+        )
+
+        assert label_map == {"SPEAKER_00": "Jacob"}
+        assert block["Jacob"]["source"] == "agent_identify"
+
+    @pytest.mark.asyncio
+    async def test_segment_without_embedding_is_label_only(
+        self, identity, mock_config,
+    ):
+        session = self._make_session()
+
+        label_map, block = await session._resolve_speaker_identities(
+            self._diar_result(None)
+        )
+
+        assert label_map == {"SPEAKER_00": "Speaker A"}
+        assert block["Speaker A"]["voice_tier"] == "unknown"
+        assert identity.enrollment.get_session_refs() == []
+
+    @pytest.mark.asyncio
+    async def test_confident_match_publishes_speaker_identified(
+        self, identity, mock_config,
+    ):
+        """The voice adapter is the single SpeakerIdentified publisher."""
+        from boxbot.core.events import SpeakerIdentified
+
+        emb = self._unit(seed=11)
+        store = identity.cloud_store
+        pid = await store.create_person("Jacob")
+        await store.add_voice_embedding(pid, emb)
+
+        published = []
+
+        async def capture(event):
+            published.append(event)
+
+        bus = get_event_bus()
+        bus.subscribe(SpeakerIdentified, capture)
+        try:
+            session = self._make_session()
+            await session._resolve_speaker_identities(self._diar_result(emb))
+        finally:
+            bus.unsubscribe(SpeakerIdentified, capture)
+
+        assert len(published) == 1
+        assert published[0].person_name == "Jacob"
+        assert published[0].person_id == pid
+        assert published[0].speaker_label == "SPEAKER_00"
+
+    @pytest.mark.asyncio
+    async def test_unknown_speaker_publishes_nothing(
+        self, identity, mock_config,
+    ):
+        from boxbot.core.events import SpeakerIdentified
+
+        published = []
+
+        async def capture(event):
+            published.append(event)
+
+        bus = get_event_bus()
+        bus.subscribe(SpeakerIdentified, capture)
+        try:
+            session = self._make_session()
+            await session._resolve_speaker_identities(
+                self._diar_result(self._unit(seed=12))
+            )
+        finally:
+            bus.unsubscribe(SpeakerIdentified, capture)
+
+        assert published == []

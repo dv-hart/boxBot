@@ -140,6 +140,17 @@ def reset_event_bus():
     events_module._event_bus = original
 
 
+@pytest.fixture(autouse=True)
+def reset_identity_registry():
+    """Reset the identity-service singleton before every test."""
+    from boxbot.perception import identity as identity_module
+
+    original = identity_module._identity_instance
+    identity_module._identity_instance = None
+    yield
+    identity_module._identity_instance = original
+
+
 @pytest.fixture
 def event_bus():
     """Return a fresh EventBus instance (also set as the global singleton)."""

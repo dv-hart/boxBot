@@ -167,7 +167,7 @@ def _build_command(
 
     Uses the shared :func:`build_sandbox_launch` so integrations drop
     privilege exactly like ``execute_script`` — ``sudo`` on the Pi,
-    ``setuid`` (preexec_fn) on root-in-chroot hosts. ``popen_kwargs``
+    ``setuid`` (preexec_fn) on root hosts. ``popen_kwargs``
     carries a ``preexec_fn`` on the setuid path and is empty otherwise.
     """
     from boxbot.tools._sandbox_launch import build_sandbox_launch

@@ -470,6 +470,17 @@ class SessionConfig(BaseModel):
 class VoiceConfig(BaseModel):
     """Voice pipeline settings."""
 
+    # Audio HAL backend. "portaudio" (ReSpeaker mic + HDMI speaker,
+    # default) or "none" (no audio I/O; voice adapter stays off).
+    audio_backend: Literal["portaudio", "none"] = "portaudio"
+
+    # Seconds after a settled agent turn before the mic goes DORMANT
+    # (ring off, wake word required to continue; the conversation thread
+    # is kept). Stops ambient chatter round-tripping through the model
+    # after BB has answered. 0 = keep the mic hot until the conversation's
+    # own silence timeout.
+    post_response_idle_seconds: float = 15.0
+
     wake_word: WakeWordConfig = Field(default_factory=WakeWordConfig)
     vad: VADConfig = Field(default_factory=VADConfig)
     turn_detection: TurnDetectionConfig = Field(default_factory=TurnDetectionConfig)

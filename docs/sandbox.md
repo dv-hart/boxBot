@@ -151,6 +151,26 @@ boxbot-sandbox (sandbox script user):
   - Can write to skills/                 (group-writable for skill creation)
 ```
 
+#### Privilege drop mechanism
+
+`sandbox.privilege_drop` (config) selects how the child sheds the main
+process's identity. Both launch paths (persistent runner, per-call
+fallback) and the integrations runner build their argv through one
+helper, `boxbot.tools._sandbox_launch.build_sandbox_launch`, so they
+cannot diverge.
+
+| value    | mechanism                                                    | when |
+|----------|--------------------------------------------------------------|------|
+| `auto`   | euid==0 + `user` → `setuid`; else `user` → `sudo`; else none | default |
+| `sudo`   | `sudo -n -u <user>` (boxBot non-root)                        | Pi |
+| `setuid` | parent forks; child does `setgid → setgroups → setuid`       | boxBot already root (containers) |
+| `none`   | run as current user                                          | dev only |
+
+`BOXBOT_SANDBOX_ENFORCE=0` forces `none`. `none` while root is refused
+unless `BOXBOT_SANDBOX_ALLOW_ROOT=1`. The `setuid` path resolves uid/gid
+in the parent and drops in a `preexec_fn`; the group set replicates
+`initgroups` (so the `boxbot` group survives) plus `sandbox.extra_groups`.
+
 #### No Subprocess Spawning: seccomp
 
 Sandbox scripts are launched with a **seccomp filter** that blocks

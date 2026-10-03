@@ -691,6 +691,18 @@ class SandboxConfig(BaseModel):
     timeout: int = 30
     memory_limit_mb: int = 256
     allow_network: bool = True
+    # How the sandbox subprocess drops privilege:
+    #   "auto"   — euid==0 + ``user`` set → setuid; else ``user`` set →
+    #              sudo; else none. Non-root boxBot (the Pi) → sudo.
+    #   "sudo"   — ``sudo -n -u <user>`` UID-drop (boxBot must be non-root).
+    #   "setuid" — parent is root (container hosts); drop directly via a
+    #              ``preexec_fn`` (setgid → setgroups → setuid), no sudo.
+    #   "none"   — run as the current user (== ``BOXBOT_SANDBOX_ENFORCE=0``).
+    # ``BOXBOT_SANDBOX_ENFORCE=0`` forces "none" regardless of this value.
+    privilege_drop: str = "auto"
+    # Supplementary GIDs granted to the sandbox child at drop time
+    # (setuid mode only). Injected by the runner; no /etc/group edit.
+    extra_groups: list[int] = Field(default_factory=list)
     install_approval_timeout: int = 300
     install_approval_channels: list[str] = Field(
         default_factory=lambda: ["display", "whatsapp"]
@@ -715,6 +727,15 @@ class SandboxConfig(BaseModel):
             raise ValueError(
                 f"seccomp_mode must be one of disabled/log/enforce, "
                 f"got {self.seccomp_mode!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_privilege_drop(self) -> SandboxConfig:
+        if self.privilege_drop not in {"auto", "sudo", "setuid", "none"}:
+            raise ValueError(
+                f"privilege_drop must be one of auto/sudo/setuid/none, "
+                f"got {self.privilege_drop!r}"
             )
         return self
 

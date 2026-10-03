@@ -124,7 +124,7 @@ git push origin main
 
 # Detect what changed between the Pi's current HEAD and the deploy
 # target. We use this for two follow-up actions:
-#   - setup-sandbox.sh changes → warn the operator (needs sudo + may
+#   - setup-sandbox.sh changes → warn the operator (escalates via sudo + may
 #     need attention).
 #   - SDK source changes (src/boxbot/sdk/*.py) → auto-refresh the
 #     sandbox venv copy. The SDK is installed non-editable, so source
@@ -183,7 +183,7 @@ if [[ "$SETUP_CHANGED" -eq 1 ]]; then
     echo ""
     echo "WARNING: scripts/setup-sandbox.sh changed in this deploy."
     echo "After restart, run on the Pi:"
-    echo "    ssh $TARGET 'cd $PI_PROJECT_DIR && sudo bash scripts/setup-sandbox.sh'"
+    echo "    ssh $TARGET 'cd $PI_PROJECT_DIR && bash scripts/setup-sandbox.sh'"
     echo ""
 fi
 
@@ -208,7 +208,7 @@ cd "$PI_PROJECT_DIR"
 SANDBOX_VENV_PIP="/var/lib/boxbot-sandbox/venv/bin/pip"
 if [[ ! -x "\$SANDBOX_VENV_PIP" ]]; then
     echo "  sandbox venv pip not found at \$SANDBOX_VENV_PIP — skipping"
-    echo "  (run 'sudo bash scripts/setup-sandbox.sh' to create it)"
+    echo "  (run 'bash scripts/setup-sandbox.sh' to create it)"
     exit 0
 fi
 "\$SANDBOX_VENV_PIP" install --force-reinstall --no-deps --quiet \\

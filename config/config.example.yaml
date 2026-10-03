@@ -320,6 +320,12 @@ sandbox:
   # Package install approval timeout (seconds, 0 = no timeout)
   install_approval_timeout: 300
   # Channels for package install approval
+  # How the sandbox subprocess drops privilege. "auto" (default) picks
+  # sudo when boxBot runs non-root (the Pi) and setuid when it already
+  # runs as root (container hosts). Explicit: "sudo" | "setuid" | "none".
+  privilege_drop: "auto"
+  # Supplementary GIDs for the sandbox child in setuid mode only.
+  extra_groups: []
   install_approval_channels:
     - "display"          # tap YES on touchscreen
     - "whatsapp"         # admin replies YES via WhatsApp

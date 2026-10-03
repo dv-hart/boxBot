@@ -160,27 +160,51 @@ def _build_command(
     enforce_sandbox: bool,
     include_secrets_path: bool = False,
     script_path: Path | None = None,
-) -> list[str]:
+) -> tuple[list[str], dict[str, Any]]:
+    """Return ``(argv, popen_kwargs)`` for the integration subprocess.
+
+    Uses the shared :func:`build_sandbox_launch` so integrations drop
+    privilege exactly like ``execute_script`` — ``sudo`` on the Pi,
+    ``setuid`` (preexec_fn) on root hosts. ``popen_kwargs`` carries a
+    ``preexec_fn`` on the setuid path and is empty otherwise.
+    """
+    from boxbot.tools._sandbox_launch import build_sandbox_launch
+
     target_script = script_path if script_path is not None else meta.script_path
-    if enforce_sandbox and sandbox_user:
-        preserve = [
-            "BOXBOT_SECCOMP_MODE", "BOXBOT_SECCOMP_DISABLE",
-            "BOXBOT_SKILLS_ROOT",
-            "BOXBOT_INTEGRATION_INPUTS_PATH", "BOXBOT_INTEGRATION_OUTPUT_PATH",
-        ]
-        if include_secrets_path:
-            # Secret *values* never cross sudo (it logs every preserved
-            # var); only the path to the staged secrets file does. The
-            # bootstrap reads it into the env after the privilege drop.
-            preserve.append("BOXBOT_SECRETS_PATH")
-        return [
-            "sudo", "-n",
-            "--preserve-env=" + ",".join(preserve),
-            "-u", sandbox_user,
-            "--", str(venv_python), str(bootstrap_path),
-            str(target_script),
-        ]
-    return [str(venv_python), str(bootstrap_path), str(target_script)]
+
+    # Fresh-read privilege_drop/extra_groups each run (same pattern as
+    # SandboxRunner.start) so a runtime config edit takes effect without
+    # a code change.
+    privilege_drop = "auto"
+    extra_groups: list[int] = []
+    try:
+        from boxbot.core.config import get_config
+        _sbx = get_config().sandbox
+        privilege_drop = _sbx.privilege_drop
+        extra_groups = list(_sbx.extra_groups)
+    except Exception:
+        pass
+
+    # sudo strips env not listed here. Secret *values* never cross sudo
+    # (it logs every preserved var); only BOXBOT_SECRETS_PATH does, and
+    # the bootstrap reads the file after the drop. (No-op on the
+    # setuid/none paths, where env passes through untouched.)
+    preserve = [
+        "BOXBOT_SECCOMP_MODE", "BOXBOT_SECCOMP_DISABLE",
+        "BOXBOT_SKILLS_ROOT",
+        "BOXBOT_INTEGRATION_INPUTS_PATH", "BOXBOT_INTEGRATION_OUTPUT_PATH",
+    ]
+    if include_secrets_path:
+        preserve.append("BOXBOT_SECRETS_PATH")
+
+    return build_sandbox_launch(
+        [str(venv_python), str(bootstrap_path), str(target_script)],
+        user=sandbox_user,
+        privilege_drop=privilege_drop,
+        extra_groups=extra_groups,
+        preserve_env_keys=preserve,
+        enforce=enforce_sandbox,
+    )
 
 
 def _build_env(
@@ -413,15 +437,23 @@ async def run(
                     "could not chmod integration script tmp file: %s", exc
                 )
             script_path = script_tmp_path
-        cmd = _build_command(
-            meta,
-            venv_python=venv_python,
-            bootstrap_path=bootstrap_path,
-            sandbox_user=sandbox_user,
-            enforce_sandbox=enforce_sandbox,
-            include_secrets_path=secrets_path is not None,
-            script_path=script_path,
-        )
+        try:
+            cmd, popen_kwargs = _build_command(
+                meta,
+                venv_python=venv_python,
+                bootstrap_path=bootstrap_path,
+                sandbox_user=sandbox_user,
+                enforce_sandbox=enforce_sandbox,
+                include_secrets_path=secrets_path is not None,
+                script_path=script_path,
+            )
+        except RuntimeError as exc:
+            # Privilege drop can't be built (missing sandbox user, or
+            # refusing to run as root with no drop). Return an error result;
+            # the finally block cleans up the staged temp/secrets files.
+            error = f"sandbox privilege drop unavailable: {exc}"
+            logger.warning("integration '%s': %s", name, error)
+            return {"status": "error", "error": error}
 
         # Same lazy import as _pump_actions — dodge the boxbot.core init chain.
         # asyncio's default StreamReader limit is 64 KiB per line, far too
@@ -438,6 +470,7 @@ async def run(
                 env=env,
                 cwd=str(Path.cwd()),
                 limit=SANDBOX_STREAM_LIMIT,
+                **popen_kwargs,
             )
         except FileNotFoundError as exc:
             error = f"sandbox python not found at {venv_python}: {exc}"

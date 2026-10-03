@@ -146,6 +146,9 @@ class ActionContext:
     # Every action processed, mirrored into the final tool result so the
     # agent can observe side effects (e.g. "photos.set_tags: ok").
     action_log: list[dict[str, Any]] = field(default_factory=list)
+    # Conversation this run belongs to (the runner's label). None for
+    # one-off runs.
+    conversation_id: str | None = None
 
 
 # ---------------------------------------------------------------------------

@@ -311,23 +311,34 @@ def test_runner_build_env_injects_declared_secrets(tmp_path, isolated_secret_sto
     assert "BOXBOT_SECRET_BAR_KEY" not in env
 
 
-def test_runner_build_command_preserves_secrets_path_not_values(tmp_path):
+def _echo_meta(tmp_path, secrets=()):
     from boxbot.integrations.manifest import IntegrationMeta
-    from boxbot.integrations.runner import _build_command
 
-    meta = IntegrationMeta(
+    return IntegrationMeta(
         name="echo",
         description="t",
         inputs={},
         outputs={},
-        secrets=("FOO_KEY",),
+        secrets=secrets,
         timeout=5,
         root_path=tmp_path,
         manifest_path=tmp_path / "manifest.yaml",
         script_path=tmp_path / "script.py",
     )
-    cmd = _build_command(
-        meta,
+
+
+def test_runner_build_command_preserves_secrets_path_not_values(
+    tmp_path, monkeypatch
+):
+    import os as _os
+
+    from boxbot.integrations.runner import _build_command
+
+    monkeypatch.delenv("BOXBOT_SANDBOX_ENFORCE", raising=False)
+    monkeypatch.setattr(_os, "geteuid", lambda: 1000)  # force the sudo path
+
+    cmd, popen_kwargs = _build_command(
+        _echo_meta(tmp_path, secrets=("FOO_KEY",)),
         venv_python=Path("/usr/bin/python3"),
         bootstrap_path=Path("/tmp/bootstrap.py"),
         sandbox_user="boxbot-sandbox",
@@ -340,26 +351,22 @@ def test_runner_build_command_preserves_secrets_path_not_values(tmp_path):
     assert "BOXBOT_SECRET_FOO_KEY" not in preserve_arg
     # Doesn't drop the default keys.
     assert "BOXBOT_SECCOMP_MODE" in preserve_arg
+    assert popen_kwargs == {}
 
 
-def test_runner_build_command_omits_secrets_path_when_none(tmp_path):
+def test_runner_build_command_omits_secrets_path_when_none(
+    tmp_path, monkeypatch
+):
     """No declared secrets → BOXBOT_SECRETS_PATH isn't preserved at all."""
-    from boxbot.integrations.manifest import IntegrationMeta
+    import os as _os
+
     from boxbot.integrations.runner import _build_command
 
-    meta = IntegrationMeta(
-        name="echo",
-        description="t",
-        inputs={},
-        outputs={},
-        secrets=(),
-        timeout=5,
-        root_path=tmp_path,
-        manifest_path=tmp_path / "manifest.yaml",
-        script_path=tmp_path / "script.py",
-    )
-    cmd = _build_command(
-        meta,
+    monkeypatch.delenv("BOXBOT_SANDBOX_ENFORCE", raising=False)
+    monkeypatch.setattr(_os, "geteuid", lambda: 1000)  # force the sudo path
+
+    cmd, _kwargs = _build_command(
+        _echo_meta(tmp_path),
         venv_python=Path("/usr/bin/python3"),
         bootstrap_path=Path("/tmp/bootstrap.py"),
         sandbox_user="boxbot-sandbox",
@@ -368,6 +375,72 @@ def test_runner_build_command_omits_secrets_path_when_none(tmp_path):
     )
     preserve_arg = next(a for a in cmd if a.startswith("--preserve-env="))
     assert "BOXBOT_SECRETS_PATH" not in preserve_arg
+
+
+def test_runner_build_command_sudo_argv_is_byte_for_byte(tmp_path, monkeypatch):
+    """Pi/sudo argv regression: exact flags + preserve-env order, no preexec."""
+    import os as _os
+
+    from boxbot.integrations.runner import _build_command
+
+    monkeypatch.delenv("BOXBOT_SANDBOX_ENFORCE", raising=False)
+    monkeypatch.setattr(_os, "geteuid", lambda: 1000)
+
+    cmd, popen_kwargs = _build_command(
+        _echo_meta(tmp_path, secrets=("FOO_KEY",)),
+        venv_python=Path("/venv/bin/python3"),
+        bootstrap_path=Path("/rt/bootstrap.py"),
+        sandbox_user="boxbot-sandbox",
+        enforce_sandbox=True,
+        include_secrets_path=True,
+        script_path=Path("/rt/x.py"),
+    )
+    assert cmd == [
+        "sudo", "-n",
+        "--preserve-env=BOXBOT_SECCOMP_MODE,BOXBOT_SECCOMP_DISABLE,"
+        "BOXBOT_SKILLS_ROOT,BOXBOT_INTEGRATION_INPUTS_PATH,"
+        "BOXBOT_INTEGRATION_OUTPUT_PATH,BOXBOT_SECRETS_PATH",
+        "-u", "boxbot-sandbox",
+        "--", "/venv/bin/python3", "/rt/bootstrap.py", "/rt/x.py",
+    ]
+    assert popen_kwargs == {}
+
+
+def test_runner_build_command_setuid_has_preexec_no_sudo(tmp_path, monkeypatch):
+    """setuid (root host): argv carries no sudo; a preexec_fn drops privilege."""
+    import os as _os
+    import pwd as _pwd
+
+    import boxbot.core.config as config_module
+    from boxbot.core.config import SandboxConfig
+    from boxbot.integrations import runner as runner_mod
+
+    monkeypatch.delenv("BOXBOT_SANDBOX_ENFORCE", raising=False)
+    monkeypatch.setattr(_os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        _pwd, "getpwnam",
+        lambda name: type("PW", (), {"pw_uid": 4242, "pw_gid": 4343})(),
+    )
+    # Force setuid via a stub config carrying an extra supplementary gid.
+    # _build_command does ``from boxbot.core.config import get_config``,
+    # so patch the name on the source module.
+    cfg = type("Cfg", (), {"sandbox": SandboxConfig(
+        privilege_drop="setuid", extra_groups=[3003],
+    )})()
+    monkeypatch.setattr(config_module, "get_config", lambda: cfg)
+
+    cmd, popen_kwargs = runner_mod._build_command(
+        _echo_meta(tmp_path),
+        venv_python=Path("/venv/bin/python3"),
+        bootstrap_path=Path("/rt/bootstrap.py"),
+        sandbox_user="boxbot-sandbox",
+        enforce_sandbox=True,
+        include_secrets_path=False,
+        script_path=Path("/rt/x.py"),
+    )
+    assert cmd == ["/venv/bin/python3", "/rt/bootstrap.py", "/rt/x.py"]
+    assert "sudo" not in cmd
+    assert callable(popen_kwargs.get("preexec_fn"))
 
 
 def test_write_secrets_file_perms_and_content(tmp_path):

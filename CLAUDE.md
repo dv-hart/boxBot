@@ -402,7 +402,8 @@ What it does, in order:
 3. **SSH to Pi → `git fetch && git pull --ff-only origin main`** —
    fast-forward only. The Pi can never silently diverge.
 4. **Warns** if `scripts/setup-sandbox.sh` changed in this deploy. The
-   operator runs `sudo bash scripts/setup-sandbox.sh` manually after
+   operator runs `bash scripts/setup-sandbox.sh` (non-root; it escalates
+   with sudo internally) manually after
    the deploy because it needs sudo and may want attention.
 5. **`scripts/restart-boxbot.sh` on the Pi** — SIGTERMs the running
    boxbot, waits up to 15s for clean exit, SIGKILLs if needed, then

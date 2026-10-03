@@ -50,6 +50,7 @@ from boxbot.tools._sandbox_actions import (
     process_action,
     read_sandbox_line,
 )
+from boxbot.tools._sandbox_launch import build_sandbox_launch
 
 logger = logging.getLogger(__name__)
 
@@ -223,24 +224,44 @@ class SandboxRunner:
                 )
                 return
 
+            # Read privilege-drop config fresh each spawn so a runtime
+            # config edit + runner restart picks up the new mode.
+            privilege_drop = "auto"
+            extra_groups: list[int] = []
+            try:
+                from boxbot.core.config import get_config
+                _sbx = get_config().sandbox
+                privilege_drop = _sbx.privilege_drop
+                extra_groups = list(_sbx.extra_groups)
+            except Exception:
+                pass
+
             # Pass the server source via ``python3 -c`` so the sandbox
             # user doesn't need read access to the project source tree.
-            if self._enforce_sandbox and self._sandbox_user:
-                cmd: list[str] = [
-                    "sudo", "-n",
-                    # sudo strips env by default; opt the seccomp
-                    # control vars in so the prologue can read them.
-                    "--preserve-env=BOXBOT_SECCOMP_MODE,BOXBOT_SECCOMP_DISABLE",
-                    "-u", self._sandbox_user,
-                    "--", str(self._venv_python), "-c", _server_code_with_seccomp(),
-                ]
-            else:
-                if self._sandbox_user:
-                    logger.warning(
-                        "Sandbox enforcement disabled "
-                        "(BOXBOT_SANDBOX_ENFORCE=0) — runner uses current user"
-                    )
-                cmd = [str(self._venv_python), "-c", _server_code_with_seccomp()]
+            # ``--preserve-env`` opts the seccomp control vars through the
+            # sudo boundary so the prologue can read them (no-op on the
+            # setuid/none paths, where env passes through untouched).
+            argv = [str(self._venv_python), "-c", _server_code_with_seccomp()]
+            try:
+                cmd, popen_kwargs = build_sandbox_launch(
+                    argv,
+                    user=self._sandbox_user,
+                    privilege_drop=privilege_drop,
+                    extra_groups=extra_groups,
+                    preserve_env_keys=[
+                        "BOXBOT_SECCOMP_MODE", "BOXBOT_SECCOMP_DISABLE",
+                    ],
+                    enforce=self._enforce_sandbox,
+                )
+            except RuntimeError as e:
+                # e.g. setuid with a missing sandbox user, or refusing to
+                # run as root with no drop. Poison the runner (same pattern
+                # as venv-missing) so execute_script falls back cleanly and
+                # the reason is visible in logs.
+                logger.warning("Sandbox privilege drop unavailable: %s", e)
+                self._poisoned = True
+                self._failure_reason = f"privilege drop unavailable: {e}"
+                return
 
             env = {
                 k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS
@@ -267,6 +288,7 @@ class SandboxRunner:
                     env=env,
                     cwd=str(Path.cwd()),
                     limit=SANDBOX_STREAM_LIMIT,
+                    **popen_kwargs,
                 )
             except FileNotFoundError as e:
                 logger.warning(
@@ -366,7 +388,10 @@ class SandboxRunner:
                     f"Sandbox runner[{self._label}] stopped while waiting"
                 )
 
-            ctx = ActionContext()
+            # The runner label is the owning conversation's id (see
+            # execute_script); non-conversation labels just won't resolve
+            # to a requester downstream.
+            ctx = ActionContext(conversation_id=self._label)
             output_lines: list[str] = []
             script_id = uuid4().hex[:12]
             request = {

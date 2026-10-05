@@ -553,3 +553,66 @@ class TestDegenerateContent:
         A new one that is not in the set silently reopens the burn-the-cap
         bug, so the set is the definition, not a copy of it."""
         assert UNRETRYABLE_DROPS == {DEGENERATE_CONTENT, TOOL_SYNTAX, BUDGET_SPENT}
+
+
+class _FakeSignalWithAttachments:
+    name = "signal"
+
+    def __init__(self):
+        self.sent = []
+        self.attachments = []
+
+    async def send_text(self, phone: str, message: str) -> bool:
+        self.sent.append((phone, message))
+        return True
+
+    async def send_attachment(self, phone, file_path, caption=None) -> bool:
+        self.attachments.append((phone, file_path, caption))
+        return True
+
+
+class TestTextAttachments:
+    @pytest.mark.asyncio
+    async def test_first_attachment_carries_caption_rest_follow_bare(
+        self, fake_voice, fake_auth, monkeypatch,
+    ):
+        import boxbot.communication.whatsapp as wa_mod
+
+        out = _FakeSignalWithAttachments()
+        out.name = "whatsapp"
+        wa_mod.set_whatsapp_client(out)
+        try:
+            results = await dispatch_outputs(
+                [{
+                    "to": "Sarah", "channel": "text", "content": "Porch now.",
+                    "attachments": ["/tmp/a.jpg", "/tmp/b.jpg"],
+                }],
+                conversation_id="c-att",
+                channel_context="signal",
+                current_speaker=None,
+            )
+        finally:
+            wa_mod.set_whatsapp_client(None)
+        assert [r.status for r in results] == ["delivered"]
+        assert out.attachments == [
+            ("+15552222222", "/tmp/a.jpg", "Porch now."),
+            ("+15552222222", "/tmp/b.jpg", None),
+        ]
+        assert out.sent == []  # caption rode the attachment
+
+    @pytest.mark.asyncio
+    async def test_transport_without_attachments_sends_text_and_says_so(
+        self, fake_voice, fake_auth, fake_whatsapp,
+    ):
+        results = await dispatch_outputs(
+            [{
+                "to": "Sarah", "channel": "text", "content": "Porch now.",
+                "attachments": ["/tmp/a.jpg"],
+            }],
+            conversation_id="c-att2",
+            channel_context="signal",
+            current_speaker=None,
+        )
+        assert fake_whatsapp.sent == [("+15552222222", "Porch now.")]
+        assert results[0].status == "delivered"
+        assert "cannot carry attachments" in (results[0].reason or "")

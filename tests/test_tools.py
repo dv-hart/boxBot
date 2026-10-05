@@ -454,3 +454,65 @@ class TestWebSearchTool:
         assert "Title" in text
         assert "Content" in text
         assert "<h1>" not in text
+
+
+class TestMessageAttachments:
+    """Attachment paths are resolved against the sandbox/workspace roots
+    and must pass the image-attach allowlist before they reach a phone."""
+
+    @staticmethod
+    def _png(path):
+        from PIL import Image
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (4, 4), (0, 128, 128)).save(path, format="PNG")
+        return path
+
+    @pytest.fixture
+    def roots(self, tmp_path, monkeypatch):
+        import boxbot.tools._sandbox_actions as actions
+
+        tmp_dir = tmp_path / "sandbox" / "tmp"
+        tmp_dir.mkdir(parents=True)
+        monkeypatch.setattr(actions, "_sandbox_tmp_dir", lambda: tmp_dir)
+        monkeypatch.setattr(actions, "_attach_roots", lambda: (tmp_dir.resolve(),))
+        monkeypatch.setattr(
+            "boxbot.tools.builtins.message._attachment_bases",
+            lambda: [tmp_path / "sandbox", tmp_dir],
+        )
+        return tmp_path, tmp_dir
+
+    def test_relative_sandbox_path_resolves(self, roots):
+        from boxbot.tools.builtins.message import _resolve_attachments
+
+        tmp_path, tmp_dir = roots
+        self._png(tmp_dir / "camera_abc.jpg")
+        paths, err = _resolve_attachments(["tmp/camera_abc.jpg"])
+        assert err is None
+        assert paths == [str((tmp_dir / "camera_abc.jpg").resolve())]
+
+    def test_outside_allowlist_is_refused(self, roots, tmp_path):
+        from boxbot.tools.builtins.message import _resolve_attachments
+
+        stray = self._png(tmp_path / "elsewhere" / "x.png")
+        paths, err = _resolve_attachments([str(stray)])
+        assert paths == [] and "not in an allowed location" in err
+
+    def test_non_image_is_refused(self, roots):
+        from boxbot.tools.builtins.message import _resolve_attachments
+
+        _tmp_path, tmp_dir = roots
+        (tmp_dir / "notes.txt").write_text("hello")
+        paths, err = _resolve_attachments(["notes.txt"])
+        assert paths == [] and "not a recognised image" in err
+
+    @pytest.mark.asyncio
+    async def test_speak_channel_rejects_attachments(self, mock_config):
+        from boxbot.tools.builtins.message import MessageTool
+
+        result = json.loads(await MessageTool().execute(
+            to="current_speaker", channel="speak", content="Look",
+            attachments=["tmp/x.jpg"],
+        ))
+        assert result["status"] == "error"
+        assert "channel \"text\"" in result["message"]

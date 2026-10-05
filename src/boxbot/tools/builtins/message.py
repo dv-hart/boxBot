@@ -40,6 +40,81 @@ _CHANNEL_MAP = {
 }
 
 
+_MAX_ATTACHMENTS = 4
+
+
+def _attachment_bases() -> list["Path"]:
+    """Directories a relative attachment path may be read against.
+
+    The sandbox reports capture paths relative to its runtime dir
+    (``tmp/camera_x.jpg``) or as bare tmp filenames; workspace and
+    photo paths are relative to their own roots. Every candidate still
+    has to land inside the image-attach allowlist.
+    """
+    from pathlib import Path
+
+    from boxbot.tools._sandbox_actions import _attach_roots, _sandbox_tmp_dir
+
+    bases: list[Path] = []
+    try:
+        from boxbot.core.config import get_config
+
+        bases.append(Path(get_config().sandbox.runtime_dir))
+    except Exception:
+        pass
+    bases.append(_sandbox_tmp_dir())
+    bases.extend(_attach_roots())
+    return bases
+
+
+def _resolve_attachments(raw: Any) -> tuple[list[str], str | None]:
+    """Turn agent-supplied attachment paths into absolute, allowlisted
+    image files. Returns ``(paths, error)``; ``error`` names the first
+    path that could not be used."""
+    from pathlib import Path
+
+    from boxbot.tools._sandbox_actions import (
+        MAX_IMAGE_BYTES,
+        _is_attach_allowed,
+        sniff_image_mime,
+    )
+
+    if not isinstance(raw, list):
+        return [], "attachments must be a list of file paths"
+    if len(raw) > _MAX_ATTACHMENTS:
+        return [], f"at most {_MAX_ATTACHMENTS} attachments per message"
+    resolved: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        candidate = Path(text)
+        found: Path | None = None
+        options = [candidate] if candidate.is_absolute() else [
+            base / candidate for base in _attachment_bases()
+        ]
+        for opt in options:
+            if opt.is_file() and _is_attach_allowed(opt):
+                found = opt.resolve()
+                break
+        if found is None:
+            return [], (
+                f"attachment '{text}' not found or not in an allowed location "
+                "(sandbox tmp, workspace, photos)"
+            )
+        try:
+            size = found.stat().st_size
+            head = found.read_bytes()[:64]
+        except OSError:
+            return [], f"attachment '{text}' is not readable"
+        if size > MAX_IMAGE_BYTES:
+            return [], f"attachment '{text}' is too large to send"
+        if sniff_image_mime(head) is None:
+            return [], f"attachment '{text}' is not a recognised image"
+        resolved.append(str(found))
+    return resolved, None
+
+
 class MessageTool(Tool):
     """Send one message to one recipient through one channel."""
 
@@ -56,7 +131,10 @@ class MessageTool(Tool):
         "`channel`: \"speak\" (box speaker, whole room hears) | \"text\" "
         "(registered user by name; cannot text \"room\" or strangers).\n"
         "Default to the channel you were contacted on. Be concise. Stay "
-        "silent when people are talking to each other, not to you."
+        "silent when people are talking to each other, not to you.\n"
+        "`attachments`: image paths to send with a text — the `path` from "
+        "bb.camera.capture / bb.photos.get, or a workspace image. Text only; "
+        "for the box screen use bb.display / bb.photos.show_on_screen."
     )
     parameters = {
         "type": "object",
@@ -76,6 +154,16 @@ class MessageTool(Tool):
             "content": {
                 "type": "string",
                 "description": "The exact words to deliver.",
+            },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Image file paths to attach (channel \"text\" only). "
+                    "Use the path returned by bb.camera.capture / "
+                    "bb.photos.get or a workspace path. Content becomes "
+                    "the caption."
+                ),
             },
             "final_turn": {
                 "type": "boolean",
@@ -129,6 +217,7 @@ class MessageTool(Tool):
         to = str(kwargs.get("to", "")).strip()
         channel = str(kwargs.get("channel", "")).strip()
         content = str(kwargs.get("content", "")).strip()
+        raw_attachments = kwargs.get("attachments") or []
 
         if not to or not channel or not content:
             return json.dumps({
@@ -147,6 +236,21 @@ class MessageTool(Tool):
                 ),
             })
 
+        attachments: list[str] = []
+        if raw_attachments:
+            if channel != "text":
+                return json.dumps({
+                    "status": "error",
+                    "message": (
+                        "attachments only go out on channel \"text\". To "
+                        "show an image in the room use bb.display or "
+                        "bb.photos.show_on_screen."
+                    ),
+                })
+            attachments, problem = _resolve_attachments(raw_attachments)
+            if problem:
+                return json.dumps({"status": "error", "message": problem})
+
         conv = get_current_conversation()
         if conv is None:
             # Ad-hoc / out-of-conversation invocation (tests, triggers
@@ -158,7 +262,8 @@ class MessageTool(Tool):
                 to, channel,
             )
             results = await dispatch_outputs(
-                [{"to": to, "channel": dispatcher_channel, "content": content}],
+                [{"to": to, "channel": dispatcher_channel, "content": content,
+                  "attachments": attachments}],
                 conversation_id="ad-hoc",
                 channel_context="unknown",
                 current_speaker=None,
@@ -202,7 +307,8 @@ class MessageTool(Tool):
             break
 
         results = await dispatch_outputs(
-            [{"to": to, "channel": dispatcher_channel, "content": content}],
+            [{"to": to, "channel": dispatcher_channel, "content": content,
+              "attachments": attachments}],
             conversation_id=conv.conversation_id,
             channel_context=conv.channel,
             current_speaker=current_speaker,

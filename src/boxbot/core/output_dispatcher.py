@@ -363,6 +363,9 @@ async def dispatch_outputs(
         to = str(entry.get("to") or "").strip()
         channel = str(entry.get("channel") or "").strip()
         content = str(entry.get("content") or "").strip()
+        attachments = [
+            str(a) for a in (entry.get("attachments") or []) if a
+        ]
 
         if not to or not channel or not content:
             logger.warning(
@@ -464,6 +467,7 @@ async def dispatch_outputs(
                     content=content,
                     conversation_id=conversation_id,
                     channel_context=channel_context,
+                    attachments=attachments,
                 )
             except BaseException:
                 segment.interrupted = True
@@ -564,11 +568,17 @@ async def _dispatch_text(
     content: str,
     conversation_id: str,
     channel_context: str,
+    attachments: list[str] | None = None,
 ) -> DispatchResult:
     """Resolve ``to`` to a registered user and send via their outbound channel.
 
     The user's ``channel`` column picks which outbound client receives
     the send — WhatsApp for legacy users, Signal once migrated.
+
+    ``attachments`` are absolute, already-validated image paths (the
+    message tool checks the allowlist). The first rides with ``content``
+    as its caption; the rest follow bare. A transport without
+    ``send_attachment`` gets the text alone and the result says so.
     """
     from boxbot.communication.auth import get_auth_manager
     from boxbot.communication.channels import Channel, get_outbound_channel
@@ -644,12 +654,35 @@ async def _dispatch_text(
         )
 
     logger.info(
-        "output: text → %s (%s via %s) (conv=%s chan=%s): %s",
+        "output: text → %s (%s via %s) (conv=%s chan=%s%s): %s",
         to, matched.phone, out.name, conversation_id, channel_context,
+        f" attachments={len(attachments)}" if attachments else "",
         content[:120],
     )
     try:
-        await out.send_text(matched.phone, content)
+        if attachments:
+            send_attachment = getattr(out, "send_attachment", None)
+            if send_attachment is None:
+                await out.send_text(matched.phone, content)
+                return DispatchResult(
+                    to=to, channel="text", status="delivered",
+                    reason=(
+                        f"{out.name} cannot carry attachments; the text "
+                        "was sent without them"
+                    ),
+                )
+            ok = await send_attachment(
+                matched.phone, attachments[0], caption=content,
+            )
+            for extra in attachments[1:]:
+                ok = await send_attachment(matched.phone, extra) and ok
+            if not ok:
+                return DispatchResult(
+                    to=to, channel="text", status="dropped",
+                    reason=f"{out.name} attachment send failed",
+                )
+        else:
+            await out.send_text(matched.phone, content)
     except Exception:
         logger.exception(
             "Text dispatch failed (conv=%s to=%s phone=%s)",

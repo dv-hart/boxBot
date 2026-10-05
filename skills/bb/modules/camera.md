@@ -68,6 +68,11 @@ bb.memory.save(
 "What is this?" — `bb.camera.capture()`, then use the attached image
 when composing your reply.
 
+"Send me a picture" (text channel) — capture, then pass the path to the
+message tool: `message(to="Jacob", channel="text", content="Here you go.",
+attachments=[result["path"]])`. Works for `bb.photos.get` paths and
+workspace images too; the content becomes the caption.
+
 ## Gotchas — 8-image attach cap, no-camera error, test-frame fallback, zero-size bbox clamps
 
 - Max 8 images per `execute_script` call. Beyond that, captures still

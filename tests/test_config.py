@@ -332,3 +332,28 @@ class TestMainInitHelpers:
         mgr = await main_mod._init_display_manager()
         assert built["size"] == (mock_config.display.width, mock_config.display.height)
         mgr.start.assert_awaited_once()
+
+
+class TestDotenvFallbackParser:
+    def test_inline_comment_is_not_the_value(self, tmp_path, monkeypatch):
+        import sys
+
+        from boxbot.core import main as main_mod
+
+        env = tmp_path / ".env"
+        env.write_text(
+            "A_KEY=          # For Whisper API\n"
+            "B_KEY=realvalue # trailing note\n"
+            "C_KEY=\"quoted # not a comment\"\n"
+            "# D_KEY=ignored\n"
+        )
+        for k in ("A_KEY", "B_KEY", "C_KEY", "D_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        # Force the manual parser regardless of python-dotenv presence.
+        monkeypatch.setitem(sys.modules, "dotenv", None)
+        main_mod._load_dotenv(env)
+        import os
+        assert os.environ.get("A_KEY", "") == ""
+        assert os.environ.get("B_KEY") == "realvalue"
+        assert os.environ.get("C_KEY") == "quoted # not a comment"
+        assert "D_KEY" not in os.environ

@@ -74,9 +74,14 @@ def _load_dotenv(path: str | Path = ".env") -> None:
             key, _, value = line.partition("=")
             key = key.strip()
             value = value.strip()
-            # Remove surrounding quotes
+            # Remove surrounding quotes; otherwise drop a trailing
+            # ``# comment`` so ``KEY=   # note`` loads as empty, not as
+            # the literal comment text.
             if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
                 value = value[1:-1]
+            elif "#" in value:
+                head, _, _ = value.partition("#")
+                value = head.strip()
             # Only set if not already in environment
             if key and key not in os.environ:
                 os.environ[key] = value

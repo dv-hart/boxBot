@@ -164,6 +164,30 @@ _REFUSAL_CLOSE_OUT = (
     "another run at it."
 )
 
+_AUTH_FAILURE_CLOSE_OUT = (
+    "I can't reach my language model right now — my API key was "
+    "rejected. Someone needs to fix my configuration."
+)
+
+
+def _looks_like_openai_key(value: str | None) -> bool:
+    """Cheap shape check for an OpenAI secret key.
+
+    Catches the failure that silenced the box once: a template line like
+    ``OPENAI_API_KEY=   # For Whisper API`` loads as the literal comment,
+    which is "set" but every request 401s. Real keys start with ``sk-``
+    and contain no whitespace or ``#``.
+    """
+    if not value:
+        return False
+    v = value.strip()
+    return (
+        v.startswith("sk-")
+        and len(v) > 20
+        and not any(ch.isspace() for ch in v)
+        and "#" not in v
+    )
+
 # The structured-output schema is defined in ``output_dispatcher`` so the
 # dispatcher and the agent loop share a single source of truth. Schema
 # mutation invalidates the messages cache — it is pinned at module scope
@@ -1423,15 +1447,16 @@ class BoxBotAgent:
             )
             if value and provider_for_model(value) == "openai"
         }
-        if openai_models and not config.api_keys.openai:
+        if openai_models and not _looks_like_openai_key(config.api_keys.openai):
             routed = ", ".join(
                 f"{field} = {value!r}"
                 for field, value in openai_models.items()
             )
             raise RuntimeError(
-                f"{routed} routes to OpenAI but OPENAI_API_KEY is not "
-                "set. Set it in .env, or point the model at Anthropic "
-                "(BOXBOT_MODEL_LARGE / BOXBOT_MODEL_FAST)."
+                f"{routed} routes to OpenAI but OPENAI_API_KEY is "
+                f"{'not set' if not config.api_keys.openai else 'not a valid key (a placeholder or an inline comment?)'}. "
+                "Set a real key in .env (no trailing comment), or point the "
+                "model at Anthropic (BOXBOT_MODEL_LARGE / BOXBOT_MODEL_FAST)."
             )
 
         self._client = anthropic.AsyncAnthropic(
@@ -4521,7 +4546,7 @@ class BoxBotAgent:
         # actionable RuntimeError from _ensure_openai_client, not as a
         # bare ImportError on this import line.
         client = self._ensure_openai_client()
-        from openai import APIError
+        from openai import APIError, AuthenticationError
 
         system_prompt = flatten_system_prompt(system_prompt_blocks)
 
@@ -4583,6 +4608,27 @@ class BoxBotAgent:
                             max_completion_tokens=_MAX_TOKENS,
                             **effort_kwargs,
                         )
+                    break
+                except AuthenticationError as e:
+                    # Not transient: the key is wrong. Retrying only
+                    # delays the silence. Say so in the room / thread
+                    # and stop the cycle — a 401 loop once left the
+                    # household with a mute box for hours.
+                    logger.critical(
+                        "OpenAI rejected the API key (conv=%s turn=%d): %s "
+                        "— check OPENAI_API_KEY in .env",
+                        conversation_id, turn_count, e,
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"(API error: {e})",
+                    })
+                    await self._dispatch_close_out(
+                        conversation_id=conversation_id,
+                        channel=channel,
+                        person_name=person_name,
+                        content=_AUTH_FAILURE_CLOSE_OUT,
+                    )
                     break
                 except APIError as e:
                     logger.error(

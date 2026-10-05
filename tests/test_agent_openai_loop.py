@@ -927,3 +927,48 @@ async def test_api_error_then_success_continues(
 
     assert turns == 1
     assert messages[-1]["content"] == [{"type": "text", "text": NOTES}]
+
+
+@pytest.mark.asyncio
+async def test_auth_error_stops_retrying_and_closes_out(
+    agent_with_openai, monkeypatch, caplog,
+):
+    """A 401 is not transient: no retry, a spoken close-out, the cycle
+    ends. The silent 401 loop once muted the box for hours."""
+    import openai
+
+    agent = agent_with_openai
+    err = openai.AuthenticationError(
+        "Incorrect API key provided",
+        response=MagicMock(status_code=401, headers={}),
+        body=None,
+    )
+    agent._openai_client.chat.completions.create.side_effect = [err, _completion()]
+    close_out = AsyncMock()
+    monkeypatch.setattr(agent, "_dispatch_close_out", close_out)
+
+    with caplog.at_level("CRITICAL"):
+        messages, turns = await _run(agent)
+
+    assert agent._openai_client.chat.completions.create.call_count == 1
+    close_out.assert_awaited_once()
+    assert "API key" in close_out.await_args.kwargs["content"]
+    assert "rejected the API key" in caplog.text
+    assert messages[-1]["role"] == "assistant"
+
+
+class TestLooksLikeOpenAIKey:
+    def test_real_shapes_pass(self):
+        from boxbot.core.agent import _looks_like_openai_key
+
+        assert _looks_like_openai_key("sk-proj-" + "a" * 40)
+        assert _looks_like_openai_key("sk-" + "b" * 30)
+
+    @pytest.mark.parametrize("bad", [
+        None, "", "   ", "# For Whisper API", "sk-abc # comment",
+        "sk-short", "proj-" + "a" * 40,
+    ])
+    def test_placeholders_and_comments_fail(self, bad):
+        from boxbot.core.agent import _looks_like_openai_key
+
+        assert not _looks_like_openai_key(bad)

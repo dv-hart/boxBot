@@ -577,20 +577,12 @@ $AS_SANDBOX touch "$SANDBOX_VENV/.verify_test" &>/dev/null && rc=0 || rc=$?
 rm -f "$SANDBOX_VENV/.verify_test" 2>/dev/null
 verify "Sandbox cannot write to venv" "should_fail" "$rc"
 
-# Test 11: Sandbox user CAN read a shipped display.json (group boxbot,
-# 640). This is the positive counterpart to the "cannot read .env" test:
-# with a correct group set after privilege drop, group-readable content
-# must be reachable. A regression here means the drop lost the boxbot
-# group (initgroups bug) — displays/config/data/secrets would all break.
-DISPLAY_JSON="$(find "$PROJECT_DIR/displays" -name display.json -type f 2>/dev/null | head -1)"
-if [[ -n "$DISPLAY_JSON" ]]; then
-    $AS_SANDBOX cat "$DISPLAY_JSON" &>/dev/null && rc=0 || rc=$?
-    verify "Sandbox CAN read a shipped display.json (group boxbot)" "should_succeed" "$rc"
-else
-    echo "  - Skipped display.json read test (no displays/ found)"
-fi
+# (No "sandbox can read displays/" check: on the Pi the project lives
+# under the operator's 0700 home dir, which blocks traversal by design —
+# display specs reach the sandbox through bb.display actions in the
+# main process, never by direct file reads.)
 
-# Test 12: Sandbox user CAN read a staged secrets-style file. The host
+# Test 11: Sandbox user CAN read a staged secrets-style file. The host
 # drops the resolved-secrets JSON into the setgid scripts dir (2770,
 # group boxbot) at mode 0640; the sandbox reads + unlinks it after the
 # drop. Prove that path works end to end.

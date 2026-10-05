@@ -305,3 +305,30 @@ class TestOpenAIEndpointShape:
         assert cfg.openai.is_azure
         assert cfg.openai.api_base == "https://r.openai.azure.com/"
         assert cfg.openai.api_version == "2025-01-01-preview"
+
+
+class TestMainInitHelpers:
+    """Startup helpers in core/main.py must at least run under a loaded
+    config — a NameError here crash-loops the service at boot."""
+
+    @pytest.mark.asyncio
+    async def test_init_display_manager_builds_from_config(
+        self, mock_config, monkeypatch,
+    ):
+        from unittest.mock import AsyncMock, MagicMock
+
+        import boxbot.displays.manager as manager_mod
+        from boxbot.core import main as main_mod
+
+        built = {}
+
+        class _FakeManager:
+            def __init__(self, width, height):
+                built["size"] = (width, height)
+                self.start = AsyncMock()
+
+        monkeypatch.setattr(manager_mod, "DisplayManager", _FakeManager)
+        monkeypatch.setattr(manager_mod, "set_display_manager", MagicMock())
+        mgr = await main_mod._init_display_manager()
+        assert built["size"] == (mock_config.display.width, mock_config.display.height)
+        mgr.start.assert_awaited_once()

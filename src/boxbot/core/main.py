@@ -467,6 +467,7 @@ async def _init_ha_events(config: Any) -> Any | None:
 
 async def _init_display_manager() -> Any:
     """Initialise and start the DisplayManager."""
+    from boxbot.core.config import get_config
     from boxbot.displays.manager import DisplayManager, set_display_manager
 
     cfg = get_config()

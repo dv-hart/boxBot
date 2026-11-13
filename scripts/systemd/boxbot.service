@@ -24,6 +24,11 @@ ExecStart=/home/jhart/software/boxBot/.venv/bin/boxbot
 Restart=on-failure
 RestartSec=5s
 
+# File-descriptor headroom. The default soft limit (1024) was exhausted
+# on 2026-11-03 by leaked camera dma_heap handles; at that point sqlite,
+# sockets and the camera itself all fail with EMFILE.
+LimitNOFILE=65536
+
 # Cgroup memory limits. MemoryHigh exerts pressure but doesn't kill;
 # our in-process RSS guardrail (config.diagnostics.memory.rss_shutdown_mb)
 # is expected to trip well before MemoryMax does. MemoryMax is the hard

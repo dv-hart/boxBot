@@ -78,9 +78,26 @@ class Camera(HardwareModule):
         watchdog_interval: float = 30.0,
         watchdog_stale: float = 60.0,
         restart_timeout: float = 30.0,
+        max_fps: int = 15,
+        min_fps: int = 5,
+        abandon_limit: int = 20,
+        shutdown_callback: Any = None,
     ) -> None:
         super().__init__()
         self._rotation = rotation
+        # Sensor frame-rate clamp. Without FrameDurationLimits the
+        # preview config lets AE run the 1536x864 mode at its 120 fps
+        # floor in daylight (measured 2026-11-12: 67→83°C in 75 s, 52%
+        # CPU with nothing consuming frames). Perception needs ≤15 fps.
+        self._max_fps = max(1, int(max_fps))
+        self._min_fps = max(1, min(int(min_fps), self._max_fps))
+        # Every abandoned pipeline handle leaks its worker thread and
+        # dma_heap FDs (646 abandons → 1413 threads, EMFILE on
+        # 2026-11-03). Past this budget the process asks for a clean
+        # restart instead of dying slowly.
+        self._abandon_limit = int(abandon_limit)
+        self._abandoned = 0
+        self._shutdown_callback = shutdown_callback
         self._main_resolution = main_resolution
         self._lores_resolution = lores_resolution
         self._scan_fps = scan_fps
@@ -128,10 +145,24 @@ class Camera(HardwareModule):
 
         Pending work items are cancelled; the stuck thread is left to
         die with the process. ``shutdown(wait=False)`` never blocks.
+        Callers awaiting a cancelled item see ``HardwareUnavailableError``
+        from ``_run_bounded`` — never a bare ``CancelledError``.
         """
         old = self._executor
         self._executor = self._new_executor()
         old.shutdown(wait=False, cancel_futures=True)
+        self._abandoned += 1
+        if self._abandon_limit > 0 and self._abandoned == self._abandon_limit:
+            logger.critical(
+                "Camera abandoned %d pipeline workers since start — leaked "
+                "threads/FDs past budget; requesting graceful restart",
+                self._abandoned,
+            )
+            if self._shutdown_callback is not None:
+                try:
+                    self._shutdown_callback()
+                except Exception:
+                    logger.exception("Camera shutdown callback failed")
 
     async def _run_bounded(self, fn: Any, *args: Any, timeout: float) -> Any:
         """Run ``fn`` on the camera executor with a hard timeout.
@@ -142,9 +173,24 @@ class Camera(HardwareModule):
         leave it for the watchdog).
         """
         loop = asyncio.get_event_loop()
-        return await asyncio.wait_for(
-            loop.run_in_executor(self._executor, fn, *args), timeout
-        )
+        fut = loop.run_in_executor(self._executor, fn, *args)
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.CancelledError:
+            # ``_recycle_executor`` cancels queued work items. That
+            # cancellation must surface to the caller as a hardware
+            # error, not as CancelledError — the latter unwinds the
+            # caller's task (perception's ``_run_loop`` broke on it and
+            # went blind for 26 days, 2026-10-17). A cancellation of the
+            # *awaiting task* itself is re-raised untouched.
+            task = asyncio.current_task()
+            cancelling = getattr(task, "cancelling", None)
+            self_cancelled = bool(cancelling()) if cancelling else task is None
+            if fut.cancelled() and not self_cancelled:
+                raise HardwareUnavailableError(
+                    "camera executor recycled while capture was queued"
+                ) from None
+            raise
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -202,6 +248,12 @@ class Camera(HardwareModule):
             main={"size": self._main_resolution, "format": "RGB888"},
             lores={"size": self._lores_resolution, "format": "YUV420"},
             transform=transform,
+            controls={
+                "FrameDurationLimits": (
+                    int(1_000_000 / self._max_fps),
+                    int(1_000_000 / self._min_fps),
+                ),
+            },
         )
         self._picam2.configure(self._preview_config)
 
@@ -363,7 +415,17 @@ class Camera(HardwareModule):
         while True:
             await asyncio.sleep(self._watchdog_interval)
             try:
-                if not self._started or self._picam2 is None:
+                if not self._started:
+                    continue
+                if self._picam2 is None:
+                    # A previous restart's re-init failed and left no
+                    # handle. Skipping here parked the watchdog for good
+                    # (2026-11-03, EMFILE) — retry instead.
+                    logger.error(
+                        "Camera watchdog: no pipeline handle (last restart "
+                        "failed) — retrying restart"
+                    )
+                    await self._restart()
                     continue
                 age = self.frame_age
                 if age is None or age < self._watchdog_stale:

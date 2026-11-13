@@ -25,6 +25,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import asyncio
 import json
 import logging
@@ -770,7 +771,7 @@ class DisplayManager:
         import sqlite3
 
         try:
-            with sqlite3.connect(str(db_path)) as conn:
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
                     "SELECT id FROM photos "
@@ -1760,7 +1761,7 @@ def _resolve_photo_refs(refs: list[str]) -> dict[str, str]:
     import sqlite3
 
     try:
-        with sqlite3.connect(str(db_path)) as conn:
+        with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
             conn.row_factory = sqlite3.Row
             placeholders = ",".join("?" for _ in remaining)
             rows = conn.execute(

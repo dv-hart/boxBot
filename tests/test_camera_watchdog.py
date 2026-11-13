@@ -273,3 +273,61 @@ async def test_stop_bounded_when_pipeline_wedged():
         assert not cam._started
     finally:
         fake._unwedge.set()
+
+
+@pytest.mark.asyncio
+async def test_recycle_while_capture_queued_raises_hardware_error():
+    """2026-10-17: ``_recycle_executor`` cancelled a queued capture and the
+    bare CancelledError unwound perception's loop. Must surface as
+    HardwareUnavailableError instead."""
+    cam, fake = make_camera(capture_timeout=5.0)
+    fake.wedged = True
+    first = asyncio.create_task(cam.capture_frame())   # strands the worker
+    await asyncio.sleep(0.05)
+    second = asyncio.create_task(cam.capture_frame())  # queued behind it
+    await asyncio.sleep(0.05)
+    try:
+        cam._recycle_executor()
+        with pytest.raises(HardwareUnavailableError):
+            await asyncio.wait_for(second, 1.0)
+        assert not second.cancelled()
+    finally:
+        fake._unwedge.set()
+        first.cancel()
+        try:
+            await first
+        except (asyncio.CancelledError, HardwareUnavailableError):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_watchdog_retries_when_handle_missing(monkeypatch):
+    """2026-11-03: a failed re-init left ``_picam2`` None and the watchdog
+    skipped forever. It must keep retrying the restart."""
+    cam, _ = make_camera()
+    cam._picam2 = None
+    calls = []
+
+    async def fake_restart():
+        calls.append(1)
+
+    monkeypatch.setattr(cam, "_restart", fake_restart)
+    task = asyncio.create_task(cam._watchdog_loop())
+    await asyncio.sleep(0.35)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert calls, "watchdog never retried the restart"
+
+
+def test_abandon_budget_requests_shutdown():
+    fired = []
+    cam = Camera(rotation=0, abandon_limit=2, shutdown_callback=lambda: fired.append(1))
+    cam._recycle_executor()
+    assert not fired
+    cam._recycle_executor()
+    assert fired == [1]
+    cam._recycle_executor()  # fires once only
+    assert fired == [1]

@@ -338,7 +338,18 @@ class PerceptionPipeline:
                     await asyncio.sleep(1.0)
 
             except asyncio.CancelledError:
-                break
+                # Only our own cancellation (stop()) ends the loop. A
+                # CancelledError surfacing from a hardware await used to
+                # break here silently and leave perception dead for the
+                # life of the process (2026-10-17 → 2026-11-12).
+                task = asyncio.current_task()
+                cancelling = getattr(task, "cancelling", None)
+                if not self._running or cancelling is None or cancelling():
+                    break
+                logger.warning(
+                    "Perception step cancelled from below; loop continues"
+                )
+                await asyncio.sleep(1.0)
             except Exception:
                 logger.exception("Error in perception loop")
                 # Brief pause before retrying to avoid tight error loops

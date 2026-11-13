@@ -270,6 +270,10 @@ async def _init_hal(
             photo_timeout=cam_cfg.photo_timeout_s,
             watchdog_interval=cam_cfg.watchdog_interval_s,
             watchdog_stale=cam_cfg.watchdog_stale_s,
+            max_fps=cam_cfg.max_fps,
+            min_fps=cam_cfg.min_fps,
+            abandon_limit=cam_cfg.abandon_limit,
+            shutdown_callback=shutdown_callback,
         )
         await camera.start()
         system.register_module(camera)

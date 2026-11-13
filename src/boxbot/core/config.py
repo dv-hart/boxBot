@@ -347,6 +347,18 @@ class HardwareCameraConfig(BaseModel):
     watchdog_interval_s: float = 30.0
     watchdog_stale_s: float = 60.0
 
+    # Sensor frame-rate clamp (FrameDurationLimits). Without it AE runs
+    # the dual-stream mode at its 120 fps floor in daylight — 7x the ISP
+    # and CPU work perception needs, SoC pinned above 80°C. max_fps caps
+    # the rate; min_fps lets AE lengthen exposure in the dark.
+    max_fps: int = 15
+    min_fps: int = 5
+
+    # Each abandoned (wedged) pipeline handle leaks a thread + dma_heap
+    # FDs. After this many since start the process requests a graceful
+    # restart (systemd brings it back). 0 disables.
+    abandon_limit: int = 20
+
 
 class HardwareHailoConfig(BaseModel):
     """Hailo NPU configuration (model paths, preloading)."""

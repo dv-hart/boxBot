@@ -138,6 +138,7 @@ def _build_client() -> Any | None:
 
     from boxbot.core.models import provider_for_model
     from boxbot.prefetch.runner import LLMHandle, _resolve_model
+    from boxbot.telemetry.model_log import instrument
 
     model = _resolve_model(get_prefetch_config())
     provider = provider_for_model(model)
@@ -180,7 +181,9 @@ def _build_client() -> Any | None:
                 api_key=api_key,
                 base_url=(oa_cfg.api_base or None) if oa_cfg else None,
             )
-        return LLMHandle(provider="openai", model=model, client=client)
+        return LLMHandle(
+            provider="openai", model=model, client=instrument(client, "openai"),
+        )
 
     try:
         import anthropic
@@ -199,5 +202,7 @@ def _build_client() -> Any | None:
     return LLMHandle(
         provider="anthropic",
         model=model,
-        client=anthropic.AsyncAnthropic(api_key=api_key),
+        client=instrument(
+            anthropic.AsyncAnthropic(api_key=api_key), "anthropic"
+        ),
     )

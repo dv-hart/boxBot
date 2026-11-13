@@ -754,7 +754,11 @@ def _maybe_get_anthropic_client(
         api_key = cfg.api_keys.anthropic
         if not api_key:
             return None
-        return anthropic.AsyncAnthropic(api_key=api_key)
+        from boxbot.telemetry.model_log import instrument
+
+        return instrument(
+            anthropic.AsyncAnthropic(api_key=api_key), "anthropic"
+        )
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("Could not lazily build Anthropic client: %s", e)
         return None

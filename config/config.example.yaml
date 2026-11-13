@@ -505,6 +505,17 @@ signal:
   inbound_refresh_seconds: 900
 
 # ── Logging ───────────────────────────────────────────────────────────
+# Observability stores. model_log keeps the complete request and response
+# of every hosted model call (Anthropic, OpenAI, Agent SDK), untruncated,
+# in a local SQLite DB — the source for offline analysis and training
+# sets. Local only: mode 0600, never read by the sandbox, never uploaded.
+telemetry:
+  model_log_enabled: true
+  model_log_path: data/telemetry/model_calls.db
+  # Images sent to models are saved as files under <db dir>/blobs/.
+  # false keeps only each image's hash and size.
+  model_log_store_images: true
+
 logging:
   level: "INFO"
   file: "logs/boxbot.log"

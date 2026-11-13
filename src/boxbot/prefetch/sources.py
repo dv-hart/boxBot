@@ -417,30 +417,82 @@ async def _memory_source(req: PrefetchRequest, store: Any) -> SourceRun | None:
 # ---------------------------------------------------------------------------
 
 
+# Words that carry no retrieval signal in a workspace keyword search.
+_WS_STOPWORDS = frozenset("""
+about after again also been before being could does doing done down from
+going have having here into just know like make more much need please
+show some tell than that their them then there these they thing this
+those today tomorrow tonight want were what when where which while will
+with would your yours yesterday
+""".split())
+_WS_MIN_TERM = 4
+_WS_MAX_TERMS = 12
+_WS_SCAN_LIMIT = 400
+
+
+def _workspace_terms(text: str) -> list[str]:
+    """Content words of ``text``, deduplicated, in order of appearance."""
+    import re
+
+    terms: list[str] = []
+    for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", text.lower()):
+        word = word.strip("'_-")
+        if word.endswith("'s"):
+            word = word[:-2]
+        if (
+            len(word) < _WS_MIN_TERM
+            or word in _WS_STOPWORDS
+            or word in terms
+        ):
+            continue
+        terms.append(word)
+        if len(terms) >= _WS_MAX_TERMS:
+            break
+    return terms
+
+
 def _workspace_source(req: PrefetchRequest) -> SourceRun | None:
+    import re
+
     from boxbot.workspace.store import Workspace
 
-    query = (req.text or "").strip()
-    if not query:
+    # ``Workspace.search`` is a line grep over a regex. The message as a
+    # whole never matches a line, so search its content words instead and
+    # rank files by how many distinct words they contain.
+    terms = _workspace_terms(req.text or "")
+    if not terms:
         return None
+    pattern = "|".join(re.escape(t) for t in terms)
     try:
         ws = Workspace()
-        hits = ws.search(query, limit=_WORKSPACE_HITS)
+        hits = ws.search(pattern, limit=_WS_SCAN_LIMIT)
     except Exception:
         logger.debug("workspace candidate search failed", exc_info=True)
         return None
     if not hits:
         return None
 
-    lines = []
-    offered_paths: set[str] = set()
+    # path -> (distinct terms matched, first matching line)
+    matched: dict[str, set[str]] = {}
+    first_line: dict[str, str] = {}
     for h in hits:
         path = h.get("path") if isinstance(h, dict) else None
         if not path:
             continue
+        line = str(h.get("text") or "").strip()
+        haystack = f"{path}\n{line}".lower()
+        found = {t for t in terms if t in haystack}
+        matched.setdefault(path, set()).update(found)
+        first_line.setdefault(path, line)
+    ranked = sorted(
+        matched, key=lambda p: (-len(matched[p]), p)
+    )[:_WORKSPACE_HITS]
+
+    lines = []
+    offered_paths: set[str] = set()
+    for path in ranked:
         offered_paths.add(path)
-        snippet = str(h.get("text") or h.get("line") or "").strip()
-        lines.append(f"- {path}: {snippet[:120]}")
+        lines.append(f"- {path}: {first_line[path][:120]}")
     if not lines:
         return None
 

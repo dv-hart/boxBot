@@ -11,6 +11,13 @@ The tables live in the memory database (``memory.db``) alongside
 ``conversation_id``. See ``boxbot.cost.record`` for the sibling pattern.
 """
 
+from boxbot.telemetry.model_log import call_context, instrument, log_call
 from boxbot.telemetry.tool_log import ToolInvocation, record_tool_invocation
 
-__all__ = ["ToolInvocation", "record_tool_invocation"]
+__all__ = [
+    "ToolInvocation",
+    "record_tool_invocation",
+    "call_context",
+    "instrument",
+    "log_call",
+]

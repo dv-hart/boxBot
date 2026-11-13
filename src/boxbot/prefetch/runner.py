@@ -30,6 +30,7 @@ from boxbot.cost import from_anthropic_usage, from_openai_usage, record as recor
 from boxbot.prefetch.bundle import PrefetchBundle
 from boxbot.prefetch.request import PrefetchRequest
 from boxbot.prefetch.sources import SourceRun, gather_sources
+from boxbot.telemetry.model_log import call_context
 
 logger = logging.getLogger(__name__)
 
@@ -174,9 +175,10 @@ async def _run_selector(
         select = (
             _select_openai if handle.provider == "openai" else _select_anthropic
         )
-        selection, usage = await asyncio.wait_for(
-            select(handle, source, briefing), timeout=timeout
-        )
+        with call_context(purpose="prefetch", lane=source.name):
+            selection, usage = await asyncio.wait_for(
+                select(handle, source, briefing), timeout=timeout
+            )
         return source, selection, usage
     except asyncio.TimeoutError:
         logger.warning(
@@ -216,9 +218,15 @@ async def run_prefetch(
         return PrefetchResult(bundle=bundle, iterations=0, cost_usd=0.0)
 
     briefing = req.briefing()
-    results = await asyncio.gather(*[
-        _run_selector(client, s, briefing, per_call_timeout) for s in sources
-    ])
+    # Tags are set before gather() so each lane task inherits them.
+    with call_context(
+        prefetch_key=req.key, prefetch_key_kind=req.key_kind,
+        channel=req.channel,
+    ):
+        results = await asyncio.gather(*[
+            _run_selector(client, s, briefing, per_call_timeout)
+            for s in sources
+        ])
 
     usages = []
     for source, selection, usage in results:

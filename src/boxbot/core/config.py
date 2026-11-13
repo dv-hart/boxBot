@@ -1097,6 +1097,18 @@ class ApiKeysConfig(BaseModel):
         return f"ApiKeysConfig({', '.join(fields)})"
 
 
+class TelemetryConfig(BaseModel):
+    """Observability stores (see ``boxbot.telemetry``)."""
+
+    # Full request + response of every hosted model call, untruncated
+    # (``telemetry/model_log.py``). Local only; never leaves the box.
+    model_log_enabled: bool = True
+    model_log_path: str = "data/telemetry/model_calls.db"
+    # Images sent to models are stored as content-addressed files next
+    # to the DB. False keeps only their hash + size (no pixels on disk).
+    model_log_store_images: bool = True
+
+
 class LoggingConfig(BaseModel):
     """Logging settings."""
 
@@ -1180,5 +1192,6 @@ class BoxBotConfig(BaseModel):
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     prefetch: PrefetchConfig = Field(default_factory=PrefetchConfig)
     api_keys: ApiKeysConfig = Field(default_factory=ApiKeysConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)

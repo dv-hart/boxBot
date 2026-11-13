@@ -600,7 +600,11 @@ class IntakePipeline:
             api_key = get_config().api_keys.anthropic
             if not api_key:
                 return None
-            self._client = anthropic.AsyncAnthropic(api_key=api_key)
+            from boxbot.telemetry.model_log import instrument
+
+            self._client = instrument(
+                anthropic.AsyncAnthropic(api_key=api_key), "anthropic"
+            )
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("Photo tagger: no Anthropic client (%s)", e)
             return None

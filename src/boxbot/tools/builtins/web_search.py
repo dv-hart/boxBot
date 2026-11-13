@@ -419,7 +419,9 @@ def _build_anthropic_client() -> "Any":
 
     if not api_key:
         return None
-    return anthropic.AsyncAnthropic(api_key=api_key)
+    from boxbot.telemetry.model_log import instrument
+
+    return instrument(anthropic.AsyncAnthropic(api_key=api_key), "anthropic")
 
 
 def _resolve_small_model() -> str:

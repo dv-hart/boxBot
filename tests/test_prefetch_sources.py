@@ -253,3 +253,62 @@ class TestGatherMemoryCandidates:
         assert await gather_memory_candidates(
             None, text="x", person="Jacob",
         ) == []
+
+
+# ---------------------------------------------------------------------------
+# workspace lane — keyword candidates
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceSource:
+    @pytest.fixture
+    def workspace(self, tmp_path, monkeypatch):
+        from boxbot.workspace import store as ws_store
+
+        root = tmp_path / "workspace"
+        (root / "notes/people/erik").mkdir(parents=True)
+        (root / "notes/people/erik/pokemon.md").write_text(
+            "# Erik's Pokemon list\n- Pikachu\n- Charizard\n"
+        )
+        (root / "notes/garden.md").write_text("Tomato planting schedule\n")
+        monkeypatch.setattr(ws_store, "DEFAULT_ROOT", root)
+        return root
+
+    def test_terms_drop_stopwords_and_short_words(self):
+        terms = sources_mod._workspace_terms(
+            "What is on Erik's Pokemon list today?"
+        )
+        assert terms == ["erik", "pokemon", "list"]
+
+    def test_sentence_finds_file_by_content_words(self, workspace):
+        # Regression: the whole sentence used to be the grep pattern, so
+        # no natural-language message ever produced a candidate.
+        run = sources_mod._workspace_source(
+            _req(text="Can you tell me which Pokemon Erik has on his list?")
+        )
+        assert run is not None
+        assert "notes/people/erik/pokemon.md" in run.candidates
+        assert "garden" not in run.candidates
+
+    def test_best_match_ranks_first(self, workspace):
+        (workspace / "notes/misc.md").write_text("pokemon cards are fun\n")
+        run = sources_mod._workspace_source(
+            _req(text="Erik pokemon list please")
+        )
+        assert run is not None
+        first = run.candidates.splitlines()[0]
+        assert first.startswith("- notes/people/erik/pokemon.md")
+
+    def test_no_content_words_skips_lane(self, workspace):
+        assert sources_mod._workspace_source(_req(text="what is it?")) is None
+
+    async def test_materialize_reads_picked_file(self, workspace):
+        run = sources_mod._workspace_source(_req(text="Erik pokemon list"))
+        bundle = PrefetchBundle()
+        await run.materialize(
+            {"paths": ["notes/people/erik/pokemon.md", "notes/bogus.md"]},
+            bundle,
+        )
+        assert [p for p, _ in bundle.workspace_excerpts] == [
+            "notes/people/erik/pokemon.md"
+        ]

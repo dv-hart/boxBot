@@ -87,6 +87,7 @@ from boxbot.cost import (
     record as record_cost,
 )
 from boxbot.telemetry import ToolInvocation, record_tool_invocation
+from boxbot.telemetry import model_log
 from boxbot import prefetch as prefetch_layer
 from boxbot.core.conversation import (
     Conversation,
@@ -1459,8 +1460,9 @@ class BoxBotAgent:
                 "model at Anthropic (BOXBOT_MODEL_LARGE / BOXBOT_MODEL_FAST)."
             )
 
-        self._client = anthropic.AsyncAnthropic(
-            api_key=config.api_keys.anthropic,
+        self._client = model_log.instrument(
+            anthropic.AsyncAnthropic(api_key=config.api_keys.anthropic),
+            "anthropic",
         )
 
         # Warm the hot-task prefetch cache (background task; no-op when
@@ -4043,7 +4045,12 @@ class BoxBotAgent:
             response = None
             for attempt in range(2):
                 try:
-                    with latency.span(conversation_id, "api"):
+                    with latency.span(conversation_id, "api"), \
+                            model_log.call_context(
+                                purpose="conversation",
+                                conversation_id=conversation_id,
+                                turn=turn_count,
+                            ):
                         response = await self._client.messages.create(
                             model=model,
                             max_tokens=_MAX_TOKENS,
@@ -4399,6 +4406,7 @@ class BoxBotAgent:
                 base_url=oa.api_base or None,
                 **call_kwargs,
             )
+        model_log.instrument(self._openai_client, "openai")
         return self._openai_client
 
     @staticmethod
@@ -4597,7 +4605,12 @@ class BoxBotAgent:
             completion = None
             for attempt in range(2):
                 try:
-                    with latency.span(conversation_id, "api"):
+                    with latency.span(conversation_id, "api"), \
+                            model_log.call_context(
+                                purpose="conversation",
+                                conversation_id=conversation_id,
+                                turn=turn_count,
+                            ):
                         completion = await client.chat.completions.create(
                             model=model,
                             messages=to_openai_messages(
@@ -4954,6 +4967,13 @@ class BoxBotAgent:
 
         latency.mark(conv.conversation_id, "gen_start")
 
+        # Full model-call log: the SDK owns the HTTP round trips, so
+        # there is no client method to instrument — record the query and
+        # every message the SDK hands back.
+        sdk_received: list[Any] = []
+        sdk_error: BaseException | None = None
+        sdk_t0 = time.monotonic()
+
         try:
             with latency.span(conv.conversation_id, "api"):
                 await sdk_client.query(initial_message)
@@ -4966,6 +4986,7 @@ class BoxBotAgent:
                 )
 
                 async for sdk_msg in sdk_client.receive_response():
+                    sdk_received.append(sdk_msg)
                     if isinstance(sdk_msg, AssistantMessage):
                         assistant_content: list[dict[str, Any]] = []
                         for block in sdk_msg.content:
@@ -5102,6 +5123,7 @@ class BoxBotAgent:
             # generation. Tell the SDK to halt cleanly so the next
             # query() starts from a settled state, then re-raise so the
             # caller's cancel-and-fold flow proceeds normally.
+            sdk_error = asyncio.CancelledError("generation cancelled")
             try:
                 await asyncio.shield(sdk_client.interrupt())
             except Exception:
@@ -5111,11 +5133,33 @@ class BoxBotAgent:
                     conv.conversation_id,
                 )
             raise
-        except Exception:
+        except Exception as e:
+            sdk_error = e
             logger.exception(
                 "SDK-backed agent loop raised (conv=%s)",
                 conv.conversation_id,
             )
+        finally:
+            with model_log.call_context(
+                purpose="conversation",
+                conversation_id=conv.conversation_id,
+            ):
+                model_log.log_call(
+                    provider="anthropic",
+                    endpoint="claude_agent_sdk.query",
+                    model=model,
+                    request={
+                        "model": model,
+                        # Applied when the SDK client was created; a
+                        # reused client keeps its original prompt/tools.
+                        "system_prompt": system_prompt,
+                        "tools": tools,
+                        "query": initial_message,
+                    },
+                    response=sdk_received,
+                    error=sdk_error,
+                    latency_ms=int((time.monotonic() - sdk_t0) * 1000),
+                )
 
         # Post-loop fallback: if the SDK hit the turn cap without
         # the agent ever dispatching a message tool, send the
@@ -5686,15 +5730,18 @@ class BoxBotAgent:
                     prior_extracted_turns=already_extracted_upto,
                 ),
             })
-            completion = await client.chat.completions.create(
-                model=ctx["model"],
-                messages=oa_messages,
-                tools=ctx["tools"],
-                tool_choice="none",
-                response_format=ctx["response_format"],
-                max_completion_tokens=_MAX_TOKENS,
-                **ctx["effort_kwargs"],
-            )
+            with model_log.call_context(
+                purpose="extraction", conversation_id=conversation_id,
+            ):
+                completion = await client.chat.completions.create(
+                    model=ctx["model"],
+                    messages=oa_messages,
+                    tools=ctx["tools"],
+                    tool_choice="none",
+                    response_format=ctx["response_format"],
+                    max_completion_tokens=_MAX_TOKENS,
+                    **ctx["effort_kwargs"],
+                )
             content = completion.choices[0].message.content or ""
             result = parse_thread_extraction_content(content)
             await process_extraction_result(

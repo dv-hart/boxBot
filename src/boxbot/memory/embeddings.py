@@ -264,7 +264,9 @@ def _load_api() -> None:
             api_key=api_key, base_url=oa.api_base, timeout=10.0, max_retries=1
         )
 
-    _api_client = client
+    from boxbot.telemetry.model_log import instrument
+
+    _api_client = instrument(client, "openai")
     _api_model = model
     _api_unavailable = False
 

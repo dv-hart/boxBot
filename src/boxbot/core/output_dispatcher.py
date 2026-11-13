@@ -101,11 +101,11 @@ _NOISE_APOLOGY_RE = re.compile(
 )
 
 # Machine-readable ``reason_code`` markers for drops that RETRYING CANNOT
-# FIX: the same call would be refused the same way. The agent loop's
-# trigger backstop ends a turn on these (see
-# ``agent._message_results_settled``) and grants a retry on every other
-# failure. Anything genuinely recoverable — an unregistered recipient, a
-# send error — must stay untagged.
+# FIX: the same call would be refused the same way. No loop heuristic
+# acts on them any more (the trigger message-only backstop was removed
+# 2026-11-12 — it ended runs the agent had not finished); they remain
+# for telemetry and for the agent to read. Anything genuinely
+# recoverable — an unregistered recipient, a send error — stays untagged.
 DEGENERATE_CONTENT = "degenerate_content"  # filler; more filler follows
 TOOL_SYNTAX = "tool_syntax"                # leaked harness syntax
 BUDGET_SPENT = "budget_spent"              # wake-cycle message budget gone
@@ -161,7 +161,7 @@ class DispatchResult:
     is a human-readable explanation safe to hand back to the agent as a
     tool result, and ``reason_code`` is the machine-readable class of
     drop for callers that must branch on it (currently only
-    ``DEGENERATE_CONTENT``; see ``agent._message_results_settled``).
+    ``DEGENERATE_CONTENT``).
     ``valid_recipients`` is populated only when the drop was
     caused by an unresolvable recipient name, so the agent can retry with
     a real name.

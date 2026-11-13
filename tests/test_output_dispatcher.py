@@ -549,9 +549,8 @@ class TestDegenerateContent:
         assert fake_whatsapp.sent == []
 
     def test_every_tagged_drop_is_declared_unretryable(self):
-        """The tags exist for one consumer — agent._message_results_settled.
-        A new one that is not in the set silently reopens the burn-the-cap
-        bug, so the set is the definition, not a copy of it."""
+        """UNRETRYABLE_DROPS is the definition of the tagged drop classes;
+        a new tag not in the set is a telemetry hole."""
         assert UNRETRYABLE_DROPS == {DEGENERATE_CONTENT, TOOL_SYNTAX, BUDGET_SPENT}
 
 

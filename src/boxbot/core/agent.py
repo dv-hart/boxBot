@@ -126,7 +126,6 @@ from boxbot.core.output_dispatcher import (
     ParsedNotes,
     parse_internal_notes,
     parse_structured_notes,
-    UNRETRYABLE_DROPS,
 )
 from boxbot.core.scheduler import get_status_line
 from boxbot.core.tool_status import publish_tool_status
@@ -532,6 +531,10 @@ def _prompt_etiquette() -> str:
         "\n"
         "final_turn beside tools = fire-and-forget only. NEVER on a lookup\n"
         "filler — the turn ends and the result would go unheard.\n"
+        "\n"
+        "Trigger runs end ONLY on your final_turn or the turn cap. Set it on\n"
+        "the response that carries your last delivery — send every\n"
+        "recipient's message in that same response.\n"
         "\n"
         "## Scenarios — examples\n"
         "\n"
@@ -1184,39 +1187,6 @@ def _tool_results_ok(results: list[dict[str, Any]]) -> bool:
         for data in _result_payloads(results)
     )
 
-
-def _message_results_settled(results: list[dict[str, Any]]) -> bool:
-    """True when no ``message`` result in the batch is worth retrying.
-
-    Settled = delivered, or dropped for a reason retrying cannot fix
-    (``UNRETRYABLE_DROPS``: filler, leaked tool syntax, spent budget) —
-    the same call would be refused the same way, so another round-trip
-    buys only silence, and on a trigger there is nobody to hear the
-    close-out either. Every OTHER failure — an unregistered recipient, a
-    send error — handed the model something it can act on, so it gets
-    another round-trip (still bounded by the turn cap).
-    """
-    return all(
-        data is not None
-        and (data.get("status") == "delivered"
-             or data.get("reason_code") in UNRETRYABLE_DROPS)
-        for data in _result_payloads(results)
-    )
-
-
-def _only_message_calls(response: Any) -> bool:
-    """True when every tool call in ``response`` is ``message``.
-
-    Nothing is pending: the model already said its piece, so the next
-    round-trip can only produce more talk. The backstop for a response
-    that forgot to set ``final_turn``.
-    """
-    names = [
-        getattr(block, "name", None)
-        for block in (getattr(response, "content", None) or [])
-        if getattr(block, "type", None) == "tool_use"
-    ]
-    return bool(names) and all(name == "message" for name in names)
 
 
 def _log_internal_notes(
@@ -4212,25 +4182,6 @@ class BoxBotAgent:
                         turn_count, conversation_id,
                     )
 
-                # Backstop for a model that forgot the flag: a batch of
-                # nothing but ``message`` calls, all of them settled,
-                # leaves no work pending. A retryable delivery failure
-                # is NOT settled — see ``_message_results_settled``.
-                # Trigger channel only; widen once the logs are clean.
-                if (
-                    not flag_set
-                    and channel == "trigger"
-                    and drained == 0
-                    and _only_message_calls(response)
-                    and _message_results_settled(tool_results)
-                ):
-                    logger.info(
-                        "Trigger run made only message calls on turn %d "
-                        "(conv=%s) and set no final_turn; ending the loop",
-                        turn_count, conversation_id,
-                    )
-                    ends_turn = True
-
                 # Penultimate iteration: prime the model for its last
                 # turn. The text rides the existing user-side content
                 # block so it lands in the same place as drained inputs
@@ -4761,21 +4712,6 @@ class BoxBotAgent:
                         "ending the loop",
                         turn_count, conversation_id,
                     )
-
-                if (
-                    not flag_set
-                    and channel == "trigger"
-                    and drained == 0
-                    and not arg_errors
-                    and _only_message_calls(response)
-                    and _message_results_settled(tool_results)
-                ):
-                    logger.info(
-                        "Trigger run made only message calls on turn %d "
-                        "(conv=%s) and set no final_turn; ending the loop",
-                        turn_count, conversation_id,
-                    )
-                    ends_turn = True
 
                 if not ends_turn and turn_count + 1 == max_turns:
                     content_blocks.append({

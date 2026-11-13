@@ -31,7 +31,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from boxbot.core.agent import BoxBotAgent, _tool_results_ok
-from boxbot.core.output_dispatcher import DEGENERATE_CONTENT, UNRETRYABLE_DROPS
+from boxbot.core.output_dispatcher import DEGENERATE_CONTENT
 
 
 # ---------------------------------------------------------------------------
@@ -392,55 +392,47 @@ async def test_flag_suppresses_the_turn_cap_notice(agent):
 
 
 # ---------------------------------------------------------------------------
-# Backstop — a trigger run whose whole batch is ``message`` calls has
-# nothing left to do, flag or no flag.
+# No backstop — only the agent's flag (or the turn cap) ends a trigger run.
+# The message-only heuristic removed 2026-11-12 ended runs mid-plan: the
+# model sent one recipient, meant to send the next on its following turn,
+# and the loop was gone (Carina missed 7 of 12 morning briefings).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_backstop_ends_a_message_only_trigger_run(agent):
-    agent._client.messages.create.side_effect = [_message_response(None)]
+async def test_message_only_trigger_turn_without_flag_keeps_running(agent):
+    agent._client.messages.create.side_effect = [
+        _message_response(None),
+        _message_response(True, block_id="t2"),
+    ]
 
     _messages, turns = await _run(agent)
 
-    assert turns == 1
+    assert turns == 2
 
 
 @pytest.mark.asyncio
-async def test_backstop_ends_when_the_message_was_dropped_as_filler(agent):
-    """A dropped junk message answered with an apology is another junk
-    message — the point of the backstop is to not buy that round-trip."""
+async def test_dropped_filler_without_flag_keeps_running(agent):
+    """A dropped message is a tool result the model must see and act on;
+    the run ends on its flag or the cap, never on our guess."""
     agent._tool_result_content = json.dumps({
         "status": "error", "message": "filler content is not deliverable",
         "reason_code": DEGENERATE_CONTENT,
     })
-    agent._client.messages.create.side_effect = [_message_response(None)]
+    agent._client.messages.create.side_effect = [
+        _message_response(None),
+        _response(_text_block(_notes(True)), stop_reason="end_turn"),
+    ]
 
     _messages, turns = await _run(agent)
 
-    assert turns == 1
+    assert turns == 2
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason_code", sorted(UNRETRYABLE_DROPS))
-async def test_backstop_ends_on_every_unretryable_drop(agent, reason_code):
-    """Leaked tool syntax and a spent wake-cycle budget are as unretryable
-    as filler: the same call comes back refused the same way. Untagged,
-    they burned the whole turn cap in silence."""
-    agent._tool_result_content = json.dumps({
-        "status": "error", "message": "nope", "reason_code": reason_code,
-    })
-    agent._client.messages.create.side_effect = [_message_response(None)]
-
-    _messages, turns = await _run(agent)
-
-    assert turns == 1
-
-
-@pytest.mark.asyncio
-async def test_backstop_grants_a_retry_on_a_recoverable_drop(agent):
+async def test_recoverable_drop_gets_a_retry(agent):
     """An unregistered recipient came back with the valid names — the
-    model can fix that. Ending here delivers nothing, silently."""
+    model can fix that on the next turn."""
     agent._tool_result_content = json.dumps({
         "status": "error", "message": "unknown recipient 'Jake'",
         "valid_recipients": ["Jacob"],
@@ -456,8 +448,7 @@ async def test_backstop_grants_a_retry_on_a_recoverable_drop(agent):
 
 
 @pytest.mark.asyncio
-async def test_backstop_is_trigger_channel_only(agent):
-    """Interactive channels keep the status quo until this is validated."""
+async def test_voice_channel_same_rule(agent):
     agent._client.messages.create.side_effect = [
         _message_response(None),
         _response(_text_block(_notes(True)), stop_reason="end_turn"),
@@ -469,7 +460,7 @@ async def test_backstop_is_trigger_channel_only(agent):
 
 
 @pytest.mark.asyncio
-async def test_backstop_leaves_filler_then_tool_alone(agent):
+async def test_filler_then_tool_keeps_running(agent):
     """The documented pattern: an interim ack alongside the real work.
     The batch has a non-message tool, so the run continues."""
     agent._client.messages.create.side_effect = [
@@ -559,9 +550,9 @@ async def test_openai_flag_ends_the_loop(openai_agent):
 
 
 @pytest.mark.asyncio
-async def test_openai_backstop_ends_a_message_only_trigger_run(openai_agent):
-    """OpenAI returns ``content: null`` beside tool calls, so a tool
-    turn carries no notes at all — exactly what the backstop is for."""
+async def test_openai_message_only_turn_without_flag_keeps_running(openai_agent):
+    """OpenAI returns ``content: null`` beside tool calls, so a tool turn
+    carries no notes; without a flag on the message call the run goes on."""
     openai_agent._openai_client.chat.completions.create.side_effect = [
         _completion(
             content=None,
@@ -571,15 +562,18 @@ async def test_openai_backstop_ends_a_message_only_trigger_run(openai_agent):
             )],
             finish_reason="tool_calls",
         ),
+        _completion(
+            content=_notes(True), tool_calls=None, finish_reason="stop",
+        ),
     ]
 
     _messages, turns = await _run_openai(openai_agent)
 
-    assert turns == 1
+    assert turns == 2
 
 
 @pytest.mark.asyncio
-async def test_openai_backstop_grants_a_retry_on_a_recoverable_drop(openai_agent):
+async def test_openai_recoverable_drop_gets_a_retry(openai_agent):
     """Same rule as the raw loop: a fixable delivery failure is not an
     end of turn."""
     openai_agent._tool_result_content = json.dumps({

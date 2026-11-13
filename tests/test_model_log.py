@@ -141,6 +141,7 @@ class TestInstrument:
         model_log.instrument(client, "openai")
         client.embeddings.create(model="emb", input=["hello"])
         (row,) = _rows(log_db)
+        assert "test_model_log" in row["caller"]
         assert row["endpoint"] == "embeddings.create"
         assert json.loads(row["request"])["input"] == ["hello"]
 
@@ -178,6 +179,7 @@ class TestInstrument:
         assert resp.model_dump() == {"text": "late"}
         (row,) = _rows(log_db)
         assert json.loads(row["response"]) == {"text": "late"}
+        assert "test_model_log" in row["caller"]
 
     async def test_real_sdk_clients_are_patched(self, log_db):
         anthropic = pytest.importorskip("anthropic")

@@ -513,7 +513,7 @@ def _wrap(fn: Any, provider: str, endpoint: str) -> Any:
 
     @functools.wraps(fn)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        caller = _caller(1)
+        caller = _caller(2)
         request, request_json = _snapshot(args, kwargs)
         t0 = time.monotonic()
         try:

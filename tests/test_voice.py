@@ -575,6 +575,7 @@ class TestWakeWordDetector:
             word="hey_jarvis",
             confidence_threshold=0.7,
             model_path=None,
+            record_audio=False,  # no clip archive under the repo in tests
         )
         defaults.update(kwargs)
         return WakeWordConfig(**defaults)

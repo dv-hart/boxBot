@@ -195,8 +195,14 @@ voice:
   wake_word:
     engine: "openwakeword"
     word: "hey_jarvis"            # built-in model; swap to "bb" for custom
-    confidence_threshold: 0.7
+    confidence_threshold: 0.5     # openwakeword's recommended point; 0.7 missed quiet/far attempts
     # model_path: null            # custom model path (null = use built-in)
+    # Archive a short clip + sidecar for every hit and near miss under
+    # data/wake_audio/ (local only). Evidence for retuning + verifier training.
+    record_audio: true
+    near_miss_floor: 0.3          # score that counts as a near miss
+    record_retention_days: 30
+    record_max_mb: 500
 
   # Voice activity detection (Silero)
   vad:

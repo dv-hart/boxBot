@@ -428,8 +428,25 @@ class WakeWordConfig(BaseModel):
 
     engine: str = "openwakeword"
     word: str = "hey_jarvis"  # built-in model; swap to "bb" when custom model ready
-    confidence_threshold: float = 0.7
+    # openwakeword's recommended operating point is 0.5. The box ran at
+    # 0.7 for months: 12 of 53 hits (Oct–Nov 2026) scored 0.70–0.80, so a
+    # thick band of real attempts was landing just under the bar and
+    # dying silently. False accepts are cheap (grace window, no reply).
+    confidence_threshold: float = 0.5
     model_path: str | None = None  # None = use built-in model
+
+    # Audio archive (``data/wake_audio/``): a short clip + JSON sidecar
+    # for every hit and every near miss (score above ``near_miss_floor``
+    # that never cleared the threshold). This is the only record of what
+    # the detector actually heard — the evidence for retuning the
+    # threshold and the training set for a custom verifier. Clips are
+    # ~3.5 s of mono 16 kHz, local only, pruned by age and size.
+    record_audio: bool = True
+    near_miss_floor: float = 0.3
+    record_pre_seconds: float = 2.5
+    record_post_seconds: float = 1.0
+    record_retention_days: int = 30
+    record_max_mb: int = 500
 
 
 class VADConfig(BaseModel):

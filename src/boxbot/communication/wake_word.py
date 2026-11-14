@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -17,6 +17,7 @@ try:
 except ImportError:
     openwakeword = None  # type: ignore[assignment]
 
+from boxbot.communication.wake_audio_log import WakeAudioLog
 from boxbot.core.config import WakeWordConfig
 from boxbot.core.events import WakeWordHeard, get_event_bus
 
@@ -55,9 +56,26 @@ def _resolve_builtin_model(name: str) -> str | None:
 class WakeWordDetector:
     """Detects wake words in the audio stream using OpenWakeWord."""
 
-    def __init__(self, config: WakeWordConfig) -> None:
+    def __init__(
+        self,
+        config: WakeWordConfig,
+        audio_log: WakeAudioLog | None = None,
+    ) -> None:
         self._config = config
         self._model: openwakeword.Model | None = None  # type: ignore[name-defined]
+        # Clip archive for hits + near misses (see wake_audio_log). None
+        # when recording is off. Tests pass their own.
+        if audio_log is None and config.record_audio:
+            audio_log = WakeAudioLog(
+                threshold=config.confidence_threshold,
+                near_miss_floor=config.near_miss_floor,
+                pre_seconds=config.record_pre_seconds,
+                post_seconds=config.record_post_seconds,
+                retention_days=config.record_retention_days,
+                max_mb=config.record_max_mb,
+                model_name=config.model_path or config.word,
+            )
+        self._audio_log = audio_log
         self._microphone: object | None = None
         # Integer handle from microphone.add_consumer (see AudioCapture for
         # the rationale — bound methods are not identity-stable).
@@ -123,7 +141,15 @@ class WakeWordDetector:
             self._microphone = None
 
         self._model = None
+        if self._audio_log is not None:
+            await self._audio_log.drain()
         logger.info("WakeWordDetector stopped")
+
+    def annotate_last_hit(self, **fields: Any) -> None:
+        """Record what followed the last wake (outcome, transcript, …)
+        on its archived clip. No-op when recording is off."""
+        if self._audio_log is not None:
+            self._audio_log.annotate_last_hit(**fields)
 
     async def _on_audio_chunk(self, chunk: AudioChunk) -> None:
         """Process audio chunk through wake word model.
@@ -136,8 +162,12 @@ class WakeWordDetector:
 
         # Debounce window: after a confirmed detection, swallow audio
         # for ~1.5 s so the tail of the wake word doesn't fire again.
+        # The archive still sees the chunk (score=None) so the hit's
+        # post-roll lands in the clip.
         now = time.monotonic()
         if now < self._suppress_until:
+            if self._audio_log is not None:
+                self._audio_log.observe(chunk, None)
             return
 
         # Convert raw PCM bytes to numpy int16 array
@@ -145,6 +175,9 @@ class WakeWordDetector:
 
         # Feed to model — OpenWakeWord handles internal framing
         predictions = self._model.predict(audio_array)
+        score = max(predictions.values(), default=0.0)
+        if self._audio_log is not None:
+            self._audio_log.observe(chunk, float(score))
 
         # Check each model's confidence against threshold
         for model_name, confidence in predictions.items():
@@ -155,6 +188,8 @@ class WakeWordDetector:
                     confidence,
                 )
                 self._suppress_until = now + self._debounce_seconds
+                if self._audio_log is not None:
+                    self._audio_log.on_hit(chunk.timestamp, float(confidence))
                 await self._bus.publish(
                     WakeWordHeard(confidence=confidence)
                 )

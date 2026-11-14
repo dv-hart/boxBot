@@ -177,6 +177,10 @@ class VoiceSession:
         # we fall back to DORMANT instead of IDLE so the conversation
         # thread isn't thrown away by an accidental wake word.
         self._activation_was_resume: bool = False
+        # True from a wake-word hit until we know what followed it (first
+        # utterance's transcript, or grace timeout). Drives the outcome
+        # annotation on the hit's archived clip (wake_audio_log).
+        self._wake_outcome_pending: bool = False
 
         # Speaker identity mapping (SPEAKER_XX → person name or display label)
         # Populated from voice ReID matches (high-confidence) + agent
@@ -549,6 +553,10 @@ class VoiceSession:
             return
         if self._state is not VoiceSessionState.ACTIVE:
             return
+        self._annotate_wake_outcome(
+            outcome="no_utterance",
+            grace_seconds=self._WAKE_WORD_GRACE_SECONDS,
+        )
         if self._activation_was_resume:
             logger.info(
                 "Voice adapter: no utterance within %.0fs grace — "
@@ -809,7 +817,25 @@ class VoiceSession:
 
     async def _on_wake_word(self, event: WakeWordHeard) -> None:
         """Wake-word entry point. See :meth:`_on_user_activation`."""
+        self._wake_outcome_pending = True
         await self._on_user_activation(event)
+
+    def _annotate_wake_outcome(self, **fields: Any) -> None:
+        """Label the last wake's archived clip with what followed it.
+
+        Fires once per wake. ``outcome`` is one of ``transcript``,
+        ``no_transcript`` (speech heard, STT returned nothing) or
+        ``no_utterance`` (grace window expired). A hit followed by
+        nothing is a false accept — that label is what makes the
+        archive a training set.
+        """
+        if not self._wake_outcome_pending or self._wake_word is None:
+            return
+        self._wake_outcome_pending = False
+        try:
+            self._wake_word.annotate_last_hit(**fields)
+        except Exception:
+            logger.debug("wake outcome annotation failed", exc_info=True)
 
     async def _on_conversation_ended(self, event: Any) -> None:
         """React to ConversationEnded — deactivate capture for voice.
@@ -1009,6 +1035,10 @@ class VoiceSession:
                 )
 
         if not stt_result or not stt_result.text.strip():
+            self._annotate_wake_outcome(
+                outcome="no_transcript",
+                utterance_seconds=round(utterance.duration, 2),
+            )
             # No transcript — go back to listening. Re-arm the grace
             # window: the utterance cancelled it above, and nothing
             # downstream (no TranscriptReady, no agent turn) will arm a
@@ -1044,6 +1074,13 @@ class VoiceSession:
         for raw_label, display_name in label_map.items():
             self._speaker_identities.setdefault(raw_label, display_name)
         self._latest_speaker_identities = identity_block
+
+        self._annotate_wake_outcome(
+            outcome="transcript",
+            utterance_seconds=round(utterance.duration, 2),
+            speakers=sorted(set(label_map.values())),
+            text=stt_result.text.strip()[:160],
+        )
 
         # Build attributed transcript using the merged label map
         transcript = self._build_attributed_transcript(

@@ -85,3 +85,23 @@ The recorder is hands-off; the only manual step is jotting down
   `output_channel`.**
 - #5 gives the real same/cross margin → **set `speaker_threshold` to the
   EER point** (and gate enrollment well above it).
+
+## Wake-word archive (`analyze_wake.py`)
+
+Separate from the voice-ID harness above and needs **no capture
+session**: the live detector already archives a clip + sidecar for
+every wake-word hit and near miss under `data/wake_audio/` (see
+`boxbot/communication/wake_audio_log.py`). On the Pi:
+
+```
+python3 scripts/diag/analyze_wake.py summary    # counts, histograms, outcomes
+python3 scripts/diag/analyze_wake.py review     # clips to listen to + label
+python3 scripts/diag/analyze_wake.py rescore --threshold 0.5   # replay through openwakeword
+```
+
+Label a clip by setting `"label": "positive"` (a real attempt) or
+`"negative"` in its `.json`. `rescore` then reports recall and false
+accepts per threshold on exactly the audio the box heard, and accepts
+`--model-path` / `--verifier` to evaluate a custom model or verifier
+before it goes live.
+

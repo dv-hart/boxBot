@@ -123,9 +123,30 @@ voice:
   wake_word:
     engine: "openwakeword"
     word: "bb"
-    confidence_threshold: 0.7       # higher = fewer false positives
+    confidence_threshold: 0.5       # openwakeword's recommended point
     model_path: "models/wake_word/"  # custom trained model
+    record_audio: true              # archive hits + near misses
+    near_miss_floor: 0.3
 ```
+
+### Audio archive and tuning
+
+Every hit and every near miss (score above `near_miss_floor` that
+never cleared the threshold) is written as a ~3.5 s mono clip plus a
+JSON sidecar under `data/wake_audio/{hits,near_misses}/`. The voice
+adapter stamps each hit with its outcome: `transcript` (with speakers
+and text), `no_transcript`, or `no_utterance` (grace window expired —
+a false accept). Clips are local only and pruned by age and size.
+
+`scripts/diag/analyze_wake.py summary|review|rescore` reads the
+archive: score histograms, outcome counts, a listen-and-label queue,
+and a replay through openwakeword at a different threshold, model or
+custom verifier. Labelled clips (`"label": "positive"|"negative"`)
+are the training set for an openwakeword custom verifier.
+
+History: the box ran at 0.7 until 2026-11-14. 12 of 53 hits in
+Oct–Nov scored 0.70–0.80, so real attempts were piling up just under
+the bar with no trace in the logs.
 
 ### Wake Word During Session
 

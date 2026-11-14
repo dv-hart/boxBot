@@ -62,6 +62,7 @@ data/integrations/
 
 # Voice-ID diagnostic recordings (scripts/diag/) — private audio, Pi-local
 data/voice_diag/
+data/wake_audio/
 
 # Ad-hoc audio artifacts (test output)
 /*.wav

@@ -127,7 +127,7 @@ class ExecuteScriptTool(Tool):
     description = (
         "Run Python in the sandbox. `import bb` (alias: boxbot_sdk) for "
         "workspace, camera, photos, audio, display, memory, tasks, skill, "
-        "integrations, secrets, packages. Use for anything without a "
+        "integrations, secrets, packages, purchases. Use for anything without a "
         "dedicated tool, and to compose many operations in one turn."
     )
     parameters = {

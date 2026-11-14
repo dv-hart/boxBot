@@ -85,6 +85,7 @@ the renderer draws from a fixed, validated registry.
 | `skill` | Create skills at runtime (SKILL.md + resources + scripts). |
 | `integrations` | List / call / create / update / delete data pipes; read run logs. |
 | `packages` | Request a PyPI install. Human approves out-of-band. |
+| `purchases` | Search products, propose a purchase. Main process decides: admin review link, or buy within limits. |
 | `secrets` | Write-only credential store. |
 | `integration` | In-script helpers for integration authors: `inputs()`, `return_output()`. |
 
@@ -122,7 +123,8 @@ returning `{"status": "error"}`) is data to inspect, not an exception.
 
 Public modules: `workspace.py`, `camera.py`, `photos.py`, `audio.py`,
 `display.py`, `memory.py`, `tasks.py`, `auth.py`, `skill.py`,
-`integrations.py`, `packages.py`, `secrets.py`, `integration.py`.
+`integrations.py`, `packages.py`, `purchases.py`, `secrets.py`,
+`integration.py`.
 
 Internal:
 

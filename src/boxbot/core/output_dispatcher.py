@@ -682,7 +682,15 @@ async def _dispatch_text(
                     reason=f"{out.name} attachment send failed",
                 )
         else:
-            await out.send_text(matched.phone, content)
+            # Transports report a failed send by returning False, not
+            # by raising. Reporting that as "delivered" would tell the
+            # agent — and the provenance ledger — that a person read
+            # something they never received.
+            if await out.send_text(matched.phone, content) is False:
+                return DispatchResult(
+                    to=to, channel="text", status="dropped",
+                    reason=f"{out.name} send failed",
+                )
     except Exception:
         logger.exception(
             "Text dispatch failed (conv=%s to=%s phone=%s)",

@@ -1,6 +1,6 @@
 ---
 name: bb
-description: The bb Python package — your hands inside the sandbox. Camera stills, photos, the 7" display, a notes/CSV workspace, memory, triggers and to-dos, audio, skill authoring, secrets, and data-pipe integrations (calendar lives here). Import from execute_script.
+description: The bb Python package — your hands inside the sandbox. Camera stills, photos, the 7" display, a notes/CSV workspace, memory, triggers and to-dos, audio, skill authoring, secrets, purchases, and data-pipe integrations (calendar lives here). Import from execute_script.
 when_to_use: User mentions photos, cameras, display/screen, notes, keeping a list, tracking something over time, reminders, or asks for a multi-step action that would otherwise cost several tool calls.
 ---
 
@@ -36,6 +36,7 @@ handle the failure instead of dying.
 | `bb.skill` | Create skills at runtime. | Teach yourself a recurring workflow. |
 | `bb.integrations` | List, call, create, update, delete data pipes. Read execution logs. | Fresh external data, or registering a new pipe. **Calendar lives here**: `bb.integrations.get("calendar", action="list_upcoming_events", …)`. |
 | `bb.packages` | Request a PyPI install; check status. | A script needs a new dependency. Admin approves out-of-band; returns `pending` immediately — check back with `status()`. |
+| `bb.purchases` | Search products, propose a purchase, check status. | A person asks you to buy something. You propose; the main process decides — admin gets a review link, or it buys within household limits. Workflow: `purchasing` skill. |
 | `bb.secrets` | Store credentials (write-only), list names, pass to scripts/integrations as env vars. | User pasted an API key; an integration declared a secret; a script needs a credential. |
 
 ## Deeper docs
@@ -45,7 +46,8 @@ Load one only when you need it:
 loop, not from inside the sandbox.
 
 `workspace` · `memory` · `tasks` · `audio` · `camera` · `photos` ·
-`display` · `integrations` · `secrets` · `auth` · `packages` · `skill`
+`display` · `integrations` · `secrets` · `auth` · `packages` ·
+`purchases` · `skill`
 
 ## Memory vs workspace
 

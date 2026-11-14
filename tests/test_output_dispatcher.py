@@ -322,6 +322,24 @@ class TestDispatchOutputs:
         assert [r.status for r in results] == ["delivered"]
 
     @pytest.mark.asyncio
+    async def test_text_the_transport_refused_is_not_reported_delivered(
+        self, fake_voice, fake_auth, fake_whatsapp, monkeypatch
+    ):
+        # Transports signal a failed send by returning False, not raising.
+        async def refuse(phone, message):
+            return False
+
+        monkeypatch.setattr(fake_whatsapp, "send_text", refuse)
+        results = await dispatch_outputs(
+            [{"to": "Sarah", "channel": "text", "content": "He's home."}],
+            conversation_id="c3x",
+            channel_context="trigger",
+            current_speaker=None,
+        )
+        assert [r.status for r in results] == ["dropped"]
+        assert "send failed" in results[0].reason
+
+    @pytest.mark.asyncio
     async def test_text_name_resolution_is_case_insensitive(
         self, fake_voice, fake_auth, fake_whatsapp
     ):

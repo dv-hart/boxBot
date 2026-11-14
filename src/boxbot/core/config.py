@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from boxbot.core.paths import PERCEPTION_MODELS_DIR, PHOTOS_DIR
 
@@ -1109,6 +1109,95 @@ class ApiKeysConfig(BaseModel):
         return f"ApiKeysConfig({', '.join(fields)})"
 
 
+DEFAULT_PURCHASE_POLICY = """\
+Allowed: low-cost physical goods for the household that a household \
+member plainly asked boxBot to buy in this conversation — children's \
+books first of all.
+Not allowed: gift cards, prepaid cards, digital goods, subscriptions or \
+anything that renews, alcohol, tobacco, nicotine, weapons, medicines, \
+adult items, or donations.
+The items and quantities must match what the person asked for. A \
+request to look into, compare, or recommend something is not a request \
+to buy it. One request buys one thing once: an item already bought or \
+on its way needs the person to ask again."""
+
+# Shortest veto window automatic purchasing may run with. Below this an
+# admin cannot realistically read the notice and reply.
+MIN_AUTO_VETO_SECONDS = 60
+
+
+class PurchasesConfig(BaseModel):
+    """Purchasing through the Shop agent API (see ``boxbot.purchases``).
+
+    Two modes. ``review``: boxBot builds a checkout and texts the
+    admins a link; a human pays. ``auto``: a checkout that passes every
+    deterministic rule *and* the policy checker is paid from the Shop
+    spending budget after a veto window; anything else falls back to
+    the review link. The policy checker runs and is logged in both
+    modes, so ``review`` doubles as a shadow run of ``auto``.
+    """
+
+    enabled: bool = False
+    mode: Literal["review", "auto"] = "review"
+
+    # Hard limits for automatic purchases, in cents. Shop enforces its
+    # own spending budget on top of these.
+    max_per_purchase_cents: int = Field(default=2000, ge=0)
+    max_per_day_cents: int = Field(default=4000, ge=0)
+    max_per_month_cents: int = Field(default=10000, ge=0)
+    max_items: int = Field(default=5, ge=1)
+
+    # Store domains the household trusts, e.g.
+    # ["www.cottagedoorpress.com"]. Only these qualify for automatic
+    # purchase and for ``bb.purchases.store_products``. A checkout at
+    # any other store needs an admin's "allow shop <domain>" text first
+    # (good for 24 hours, review only). Bare hostnames; anything else
+    # is rejected at load.
+    allowed_shops: list[str] = Field(default_factory=list)
+
+    # Automatic purchase only when the request arrived as a text from a
+    # registered admin. Voice (anyone in the room) and trigger
+    # conversations always go to review.
+    auto_requires_admin_text: bool = True
+
+    # Seconds between announcing an automatic purchase to the admins
+    # and paying, during which "cancel buy <id>" stops it. Automatic
+    # mode refuses to load with less than MIN_AUTO_VETO_SECONDS.
+    veto_window_seconds: int = Field(default=300, ge=0)
+
+    # Automatic purchase is refused when the same store + item was
+    # proposed within this many days, whatever became of it — bought,
+    # sent for review (a person may have paid), or cancelled.
+    duplicate_window_days: int = Field(default=14, ge=1)
+
+    # Ceiling on checkouts the agent may build per rolling 24 hours.
+    max_proposals_per_day: int = Field(default=20, ge=1)
+
+    # Policy checker. None = ``models.large``.
+    checker_model: str | None = None
+    # Kept short: the sandbox script that proposed is still waiting
+    # (see ``sandbox.timeout``). A timeout is a fail-closed "error".
+    checker_timeout_seconds: float = 20.0
+    policy: str = DEFAULT_PURCHASE_POLICY
+
+    @field_validator("allowed_shops")
+    @classmethod
+    def _normalise_shops(cls, value: list[str]) -> list[str]:
+        from boxbot.purchases.shop_client import normalize_shop
+
+        # A malformed entry would silently never match; fail loudly.
+        return [normalize_shop(v) for v in value if v and v.strip()]
+
+    @model_validator(mode="after")
+    def _auto_needs_a_veto_window(self) -> "PurchasesConfig":
+        if self.mode == "auto" and self.veto_window_seconds < MIN_AUTO_VETO_SECONDS:
+            raise ValueError(
+                "purchases.mode 'auto' needs purchases.veto_window_seconds "
+                f">= {MIN_AUTO_VETO_SECONDS}"
+            )
+        return self
+
+
 class TelemetryConfig(BaseModel):
     """Observability stores (see ``boxbot.telemetry``)."""
 
@@ -1205,5 +1294,6 @@ class BoxBotConfig(BaseModel):
     prefetch: PrefetchConfig = Field(default_factory=PrefetchConfig)
     api_keys: ApiKeysConfig = Field(default_factory=ApiKeysConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    purchases: PurchasesConfig = Field(default_factory=PurchasesConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)

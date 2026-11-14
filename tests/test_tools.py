@@ -264,10 +264,14 @@ class TestTriggerMessageBudget:
 
     @staticmethod
     def _conv(channel: str):
-        return SimpleNamespace(
+        conv = SimpleNamespace(
             conversation_id="conv-1", channel=channel, participants=set(),
             record_segment=lambda _seg: None, delivered_messages=0,
+            delivered=[],
         )
+        # Mirrors Conversation.note_delivered (the provenance ledger).
+        conv.note_delivered = lambda **kw: conv.delivered.append(kw)
+        return conv
 
     async def _send(self, conv, results):
         from boxbot.tools.builtins.message import MessageTool
@@ -298,6 +302,10 @@ class TestTriggerMessageBudget:
         assert third["status"] == "error"
         assert "final_turn=true" in third["message"]
         assert conv.delivered_messages == 2
+        # Only what was actually delivered lands in the provenance ledger.
+        assert conv.delivered == [
+            {"channel": "text", "to": "Jacob", "text": "Bins go out tonight."},
+        ] * 2
         # Tagged unretryable: every further call is refused identically, so
         # the trigger backstop must be able to end the run on it.
         assert third["reason_code"] == BUDGET_SPENT
@@ -316,6 +324,7 @@ class TestTriggerMessageBudget:
         for _ in range(3):
             assert (await self._send(conv, dropped))["status"] == "error"
         assert conv.delivered_messages == 0
+        assert conv.delivered == []
 
     @pytest.mark.asyncio
     async def test_interactive_channels_are_not_budgeted(self, mock_config):

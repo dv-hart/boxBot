@@ -516,6 +516,40 @@ telemetry:
   # false keeps only each image's hash and size.
   model_log_store_images: true
 
+# Purchasing through the Shop agent API (boxbot.purchases). The agent can
+# only propose; the main process builds the checkout and decides.
+#   review — an admin is texted a link and pays in their browser.
+#   auto   — a checkout that passes every limit below AND the policy
+#            checker is paid from the Shop spending budget after the
+#            veto window; everything else falls back to review.
+# The policy checker runs and is logged in both modes, so "review" is a
+# shadow run of "auto". Veto notices rely on the admin's messaging
+# channel; a transport that accepts a message without delivering it
+# (WhatsApp can) weakens the veto — prefer a Signal-registered admin
+# before turning "auto" on. Connect the Shop account first: an admin texts
+# "shop connect" (or run scripts/shop_sign_in.py), then sets a spending
+# limit for the boxBot connection in their Shop account settings.
+purchases:
+  enabled: false
+  mode: review                    # review | auto
+  max_per_purchase_cents: 2000
+  max_per_day_cents: 4000
+  max_per_month_cents: 10000
+  max_items: 5
+  # Stores the household trusts (bare domains). Only these qualify for
+  # automatic purchase and for bb.purchases.store_products. For any
+  # other store boxBot asks the admins first; an admin replies
+  # "allow shop <domain>" to permit review-only checkouts for 24 hours.
+  allowed_shops: []               # e.g. ["www.cottagedoorpress.com"]
+  auto_requires_admin_text: true  # voice/trigger requests always go to review
+  veto_window_seconds: 300        # admins can reply "cancel buy <id>"; auto needs >= 60
+  duplicate_window_days: 14       # no automatic re-buy of the same item within this
+  max_proposals_per_day: 20
+  checker_model: null             # null = BOXBOT_MODEL_LARGE
+  checker_timeout_seconds: 20
+  # policy: |                     # replaces the built-in purchase policy
+  #   Allowed: ...
+
 logging:
   level: "INFO"
   file: "logs/boxbot.log"

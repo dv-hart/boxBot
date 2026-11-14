@@ -57,6 +57,7 @@ Thumbs.db
 # Runtime state
 data/scheduler/
 data/telemetry/
+data/purchases/
 data/integrations/
 
 # Voice-ID diagnostic recordings (scripts/diag/) — private audio, Pi-local
@@ -73,6 +74,7 @@ skills/*/
 !skills/hal-sandbox-ref/
 !skills/skill_authoring/
 !skills/home/
+!skills/purchasing/
 integrations/*/
 !integrations/weather/
 !integrations/calendar/

@@ -227,6 +227,24 @@ class MessageTool(Tool):
                 ),
             })
 
+        # Purchase notices, review links and Shop sign-in links reach
+        # people only from the purchases service. Refusing look-alikes
+        # here keeps the agent from forging one in the same thread.
+        from boxbot.purchases.service import looks_like_service_notice
+
+        if channel == "text" and looks_like_service_notice(content):
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    "not sent: this reads like a purchase notice or a "
+                    "Shop sign-in/checkout link, which only the purchases "
+                    "service sends. Say it in your own words without "
+                    "payment or sign-in links; use "
+                    "bb.purchases.send_review_link(id) to resend a "
+                    "review link."
+                ),
+            })
+
         dispatcher_channel = _CHANNEL_MAP.get(channel)
         if dispatcher_channel is None:
             return json.dumps({
@@ -317,5 +335,10 @@ class MessageTool(Tool):
 
         if any(r.status == "delivered" for r in results):
             conv.delivered_messages += 1
+            # Provenance: what a person was actually told (see
+            # Conversation.exchange_log).
+            for r in results:
+                if r.status == "delivered":
+                    conv.note_delivered(channel=r.channel, to=r.to, text=content)
 
         return self._result_json(results, to, channel)

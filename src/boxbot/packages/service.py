@@ -150,11 +150,15 @@ async def _notify_admins_of_request(request: dict[str, Any]) -> tuple[int, int]:
     or zero registered outbound clients leaves the request pending —
     an admin can still resolve it later.
     """
+    # The reason is agent-written and lands in an admin's thread: one
+    # line, no links, so it cannot pose as another kind of notice.
+    from boxbot.purchases.shop_client import plain_text
+
     context = request.get("requested_by") or "agent (no conversation context)"
     text = (
         f"📦 boxBot package request {request['id']}\n"
         f"Package: {request['package']}\n"
-        f"Reason: {request['reason']}\n"
+        f"Reason: {plain_text(request['reason'], 300)}\n"
         f"From: {context}\n"
         f'Reply "approve pkg {request["id"]}" or '
         f'"deny pkg {request["id"]}".'

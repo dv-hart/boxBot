@@ -357,3 +357,21 @@ class TestDotenvFallbackParser:
         assert os.environ.get("B_KEY") == "realvalue"
         assert os.environ.get("C_KEY") == "quoted # not a comment"
         assert "D_KEY" not in os.environ
+
+
+class TestPurchasesConfig:
+    def test_allowed_shops_are_normalised_or_rejected(self):
+        from boxbot.core.config import PurchasesConfig
+
+        cfg = PurchasesConfig(allowed_shops=["https://WWW.Example.com/", " shop.example.org "])
+        assert cfg.allowed_shops == ["www.example.com", "shop.example.org"]
+        for bad in ("not a host", "192.168.0.10", "http://example.com", "example.com:8443"):
+            with pytest.raises(ValueError):
+                PurchasesConfig(allowed_shops=[bad])
+
+    def test_defaults_are_off_and_review_only(self):
+        from boxbot.core.config import PurchasesConfig
+
+        cfg = PurchasesConfig()
+        assert cfg.enabled is False and cfg.mode == "review"
+        assert cfg.allowed_shops == [] and cfg.max_per_purchase_cents == 2000

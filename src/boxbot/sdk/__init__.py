@@ -16,6 +16,9 @@ Modules:
     integrations — Call, list, create, update, delete data-pipe
                    integrations (weather, calendar, custom services)
     packages     — Package installation with user approval
+    purchases    — Find products and propose purchases; the main
+                   process decides, a human reviews or it buys within
+                   household limits
     memory       — Memory store operations (save, search, delete/invalidate)
     photos       — Photo library management
     tasks        — Trigger and to-do management
@@ -46,6 +49,7 @@ from . import (
     memory,
     packages,
     photos,
+    purchases,
     secrets,
     skill,
     tasks,
@@ -65,6 +69,7 @@ __all__ = [
     "memory",
     "packages",
     "photos",
+    "purchases",
     "secrets",
     "skill",
     "tasks",

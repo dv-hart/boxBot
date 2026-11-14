@@ -152,6 +152,10 @@ class MessageRouter:
                 user, message, Channel.WHATSAPP
             ):
                 return True
+            if await self._maybe_handle_purchase_command(
+                user, message, Channel.WHATSAPP
+            ):
+                return True
 
             event = WhatsAppMessage(
                 sender_name=user.name,
@@ -257,6 +261,10 @@ class MessageRouter:
             await self._auth.update_last_seen(sender_phone)
 
             if await self._maybe_handle_package_reply(
+                user, message, Channel.SIGNAL
+            ):
+                return True
+            if await self._maybe_handle_purchase_command(
                 user, message, Channel.SIGNAL
             ):
                 return True
@@ -396,6 +404,54 @@ class MessageRouter:
         )
         await self._send_to_user(
             user, inbound_channel, reply, what=f"package {verb} confirmation"
+        )
+        return True
+
+    async def _maybe_handle_purchase_command(
+        self,
+        user: "User",
+        message: str | None,
+        inbound_channel: Channel,
+    ) -> bool:
+        """Intercept an admin's ``cancel buy <id>``, ``shop connect`` or
+        ``allow shop <domain>``.
+
+        Returns True iff the message was a purchase command from a
+        registered **admin** and was fully handled here — the agent
+        never sees it, so nothing the agent does can issue or suppress
+        one. The reply goes back on the channel the command arrived on.
+
+        A matching command from a non-admin returns False and routes to
+        the agent as ordinary text; it cancels and connects nothing.
+        """
+        if not message:
+            return False
+
+        from boxbot.purchases.service import (
+            handle_admin_command,
+            parse_admin_command,
+        )
+
+        parsed = parse_admin_command(message)
+        if parsed is None:
+            return False
+        if user.role != "admin":
+            logger.warning(
+                "Non-admin %s sent a purchase command; routing as a "
+                "normal message",
+                user.phone,
+            )
+            return False
+
+        verb, arg = parsed
+        try:
+            reply = await handle_admin_command(verb, arg, admin=user)
+        except Exception:  # noqa: BLE001 — the admin must get an answer
+            logger.exception("purchase command %s failed", verb)
+            reply = f"boxBot hit an error handling \"{verb}\". Nothing was changed."
+        logger.info("Purchase command %s handled from admin %s", verb, user.phone)
+        await self._send_to_user(
+            user, inbound_channel, reply, what=f"purchase {verb} reply"
         )
         return True
 

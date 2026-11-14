@@ -1053,6 +1053,19 @@ async def _handle_auth_action(
             text = str(payload.get("text") or "")
             if not text.strip():
                 return {"status": "error", "error": "text is required"}
+            # Same rule as the message tool: agent text may not pose as
+            # a purchase notice or carry pay/sign-in links to admins.
+            from boxbot.purchases.service import looks_like_service_notice
+
+            if looks_like_service_notice(text):
+                return {
+                    "status": "error",
+                    "error": (
+                        "not sent: this reads like a purchase notice or a "
+                        "payment/sign-in link, which only the purchases "
+                        "service sends"
+                    ),
+                }
             admins = [u for u in await auth.list_users() if u.role == "admin"]
             sent = 0
             for admin in admins:
@@ -1079,6 +1092,125 @@ async def _handle_auth_action(
     except Exception as e:  # noqa: BLE001
         logger.exception("%s failed", action_type)
         return {"status": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Purchases action handler
+# ---------------------------------------------------------------------------
+
+
+@action_handler("purchases")
+async def _handle_purchases_action(
+    action_type: str,
+    payload: dict[str, Any],
+    ctx: ActionContext,  # unused; kept for uniform handler signature
+) -> dict[str, Any]:
+    """Dispatch ``purchases.*`` — search, store_products, propose,
+    status, list, send_review_link, cancel.
+
+    The sandbox can find products and *propose* a purchase. It cannot
+    pay, approve, choose an address or payment method, or read the
+    checkout's review link: ``propose`` hands the request to
+    :mod:`boxbot.purchases.service`, which builds the checkout itself,
+    runs the deterministic rules and the isolated policy checker, and
+    then either texts the admins a review link or schedules an
+    automatic purchase. Every record returned here is the service's
+    sanitised ``public_view``.
+
+    The requester is taken from the conversation the tool call runs in
+    (transport-attributed), never from the payload.
+    """
+    from boxbot.purchases import service
+    from boxbot.purchases.store import VALID_STATUSES, get_purchase_store
+    from boxbot.tools._tool_context import get_current_conversation
+
+    sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+
+    try:
+        if sub == "search":
+            results = await service.search(
+                payload.get("query"),
+                max_price_cents=payload.get("max_price_cents"),
+                limit=payload.get("limit") or 8,
+            )
+            return {"status": "ok", "results": results}
+
+        if sub == "store_products":
+            results = await service.store_products(
+                payload.get("shop"),
+                query=payload.get("query"),
+                limit=payload.get("limit") or 20,
+            )
+            return {"status": "ok", "results": results}
+
+        if sub == "propose":
+            outcome = await service.propose(
+                payload.get("shop"),
+                payload.get("items"),
+                payload.get("reason"),
+                conv=get_current_conversation(),
+            )
+            # The checker's verdict stays in the decision log. Handing
+            # it back — or the list of rules that passed, from which it
+            # can be read off — would give a compromised agent a
+            # per-try signal to tune proposals against. Where automatic
+            # purchasing is on, a proposal that goes to review says
+            # only that.
+            outcome.pop("checker", None)
+            from boxbot.core.config import get_config
+
+            if (
+                get_config().purchases.mode == "auto"
+                and outcome.get("decision") == "review"
+            ):
+                outcome["blocked_by"] = ["needs_review"]
+            return {"status": "ok", **outcome}
+
+        if sub in ("status", "get", "send_review_link", "cancel"):
+            purchase_id = payload.get("id")
+            if not isinstance(purchase_id, str) or not purchase_id.strip():
+                return {"status": "error", "message": "'id' is required"}
+            purchase_id = purchase_id.strip().lower()
+            if sub == "send_review_link":
+                outcome = await service.resend_review_link(purchase_id)
+                return {"status": "ok", **outcome}
+            if sub == "cancel":
+                row = await service.cancel(purchase_id, by="boxBot")
+                return {"status": "ok", "purchase": service.public_view(row)}
+            row = await get_purchase_store().get(purchase_id)
+            if row is None:
+                return {
+                    "status": "error",
+                    "message": f"no purchase '{purchase_id}' found",
+                }
+            return {"status": "ok", "purchase": service.public_view(row)}
+
+        if sub == "list":
+            status_filter = payload.get("purchase_status")
+            if status_filter is not None and status_filter not in VALID_STATUSES:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"invalid status filter {status_filter!r}; "
+                        f"valid: {', '.join(VALID_STATUSES)}"
+                    ),
+                }
+            rows = await get_purchase_store().list(status=status_filter)
+            return {
+                "status": "ok",
+                "purchases": [service.public_view(r) for r in rows],
+            }
+
+        return {
+            "status": "error",
+            "message": f"unknown purchases action '{action_type}'",
+        }
+
+    except service.PurchaseError as e:
+        return {"status": "error", "message": str(e)}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("%s failed", action_type)
+        return {"status": "error", "message": f"{type(exc).__name__}: purchase action failed"}
 
 
 # ---------------------------------------------------------------------------

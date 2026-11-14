@@ -1463,6 +1463,17 @@ class BoxBotAgent:
         )
         await self._dream_poller.start()
 
+        # Purchases interrupted by the restart: ones waiting out a veto
+        # window go to human review; any that were mid-payment are read
+        # back (never re-sent). Runs in the background — it does
+        # network reads.
+        try:
+            from boxbot.purchases import service as purchases_service
+
+            purchases_service.start()
+        except Exception:
+            logger.exception("purchase recovery could not start")
+
         # Subscribe to events that initiate or inform conversations.
         # Note: WakeWordHeard is intentionally NOT handled here. The
         # voice pipeline activates the mic on wake word; the agent only
@@ -1829,6 +1840,7 @@ class BoxBotAgent:
             text,
             speaker_name=event.sender_name or None,
             source="user",
+            human=True,
             context={
                 "sender_phone": event.sender_phone,
                 "media_url": event.media_url,
@@ -1889,6 +1901,7 @@ class BoxBotAgent:
             text,
             speaker_name=event.sender_name or None,
             source="user",
+            human=True,
             context={
                 "sender_phone": event.sender_phone,
                 "media_url": event.media_url,
@@ -2896,6 +2909,7 @@ class BoxBotAgent:
             transcript,
             speaker_name=person_name,
             source="user",
+            human=True,
             context={
                 "voice_session_id": voice_session_id,
                 "speaker_identities": dict(event.speaker_identities or {}),

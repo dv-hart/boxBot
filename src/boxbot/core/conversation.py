@@ -47,6 +47,7 @@ import asyncio
 import gc
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
@@ -294,6 +295,19 @@ class Conversation:
         # ``message`` tool and ``agent.max_messages_trigger``).
         self.delivered_messages: int = 0
 
+        # Provenance ledger: what people actually said to this
+        # conversation and what was actually delivered to them, in
+        # order. Kept apart from ``_thread`` on purpose — the thread is
+        # the model's working context and gets compacted, summarised,
+        # and interleaved with tool results, prefetch bundles and
+        # machine-written framing turns, none of which is evidence of
+        # what a person wants. Entries are appended only at the two
+        # transport choke points (``handle_input(human=True)`` and a
+        # delivered ``message`` tool call), never by the agent. In
+        # memory only: it does not survive a restart, and consumers
+        # must treat an empty log as "no evidence".
+        self.exchange_log: deque[dict[str, Any]] = deque(maxlen=80)
+
         # Wall-clock start of the conversation (UTC ISO 8601). Recorded
         # at construction so post-conversation extraction has a stable
         # ``started_at`` independent of how long the conversation ran.
@@ -360,6 +374,7 @@ class Conversation:
         speaker_name: str | None = None,
         source: str = "user",
         context: dict[str, Any] | None = None,
+        human: bool = False,
     ) -> None:
         """Accept new input and drive (or queue against) the generation cycle.
 
@@ -396,6 +411,11 @@ class Conversation:
             context: Per-turn context passed through to generate_fn via
                 ``_current_context``. Examples: voice speaker identity
                 block, whatsapp media url.
+            human: True only when ``text`` is what a person wrote or
+                said, as attributed by the transport (an inbound text
+                from a registered number, a voice transcript). Records
+                the utterance in :attr:`exchange_log`. Machine-written
+                inputs (triggers, presence updates) leave it False.
         """
         cleaned = (text or "").strip()
         if not cleaned:
@@ -416,6 +436,14 @@ class Conversation:
             # Participants tracking (voice attribution).
             if speaker_name:
                 self.participants.add(speaker_name)
+
+            if human:
+                self.exchange_log.append({
+                    "speaker": "person",
+                    "name": speaker_name,
+                    "text": cleaned,
+                    "at": time.time(),
+                })
 
             user_message = self._format_user_message(
                 cleaned, speaker_name=speaker_name, source=source,
@@ -538,6 +566,21 @@ class Conversation:
                 self._run_generation(),
                 name=f"gen-{self.conversation_id}",
             )
+
+    def note_delivered(self, *, channel: str, to: str, text: str) -> None:
+        """Record a message that was actually delivered to a person.
+
+        Called by the ``message`` tool after the dispatcher reports
+        delivery. ``channel`` is the dispatcher channel (``"voice"`` or
+        ``"text"``); ``to`` is the resolved recipient.
+        """
+        self.exchange_log.append({
+            "speaker": "boxbot",
+            "channel": channel,
+            "to": to,
+            "text": text,
+            "at": time.time(),
+        })
 
     def drain_pending_inputs(self) -> list[dict[str, Any]]:
         """Return queued utterances and clear the queue.

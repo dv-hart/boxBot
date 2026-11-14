@@ -447,8 +447,12 @@ prefetch:
   #   hot_tasks:
   #     - name: show_camera
   #       exemplars: ["show me the garage camera", "show me the front door"]
-  #       keywords: []   # whole words that also match, follow-up turns only
   hot_tasks_enabled: true
+  # Follow-up gate: on voice follow-up turns the conversation model is
+  # asked, over its cached thread, which docs the turn needs (usually
+  # none). Replaces the selector fan-out those turns skip.
+  followup_gate: true
+  followup_gate_timeout_seconds: 4.0
   # Minimum cosine similarity (utterance vs task centroid) for a hit.
   hot_match_threshold: 0.60
 

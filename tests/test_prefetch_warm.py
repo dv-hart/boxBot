@@ -33,6 +33,9 @@ def _agent(monkeypatch, *, active=True):
     a = BoxBotAgent.__new__(BoxBotAgent)
     a._prefetch_warm = None
     a._prefetch_injected = {}
+    a._thread_extraction_ctx = {}
+    a._conversations = {}
+    a._current_voice_session_id = None
     a._memory_store = None
     a._conn_warm_at = 0.0
     a._conn_warm_task = None
@@ -208,6 +211,129 @@ async def test_person_drift_on_fanout_bundle_falls_back_to_fresh(monkeypatch):
     assert "home-control" in ctx["prefetch_text"]
 
 
+@pytest.mark.asyncio
+async def test_person_drift_keeps_a_person_independent_result(monkeypatch):
+    """A follow-up gate result holds docs only. The speaker resolving
+    differently must not throw it away and run the gate a second time
+    — that doubled the wait before the reply."""
+    from boxbot.prefetch.request import PrefetchRequest
+
+    a = _agent(monkeypatch)
+    a._prefetch_lookup = AsyncMock(side_effect=AssertionError("ran twice"))
+    req = PrefetchRequest(
+        key="c1", key_kind="conversation", channel="voice", text="order it",
+        person_independent=True,
+    )
+    task = asyncio.create_task(_return((BUNDLE, False)))
+    a._prefetch_warm = ("vs1", "order it", None, req, task)
+
+    ctx = await a._prefetch_context_for_text(
+        _Conv(), "voice", "Jacob", "order it", warm_key="vs1"
+    )
+    assert "home-control" in ctx["prefetch_text"]
+
+
+@pytest.mark.asyncio
+async def test_person_drift_keeps_an_empty_gate_result(monkeypatch):
+    """'Nothing needed' is an answer too — no second gate call."""
+    from boxbot.prefetch.request import PrefetchRequest
+
+    a = _agent(monkeypatch)
+    a._prefetch_lookup = AsyncMock(side_effect=AssertionError("ran twice"))
+    req = PrefetchRequest(
+        key="c1", key_kind="conversation", channel="voice", text="thanks",
+        person_independent=True,
+    )
+    task = asyncio.create_task(_return((None, False)))
+    a._prefetch_warm = ("vs1", "thanks", None, req, task)
+
+    ctx = await a._prefetch_context_for_text(
+        _Conv(), "voice", "Jacob", "thanks", warm_key="vs1"
+    )
+    assert ctx == {}
+
+
+@pytest.mark.asyncio
+async def test_gate_lookup_marks_the_request_person_independent(monkeypatch):
+    from boxbot.prefetch.request import PrefetchRequest
+
+    a = _agent(monkeypatch)
+    a._hot_prefetch = MagicMock()
+    a._hot_prefetch.lookup = AsyncMock(return_value=None)
+    a._followup_gate = AsyncMock(return_value=None)
+    req = PrefetchRequest(
+        key="c1", key_kind="conversation", channel="voice", text="thanks",
+    )
+    await a._prefetch_lookup(req, hot_only=True)
+    assert req.person_independent is True
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_handler_does_not_start_a_fresh_lookup(
+    monkeypatch,
+):
+    """Cancelled while waiting on the warm task: propagate. Falling
+    back to a fresh lookup would hold the cancel behind a model call."""
+    a = _agent(monkeypatch)
+    a._prefetch_lookup = AsyncMock(side_effect=AssertionError("fresh ran"))
+
+    async def _slow():
+        await asyncio.sleep(30)
+
+    task = asyncio.create_task(_slow())
+    a._prefetch_warm = ("vs1", "order it", "Jacob", None, task)
+    handler = asyncio.create_task(a._prefetch_context_for_text(
+        _Conv(), "voice", "Jacob", "order it", warm_key="vs1"
+    ))
+    await asyncio.sleep(0.01)
+    handler.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await handler
+    # The abandoned lookup is not left running either.
+    await asyncio.sleep(0)
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_draft_for_a_new_session_ignores_the_old_conversation(
+    monkeypatch,
+):
+    """The previous session's room conversation is still on the books
+    when a new session's first draft arrives. That draft is a FIRST
+    turn: full lookup, keyed and deduped against nothing old."""
+    a = _agent(monkeypatch)
+    a._get_voice_room_conversation = MagicMock(return_value=_ConvWithReply())
+    a._current_voice_session_id = "vs-old"
+    a._recent_activity_lines = AsyncMock(return_value=[])
+    a._prefetch_lookup = AsyncMock(return_value=(None, False))
+
+    await a._on_transcript_draft(
+        TranscriptDraft(conversation_id="vs-new", text="order a book")
+    )
+    await a._prefetch_warm[4]
+    req = a._prefetch_lookup.await_args.args[0]
+    assert a._prefetch_lookup.await_args.kwargs == {"hot_only": False}
+    assert req.key == "voice-draft:vs-new"
+    assert req.recent_thread_tail is None and req.already_loaded is None
+
+
+@pytest.mark.asyncio
+async def test_draft_for_the_running_session_is_a_followup(monkeypatch):
+    a = _agent(monkeypatch)
+    a._get_voice_room_conversation = MagicMock(return_value=_ConvWithReply())
+    a._current_voice_session_id = "vs1"
+    a._recent_activity_lines = AsyncMock(return_value=[])
+    a._prefetch_lookup = AsyncMock(return_value=(None, False))
+
+    await a._on_transcript_draft(
+        TranscriptDraft(conversation_id="vs1", text="order the first one")
+    )
+    await a._prefetch_warm[4]
+    req = a._prefetch_lookup.await_args.args[0]
+    assert a._prefetch_lookup.await_args.kwargs == {"hot_only": True}
+    assert req.key == "c1" and len(req.recent_thread_tail) == 2
+
+
 # ---------------------------------------------------------------------------
 # Connection pre-warm
 # ---------------------------------------------------------------------------
@@ -281,6 +407,27 @@ async def test_hot_only_skips_the_fanout_on_a_miss(monkeypatch):
     )
     bundle, was_hot = await a._prefetch_lookup(req, hot_only=True)
     assert bundle is None and was_hot is False
+
+
+@pytest.mark.asyncio
+async def test_hot_miss_on_a_followup_asks_the_gate(monkeypatch):
+    """Voice follow-up + hot miss: the conversation model is asked which
+    docs the turn needs; its picks are what gets injected."""
+    a = _agent(monkeypatch)
+    a._hot_prefetch = MagicMock()
+    a._hot_prefetch.lookup = AsyncMock(return_value=None)
+    a._run_prefetch = AsyncMock(side_effect=AssertionError("fan-out ran"))
+    a._followup_gate = AsyncMock(return_value=BUNDLE)
+
+    from boxbot.prefetch.request import PrefetchRequest
+
+    req = PrefetchRequest(
+        key="c1", key_kind="conversation", channel="voice",
+        text="ok order the first one",
+    )
+    bundle, was_hot = await a._prefetch_lookup(req, hot_only=True)
+    assert bundle is BUNDLE and was_hot is False
+    a._followup_gate.assert_awaited_once_with(req)
 
 
 @pytest.mark.asyncio

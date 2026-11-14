@@ -1980,18 +1980,19 @@ class BoxBotAgent:
         a hot bundle after person drift (its skills/sdk content is
         person-independent).
 
-        ``hot_only`` (voice follow-up turns): on a hot miss, inject
-        nothing — no selector fan-out mid-conversation. The hot lane is
-        local (ONNX embed, ~150ms) and carries live device state +
-        fresh memories; docs/skills the thread doesn't already hold are
-        the agent's own job via load_skill/search_memory. The fan-out
-        measurably blocked follow-up replies (+2-3s) to re-select
-        content the thread already had.
+        ``hot_only`` (voice follow-up turns): on a hot miss there is
+        no selector fan-out mid-conversation — it measurably blocked
+        follow-up replies (+2-3s) to re-select content the thread
+        already had. Instead the follow-up gate asks the conversation
+        model itself, over its cached thread, which docs this turn
+        needs (see :meth:`_followup_gate`). No gate (Anthropic path,
+        gate disabled, call failed) means nothing is injected and
+        docs stay the agent's own job via load_skill.
         """
         if prefetch_layer.should_prefetch(req.channel) and prefetch_layer.is_active():
             try:
                 hot = await self._hot_prefetch.lookup(
-                    req, store=self._memory_store, followup=hot_only,
+                    req, store=self._memory_store
                 )
             except Exception:
                 logger.debug("hot prefetch lookup failed", exc_info=True)
@@ -2003,16 +2004,111 @@ class BoxBotAgent:
             # and _run_prefetch is the sole writer of prefetch_events —
             # skipping it there would blind the offline harness on
             # exactly the turns this policy changes.
-            logger.info(
-                "prefetch fan-out skipped (voice follow-up, hot miss): %s",
-                req.key,
-            )
-            return None, False
+            bundle = await self._followup_gate(req)
+            # Docs only — nothing in a gate result depends on who is
+            # speaking, so the warm consumer keeps it on person drift.
+            req.person_independent = True
+            return bundle, False
         try:
             return await self._run_prefetch(req), False
         except Exception:
             logger.debug("text prefetch failed", exc_info=True)
             return None, False
+
+    async def _followup_gate(
+        self, req: "prefetch_layer.PrefetchRequest",
+    ) -> "prefetch_layer.PrefetchBundle | None":
+        """Ask the conversation model which docs this follow-up needs.
+
+        One call over the conversation's cached thread (see
+        ``prefetch/gate.py``). Needs the request shape the last reply
+        stashed, so it only runs on the OpenAI path and from the second
+        turn on. Returns a bundle of skill bodies / SDK sections, or
+        None when nothing is needed or the gate did not run.
+        """
+        cfg = prefetch_layer.get_prefetch_config()
+        ctx = self._thread_extraction_ctx.get(req.key)
+        if (
+            cfg is None
+            or not getattr(cfg, "followup_gate", False)
+            or ctx is None
+        ):
+            logger.info(
+                "follow-up gate skipped (%s): %s",
+                "no cached request shape" if ctx is None else "disabled",
+                req.key,
+            )
+            return None
+        conv = self._conversations.get(req.key)
+        if conv is not None and conv.state in (
+            ConversationState.THINKING, ConversationState.SPEAKING,
+        ):
+            # Barge-in: this input is about to cancel a running reply.
+            # Holding that cancel behind a model call would leave the
+            # box talking over the person. Docs stay the agent's own
+            # job (load_skill) on these turns.
+            logger.info(
+                "follow-up gate skipped (barge-in, state=%s): %s",
+                conv.state.value, req.key,
+            )
+            return None
+        # The reply call sends the full tool list. The stashed "tools"
+        # can be the message-only list of a turn-capped final turn —
+        # a different cache key, so neither a hit nor a warm-up.
+        ctx = {**ctx, "tools": ctx.get("full_tools") or ctx["tools"]}
+        from boxbot.prefetch import gate as gate_mod
+
+        try:
+            result = await gate_mod.run_gate(
+                req,
+                client=self._ensure_openai_client(),
+                ctx=ctx,
+                # Bare thread, as the reply call will replay it.
+                history=self._materialize_history(
+                    list(req.recent_thread_tail or [])
+                ),
+                timeout_seconds=float(
+                    getattr(cfg, "followup_gate_timeout_seconds", 4.0)
+                ),
+            )
+        except Exception:
+            logger.warning("follow-up gate failed: %s", req.key, exc_info=True)
+            return None
+        if result is None:
+            return None
+
+        bundle = result.bundle
+        cost_usd: float | None = None
+        cached = total = 0
+        try:
+            event = from_openai_usage(
+                purpose=gate_mod.PURPOSE,
+                model=ctx["model"],
+                usage=result.usage,
+                correlation_id=req.key,
+                metadata={"conversation_id": req.key},
+            )
+            await record_cost(self._memory_store, event)
+            cost_usd = event.cost_usd
+            cached, total = event.cache_read_tokens, event.input_tokens
+        except Exception:
+            logger.debug("follow-up gate cost record failed", exc_info=True)
+        try:
+            await prefetch_layer.record_prefetch_event(
+                self._memory_store,
+                key=req.key, key_kind=req.key_kind, channel=req.channel,
+                mode="gate", bundle=bundle,
+                latency_ms=result.latency_ms, cost_usd=cost_usd,
+            )
+        except Exception:
+            logger.debug("follow-up gate event write failed", exc_info=True)
+        logger.info(
+            "follow-up gate: skills=%s sdk=%s (%dms, cached=%d/%d input "
+            "tokens) conv=%s",
+            bundle.predicted_skills(), bundle.predicted_sdk_sections(),
+            result.latency_ms, cached, total, req.key,
+        )
+        return None if bundle.is_empty() else bundle
 
     @staticmethod
     def _is_followup_turn(conv: "Conversation | None") -> bool:
@@ -2046,6 +2142,15 @@ class BoxBotAgent:
         self._kick_openai_conn_warm()
 
         conv = self._get_voice_room_conversation()
+        if (
+            conv is not None
+            and event.conversation_id != self._current_voice_session_id
+        ):
+            # A new voice session: the room conversation still on the
+            # books belongs to the previous one and is ended when this
+            # transcript lands. This utterance is a FIRST turn — it
+            # must not be gated or deduped against the old thread.
+            conv = None
         person = self._get_most_recent_person()
         try:
             req = prefetch_layer.PrefetchRequest(
@@ -2111,9 +2216,20 @@ class BoxBotAgent:
             self._prefetch_warm = None
             if wkey == warm_key and wtext == text:
                 try:
-                    bundle, was_hot = await task
+                    # Shielded so the two cancellations are tellable
+                    # apart: awaiting the task bare, a cancel of THIS
+                    # handler would cancel the task too.
+                    bundle, was_hot = await asyncio.shield(task)
                     used_warm = True
                 except asyncio.CancelledError:
+                    # Only the warm task's own cancellation (a newer
+                    # draft replaced it) falls back to a fresh run. If
+                    # it is this handler being cancelled, starting
+                    # another lookup would hold the cancel behind a
+                    # second model call.
+                    if not task.cancelled():
+                        task.cancel()
+                        raise
                     bundle = None
                 except Exception:
                     bundle = None
@@ -2121,7 +2237,19 @@ class BoxBotAgent:
                         "warm prefetch task failed; running fresh",
                         exc_info=True,
                     )
-                if used_warm and wperson != sender_name:
+                if (
+                    used_warm and wperson != sender_name
+                    and getattr(wreq, "person_independent", False)
+                ):
+                    # Follow-up gate result: docs only, no person in
+                    # it. Keep as is — discarding would run the gate a
+                    # second time and double the wait.
+                    logger.info(
+                        "warm prefetch kept across person drift "
+                        "(%s -> %s, person-independent)",
+                        wperson, sender_name,
+                    )
+                elif used_warm and wperson != sender_name:
                     # Person resolved differently after the draft (the
                     # common first-turn case: presence was stale, voice
                     # ReID just identified the speaker). Hot bundles are
@@ -4797,6 +4925,8 @@ class BoxBotAgent:
                 "model": model,
                 "system_prompt": system_prompt,
                 "tools": to_openai_tools(turn_tools),
+                # What a cycle's first call sends (see _followup_gate).
+                "full_tools": to_openai_tools(tool_definitions),
                 "response_format": notes_format,
                 "effort_kwargs": effort_kwargs,
                 # The final cycle's initial user turn went out with the

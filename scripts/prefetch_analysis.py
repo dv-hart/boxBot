@@ -238,7 +238,7 @@ def main() -> None:
     print("=" * 64)
     print("Prefetch analysis")
     print(f"  prefetch_events: {len(events)}  unmatched (no telemetry): {unmatched}")
-    for mode in ("shadow", "active", "hot"):
+    for mode in ("shadow", "active", "hot", "gate"):
         _report(mode, by_mode.get(mode, []))
     conn.close()
 

@@ -25,7 +25,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
 import time
 from typing import Any
 
@@ -122,14 +121,9 @@ class HotTaskCache:
     # -- lookup (reply path) --------------------------------------------
 
     async def lookup(
-        self, req: PrefetchRequest, *, store: Any, followup: bool = False,
+        self, req: PrefetchRequest, *, store: Any
     ) -> PrefetchBundle | None:
         """Canned bundle for a recognized hot task, or None (= miss).
-
-        ``followup``: this is a later turn of a running conversation.
-        Only then do task ``keywords`` count as a match — on a first
-        turn a centroid miss falls through to the selector fan-out,
-        which does the same job with more context.
 
         A returned EMPTY bundle is still a hit: the task predictably
         needs no extra context, so the caller should skip the selector
@@ -160,10 +154,6 @@ class HotTaskCache:
             sim = cosine_similarity(embedding, centroid)
             if sim >= score:
                 task, score = name, sim
-        via = "centroid"
-        if task is None and followup:
-            task = _keyword_task(self._tasks(cfg), text)
-            via, score = "keyword", 0.0
         if task is None:
             return None
 
@@ -184,8 +174,8 @@ class HotTaskCache:
         )
         bundle.live_context = await self._live_context(cfg, task)
         logger.info(
-            "hot prefetch hit task=%s via=%s score=%.2f key=%s empty=%s (%.0fms)",
-            task, via, score, req.key, bundle.is_empty(),
+            "hot prefetch hit task=%s score=%.2f key=%s empty=%s (%.0fms)",
+            task, score, req.key, bundle.is_empty(),
             (time.monotonic() - t0) * 1000,
         )
         try:
@@ -375,15 +365,6 @@ class HotTaskCache:
             built += 1
         if built:
             logger.info("hot prefetch bundles built: %d task(s)", built)
-
-
-def _keyword_task(tasks: list[Any], text: str) -> str | None:
-    """First task with a keyword present in ``text`` as a whole word."""
-    words = set(re.findall(r"[a-z0-9']+", text.lower()))
-    for t in tasks:
-        if any(k.lower() in words for k in getattr(t, "keywords", None) or ()):
-            return t.name
-    return None
 
 
 class _ShimConfig:

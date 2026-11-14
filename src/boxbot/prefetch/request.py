@@ -61,6 +61,11 @@ class PrefetchRequest:
     # Utterance embedding, filled by the hot-task matcher when it runs
     # first so the memory lane doesn't embed the same text twice.
     query_embedding: Any = field(default=None, repr=False)
+    # Set by the lookup when its result does not depend on ``person``
+    # (the follow-up gate picks docs, nothing person-specific). A
+    # draft-warmed result then survives the speaker resolving
+    # differently instead of being thrown away and recomputed.
+    person_independent: bool = False
 
     def briefing(self) -> str:
         """A compact natural-language brief shared by every selector."""

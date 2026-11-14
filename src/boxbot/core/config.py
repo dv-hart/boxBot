@@ -944,6 +944,13 @@ class HotTaskConfig(BaseModel):
     # centroid fingerprint: providers change what a hit injects, never
     # what matches.
     providers: list[str] = Field(default_factory=list)
+    # Whole words that also select this task, on FOLLOW-UP turns only
+    # (where no selector fan-out runs). For a broad intent the centroid
+    # cannot capture — "ok, order the first one" sits nowhere near
+    # "can you buy a book" in embedding space. Case-insensitive,
+    # word-boundary match. A false hit costs one doc injection per
+    # conversation; a miss leaves the agent without its SOP.
+    keywords: list[str] = Field(default_factory=list)
 
 
 # The stock hot-task set: common household one-shots. Overridable
@@ -975,7 +982,26 @@ _DEFAULT_HOT_TASKS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
         "what time is it",
         "what's the date today",
     ), ()),
+    # Buying often comes up mid-conversation ("…ok, order that one"),
+    # where no selector fan-out runs. The hot lane is the only path
+    # that puts the purchasing SOP in front of the agent on those turns.
+    ("purchase", (
+        "can you order a book for the kids",
+        "buy that one for me",
+        "are you able to order things now",
+        "send me purchase links for those",
+        "find one I can buy and order it",
+        "did that order go through",
+    ), ()),
 )
+
+# Follow-up keywords per stock task (see ``HotTaskConfig.keywords``).
+_DEFAULT_HOT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "purchase": (
+        "buy", "buying", "purchase", "purchases", "purchasing",
+        "order", "ordering", "ordered", "checkout",
+    ),
+}
 
 
 class PrefetchConfig(BaseModel):
@@ -1059,6 +1085,7 @@ class PrefetchConfig(BaseModel):
             HotTaskConfig(
                 name=name, exemplars=list(exemplars),
                 providers=list(providers),
+                keywords=list(_DEFAULT_HOT_KEYWORDS.get(name, ())),
             )
             for name, exemplars, providers in _DEFAULT_HOT_TASKS
         ]

@@ -1991,7 +1991,7 @@ class BoxBotAgent:
         if prefetch_layer.should_prefetch(req.channel) and prefetch_layer.is_active():
             try:
                 hot = await self._hot_prefetch.lookup(
-                    req, store=self._memory_store
+                    req, store=self._memory_store, followup=hot_only,
                 )
             except Exception:
                 logger.debug("hot prefetch lookup failed", exc_info=True)

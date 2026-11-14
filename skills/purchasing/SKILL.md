@@ -20,6 +20,31 @@ household limits and the purchase policy with a separate checker, and
 decides. Money moves only there. API reference:
 `load_skill(name="bb", subpath="modules/purchases.md")`.
 
+## What you can buy, and where
+
+| Where | Can you buy there? |
+|---|---|
+| Stores in the Shop catalogue (`bb.purchases.search`) | Yes. |
+| A household-approved store's own feed (`bb.purchases.store_products`) | Yes. |
+| Amazon, Walmart, Target, or any other site found by `web_search` | **No.** No checkout exists for them. |
+
+- Asked "can you order things?" — yes: you find it and an admin gets a
+  review-and-pay link by text.
+- "Send me a link to buy it" / "send me purchase links" **is a purchase
+  request.** Propose. The review link the main process texts is the
+  purchase link. Do not `web_search` for retailer links instead.
+- Look in the catalogue first, every time. Only when `search` (try two
+  or three phrasings) finds nothing suitable: say plainly that you
+  cannot buy it, and offer product-page links so the person can buy it
+  themselves. Say which case it is — never present a retailer link as
+  something you arranged.
+- Pick offers with `available` true, `currency == "USD"`, and a price
+  that is sane for the item. The catalogue also lists foreign and
+  wholesale sellers.
+- Several items: prefer one store that carries all of them — one
+  proposal, one shipping charge. Items only at different stores: one
+  proposal per store; tell the person there will be that many links.
+
 ## The two outcomes
 
 | `decision` | Who pays | When |
@@ -112,6 +137,8 @@ main process resend it to the admins (once per 10 minutes).
   is `unknown` or `failed`. Report it and stop. `unknown` may already
   have charged.
 - Split one request into several proposals to fit under a limit.
+  (One proposal per store, because items are at different stores, is
+  not that.)
 - Quote a search price as the total. Shipping and tax arrive with the
   proposal.
 - Say something was bought unless `status` is `ordered`.

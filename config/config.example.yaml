@@ -447,6 +447,7 @@ prefetch:
   #   hot_tasks:
   #     - name: show_camera
   #       exemplars: ["show me the garage camera", "show me the front door"]
+  #       keywords: []   # whole words that also match, follow-up turns only
   hot_tasks_enabled: true
   # Minimum cosine similarity (utterance vs task centroid) for a hit.
   hot_match_threshold: 0.60

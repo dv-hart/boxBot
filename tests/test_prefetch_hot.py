@@ -149,6 +149,43 @@ class TestLookup:
         finally:
             await store.close()
 
+    async def test_keyword_hits_on_followup_only(self, tmp_path, hot_env):
+        """A broad intent the centroid misses still gets its bundle on a
+        follow-up turn; on a first turn it falls to the selector."""
+        hot_env.hot_tasks[0].keywords = ["order", "buy"]
+        store = await _store(tmp_path)
+        try:
+            canned = PrefetchBundle(skill_bodies={"purchasing": "sop"})
+            await _seed(
+                store, hot_env, bundle_dict=canned.to_dict(),
+                centroid=_OTHER,  # centroid misses
+            )
+            req = _req(text="OK,   order   the first one")
+            assert await HotTaskCache().lookup(req, store=store) is None
+            bundle = await HotTaskCache().lookup(
+                _req(text="OK,   order   the first one"),
+                store=store, followup=True,
+            )
+            assert bundle is not None
+            assert bundle.skill_bodies == {"purchasing": "sop"}
+        finally:
+            await store.close()
+
+    async def test_keyword_needs_a_whole_word(self, tmp_path, hot_env):
+        hot_env.hot_tasks[0].keywords = ["order", "buy"]
+        store = await _store(tmp_path)
+        try:
+            await _seed(
+                store, hot_env,
+                bundle_dict=PrefetchBundle().to_dict(), centroid=_OTHER,
+            )
+            for text in ("the border is disordered", "buyer beware", "thanks"):
+                assert await HotTaskCache().lookup(
+                    _req(text=text), store=store, followup=True,
+                ) is None
+        finally:
+            await store.close()
+
     async def test_stale_fingerprint_misses_and_kicks_rebuild(
         self, tmp_path, hot_env, monkeypatch,
     ):

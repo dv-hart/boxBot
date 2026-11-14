@@ -81,7 +81,6 @@ _LINK_RESEND_SECONDS = 600
 _NOT_CONNECTED_NOTICE_SECONDS = 3600
 _SWEEP_SECONDS = 60
 _CONNECT_MAX_SECONDS = 1200
-_SHOP_APPROVAL_HOURS = 24
 _REVIEW_LINK_MAX_AGE_SECONDS = 86400
 # Checkout states in which Shop has certainly not taken payment.
 _UNPAID_STATES = ("ready_for_complete", "incomplete", "requires_escalation")
@@ -90,6 +89,7 @@ _TEXT_CHANNELS = ("signal", "whatsapp")
 _CANCEL_RE = re.compile(r"^\s*cancel\s+buy\s+([0-9a-fA-F]{6,12})\s*$", re.IGNORECASE)
 _CONNECT_RE = re.compile(r"^\s*shop\s+connect\s*$", re.IGNORECASE)
 _ALLOW_SHOP_RE = re.compile(r"^\s*allow\s+shop\s+(\S{4,253})\s*$", re.IGNORECASE)
+_BLOCK_SHOP_RE = re.compile(r"^\s*block\s+shop\s+(\S{4,253})\s*$", re.IGNORECASE)
 
 
 class PurchaseError(Exception):
@@ -904,7 +904,9 @@ async def _ask_shop_approval(host: str, requester: rules.Requester) -> str:
         f"Came from: {requester.label}\n"
         "Building a checkout there gives that store your saved name, "
         "contact and delivery address. Nothing has been sent to it.\n"
-        f'To allow it for {_SHOP_APPROVAL_HOURS} hours, reply: allow shop {host}'
+        "Allowing it lets boxBot send you review links for that store "
+        "from now on; it never buys there on its own.\n"
+        f"To allow it, reply: allow shop {host}"
     )
     if delivered == 0:
         return "unreachable"
@@ -1410,7 +1412,7 @@ async def _sweep_scheduled() -> None:
 
 def parse_admin_command(text: str | None) -> tuple[str, str] | None:
     """``("cancel", <id>)`` / ``("connect", "")`` / ``("allow_shop",
-    <host>)`` or None."""
+    <host>)`` / ``("block_shop", <host>)`` or None."""
     if not text:
         return None
     m = _CANCEL_RE.match(text)
@@ -1421,6 +1423,9 @@ def parse_admin_command(text: str | None) -> tuple[str, str] | None:
     m = _ALLOW_SHOP_RE.match(text)
     if m is not None:
         return "allow_shop", m.group(1)
+    m = _BLOCK_SHOP_RE.match(text)
+    if m is not None:
+        return "block_shop", m.group(1)
     return None
 
 
@@ -1448,16 +1453,45 @@ async def handle_admin_command(verb: str, arg: str, *, admin: "User") -> str:
             host = normalize_shop(arg)
         except ValueError:
             return "That is not a store domain. Example: allow shop www.example.com"
-        expires = datetime.now(timezone.utc) + timedelta(hours=_SHOP_APPROVAL_HOURS)
-        await get_purchase_store().approve_shop(
-            host, approved_by=admin.phone, expires_at=utc_iso(expires),
-        )
-        logger.info("Shop %s approved for %dh by %s", host, _SHOP_APPROVAL_HOURS, admin.phone)
-        return (
-            f"OK. For the next {_SHOP_APPROVAL_HOURS} hours boxBot may build "
-            f"checkouts at {host} and send them to you to review. It will "
-            "not buy there automatically; add the store to "
+        await get_purchase_store().approve_shop(host, approved_by=admin.phone)
+        logger.info("Shop %s approved by %s", host, admin.phone)
+        reply = (
+            f"OK. boxBot may now build checkouts at {host} and send them "
+            "to you to review, until you reply: "
+            f"block shop {host}\n"
+            "It will not buy there automatically; add the store to "
             "purchases.allowed_shops for that."
+        )
+        # A mistyped domain approves a store nobody asked for and
+        # leaves the wanted one blocked, with no error anywhere. Say so
+        # when this is not a store boxBot has asked about.
+        asked = sorted(h for h in _shop_asked if h != host)
+        if host not in _shop_asked and asked:
+            reply += (
+                "\nNote: boxBot has not asked about that store. It did "
+                "ask about: " + ", ".join(asked[:5]) + ". Check the "
+                "spelling if you meant one of those."
+            )
+        return reply
+    if verb == "block_shop":
+        try:
+            host = normalize_shop(arg)
+        except ValueError:
+            return "That is not a store domain. Example: block shop www.example.com"
+        removed = await get_purchase_store().revoke_shop(host)
+        logger.info("Shop %s blocked by %s (was approved: %s)",
+                    host, admin.phone, removed)
+        if host in _config().allowed_shops:
+            return (
+                f"{host} is on the configured allow-list "
+                "(purchases.allowed_shops), which a text cannot change. "
+                "Remove it from the config to block it."
+            )
+        if not removed:
+            return f"{host} was not an approved store. Nothing changed."
+        return (
+            f"OK. boxBot will no longer build checkouts at {host}. "
+            "Review links already sent still work."
         )
     return "Unknown purchase command."
 

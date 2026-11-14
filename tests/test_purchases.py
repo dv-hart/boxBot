@@ -1324,15 +1324,44 @@ class TestProposeReview:
         assert time.perf_counter() - started < 1.0
         assert len(out["purchase"]["reason"]) <= 200
 
-    async def test_store_approval_expires(self, env):
+    async def test_store_approval_lasts_until_blocked(self, env):
         env.cfg.allowed_shops = []
-        await env.store.approve_shop(
-            SHOP, approved_by=ADMIN,
-            expires_at=utc_iso(datetime.now() - timedelta(minutes=1)),
-        )
+        admin = await (await _auth()).get_user(ADMIN)
+        await env.store.approve_shop(SHOP, approved_by=ADMIN)
+        with patch.object(checker, "check", side_effect=allow):
+            out = await service.propose(SHOP, ITEMS, "why", conv=conv_from())
+        assert out["decision"] == "review" and len(env.shop.created) == 1
+
+        reply = await service.handle_admin_command("block_shop", SHOP, admin=admin)
+        assert "no longer" in reply and SHOP in reply
+        assert not await env.store.shop_approved(SHOP)
         with pytest.raises(service.PurchaseError):
-            await service.propose(SHOP, ITEMS, "why", conv=conv_from())
-        assert env.shop.created == []
+            await service.propose(
+                SHOP, [{"variant_id": "gid://shopify/ProductVariant/2", "quantity": 1}],
+                "why", conv=conv_from())
+        assert len(env.shop.created) == 1       # no second checkout
+
+    async def test_old_time_limited_approvals_are_not_carried_over(self, env):
+        """A database from before approvals were permanent: its 24-hour
+        grants are dropped, never promoted to permanent ones."""
+        import aiosqlite
+        async with aiosqlite.connect(str(env.store._db_path)) as db:
+            await db.execute(
+                "CREATE TABLE shop_approvals (shop TEXT PRIMARY KEY, "
+                "approved_by TEXT NOT NULL, approved_at TEXT NOT NULL, "
+                "expires_at TEXT NOT NULL)")
+            await db.execute(
+                "INSERT INTO shop_approvals VALUES (?, ?, ?, ?)",
+                (SHOP, ADMIN, "2026-01-01T00:00:00.000000Z",
+                 "2099-01-01T00:00:00.000000Z"))
+            await db.commit()
+        from boxbot.purchases.store import PurchaseStore
+        fresh = PurchaseStore(env.store._db_path)
+        assert not await fresh.shop_approved(SHOP)
+        async with aiosqlite.connect(str(env.store._db_path)) as db:
+            rows = await db.execute_fetchall(
+                "SELECT name FROM sqlite_master WHERE name = 'shop_approvals'")
+        assert rows == []
 
     async def test_failure_after_the_checkout_exists_still_reaches_a_human(self, env):
         with patch.object(env.store, "record_decision", side_effect=RuntimeError("db")), \
@@ -1602,12 +1631,7 @@ class TestProposeAuto:
         reply = await service.handle_admin_command(
             "allow_shop", f"https://{SHOP.upper()}/", admin=admin
         )
-        assert "24 hours" in reply and SHOP in reply
-        import aiosqlite
-        async with aiosqlite.connect(str(self.env.store._db_path)) as db:
-            ((expires,),) = await db.execute_fetchall(
-                "SELECT expires_at FROM shop_approvals WHERE shop = ?", (SHOP,))
-        assert 23.9 * 3600 < service._epoch(expires) - time.time() <= 24 * 3600
+        assert f"block shop {SHOP}" in reply
         out = await self.propose()
         assert out["decision"] == "review" and out["blocked_by"] == ["shop_allowed"]
         assert self.env.shop.completions == []
@@ -2369,6 +2393,9 @@ class TestAdminCommands:
         assert service.parse_admin_command("  Shop Connect ") == ("connect", "")
         assert service.parse_admin_command("Allow shop WWW.Example.com") == (
             "allow_shop", "WWW.Example.com")
+        assert service.parse_admin_command("Block shop WWW.Example.com") == (
+            "block_shop", "WWW.Example.com")
+        assert service.parse_admin_command("block shop") is None
         assert service.parse_admin_command("allow shop") is None
         assert service.parse_admin_command("allow shop a b") is None
         for text in ("cancel buy", "cancel buy zzzz1234", "please cancel buy ab12cd34",
@@ -2427,7 +2454,43 @@ class TestAdminCommands:
         assert env.out.sent == []
         await router.route_incoming(Channel.SIGNAL, ADMIN, f"allow shop {SHOP}")
         assert await env.store.shop_approved(SHOP)
-        assert "24 hours" in texts(env.out)[-1]
+        assert f"block shop {SHOP}" in texts(env.out)[-1]
+
+    async def test_allow_shop_flags_a_likely_typo(self, env):
+        """Approving a domain boxBot never asked about, while it IS
+        waiting on a similar one, gets a spelling warning."""
+        env.cfg.allowed_shops = []
+        admin = await (await _auth()).get_user(ADMIN)
+        with pytest.raises(service.PurchaseError):
+            await service.propose("bookandmortar.com", ITEMS, "why", conv=conv_from())
+        reply = await service.handle_admin_command(
+            "allow_shop", "bookandmorter.com", admin=admin)
+        assert "has not asked about that store" in reply
+        assert "bookandmortar.com" in reply
+        reply = await service.handle_admin_command(
+            "allow_shop", "bookandmortar.com", admin=admin)
+        assert "has not asked" not in reply
+
+    async def test_block_shop_only_from_an_admin(self, env, event_bus):
+        env.cfg.allowed_shops = []
+        await env.store.approve_shop(SHOP, approved_by=ADMIN)
+        router = MessageRouter(auth=await _auth())
+        await router.route_incoming(Channel.SIGNAL, PLAIN, f"block shop {SHOP}")
+        assert await env.store.shop_approved(SHOP)
+        assert env.out.sent == []
+        await router.route_incoming(Channel.SIGNAL, ADMIN, f"block shop {SHOP}")
+        assert not await env.store.shop_approved(SHOP)
+
+    async def test_block_shop_replies_for_config_and_unknown_stores(self, env):
+        admin = await (await _auth()).get_user(ADMIN)
+        # SHOP is on the configured allow-list: a text cannot remove it.
+        reply = await service.handle_admin_command("block_shop", SHOP, admin=admin)
+        assert "purchases.allowed_shops" in reply
+        reply = await service.handle_admin_command(
+            "block_shop", "never-seen.example.org", admin=admin)
+        assert "was not an approved store" in reply
+        reply = await service.handle_admin_command("block_shop", "x", admin=admin)
+        assert "not a store domain" in reply
 
     @pytest.mark.parametrize("bad", ["192.168.0.10", "localhost", "http://x.com", "x"])
     async def test_allow_shop_rejects_non_domains(self, env, bad):
@@ -2437,7 +2500,8 @@ class TestAdminCommands:
 
     async def test_no_sdk_action_can_approve_a_store(self, env):
         env.cfg.allowed_shops = []
-        for verb in ("allow_shop", "approve_shop", "allow", "approve"):
+        for verb in ("allow_shop", "approve_shop", "allow", "approve",
+                     "block_shop", "revoke_shop"):
             reply = await process_action(
                 {"_sdk": f"purchases.{verb}", "shop": SHOP, "id": SHOP}, ActionContext()
             )
@@ -2605,10 +2669,8 @@ class TestActionHandler:
     async def test_store_products_requires_allow_listed_shop(self, env):
         out = await self.dispatch("store_products", shop="evil.example.org")
         assert out["status"] == "error" and "allowed_shops" in out["message"]
-        # A 24-hour admin approval does not open the product feed either.
-        await env.store.approve_shop(
-            "evil.example.org", approved_by=ADMIN,
-            expires_at=utc_iso(datetime.now() + timedelta(hours=1)))
+        # An admin's text approval does not open the product feed either.
+        await env.store.approve_shop("evil.example.org", approved_by=ADMIN)
         out = await self.dispatch("store_products", shop="evil.example.org")
         assert out["status"] == "error"
 

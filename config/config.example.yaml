@@ -544,7 +544,8 @@ purchases:
   # Stores the household trusts (bare domains). Only these qualify for
   # automatic purchase and for bb.purchases.store_products. For any
   # other store boxBot asks the admins first; an admin replies
-  # "allow shop <domain>" to permit review-only checkouts for 24 hours.
+  # "allow shop <domain>" to permit review-only checkouts there, until
+  # an admin replies "block shop <domain>".
   allowed_shops: []               # e.g. ["www.cottagedoorpress.com"]
   auto_requires_admin_text: true  # voice/trigger requests always go to review
   veto_window_seconds: 300        # admins can reply "cancel buy <id>"; auto needs >= 60

@@ -29,7 +29,8 @@ Trust boundaries:
   sign-in/checkout link.
 - A store outside ``purchases.allowed_shops`` gets a checkout — and
   with it the household's saved contact and address — only after an
-  admin's own ``allow shop <domain>`` text (24 hours, review only).
+  admin's own ``allow shop <domain>`` text. That approval is review
+  only and lasts until an admin texts ``block shop <domain>``.
 - A veto window interrupted by a restart is never resumed: the
   purchase goes to review.
 - Admin commands (``cancel buy <id>``, ``shop connect``,

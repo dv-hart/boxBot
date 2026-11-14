@@ -413,8 +413,8 @@ class MessageRouter:
         message: str | None,
         inbound_channel: Channel,
     ) -> bool:
-        """Intercept an admin's ``cancel buy <id>``, ``shop connect`` or
-        ``allow shop <domain>``.
+        """Intercept an admin's ``cancel buy <id>``, ``shop connect``,
+        ``allow shop <domain>`` or ``block shop <domain>``.
 
         Returns True iff the message was a purchase command from a
         registered **admin** and was fully handled here — the agent

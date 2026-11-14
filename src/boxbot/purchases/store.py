@@ -23,9 +23,10 @@ Purchase statuses:
 correctly afterwards: a row left in ``verifying`` never had payment
 sent; a row left in ``paying`` may have.
 
-``shop_approvals`` holds stores an admin has allowed for a limited
-time by text command (``allow shop <domain>``), on top of the
-configured allow-list.
+``approved_shops`` holds stores an admin has allowed by text command
+(``allow shop <domain>``), on top of the configured allow-list. An
+approval lasts until an admin sends ``block shop <domain>``. It covers
+review-and-pay checkouts only, never automatic purchase.
 
 ``decisions`` holds one row per policy evaluation — the deterministic
 rule results plus the checker model's full input and raw output. It is
@@ -94,12 +95,15 @@ CREATE TABLE IF NOT EXISTS decisions (
     final TEXT NOT NULL
 )""",
     """\
-CREATE TABLE IF NOT EXISTS shop_approvals (
+CREATE TABLE IF NOT EXISTS approved_shops (
     shop TEXT PRIMARY KEY,
     approved_by TEXT NOT NULL,
-    approved_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
+    approved_at TEXT NOT NULL
 )""",
+    # Predecessor of approved_shops: approvals that were granted for 24
+    # hours. Dropped rather than carried over — a grant given as
+    # temporary must not quietly become permanent.
+    "DROP TABLE IF EXISTS shop_approvals",
     "CREATE INDEX IF NOT EXISTS idx_purchases_created ON purchases(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_decisions_purchase ON decisions(purchase_id)",
 )
@@ -353,28 +357,39 @@ class PurchaseStore:
 
     # -- shop approvals ----------------------------------------------------
 
-    async def approve_shop(self, shop: str, *, approved_by: str, expires_at: str) -> None:
-        """Record (or renew) an admin's time-limited approval of a store."""
+    async def approve_shop(self, shop: str, *, approved_by: str) -> None:
+        """Record an admin's approval of a store. Lasts until revoked."""
         db = await self._get_db()
         try:
             await db.execute(
-                "INSERT INTO shop_approvals (shop, approved_by, approved_at, "
-                "expires_at) VALUES (?, ?, ?, ?) "
+                "INSERT INTO approved_shops (shop, approved_by, approved_at) "
+                "VALUES (?, ?, ?) "
                 "ON CONFLICT(shop) DO UPDATE SET approved_by = excluded.approved_by, "
-                "approved_at = excluded.approved_at, expires_at = excluded.expires_at",
-                (shop, approved_by, _now(), expires_at),
+                "approved_at = excluded.approved_at",
+                (shop, approved_by, _now()),
             )
             await db.commit()
         finally:
             await db.close()
 
-    async def shop_approved(self, shop: str) -> bool:
-        """True while an admin's approval of ``shop`` has not expired."""
+    async def revoke_shop(self, shop: str) -> bool:
+        """Remove an admin's approval of a store. True if there was one."""
         db = await self._get_db()
         try:
             cursor = await db.execute(
-                "SELECT 1 FROM shop_approvals WHERE shop = ? AND expires_at > ?",
-                (shop, _now()),
+                "DELETE FROM approved_shops WHERE shop = ?", (shop,)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+        finally:
+            await db.close()
+
+    async def shop_approved(self, shop: str) -> bool:
+        """True when an admin has approved ``shop`` by text command."""
+        db = await self._get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT 1 FROM approved_shops WHERE shop = ?", (shop,)
             )
             row = await cursor.fetchone()
         finally:

@@ -78,8 +78,8 @@ out = bb.purchases.propose(
   day; the error text says whether they were actually asked — telling
   them how to approve. Say an admin needs to approve the store; do not send
   approval instructions yourself (the `message` tool refuses them).
-  Propose again only once an admin has approved. You cannot approve a
-  store.
+  Propose again only once an admin has approved. An approval lasts
+  until an admin blocks the store. You cannot approve a store.
 - Where automatic purchasing is on, `blocked_by` is just
   `["needs_review"]` for anything sent to review.
 
@@ -124,6 +124,6 @@ bb.purchases.cancel("ab12cd34")        # only before payment is sent
   new message from the person since the last one.
 - Text anyone a checkout, payment, or Shop sign-in link, or anything
   dressed as a purchase notice. The `message` tool refuses it.
-- Act for an admin by text command: `cancel buy <id>`, `shop connect`
-  and `allow shop <domain>` are honoured only from an admin's own
+- Act for an admin by text command: `cancel buy <id>`, `shop connect`,
+  `allow shop <domain>` and `block shop <domain>` are honoured only from an admin's own
   registered number, handled before you see the message.

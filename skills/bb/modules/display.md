@@ -11,20 +11,77 @@ Output *you* need to see → `bb.workspace.view` / `bb.camera.capture` /
 `bb.photos.view`, not a display. Switches tear down data sources — max
 ~1/sec.
 
-## Built-in displays — clock / weather_simple / notice / picture + their args
+## Built-in displays — clock / weather_simple / notice / picture / web / product + their args
 
 `clock` · `weather_simple` · `notice` (`args.title` + `args.lines`) ·
 `picture` (`args.image_ids: [str, ...]` required; 1 id = static, 2+ =
-slideshow every `args.interval` sec, default 8) · everything in
-`displays/` and `data/displays/`. Enumerate: `bb.display.list()`.
+slideshow every `args.interval` sec, default 8; an id may be a
+workspace image path, e.g. `"tmp/cat.jpg"`) · `web` · `product` ·
+everything in `displays/` and `data/displays/`. Enumerate:
+`bb.display.list()`.
+
+## Web display — switch_display('web', args={'url'}): YouTube video or web page in a browser
+
+```
+switch_display("web", args={"url": "https://www.youtube.com/watch?v=…"})
+switch_display("web", args={"url": "https://en.wikipedia.org/wiki/Otter"})
+```
+
+- `url`: `https://` + public hostname only. Rejected: `http`, IPs, LAN
+  names, ports, credentials. Error names the reason.
+- YouTube watch / `youtu.be` / shorts links play full-screen
+  (`t=` start time kept). Find links with `web_search`.
+- Always pinned. Goes away when:
+
+  | Cause | When |
+  | --- | --- |
+  | you | `switch_display` to anything else, or `bb.display.unpin()` |
+  | idle | nothing playing + nobody touching the page for 5 min. Per page: `args.idle_minutes` (a recipe someone cooks from → 30) |
+  | hard limit | 2 h |
+
+  Then rotation resumes. A video that ended, or one you paused, is idle.
+- `bb.display.web_media("pause")` holds until `web_media("play")`.
+  `"play"` also starts a video that loaded without autoplaying
+  (YouTube links autoplay). No seek, no clicking: page needs a tap →
+  the person taps the screen.
+- **Sound vs. mic.** Media plays only while the room is quiet: pauses
+  when the wake word fires, while you speak, and while the mic is
+  listening; resumes on its own after. Opening it on a voice
+  conversation mutes the mic (result `mic_muted: true`) — wake word
+  re-engages. Speak *before* you open it, not after.
+- State: `bb.display.get_active()["web"]` → `{url, kind, title, playing,
+  paused, audio, open_seconds, closes_if_idle_seconds}` or `None`.
+  `audio: false` = showing silently (no speaker path). `screenshot()` errors while it is open —
+  page pixels never enter your context.
+- A web image → download to workspace, show with `picture` (no browser).
+
+## Product display — switch_display('product', args): one item with image + price
+
+```python
+hit = bb.purchases.search("goldilocks board book", limit=5)[0]
+image = None
+if hit["image_url"]:
+    import requests
+    image = bb.workspace.write(
+        "tmp/product.jpg", requests.get(hit["image_url"], timeout=15).content,
+    )["path"]
+print(image)
+```
+```
+switch_display("product", args={"title": …, "price": "$11.99",
+    "seller": …, "detail": "4.8 stars (212)", "image": "tmp/product.jpg"})
+```
+
+All args optional strings except `title`. `image` = workspace path.
 
 ## Call signatures — every bb.display call (list, screenshot, load/save/preview, …)
 
 | Call | Returns | Purpose |
 | --- | --- | --- |
 | `bb.display.list()` | `[{name, source}, …]` | enumerate |
-| `bb.display.get_active()` | `{name, args, theme, pinned, rotation}` | what's on screen + pin/rotation state |
+| `bb.display.get_active()` | `{name, args, theme, pinned, rotation, web}` | what's on screen + pin/rotation state |
 | `bb.display.unpin()` | `{pinned, rotation}` | release pin, resume rotation |
+| `bb.display.web_media("play"\|"pause")` | web state | play / pause the `web` display |
 | `bb.display.set_rotation(displays=, interval=)` | `{pinned, rotation}` | configure idle rotation (clears pin) |
 | `bb.display.screenshot()` | `{path, attached, name}` | live screen → PNG, attached |
 | `bb.display.load(name)` | `dict` | read a spec for editing |

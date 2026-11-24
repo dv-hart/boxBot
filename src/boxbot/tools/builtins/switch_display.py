@@ -27,7 +27,13 @@ class SwitchDisplayTool(Tool):
         "switch_display('picture', args={}) — slideshow\n"
         "switch_display('picture', args={'image_ids': ['abc', 'def']}) — "
         "specific photos\n"
-        "switch_display('weather')"
+        "switch_display('weather')\n"
+        "switch_display('web', args={'url': 'https://…'}) — YouTube video "
+        "(autoplays) or any public https page, in a browser over the "
+        "screen. Has sound: pauses while you speak or listen, so on "
+        "voice it mutes the mic (wake word re-engages). Closes itself "
+        "after 5 idle min (args.idle_minutes to change); close now: "
+        "switch to another display."
     )
     parameters = {
         "type": "object",
@@ -87,10 +93,43 @@ class SwitchDisplayTool(Tool):
             })
 
         ok = await mgr.switch(display_name, args=args, pin=pin)
-        return json.dumps({
-            "status": "ok" if ok else "error",
+        if not ok:
+            return json.dumps({
+                "status": "error",
+                "error": getattr(mgr, "last_switch_error", None)
+                or f"could not switch to '{display_name}'",
+                "display_name": display_name,
+                "args": args,
+            })
+
+        result: dict[str, Any] = {
+            "status": "ok",
             "display_name": display_name,
             "args": args,
-            "pinned": pin and ok,
+            "pinned": mgr.is_pinned(),
             "available_displays": available,
-        })
+        }
+        web = mgr.get_web_state()
+        if web is not None:
+            result["web"] = web
+            result["mic_muted"] = _mute_mic_for_playback()
+        return json.dumps(result)
+
+
+def _mute_mic_for_playback() -> bool:
+    """Close the mic on the voice conversation that opened the web view.
+
+    Browser audio is not in the mic's echo-cancellation reference, so an
+    open mic would transcribe the video back to the agent as if the room
+    had said it — and the view pauses itself whenever the mic is
+    listening. Same mechanism as the ``mute_mic`` tool: the wake word
+    stays armed and re-engages (which pauses playback).
+    """
+    from boxbot.communication.voice import get_voice_session
+    from boxbot.tools._tool_context import get_current_conversation
+
+    conv = get_current_conversation()
+    if conv is None or conv.channel != "voice":
+        return False
+    session = get_voice_session()
+    return bool(session is not None and session.mute_mic())

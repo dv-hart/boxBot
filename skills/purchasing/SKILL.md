@@ -112,7 +112,9 @@ print(out["decision"], p["id"], p["total_cents"], out["admins_notified"], out["b
 Speaking to someone who is not an admin: the review link goes to the
 admins, not to them. Say an admin will decide.
 
-Product page `url`s are fine to text so the person can look. You never
+In the room: put the item you are quoting on the screen
+(`switch_display("product", …)`, see `bb.display` docs) so they see
+what you mean. Product page `url`s are fine to text so the person can look. You never
 have the checkout link; `bb.purchases.send_review_link(id)` makes the
 main process resend it to the admins (once per 10 minutes).
 

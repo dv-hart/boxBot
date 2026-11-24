@@ -113,6 +113,17 @@ display:
     start: "22:00"
     end: "07:00"
     brightness: 0.3
+  # Kiosk browser behind the "web" display (YouTube videos, web pages).
+  # Runs as its own OS user; scripts/setup-sandbox.sh creates it.
+  web:
+    enabled: true
+    browser: "chromium"
+    user: "boxbot-kiosk"
+    state_dir: "/var/lib/boxbot-kiosk"
+    # Closes once nothing has played and nobody touched it for this long
+    idle_minutes: 5
+    # Hard ceiling: closes after this many minutes no matter what
+    max_minutes: 120
 
 # ── Hardware ──────────────────────────────────────────────────────────
 hardware:

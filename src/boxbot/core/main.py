@@ -1108,6 +1108,9 @@ async def _async_main() -> None:
         # Display manager — manages screen output
         display_manager = await _init_display_manager()
         subsystems["display_manager"] = display_manager
+        # Web view sound plays through the speaker HAL (the one owner of
+        # the audio output, and the AEC reference).
+        display_manager.set_speaker(hal_modules.get("speaker"))
 
         # Start idle display rotation
         display_manager.start_rotation()

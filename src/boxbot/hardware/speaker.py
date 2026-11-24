@@ -70,6 +70,10 @@ _AEC_BLOCK_FRAMES = max(
 # uses both as the AEC reference; we duplicate mono to stereo.
 _AEC_CHANNELS = 2
 
+# Live-source feed (see Speaker.feed).
+_FEED_CUSHION_MS = 150
+_FEED_MAX_BACKLOG_MS = 500
+
 
 def _list_output_device_names() -> list[str]:
     """Return a flat list of output-capable device names (best effort)."""
@@ -687,10 +691,69 @@ class Speaker(HardwareModule):
                 await self.stop_playback()
                 raise
 
+    def feed(
+        self,
+        audio_data: bytes,
+        sample_rate: int = _HDMI_TARGET_RATE,
+        channels: int = 1,
+    ) -> bool:
+        """Queue one chunk of a live, continuous source (web view audio).
+
+        Unlike :meth:`play` / :meth:`play_stream` this neither takes the
+        playback lock nor waits for the queue to drain — a source that
+        never ends would hold both forever and starve TTS. The caller
+        owns the politeness instead: it must stop feeding while BB
+        speaks, and must not feed silence (a queue that never empties
+        never reports "drained").
+
+        The audio takes the same route as speech, so it lands in the
+        AEC reference too: the mic does not hear it as room sound.
+
+        A run starts with a short cushion of silence so real-time chunks
+        arriving with jitter do not starve the writer between arrivals.
+        Chunks are dropped once the backlog passes
+        ``_FEED_MAX_BACKLOG_MS`` — the source's clock and the DAC's
+        drift apart, and falling behind the picture is worse than a
+        dropped 20 ms.
+
+        Returns:
+            True if queued, False if dropped (not started, or backlog).
+        """
+        if not self._started:
+            return False
+        samples = np.frombuffer(audio_data, dtype=np.int16)
+        if samples.size == 0:
+            return False
+        with self._queue_lock:
+            backlog_frames = sum(block.shape[0] for block in self._queue)
+        if backlog_frames > _FEED_MAX_BACKLOG_MS * _HDMI_TARGET_RATE // 1000:
+            return False
+        self._enqueue_samples(
+            samples.copy(), sample_rate, channels,
+            limiter=False,
+            # Only a new run gets the cushion and the reference delay;
+            # repeating either per chunk would stretch the stream.
+            cushion_ms=_FEED_CUSHION_MS if backlog_frames == 0 else 0,
+            reference_delay=backlog_frames == 0,
+        )
+        return True
+
     def _enqueue_samples(
-        self, samples: np.ndarray, sample_rate: int, channels: int
+        self,
+        samples: np.ndarray,
+        sample_rate: int,
+        channels: int,
+        *,
+        limiter: bool = True,
+        cushion_ms: int = 0,
+        reference_delay: bool = True,
     ) -> None:
         """Apply gain/volume, downmix, resample, split into blocks, enqueue.
+
+        ``limiter=False`` skips the speech loudness stage (volume still
+        applies). ``cushion_ms`` prepends that much silence to both
+        paths. ``reference_delay=False`` omits the calibrated AEC delay
+        — for a chunk that continues audio already queued.
 
         Splits one chunk into HDMI-rate blocks (audible playback) and,
         if the AEC reference stream is up, AEC-rate stereo blocks. Both
@@ -704,7 +767,7 @@ class Speaker(HardwareModule):
         accepts any size, and padding with silence would insert an
         audible chop at every chunk boundary.
         """
-        scaled = self._apply_volume(samples)
+        scaled = self._apply_volume(samples, limiter=limiter)
 
         if channels > 1:
             # Average multi-channel input down to mono.
@@ -757,7 +820,7 @@ class Speaker(HardwareModule):
         # tens of ms early (HDMI buffer is much deeper than the USB AEC
         # ref stream) and the adaptive filter can't subtract cleanly.
         delay_blocks: list[np.ndarray] = []
-        if aec_blocks and self._aec_delay_samples > 0:
+        if aec_blocks and reference_delay and self._aec_delay_samples > 0:
             remaining = self._aec_delay_samples
             while remaining > 0:
                 n = min(_AEC_BLOCK_FRAMES, remaining)
@@ -768,6 +831,16 @@ class Speaker(HardwareModule):
                         np.zeros((n, _AEC_CHANNELS), dtype=np.int16)
                     )
                 remaining -= n
+
+        if cushion_ms > 0:
+            hdmi_blocks.insert(0, np.zeros(
+                (cushion_ms * _HDMI_TARGET_RATE // 1000, 1), dtype=np.int16,
+            ))
+            if aec_blocks:
+                delay_blocks.insert(0, np.zeros(
+                    (cushion_ms * _AEC_TARGET_RATE // 1000, _AEC_CHANNELS),
+                    dtype=np.int16,
+                ))
 
         self._mark_busy()
         with self._queue_lock:
@@ -841,8 +914,14 @@ class Speaker(HardwareModule):
             await asyncio.sleep(step_duration)
         self._volume = target
 
-    def _apply_volume(self, samples: np.ndarray) -> np.ndarray:
+    def _apply_volume(
+        self, samples: np.ndarray, *, limiter: bool = True
+    ) -> np.ndarray:
         """Apply gain + soft limiter + volume to int16 PCM samples.
+
+        ``limiter=False`` applies volume only: already-mastered audio
+        (music, video) has no headroom for the speech gain stage, which
+        would flatten it.
 
         Pipeline: samples * 10^(gain_db/20) → tanh soft-limit to ceiling
         → * volume. The soft-limit matters for TTS: ElevenLabs output
@@ -854,7 +933,7 @@ class Speaker(HardwareModule):
             return np.zeros_like(samples)
 
         x = samples.astype(np.float32)
-        if self._gain_db != 0.0:
+        if limiter and self._gain_db != 0.0:
             g = float(10.0 ** (self._gain_db / 20.0))
             ceiling = 32767.0 * float(
                 10.0 ** (self._CEILING_DBFS / 20.0)

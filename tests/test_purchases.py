@@ -417,6 +417,29 @@ class TestViews:
         checkout["payment"]["instruments"][0]["selected"] = True
         assert budget_instrument(checkout) is None
 
+    def test_search_summary_image_url_is_https_or_nothing(self):
+        def rows_for(**product_extra):
+            return summarize_search({"products": [{
+                "title": "P", **product_extra,
+                "variants": [{
+                    "id": VARIANT, "price": {"amount": 999, "currency": "USD"},
+                    "seller": {"name": "B", "url": "https://books.example.com"},
+                }],
+            }]}, 8)
+
+        good = "https://cdn.shopify.com/s/files/1/book.jpg"
+        assert rows_for(media=[{"url": good}])[0]["image_url"] == good
+        assert rows_for(image={"src": good})[0]["image_url"] == good
+        assert rows_for(media=[{"url": "http://x.example/a.jpg"}, good])[0][
+            "image_url"] == good
+        assert rows_for()[0]["image_url"] is None
+        for bad in (
+            "http://cdn.shopify.com/a.jpg", "file:///etc/passwd",
+            "https://user@cdn.example.com/a.jpg", "https://cdn.example.com:8443/a.jpg",
+            "https://cdn.example.com/a b.jpg", "javascript:alert(1)", 7, {"url": None},
+        ):
+            assert rows_for(media=[bad])[0]["image_url"] is None
+
     def test_search_summary_clips_and_drops_bad_sellers(self):
         result = {"products": [{
             "title": "P", "description": {"plain": "x" * 5000},

@@ -319,6 +319,23 @@ class VoiceSession:
         """True iff the audio_capture is currently muted."""
         return self._audio_capture is not None and self._audio_capture.is_muted
 
+    def _web_view_holds_mute(self) -> bool:
+        """True iff the mic is muted and a web view is on screen.
+
+        See ``boxbot.displays.web_view``: media plays only while the mic
+        is closed, so agent speech must not reopen it mid-video.
+        """
+        if not self.is_mic_muted:
+            return False
+        try:
+            from boxbot.displays.manager import get_display_manager
+
+            mgr = get_display_manager()
+            return mgr is not None and mgr.get_web_state() is not None
+        except Exception:
+            logger.debug("web view state check failed", exc_info=True)
+            return False
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -1204,8 +1221,16 @@ class VoiceSession:
                 # This is the contract documented on ``mute_mic``.
                 # Outside ACTIVE we only put back what we took, and
                 # never unmute — muting was a deliberate agent choice.
+                #
+                # Exception: a web view the agent opened is playing. Its
+                # audio is not echo-cancelled, so reopening the mic would
+                # feed the video back as room speech — the mute placed
+                # when the view opened stays until the wake word.
                 if self._audio_capture is not None and self._microphone is not None:
-                    if self._state is VoiceSessionState.ACTIVE:
+                    if (
+                        self._state is VoiceSessionState.ACTIVE
+                        and not self._web_view_holds_mute()
+                    ):
                         self._audio_capture.unmute()
                     if self._state is VoiceSessionState.ACTIVE or was_capturing:
                         try:

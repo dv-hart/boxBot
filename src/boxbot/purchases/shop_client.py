@@ -141,6 +141,45 @@ def _product_url(url: Any, shop: str) -> str | None:
     return url
 
 
+def _image_url(url: Any) -> str | None:
+    """A product image URL, only if it is a plain https URL.
+
+    Unlike the product page it need not be on the store's own host —
+    Shopify serves images from its CDN. The sandbox downloads it; the
+    main process never fetches it.
+    """
+    if not isinstance(url, str) or len(url) > 600:
+        return None
+    if not url.isascii() or any(ch.isspace() or ord(ch) < 0x21 for ch in url):
+        return None
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            return None
+        if parsed.port or parsed.username:
+            return None
+    except ValueError:
+        return None
+    return url
+
+
+def _first_image(*candidates: Any) -> str | None:
+    """First usable image URL among ``candidates``.
+
+    Each candidate is a URL string, a dict carrying one under ``url`` /
+    ``src``, or a list of either (a product's media gallery).
+    """
+    for candidate in candidates:
+        entries = candidate if isinstance(candidate, list) else [candidate]
+        for entry in entries:
+            if isinstance(entry, dict):
+                entry = entry.get("url") or entry.get("src")
+            url = _image_url(entry)
+            if url is not None:
+                return url
+    return None
+
+
 # Anything a phone would turn into a tap target. \w is Unicode-aware, so
 # non-ASCII (IDN) hosts are covered too.
 #
@@ -250,6 +289,10 @@ def summarize_search(result: dict[str, Any], limit: int) -> list[dict[str, Any]]
                 "currency": _currency(price.get("currency")),
                 "available": _dict(variant.get("availability")).get("available") is True,
                 "url": _product_url(variant.get("url"), shop),
+                "image_url": _first_image(
+                    variant.get("media"), variant.get("image"),
+                    product.get("media"), product.get("image"),
+                ),
                 "rating": _number(rating.get("value")),
                 "rating_count": _int(rating.get("count")),
             })
@@ -660,6 +703,9 @@ async def fetch_store_products(
                         "url": _product_url(
                             f"https://{host}/products/{product.get('handle')}", host,
                         ) if _HANDLE_RE.match(str(product.get("handle") or "")) else None,
+                        "image_url": _first_image(
+                            variant.get("featured_image"), product.get("images"),
+                        ),
                         "rating": None,
                         "rating_count": None,
                     })

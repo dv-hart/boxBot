@@ -910,6 +910,28 @@ display:
     brightness: 0.3
 ```
 
+### Web Display
+
+`switch_display("web", args={"url": ...})` is the one display the block
+renderer does not draw. The manager validates the URL, renders the
+built-in `web` card ("Opening…"), then launches Chromium in kiosk mode
+on top of the pygame surface (`displays/web_view.py`, driven over
+`displays/cdp_pipe.py`). It closes — and the screen goes back to
+rotation — on a switch to any other display, on `unpin()`, when nothing
+has played or been touched for `display.web.idle_minutes` (per page:
+`args.idle_minutes`), at the `display.web.max_minutes` ceiling, or if
+the browser dies.
+
+Sound: the speaker HAL owns the output device exclusively, so the
+browser plays into a PipeWire null sink and `displays/web_audio.py`
+records that sink into `Speaker.feed()`. Web audio therefore shares the
+TTS path, including the AEC reference; it trails the picture by about
+the speaker's buffer depth. The view keeps one invariant: media plays
+only while the mic's utterance pipeline is closed and BB is not
+speaking. `WakeWordHeard` pauses immediately; a 4 Hz poll of the voice
+session resumes it when the session is muted, dormant, or ended.
+Security model: [security.md](security.md#web-view-kiosk-browser).
+
 ### Data Source Lifecycle
 
 Data sources are tied to their display:

@@ -60,7 +60,10 @@ hot-path or security-sensitive operations remain as standalone tools.
 - `execute_script` — primary gateway: run Python in the sandbox with
   the `bb` package (photos, camera, workspace, display, memory, tasks,
   skill, secrets, packages, integrations). Composes many ops per turn.
-- `switch_display` — change what's on the 7" screen (hot-path singleton)
+- `switch_display` — change what's on the 7" screen (hot-path
+  singleton). The reserved `web` display opens a kiosk browser over
+  the screen (YouTube video or public https page) as its own OS user,
+  driven over a pipe — see [docs/security.md](docs/security.md)
 - `identify_person` — the identity gateway: register / correct a
   speaker's identity, rename a person ("call me Jake"), merge
   duplicate records (confirm with the humans first), and read the

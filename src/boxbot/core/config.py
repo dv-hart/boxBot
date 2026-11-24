@@ -274,6 +274,36 @@ class NightModeConfig(BaseModel):
     brightness: float = 0.3
 
 
+class WebViewConfig(BaseModel):
+    """Kiosk browser behind the reserved ``web`` display.
+
+    See :mod:`boxbot.displays.web_view` for the security model.
+    """
+
+    enabled: bool = True
+    # Browser binary: a name on PATH or an absolute path.
+    browser: str = "chromium"
+    # OS user the browser runs as. Created by scripts/setup-sandbox.sh.
+    user: str = "boxbot-kiosk"
+    # "auto"/"sudo": re-exec as ``user`` via ``sudo -n -u``; launch is
+    # refused if the user does not exist. "none": run as the service
+    # user — dev machines only, never on the box.
+    privilege_drop: Literal["auto", "sudo", "none"] = "auto"
+    # Profile, runtime dir and control FIFOs. Owned by ``user``.
+    state_dir: str = "/var/lib/boxbot-kiosk"
+    # The view closes itself once nothing has played and nobody has
+    # touched the page for this long. ``switch_display('web', args=
+    # {'idle_minutes': N})`` overrides it per page.
+    idle_minutes: float = 5
+    # Hard ceiling: the view closes after this long no matter what.
+    max_minutes: int = 120
+    # Seconds to wait for the browser to start / a page to load.
+    launch_timeout: int = 20
+    load_timeout: int = 20
+    # Extra browser flags (e.g. ``--headless=new`` for tests).
+    extra_args: list[str] = Field(default_factory=list)
+
+
 class DisplayConfig(BaseModel):
     """Display manager settings."""
 
@@ -283,6 +313,7 @@ class DisplayConfig(BaseModel):
     )
     brightness: float = 0.8
     night_mode: NightModeConfig = Field(default_factory=NightModeConfig)
+    web: WebViewConfig = Field(default_factory=WebViewConfig)
 
     # Screen HAL backend + canvas geometry. "pygame" (HDMI, default) or
     # "none" (headless, no screen). width/height drive both the renderer

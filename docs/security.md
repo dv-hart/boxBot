@@ -142,6 +142,35 @@ checks:
 **Secrets:** Scripts receive only specific API keys needed for the current
 task, passed as env vars by the main process. Never the full `.env`.
 
+### Web View (Kiosk Browser)
+
+The `web` display shows a YouTube video or web page by opening Chromium
+over the screen. Web content is the least-trusted thing the box renders,
+so it is fenced separately from both the main process and the sandbox:
+
+- **Own OS user** (`boxbot-kiosk`, created by `setup-sandbox.sh`): no
+  access to `.env`, the project tree, `data/`, or the sandbox. Launch
+  is refused if the user is missing — there is no fallback to the
+  service user.
+- **No listener:** boxBot drives the browser over a FIFO pair
+  (`--remote-debugging-pipe`), never a debugging port. Only the service
+  user and the kiosk user can open the FIFOs.
+- **URL policy:** `https` on public hostnames only. No IPs, LAN names,
+  ports, or credentials — a link cannot aim the browser at the router
+  or Home Assistant. Downloads are denied.
+- **Throwaway profile:** wiped at every launch; no cookies or logins
+  persist.
+- **Not an agent input:** page pixels are never attached to the agent's
+  context. Web text reaches the agent only through `web_search`'s
+  content firewall.
+
+To draw on the screen and play sound, the kiosk user is granted the
+service user's Wayland and audio sockets (ACLs set at launch). It can
+therefore see the screen and use the audio server; it cannot reach
+anything on disk. The touchscreen stays live while a page is open, so a
+person at the box can follow links — physical presence, same trust as
+the buttons.
+
 ### Package Installation (Out-of-Band Approval)
 
 The sandbox **cannot install packages**. This is enforced by four

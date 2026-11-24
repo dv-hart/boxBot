@@ -111,6 +111,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from PIL import Image
 
@@ -131,6 +132,15 @@ from boxbot.displays.spec import (
 )
 from boxbot.core.paths import DISPLAYS_DIR, PROJECT_ROOT
 from boxbot.displays.themes import Theme, get_theme
+from boxbot.displays.web_view import (
+    WebTarget,
+    WebView,
+    WebViewError,
+    normalize_url,
+)
+
+# Reserved display name backed by the kiosk browser instead of blocks.
+WEB_DISPLAY = "web"
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +327,13 @@ class DisplayManager:
         # Event bus subscription tracking
         self._event_subscribed: bool = False
 
+        # Kiosk browser behind the reserved ``web`` display. Built on
+        # first use; ``last_switch_error`` carries the reason a switch
+        # returned False so the tool can tell the agent what was wrong.
+        self._web_view: WebView | None = None
+        self._speaker: Any | None = None
+        self.last_switch_error: str | None = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -369,6 +386,9 @@ class DisplayManager:
         # Stop slideshow tick if running
         self._stop_slideshow()
 
+        # Never leave a browser window behind on the screen
+        await self._close_web_view()
+
         # Stop live tick task
         if self._live_tick_task and not self._live_tick_task.done():
             self._live_tick_task.cancel()
@@ -395,10 +415,12 @@ class DisplayManager:
         try:
             from boxbot.core.events import (
                 AgentSpeaking,
+                AgentSpeakingDone,
                 AgentToolCalled,
                 AgentTurnEnded,
                 ConversationEnded,
                 DisplaySwitch,
+                WakeWordHeard,
                 get_event_bus,
             )
 
@@ -408,6 +430,9 @@ class DisplayManager:
             bus.subscribe(AgentSpeaking, self._on_status_clear)
             bus.subscribe(AgentTurnEnded, self._on_status_clear)
             bus.subscribe(ConversationEnded, self._on_status_clear)
+            bus.subscribe(WakeWordHeard, self._on_wake_word)
+            bus.subscribe(AgentSpeaking, self._on_agent_speaking)
+            bus.subscribe(AgentSpeakingDone, self._on_agent_speaking_done)
             self._event_subscribed = True
             logger.debug("Subscribed to display events")
         except ImportError:
@@ -423,10 +448,12 @@ class DisplayManager:
         try:
             from boxbot.core.events import (
                 AgentSpeaking,
+                AgentSpeakingDone,
                 AgentToolCalled,
                 AgentTurnEnded,
                 ConversationEnded,
                 DisplaySwitch,
+                WakeWordHeard,
                 get_event_bus,
             )
 
@@ -436,6 +463,9 @@ class DisplayManager:
             bus.unsubscribe(AgentSpeaking, self._on_status_clear)
             bus.unsubscribe(AgentTurnEnded, self._on_status_clear)
             bus.unsubscribe(ConversationEnded, self._on_status_clear)
+            bus.unsubscribe(WakeWordHeard, self._on_wake_word)
+            bus.unsubscribe(AgentSpeaking, self._on_agent_speaking)
+            bus.unsubscribe(AgentSpeakingDone, self._on_agent_speaking_done)
             self._event_subscribed = False
             logger.debug("Unsubscribed from display events")
         except Exception:
@@ -474,6 +504,82 @@ class DisplayManager:
         """Drop the status pill — the turn resolved (speech started,
         turn ended, or the conversation closed)."""
         self.clear_status_text()
+
+    async def _on_wake_word(self, event: Any) -> None:
+        """Someone is addressing BB: silence the web view right away."""
+        if self._web_view is not None:
+            await self._web_view.pause_now()
+
+    async def _on_agent_speaking(self, event: Any) -> None:
+        if self._web_view is not None:
+            await self._web_view.set_speaking(True)
+
+    async def _on_agent_speaking_done(self, event: Any) -> None:
+        if self._web_view is not None:
+            await self._web_view.set_speaking(False)
+
+    # ------------------------------------------------------------------
+    # Web view (the reserved ``web`` display)
+    # ------------------------------------------------------------------
+
+    def set_speaker(self, speaker: Any | None) -> None:
+        """Give the web view the speaker HAL to play its sound through.
+
+        Called once at startup, before any web view exists. ``None``
+        (no audio hardware) means web pages show silently.
+        """
+        self._speaker = speaker
+
+    def _get_web_view(self) -> WebView:
+        if self._web_view is None:
+            from boxbot.core.config import get_config
+
+            self._web_view = WebView(
+                get_config().display.web,
+                size=(self._width, self._height),
+                on_exit=self._on_web_view_exit,
+                speaker=self._speaker,
+            )
+        return self._web_view
+
+    async def web_media(self, action: str) -> dict[str, Any]:
+        """Play or pause the web view's media. Raises ``WebViewError``."""
+        if self._web_view is None:
+            raise WebViewError("web view is not open")
+        return await self._web_view.media(action)
+
+    async def _close_web_view(self) -> None:
+        if self._web_view is not None:
+            await self._web_view.close()
+
+    async def _on_web_view_exit(self, reason: str) -> None:
+        """The browser went away on its own (crash, time limit)."""
+        logger.info("Web view closed: %s", reason)
+        await self._leave_web()
+
+    async def _leave_web(self) -> None:
+        """Put a normal display back after the web view is gone.
+
+        Without this the ``web`` display's "Opening…" card would sit on
+        screen forever once the browser window above it disappears.
+        """
+        if self._active_display != WEB_DISPLAY:
+            return
+        self._pinned = False
+        if self._rotation_displays:
+            self.start_rotation(
+                list(self._rotation_displays), self._rotation_interval,
+            )
+            return
+        fallback = next(
+            (n for n in ("clock", "picture") if n in self._specs), None,
+        )
+        if fallback is not None:
+            await self.switch(fallback, pin=False)
+
+    def get_web_state(self) -> dict[str, Any] | None:
+        """What the web view is showing, or ``None`` when it is closed."""
+        return self._web_view.state() if self._web_view is not None else None
 
     # ------------------------------------------------------------------
     # Discovery & loading
@@ -653,12 +759,41 @@ class DisplayManager:
         Returns:
             True if the switch succeeded.
         """
+        self.last_switch_error = None
         spec = self._specs.get(name)
         if spec is None:
             logger.warning("Display '%s' not found. Available: %s", name, self.list_available())
+            self.last_switch_error = f"unknown display '{name}'"
             return False
 
         args = dict(args) if args else {}
+
+        # Web display: validate the URL before touching anything on
+        # screen, so a rejected link leaves the current display alone.
+        web_target: WebTarget | None = None
+        if name == WEB_DISPLAY:
+            try:
+                web_target = normalize_url(args.get("url"))
+            except WebViewError as e:
+                logger.info("web display rejected: %s", e)
+                self.last_switch_error = str(e)
+                return False
+            web_idle = args.get("idle_minutes")
+            if web_idle is not None and (
+                isinstance(web_idle, bool)
+                or not isinstance(web_idle, (int, float))
+                or web_idle <= 0
+            ):
+                self.last_switch_error = "args.idle_minutes must be a positive number"
+                return False
+            args = {"url": web_target.url, "host": urlsplit(web_target.url).hostname}
+            if web_idle is not None:
+                args["idle_minutes"] = web_idle
+            # The browser covers the screen; rotating the display hidden
+            # underneath it would tear the view down mid-video.
+            pin = True
+        else:
+            await self._close_web_view()
 
         # Picture display without explicit image_ids => slideshow mode.
         # Populate the id list from the slideshow-enabled photo set. With
@@ -687,7 +822,8 @@ class DisplayManager:
         # state can change. Tearing every data source down and rebuilding
         # it to render an identical frame is pure churn — the rotation
         # loop did exactly that 1,850 times in one boxbot log.
-        if (name == self._active_display
+        if (web_target is None
+                and name == self._active_display
                 and spec is self._active_spec
                 and args == self._active_args):
             if pin and not self._pinned:
@@ -744,6 +880,17 @@ class DisplayManager:
             "Switched to display '%s' (args=%s, pinned=%s)",
             name, self._active_args, self._pinned,
         )
+
+        if web_target is not None:
+            try:
+                await self._get_web_view().open(
+                    web_target, idle_minutes=args.get("idle_minutes"),
+                )
+            except WebViewError as e:
+                logger.warning("web display failed: %s", e)
+                await self._leave_web()
+                self.last_switch_error = str(e)
+                return False
         return True
 
     # ------------------------------------------------------------------
@@ -858,6 +1005,13 @@ class DisplayManager:
         Returns:
             True on success.
         """
+        if self._active_display == WEB_DISPLAY:
+            # Unpinning the web display means "done watching": close the
+            # browser and hand the screen back.
+            await self._close_web_view()
+            await self._leave_web()
+            return True
+
         self._pinned = False
 
         # Use the in-memory rotation list, not the config defaults —
@@ -1785,12 +1939,21 @@ def _resolve_direct_image_path(ref: str) -> str | None:
     Reuses the sandbox attach-root allowlist so display sources are held
     to the same boundary as tool-result attachments.
     """
-    if not ref or not Path(ref).is_absolute():
+    if not ref:
         return None
     try:
         from boxbot.tools._sandbox_actions import _is_attach_allowed
 
-        abs_path = Path(ref).resolve()
+        candidate = Path(ref)
+        if not candidate.is_absolute():
+            # Workspace-relative, as ``bb.workspace.write`` returns it.
+            # Only path-like refs qualify: a bare photo id has no suffix.
+            if not candidate.suffix:
+                return None
+            from boxbot.core.paths import WORKSPACE_DIR
+
+            candidate = WORKSPACE_DIR / candidate
+        abs_path = candidate.resolve()
     except Exception:
         return None
     if not abs_path.is_file() or not _is_attach_allowed(abs_path):

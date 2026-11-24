@@ -489,7 +489,61 @@ echo "Installed seccomp profile at config/seccomp-sandbox.json"
 CHANGES+=("Installed seccomp profile")
 
 # -------------------------------------------------------------------
-# 8. Verify sandbox isolation
+# 8. Web view (kiosk browser) user
+# -------------------------------------------------------------------
+#
+# The ``web`` display runs Chromium as its own system user so web
+# content never executes next to .env. boxBot reaches it only through
+# ``sudo -n -u $KIOSK_USER`` and a FIFO pair in $KIOSK_DIR/ctl. See
+# src/boxbot/displays/web_view.py.
+
+echo ""
+echo "--- Configuring web view user ---"
+
+KIOSK_USER="${BOXBOT_KIOSK_USER:-boxbot-kiosk}"
+KIOSK_DIR="${BOXBOT_KIOSK_DIR:-/var/lib/boxbot-kiosk}"
+KIOSK_READY=0
+
+if ! command -v setfacl &>/dev/null; then
+    echo "setfacl not found — install it (sudo apt install acl) and re-run."
+    echo "The web display stays unavailable until then."
+    CHANGES+=("Web view NOT configured: setfacl missing")
+else
+    if id "$KIOSK_USER" &>/dev/null; then
+        echo "User $KIOSK_USER already exists."
+    else
+        $SUDO useradd \
+            --system \
+            --no-create-home \
+            --shell /usr/sbin/nologin \
+            "$KIOSK_USER"
+        echo "Created system user: $KIOSK_USER"
+        CHANGES+=("Created system user: $KIOSK_USER")
+    fi
+
+    # State dir: profile + runtime dir (kiosk-owned, wiped per launch)
+    # and ctl/ (control FIFOs, created by $REAL_USER at each launch).
+    $SUDO mkdir -p "$KIOSK_DIR/ctl"
+    $SUDO chown "$KIOSK_USER:$KIOSK_USER" "$KIOSK_DIR" "$KIOSK_DIR/ctl"
+    $SUDO chmod 750 "$KIOSK_DIR"
+    $SUDO chmod 770 "$KIOSK_DIR/ctl"
+    # $REAL_USER may enter the state dir and manage ctl/. The default
+    # ACL hands each new FIFO to the kiosk user and nobody else.
+    $SUDO setfacl -m "u:$REAL_USER:x" "$KIOSK_DIR"
+    $SUDO setfacl -m "u:$REAL_USER:rwx" "$KIOSK_DIR/ctl"
+    $SUDO setfacl -d -m "u:$KIOSK_USER:rw,u:$REAL_USER:rw" "$KIOSK_DIR/ctl"
+    echo "Web view state dir: $KIOSK_DIR"
+    CHANGES+=("Web view state dir ready: $KIOSK_DIR")
+    KIOSK_READY=1
+
+    if ! command -v chromium &>/dev/null; then
+        echo "NOTE: chromium not found — install it (sudo apt install chromium)"
+        echo "      or set display.web.browser in config/config.yaml."
+    fi
+fi
+
+# -------------------------------------------------------------------
+# 9. Verify sandbox isolation
 # -------------------------------------------------------------------
 
 echo ""
@@ -592,6 +646,31 @@ chmod 640 "$SECRET_PROBE" 2>/dev/null || true
 $AS_SANDBOX cat "$SECRET_PROBE" &>/dev/null && rc=0 || rc=$?
 rm -f "$SECRET_PROBE" 2>/dev/null
 verify "Sandbox CAN read a staged secrets file (group boxbot, 0640)" "should_succeed" "$rc"
+
+if [[ $KIOSK_READY -eq 1 ]]; then
+    # Test 12: boxBot can become the kiosk user without a password —
+    # this is how the browser is launched.
+    sudo -n -u "$KIOSK_USER" true &>/dev/null && rc=0 || rc=$?
+    verify "Can run commands as $KIOSK_USER (sudo -n)" "should_succeed" "$rc"
+
+    # Test 13: Kiosk user CANNOT read .env
+    if [[ -f "$PROJECT_DIR/.env" ]]; then
+        sudo -n -u "$KIOSK_USER" cat "$PROJECT_DIR/.env" &>/dev/null && rc=0 || rc=$?
+        verify "Kiosk user cannot read .env" "should_fail" "$rc"
+    fi
+
+    # Test 14: Kiosk user CAN open a control FIFO boxBot creates
+    KIOSK_PROBE="$KIOSK_DIR/ctl/.verify_fifo"
+    rm -f "$KIOSK_PROBE" 2>/dev/null
+    mkfifo -m 660 "$KIOSK_PROBE" 2>/dev/null || true
+    sudo -n -u "$KIOSK_USER" test -r "$KIOSK_PROBE" -a -w "$KIOSK_PROBE" &>/dev/null && rc=0 || rc=$?
+    rm -f "$KIOSK_PROBE" 2>/dev/null
+    verify "Kiosk user CAN open boxBot's control FIFOs" "should_succeed" "$rc"
+
+    # Test 15: Sandbox user CANNOT reach the browser's control FIFOs
+    $AS_SANDBOX ls "$KIOSK_DIR/ctl" &>/dev/null && rc=0 || rc=$?
+    verify "Sandbox cannot access $KIOSK_DIR/ctl" "should_fail" "$rc"
+fi
 
 echo ""
 if [[ $VERIFY_FAILED -eq 0 ]]; then

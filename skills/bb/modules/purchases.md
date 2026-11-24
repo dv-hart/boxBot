@@ -12,7 +12,7 @@ import boxbot_sdk as bb
 
 hits = bb.purchases.search("goldilocks board book", max_price_cents=1200, limit=8)
 # → [{"title", "description", "variant_id", "shop", "seller",
-#     "price_cents", "currency", "available", "url",
+#     "price_cents", "currency", "available", "url", "image_url",
 #     "rating", "rating_count"}, …]
 
 # Household-approved store that search() does not list:
@@ -26,6 +26,8 @@ hits = bb.purchases.store_products("www.cottagedoorpress.com", query="goldilocks
   household allow-list. Only an admin can add one (config).
 - `url` is the product page on the store's own site (or `None`) — fine
   to text to the person.
+- `image_url` (or `None`): product photo. Show the item on the screen
+  with the `product` display — recipe in `bb.display` docs.
 - Hourly ceiling on searches and store lookups.
 
 ## Propose — propose(shop, items, reason) builds a real checkout

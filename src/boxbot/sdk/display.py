@@ -50,6 +50,7 @@ Discovery::
 Control::
 
     bb.display.unpin()                         # release pin, resume rotation
+    bb.display.web_media("pause")              # play / pause the web display
     bb.display.set_rotation(displays=[...],    # configure idle rotation
                             interval=30)       #   (also clears pin)
 
@@ -191,6 +192,11 @@ def get_active() -> dict[str, Any]:
               "interval": 30,                # seconds between switches
               "next_in_sec": null,           # ~time until next tick (None if inactive)
           },
+          "web": None | {                    # set while the `web` display's
+              "url", "kind", "title",        #   browser is on screen
+              "playing", "paused", "audio",
+              "open_seconds", "closes_if_idle_seconds",
+          },
         }
 
     Use this to inspect state before deciding what to do: e.g. ``if
@@ -234,6 +240,23 @@ def set_rotation(
     return _check(_transport.request("display.set_rotation", payload))
 
 
+def web_media(action: str) -> dict[str, Any]:
+    """Play or pause media in the ``web`` display's browser.
+
+    Args:
+        action: ``"pause"`` — hold until the next ``"play"`` (the
+            automatic pause while people talk lifts on its own; this
+            one does not). ``"play"`` — resume, or start a video the
+            page loaded without autoplaying.
+
+    Returns the web state (same shape as ``get_active()["web"]``).
+
+    Raises:
+        RuntimeError: If the web display is not on screen.
+    """
+    return _check(_transport.request("display.web_media", {"action": action}))["web"]
+
+
 def screenshot() -> dict[str, Any]:
     """Capture the live display surface and attach it as an image.
 
@@ -252,8 +275,10 @@ def screenshot() -> dict[str, Any]:
     viewable via ``bb.workspace.view``).
 
     Raises:
-        RuntimeError: If no display is currently active or the display
-            manager is not running.
+        RuntimeError: If no display is currently active, the display
+            manager is not running, or the ``web`` display is on screen
+            (browser pixels are never captured — read
+            ``get_active()["web"]`` instead).
     """
     return _check(_transport.request("display.screenshot", {}))
 

@@ -2537,7 +2537,21 @@ async def _handle_display_action(
                 "theme": getattr(theme, "name", None) if theme else None,
                 "pinned": mgr.is_pinned(),
                 "rotation": mgr.get_rotation_state(),
+                # Non-null while the kiosk browser is on screen.
+                "web": mgr.get_web_state(),
             }
+
+        if sub == "web_media":
+            mgr = get_display_manager()
+            if mgr is None:
+                return {"status": "error", "error": "display manager not running"}
+            from boxbot.displays.web_view import WebViewError
+
+            try:
+                web = await mgr.web_media(str(payload.get("action", "")))
+            except WebViewError as e:
+                return {"status": "error", "error": str(e)}
+            return {"status": "ok", "web": web}
 
         if sub == "unpin":
             mgr = get_display_manager()
@@ -2582,6 +2596,21 @@ async def _handle_display_action(
                 return {
                     "status": "error",
                     "error": "no display is currently active",
+                }
+            web = mgr.get_web_state()
+            if web is not None:
+                # The frame buffer is hidden behind the browser, and the
+                # browser's pixels are raw web content: they do not go
+                # into the agent's context (web text reaches it only
+                # through web_search's content firewall).
+                return {
+                    "status": "error",
+                    "error": (
+                        "web view is on screen; its page is not captured. "
+                        f"Showing: {web['title'] or web['url']} "
+                        f"(paused={web['paused']}). "
+                        "State: bb.display.get_active()['web']."
+                    ),
                 }
             frame = mgr.get_current_frame()
             if frame is None:

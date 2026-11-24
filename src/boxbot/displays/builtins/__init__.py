@@ -10,6 +10,10 @@ Built-in displays:
 - picture: Show a single photo, parameterized by args.image_ids
 - notice: Centered text card; agent's quick "show this short message"
   channel — used during onboarding to surface a bootstrap code, etc.
+- web: Placeholder card under the kiosk browser (args.url). The display
+  manager opens the browser window on top; this is what shows while it
+  loads.
+- product: One product from a purchase search — image, title, price.
 """
 
 from boxbot.displays.blocks import (
@@ -30,6 +34,8 @@ def get_builtin_specs() -> list[DisplaySpec]:
         _weather_simple_display(),
         _picture_display(),
         _notice_display(),
+        _web_display(),
+        _product_display(),
     ]
 
 
@@ -171,5 +177,78 @@ def _picture_display() -> DisplaySpec:
             source="photo:{args.image_ids[0]}",
             fit="contain",
         ),
+        transition="crossfade",
+    )
+
+
+def _web_display() -> DisplaySpec:
+    """Card shown underneath the kiosk browser while it starts.
+
+    Called via:
+        mgr.switch("web", args={"url": "https://youtu.be/..."})
+
+    The page itself is not drawn by the block renderer. The display
+    manager validates ``args.url``, renders this card, then opens a
+    browser window over it (see ``boxbot.displays.web_view``).
+    ``args.host`` is filled in by the manager.
+    """
+    from boxbot.displays.blocks import IconBlock
+
+    root = ColumnBlock(
+        gap=14, align="center", item_align="center", padding=[40, 40, 40, 40],
+    )
+    root.children = [
+        IconBlock(name="tv", size="xl", color="muted"),
+        TextBlock(content="Opening…", size="heading", weight="bold", align="center"),
+        TextBlock(
+            content="{args.host}", size="body", color="muted", align="center",
+            max_lines=1,
+        ),
+    ]
+    return DisplaySpec(
+        name="web",
+        theme="boxbot",
+        data_sources=[],
+        root_block=root,
+        transition="none",
+    )
+
+
+def _product_display() -> DisplaySpec:
+    """One product, as BB found it: image left, details right.
+
+    Called via:
+        mgr.switch("product", args={
+            "title": "Goldilocks Board Book",
+            "price": "$11.99",
+            "seller": "Cottage Door Press",
+            "detail": "4.8 stars (212) · arrives Thursday",
+            "image": "tmp/product.jpg",   # workspace path, optional
+        })
+
+    Rendered from the search result's own fields rather than the
+    merchant's web page: nothing merchant-controlled runs on the box.
+    """
+    from boxbot.displays.blocks import ColumnsBlock, SpacerBlock
+
+    details = ColumnBlock(gap=12, align="center")
+    details.children = [
+        TextBlock(content="{args.seller}", size="caption", color="muted", max_lines=1),
+        TextBlock(content="{args.title}", size="heading", weight="bold", max_lines=4),
+        SpacerBlock(size=4),
+        TextBlock(content="{args.price}", size=64, weight="bold", color="accent",
+                  max_lines=1),
+        TextBlock(content="{args.detail}", size="body", color="muted", max_lines=3),
+    ]
+    root = ColumnsBlock(ratios=[5, 6], gap=36, padding=[36, 40, 36, 40])
+    root.children = [
+        ImageBlock(source="photo:{args.image}", fit="contain", radius=18),
+        details,
+    ]
+    return DisplaySpec(
+        name="product",
+        theme="boxbot",
+        data_sources=[],
+        root_block=root,
         transition="crossfade",
     )

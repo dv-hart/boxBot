@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -165,7 +167,6 @@ class TestWebView:
             state = await view.open(normalize_url("https://youtu.be/jNQXAC9IVRw"))
             assert view.is_open
             assert state["kind"] == "youtube"
-            assert state["title"] == "Fake Page"
             assert state["paused"] is False
 
             navigate = next(
@@ -180,6 +181,20 @@ class TestWebView:
         assert not view.is_open
         assert view.state() is None
 
+    async def test_nothing_the_page_controls_reaches_the_agent(self, tmp_path):
+        """A page title is attacker-written text; the state the agent
+        reads must be built only from what BB itself supplied."""
+        view = WebView(make_config(tmp_path), listening_probe=lambda: False)
+        try:
+            state = await view.open(normalize_url("https://example.com/"))
+            assert set(state) == {
+                "url", "kind", "playing", "paused", "audio",
+                "open_seconds", "closes_if_idle_seconds",
+            }
+            assert not any("title" in e for e in evaluated(tmp_path))
+        finally:
+            await view.close()
+
     async def test_second_open_reuses_the_running_browser(self, tmp_path):
         view = WebView(make_config(tmp_path), listening_probe=lambda: False)
         try:
@@ -191,15 +206,21 @@ class TestWebView:
         finally:
             await view.close()
 
-    async def test_profile_is_wiped_on_every_launch(self, tmp_path):
+    async def test_whole_home_is_wiped_on_every_launch(self, tmp_path):
         view = WebView(make_config(tmp_path), listening_probe=lambda: False)
-        leftover = tmp_path / "kiosk" / "profile" / "Cookies"
+        home = tmp_path / "kiosk" / "home"
+        cookies = home / "profile" / "Cookies"
+        planted_ca = home / ".pki" / "nssdb" / "cert9.db"
         try:
             await view.open(normalize_url("https://example.com/"))
-            leftover.write_text("session")
+            cookies.write_text("session")
+            planted_ca.parent.mkdir(parents=True)
+            planted_ca.write_text("rogue CA")
             await view.close()
             await view.open(normalize_url("https://example.com/"))
-            assert not leftover.exists()
+            assert not cookies.exists()
+            # Outside the profile: Chromium's certificate store.
+            assert not planted_ca.exists()
         finally:
             await view.close()
 
@@ -211,9 +232,9 @@ class TestWebView:
             assert view.state()["paused"] is False
 
             # Wake word: pause at once, before the session reports ACTIVE.
-            await view.pause_now(grace=0.3)
+            view.pause_now(grace=0.3)
             assert view.state()["paused"] is True
-            assert any(".pause()" in e for e in evaluated(tmp_path))
+            await wait_for(lambda: any(".pause()" in e for e in evaluated(tmp_path)))
 
             # The session is now listening; the pause outlives the grace.
             listening = True
@@ -223,7 +244,7 @@ class TestWebView:
             # Mic closes (muted / dormant / ended): playback resumes.
             listening = False
             await wait_for(lambda: view.state()["paused"] is False)
-            assert any(".play()" in e for e in evaluated(tmp_path))
+            await wait_for(lambda: any(".play()" in e for e in evaluated(tmp_path)))
         finally:
             await view.close()
 
@@ -231,12 +252,125 @@ class TestWebView:
         view = WebView(make_config(tmp_path), listening_probe=lambda: False)
         try:
             await view.open(normalize_url("https://example.com/"))
-            await view.set_speaking(True)
+            view.set_speaking(True)
             assert view.state()["paused"] is True
             await asyncio.sleep(0.6)
             assert view.state()["paused"] is True
-            await view.set_speaking(False)
+            view.set_speaking(False)
             await wait_for(lambda: view.state()["paused"] is False)
+        finally:
+            await view.close()
+
+    async def test_speech_in_progress_survives_opening_a_page(self, tmp_path):
+        """Another conversation opens a page while BB is mid-sentence in
+        the room: the page must not start over the speech."""
+        view = WebView(make_config(tmp_path), listening_probe=lambda: False)
+        try:
+            view.set_speaking(True)
+            await view.open(normalize_url("https://example.com/"))
+            await wait_for(lambda: view.state()["paused"] is True)
+            view.set_speaking(False)
+            await wait_for(lambda: view.state()["paused"] is False)
+        finally:
+            await view.close()
+
+    async def test_a_lost_speaking_done_does_not_pause_forever(
+        self, tmp_path, monkeypatch,
+    ):
+        from boxbot.displays import web_view as module
+
+        monkeypatch.setattr(module, "_SPEAKING_MAX_SECONDS", 0.4)
+        view = WebView(make_config(tmp_path), listening_probe=lambda: False)
+        try:
+            await view.open(normalize_url("https://example.com/"))
+            view.set_speaking(True)           # ...and no "done" ever arrives
+            assert view.state()["paused"] is True
+            await wait_for(lambda: view.state()["paused"] is False)
+        finally:
+            await view.close()
+
+    async def test_pausing_never_waits_on_the_browser(self, tmp_path):
+        """pause_now / set_speaking run inside the voice pipeline's
+        event publish; a hung renderer must not delay speech."""
+        import time as _time
+
+        view = WebView(make_config(tmp_path), listening_probe=lambda: False)
+        try:
+            await view.open(normalize_url("https://example.com/"))
+
+            async def hung(expression: str) -> None:
+                await asyncio.sleep(30)
+
+            view._evaluate = hung  # type: ignore[method-assign]
+            started = _time.monotonic()
+            view.pause_now()
+            view.set_speaking(True)
+            assert _time.monotonic() - started < 0.1
+            assert view.state()["paused"] is True
+        finally:
+            for task in list(view._background):
+                task.cancel()
+            await view.close()
+
+    async def test_cancelled_open_leaves_no_browser_behind(self, tmp_path):
+        """The wake word cancels the agent's tool call mid page-load. A
+        half-open browser has no idle clock and no time limit."""
+        view = WebView(make_config(tmp_path), listening_probe=lambda: False)
+        task = asyncio.ensure_future(
+            view.open(normalize_url("https://slow.example.com/"))
+        )
+        await wait_for(lambda: any(
+            c["method"] == "Page.navigate" for c in commands(tmp_path)
+        ))
+        proc = view._proc
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not view.is_open
+        assert view.state() is None
+        assert proc.returncode is not None
+        assert view._fds == [] and view._cdp is None
+
+    async def test_stale_self_close_spares_a_newer_page(self, tmp_path):
+        """Idle/limit decided to close, then someone opened a new page
+        before the close got the lock: the new page stays."""
+        reasons: list[str] = []
+
+        async def on_exit(reason: str) -> None:
+            reasons.append(reason)
+
+        view = WebView(
+            make_config(tmp_path), on_exit=on_exit, listening_probe=lambda: False,
+        )
+        try:
+            await view.open(normalize_url("https://example.com/a"))
+            stale = view._epoch
+            await view.open(normalize_url("https://example.com/b"))
+            assert await view._close_self(stale, "nothing playing — idle timeout") is False
+            assert view.is_open and reasons == []
+            assert await view._close_self(view._epoch, "time limit reached") is True
+            assert not view.is_open and reasons == ["time limit reached"]
+        finally:
+            await view.close()
+
+    async def test_open_after_a_crash_does_not_leak_the_old_handles(self, tmp_path):
+        view = WebView(make_config(tmp_path), listening_probe=lambda: False)
+        try:
+            await view.open(normalize_url("https://example.com/"))
+            old_fds = list(view._fds)
+            # The browser dies and open() wins the race for the lock
+            # against the exit watcher.
+            async with view._lock:
+                view._proc.kill()
+                await view._proc.wait()
+            await view.open(normalize_url("https://example.com/again"))
+            assert view.is_open
+            for fd in old_fds:
+                if fd not in view._fds:
+                    with pytest.raises(OSError):
+                        os.fstat(fd)
+            await asyncio.sleep(0.3)   # the old watcher must not close it
+            assert view.is_open
         finally:
             await view.close()
 
@@ -401,14 +535,13 @@ class TestWebView:
             make_config(tmp_path), on_exit=on_exit, listening_probe=lambda: False,
         )
         try:
-            # The fake exits right after acknowledging this navigation.
-            try:
-                await view.open(normalize_url("https://crash.example.com/"))
-            except WebViewError:
-                return  # died before open() finished: reported as an error
+            # The fake loads the page, then dies 0.3 s later.
+            await view.open(normalize_url("https://crash.example.com/"))
+            assert view.is_open
             await wait_for(lambda: bool(reasons))
-            assert "exited" in reasons[0]
+            assert reasons == ["browser exited (code 7)"]
             assert not view.is_open
+            assert view._fds == []
         finally:
             await view.close()
 
@@ -418,17 +551,13 @@ class TestWebView:
         async def on_exit(reason: str) -> None:
             reasons.append(reason)
 
+        # 0.005 min = 0.3 s; "playing" keeps the idle timeout out of it.
+        (tmp_path / "kiosk").mkdir()
+        (tmp_path / "kiosk" / "playing").touch()
         view = WebView(
-            make_config(tmp_path), on_exit=on_exit, listening_probe=lambda: False,
+            make_config(tmp_path, max_minutes=0.005), on_exit=on_exit,
+            listening_probe=lambda: False,
         )
-
-        async def short_limit() -> None:
-            await asyncio.sleep(0.2)
-            view._limit_task = None
-            await view.close()
-            await view._notify_exit("time limit reached")
-
-        monkeypatch.setattr(view, "_enforce_limit", short_limit)
         await view.open(normalize_url("https://example.com/"))
         await wait_for(lambda: bool(reasons))
         assert reasons == ["time limit reached"]
@@ -448,6 +577,74 @@ class TestWebView:
             await view.open(normalize_url("https://example.com/"))
         assert not view.is_open
 
+    async def test_no_network_fence_refuses_to_launch(self, tmp_path, monkeypatch):
+        """Without the firewall rule a page could reach the LAN: the
+        browser must not start at all."""
+        import os
+        import pwd
+        import subprocess
+
+        me = pwd.getpwuid(os.getuid()).pw_name
+        calls: list[tuple[str, ...]] = []
+
+        def as_kiosk(self, *argv: str):
+            calls.append(argv)
+            # pkill: nothing to kill. Probe: loopback was reachable.
+            return subprocess.CompletedProcess(argv, 1 if argv[0] == "pkill" else 3, "", "")
+
+        monkeypatch.setattr(WebView, "_as_kiosk", as_kiosk)
+        granted: list[str] = []
+        monkeypatch.setattr(
+            WebView, "_grant_session_access",
+            staticmethod(lambda *a: granted.append("x")),
+        )
+        view = WebView(make_config(tmp_path, privilege_drop="sudo", user=me))
+        with pytest.raises(WebViewError, match="network fence"):
+            await view.open(normalize_url("https://example.com/"))
+        assert not view.is_open
+        assert [c[0] for c in calls] == ["pkill", "python3"]
+        assert granted == []          # no session access was handed out
+
+    async def test_control_pipe_must_be_a_real_fifo(self, tmp_path):
+        """A compromised browser swapping the FIFO for a link to one of
+        our files must not get the service to write into it."""
+        victim = tmp_path / "victim"
+        victim.write_text("precious")
+        link = tmp_path / "to_browser"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            WebView._open_fifo(str(link))       # O_NOFOLLOW
+        with pytest.raises(WebViewError, match="not a FIFO"):
+            WebView._open_fifo(str(victim))
+        assert victim.read_text() == "precious"
+
+    async def test_full_control_pipe_is_an_error_not_a_hang(self, tmp_path):
+        """A stalled browser stops reading. write() must fail, never
+        block the event loop."""
+        from boxbot.displays.cdp_pipe import CDPError, CDPPipe
+
+        to_browser, from_browser = tmp_path / "to", tmp_path / "from"
+        os.mkfifo(to_browser)
+        os.mkfifo(from_browser)
+        write_fd = WebView._open_fifo(str(to_browser))    # nobody drains it
+        read_fd = WebView._open_fifo(str(from_browser))
+        pipe = CDPPipe(write_fd, read_fd)
+        pipe.start()
+        try:
+            errors: list[str] = []
+            for _ in range(400):                          # > 64 KiB of commands
+                try:
+                    await pipe.call(
+                        "Runtime.evaluate", {"expression": "x" * 500}, timeout=0.001,
+                    )
+                except CDPError as e:
+                    errors.append(str(e))
+            assert any("pipe is full" in e for e in errors)
+        finally:
+            pipe.close()
+            os.close(write_fd)
+            os.close(read_fd)
+
     async def test_disabled_by_config(self, tmp_path):
         view = WebView(make_config(tmp_path, enabled=False))
         with pytest.raises(WebViewError, match="disabled"):
@@ -459,8 +656,12 @@ class TestWebView:
 
         me = pwd.getpwuid(os.getuid()).pw_name
         view = WebView(make_config(tmp_path, privilege_drop="sudo", user=me))
-        monkeypatch.setattr(WebView, "_grant_session_access", lambda *a: None)
-        argv, _, _ = view._build_launch()
+        # On the box setup-sandbox.sh creates these; the service does not.
+        (tmp_path / "kiosk" / "ctl").mkdir(parents=True)
+        argv, ctl_in, ctl_out = view._build_launch()
+        assert stat.S_IMODE(os.stat(ctl_in).st_mode) == 0o660
+        assert stat.S_IMODE(os.stat(ctl_out).st_mode) == 0o660
+        assert "--block-new-web-contents" in argv
         assert argv[:5] == ["sudo", "-n", "-u", me, "--"]
         # A clean environment: nothing of the service's leaks through.
         assert argv[5:7] == ["env", "-i"]
@@ -481,15 +682,28 @@ class FakeWebView:
         self.is_open = False
         self.idle_minutes: float | None = None
         self.media_actions: list[str] = []
+        self.holds_mic_mute = False
+        self.pauses = 0
+        self.speaking: list[bool] = []
+        self.block_open: asyncio.Event | None = None
+
+    def pause_now(self, grace: float = 2.0) -> None:
+        self.pauses += 1
+
+    def set_speaking(self, speaking: bool) -> None:
+        self.speaking.append(speaking)
 
     async def open(
         self, target: WebTarget, *, idle_minutes: float | None = None,
     ) -> dict[str, Any]:
         if self.fail:
             raise WebViewError(self.fail)
+        if self.block_open is not None:
+            await self.block_open.wait()
         self.opened.append(target)
         self.idle_minutes = idle_minutes
         self.is_open = True
+        self.holds_mic_mute = False
         return {}
 
     async def media(self, action: str) -> dict[str, Any]:
@@ -500,11 +714,12 @@ class FakeWebView:
         if self.is_open:
             self.closed += 1
         self.is_open = False
+        self.holds_mic_mute = False
 
     def state(self) -> dict[str, Any] | None:
         if not self.is_open:
             return None
-        return {"url": self.opened[-1].url, "kind": "page", "title": "",
+        return {"url": self.opened[-1].url, "kind": "page",
                 "paused": False, "open_seconds": 0}
 
 
@@ -606,6 +821,58 @@ class TestManagerWebDisplay:
         mgr = DisplayManager()
         with pytest.raises(WebViewError, match="not open"):
             await mgr.web_media("play")
+
+    async def test_cancelled_switch_does_not_strand_the_opening_card(self, manager):
+        await manager.switch("clock")
+        manager._web_view.block_open = asyncio.Event()
+        task = asyncio.ensure_future(
+            manager.switch("web", args={"url": "https://example.com/"})
+        )
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if manager.get_active() == "web":
+                break
+        assert manager.get_active() == "web"       # card is up, browser loading
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert manager.get_active() != "web"
+        assert not manager.is_pinned()
+
+    async def test_falls_back_to_any_display_when_the_usual_ones_are_gone(self, manager):
+        await manager.switch("web", args={"url": "https://example.com/"})
+        for name in ("clock", "picture"):
+            manager._specs.pop(name)
+        manager._rotation_displays = []
+        manager._web_view.is_open = False
+        await manager._on_web_view_exit("browser exited (code 1)")
+        assert manager.get_active() not in (None, "web")
+
+    async def test_voice_events_reach_the_view_through_the_bus(self, manager):
+        from boxbot.core.events import (
+            AgentSpeaking, AgentSpeakingDone, WakeWordHeard, get_event_bus,
+        )
+
+        manager._subscribe_events()
+        try:
+            bus = get_event_bus()
+            await bus.publish(WakeWordHeard(confidence=0.9))
+            await bus.publish(AgentSpeaking(conversation_id="c", text="hi"))
+            await bus.publish(AgentSpeakingDone(conversation_id="c"))
+        finally:
+            manager._unsubscribe_events()
+        assert manager._web_view.pauses == 1
+        assert manager._web_view.speaking == [True, False]
+
+    async def test_mic_mute_hold_lasts_only_as_long_as_the_view(self, manager):
+        manager.note_web_mic_muted()               # nothing open: ignored
+        assert not manager.web_holds_mic_mute()
+        await manager.switch("web", args={"url": "https://example.com/"})
+        assert not manager.web_holds_mic_mute()    # open alone is not a hold
+        manager.note_web_mic_muted()
+        assert manager.web_holds_mic_mute()
+        await manager.switch("clock")
+        assert not manager.web_holds_mic_mute()
 
     async def test_stop_closes_the_view(self):
         mgr = DisplayManager()
@@ -711,6 +978,35 @@ class TestSpeakerFeed:
         assert 0 < accepted < 40
         assert self.frames(speaker._queue) <= (500 + 150 + 20) * 48 + 960
 
+    def test_video_sound_is_not_bb_talking(self, speaker):
+        """is_playing drives barge-in ("user spoke during TTS"); a wake
+        word over a video must not be mistaken for one."""
+        speaker._playback_lock = asyncio.Lock()
+        speaker.feed(b"\x10\x27" * 960)
+        assert len(speaker._queue) > 0
+        assert speaker.is_playing is False
+
+    def test_reference_stays_aligned_across_an_underrun(self, speaker):
+        """After the audible queue runs dry the reference queue still
+        holds a tail. Padding by the full delay again would push the
+        reference a further delay behind the speaker every time."""
+        import numpy as np
+
+        speaker._aec_stream = object()
+        speaker._aec_delay_samples = 320
+        chunk = np.full(960, 10000, dtype=np.int16).tobytes()
+        speaker.feed(chunk)
+        speaker._queue.clear()                     # audible path underran
+        tail = 400
+        while self.frames(speaker._aec_queue) > tail:   # reference: tail left
+            speaker._aec_queue.popleft()
+        tail = self.frames(speaker._aec_queue)
+        speaker.feed(chunk)
+        # Audible: cushion then audio. Reference: must come out
+        # cushion + delay after "now", i.e. padded by that minus the tail.
+        assert self.frames(speaker._aec_queue) == (150 * 16 + 320) + 320
+        assert tail > 0
+
     def test_reference_delay_is_added_once_per_run(self, speaker):
         import numpy as np
 
@@ -727,3 +1023,84 @@ class TestSpeakerFeed:
         assert speaker.feed(b"") is False
         speaker._started = False
         assert speaker.feed(b"\x10\x27" * 960) is False
+
+
+# ---------------------------------------------------------------------------
+# Mic handling around a playing view
+# ---------------------------------------------------------------------------
+
+
+class TestMicMuteForPlayback:
+    """Opening a video on a voice conversation closes the mic, and BB's
+    own speech must not reopen it while that view is up — but a mute
+    placed for any other reason keeps the normal mute_mic contract."""
+
+    class Session:
+        def __init__(self, can_mute: bool = True) -> None:
+            self.can_mute = can_mute
+            self.muted = False
+
+        def mute_mic(self) -> bool:
+            self.muted = self.can_mute
+            return self.can_mute
+
+    class Conv:
+        def __init__(self, channel: str) -> None:
+            self.channel = channel
+
+    @pytest.fixture
+    async def wired(self, manager, monkeypatch):
+        from boxbot.displays import manager as manager_module
+
+        monkeypatch.setattr(manager_module, "_display_manager_instance", manager)
+        await manager.switch("web", args={"url": "https://example.com/"})
+        return manager
+
+    def _patch(self, monkeypatch, session, conv) -> None:
+        import boxbot.communication.voice as voice
+        import boxbot.tools._tool_context as tool_context
+
+        monkeypatch.setattr(voice, "get_voice_session", lambda: session)
+        monkeypatch.setattr(tool_context, "get_current_conversation", lambda: conv)
+
+    async def test_voice_conversation_gets_muted_and_held(self, wired, monkeypatch):
+        from boxbot.tools.builtins.switch_display import _mute_mic_for_playback
+
+        session = self.Session()
+        self._patch(monkeypatch, session, self.Conv("voice"))
+        assert _mute_mic_for_playback() is True
+        assert session.muted
+        assert wired.web_holds_mic_mute()
+
+    async def test_text_conversation_touches_nothing(self, wired, monkeypatch):
+        from boxbot.tools.builtins.switch_display import _mute_mic_for_playback
+
+        session = self.Session()
+        self._patch(monkeypatch, session, self.Conv("whatsapp"))
+        assert _mute_mic_for_playback() is False
+        assert not session.muted
+        assert not wired.web_holds_mic_mute()
+
+    async def test_no_hold_when_the_mic_could_not_be_muted(self, wired, monkeypatch):
+        from boxbot.tools.builtins.switch_display import _mute_mic_for_playback
+
+        self._patch(monkeypatch, self.Session(can_mute=False), self.Conv("voice"))
+        assert _mute_mic_for_playback() is False
+        assert not wired.web_holds_mic_mute()
+
+    async def test_tts_end_keeps_the_mute_only_while_the_view_holds_it(self, wired):
+        from types import SimpleNamespace
+
+        from boxbot.communication.voice import VoiceSession
+
+        muted = SimpleNamespace(is_mic_muted=True)
+        # A page is open, but this mute was the agent's own (mute_mic):
+        # speech reopens the mic as documented.
+        assert VoiceSession._web_view_holds_mute(muted) is False
+        wired.note_web_mic_muted()
+        assert VoiceSession._web_view_holds_mute(muted) is True
+        assert VoiceSession._web_view_holds_mute(
+            SimpleNamespace(is_mic_muted=False)
+        ) is False
+        await wired.switch("clock")
+        assert VoiceSession._web_view_holds_mute(muted) is False

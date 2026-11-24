@@ -726,15 +726,31 @@ class Speaker(HardwareModule):
             return False
         with self._queue_lock:
             backlog_frames = sum(block.shape[0] for block in self._queue)
+            reference_backlog = sum(block.shape[0] for block in self._aec_queue)
         if backlog_frames > _FEED_MAX_BACKLOG_MS * _HDMI_TARGET_RATE // 1000:
             return False
+
+        # A chunk that continues queued audio is appended as is. A new
+        # run — first chunk, or the first after the writer ran dry —
+        # gets the cushion, and the reference is padded so that it once
+        # again trails the audible path by exactly the calibrated delay.
+        # The pad is measured against what the reference queue still
+        # holds: after an underrun it usually has a tail left, and
+        # adding the full delay again each time would walk the
+        # reference further and further behind the speaker.
+        cushion_ms = 0
+        reference_lead = 0
+        if backlog_frames == 0:
+            cushion_ms = _FEED_CUSHION_MS
+            wanted = (
+                cushion_ms * _AEC_TARGET_RATE // 1000 + self._aec_delay_samples
+            )
+            reference_lead = max(0, wanted - reference_backlog)
         self._enqueue_samples(
             samples.copy(), sample_rate, channels,
             limiter=False,
-            # Only a new run gets the cushion and the reference delay;
-            # repeating either per chunk would stretch the stream.
-            cushion_ms=_FEED_CUSHION_MS if backlog_frames == 0 else 0,
-            reference_delay=backlog_frames == 0,
+            cushion_ms=cushion_ms,
+            reference_lead_frames=reference_lead,
         )
         return True
 
@@ -746,14 +762,15 @@ class Speaker(HardwareModule):
         *,
         limiter: bool = True,
         cushion_ms: int = 0,
-        reference_delay: bool = True,
+        reference_lead_frames: int | None = None,
     ) -> None:
         """Apply gain/volume, downmix, resample, split into blocks, enqueue.
 
         ``limiter=False`` skips the speech loudness stage (volume still
-        applies). ``cushion_ms`` prepends that much silence to both
-        paths. ``reference_delay=False`` omits the calibrated AEC delay
-        — for a chunk that continues audio already queued.
+        applies). ``cushion_ms`` prepends that much silence to the
+        audible path. ``reference_lead_frames`` is the silence put ahead
+        of this chunk on the AEC reference path: ``None`` (speech) uses
+        the calibrated delay; a number is used exactly (see ``feed``).
 
         Splits one chunk into HDMI-rate blocks (audible playback) and,
         if the AEC reference stream is up, AEC-rate stereo blocks. Both
@@ -820,8 +837,12 @@ class Speaker(HardwareModule):
         # tens of ms early (HDMI buffer is much deeper than the USB AEC
         # ref stream) and the adaptive filter can't subtract cleanly.
         delay_blocks: list[np.ndarray] = []
-        if aec_blocks and reference_delay and self._aec_delay_samples > 0:
-            remaining = self._aec_delay_samples
+        lead_frames = (
+            self._aec_delay_samples if reference_lead_frames is None
+            else reference_lead_frames
+        )
+        if aec_blocks and lead_frames > 0:
+            remaining = lead_frames
             while remaining > 0:
                 n = min(_AEC_BLOCK_FRAMES, remaining)
                 if n == _AEC_BLOCK_FRAMES:
@@ -836,11 +857,6 @@ class Speaker(HardwareModule):
             hdmi_blocks.insert(0, np.zeros(
                 (cushion_ms * _HDMI_TARGET_RATE // 1000, 1), dtype=np.int16,
             ))
-            if aec_blocks:
-                delay_blocks.insert(0, np.zeros(
-                    (cushion_ms * _AEC_TARGET_RATE // 1000, _AEC_CHANNELS),
-                    dtype=np.int16,
-                ))
 
         self._mark_busy()
         with self._queue_lock:
@@ -949,7 +965,16 @@ class Speaker(HardwareModule):
 
     @property
     def is_playing(self) -> bool:
-        """Whether real audio (not silence) is currently queued or playing."""
+        """Whether speech or a played file is currently queued or playing.
+
+        Audio from :meth:`feed` does not count: callers use this to ask
+        "is BB talking?" (barge-in, urgent-message preemption), and a
+        video's soundtrack is not BB talking. ``play`` / ``play_stream``
+        hold the playback lock for exactly as long as their audio is
+        outstanding, which is what distinguishes the two.
+        """
+        if self._playback_lock is None or not self._playback_lock.locked():
+            return False
         with self._queue_lock:
             return len(self._queue) > 0
 

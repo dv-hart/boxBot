@@ -114,7 +114,9 @@ display:
     end: "07:00"
     brightness: 0.3
   # Kiosk browser behind the "web" display (YouTube videos, web pages).
-  # Runs as its own OS user; scripts/setup-sandbox.sh creates it.
+  # Runs as its own OS user behind a LAN firewall rule; both are set
+  # up by scripts/setup-sandbox.sh, and the browser refuses to start
+  # without them.
   web:
     enabled: true
     browser: "chromium"

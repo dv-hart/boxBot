@@ -119,11 +119,12 @@ class SwitchDisplayTool(Tool):
 def _mute_mic_for_playback() -> bool:
     """Close the mic on the voice conversation that opened the web view.
 
-    Browser audio is not in the mic's echo-cancellation reference, so an
-    open mic would transcribe the video back to the agent as if the room
-    had said it — and the view pauses itself whenever the mic is
-    listening. Same mechanism as the ``mute_mic`` tool: the wake word
-    stays armed and re-engages (which pauses playback).
+    The view plays only while the mic is closed (BB does not listen
+    over a video), so leaving the mic open would hold the page paused
+    until the conversation timed out. Same mechanism as the
+    ``mute_mic`` tool: the wake word stays armed and re-engages, which
+    pauses playback. The display manager is told, so BB's own speech
+    does not reopen the mic while the view is up.
     """
     from boxbot.communication.voice import get_voice_session
     from boxbot.tools._tool_context import get_current_conversation
@@ -132,4 +133,11 @@ def _mute_mic_for_playback() -> bool:
     if conv is None or conv.channel != "voice":
         return False
     session = get_voice_session()
-    return bool(session is not None and session.mute_mic())
+    if session is None or not session.mute_mic():
+        return False
+    from boxbot.displays.manager import get_display_manager
+
+    mgr = get_display_manager()
+    if mgr is not None:
+        mgr.note_web_mic_muted()
+    return True

@@ -16,10 +16,20 @@ Security model:
   override).
 - **No listener.** Control is the DevTools protocol over a FIFO pair
   (``--remote-debugging-pipe``), never a debugging TCP port.
-- **Throwaway profile.** The profile directory is wiped on every launch:
-  no cookies, logins, or history persist.
+- **Throwaway home.** The kiosk user's whole home (profile, certificate
+  store, caches) is wiped on every launch: nothing a page did persists.
 - **URL policy.** ``https`` only, public hostnames only — see
-  :func:`normalize_url`. Downloads are denied.
+  :func:`normalize_url`. That vets the link BB was handed; it cannot
+  vet where the page goes next.
+- **Network fence.** What the page can reach afterwards is bounded by
+  the OS: an nftables rule keyed on the kiosk uid rejects loopback and
+  every private range (``scripts/setup-sandbox.sh``). Launch probes for
+  the rule and refuses without it. Downloads and popups are denied.
+- **Service-owned control dir.** The FIFOs live in a directory only the
+  service user can modify, and are opened ``O_NOFOLLOW``: a compromised
+  browser cannot swap one for a link to a file of ours.
+- **Nothing from the page reaches the agent.** Not pixels, not the
+  title: :meth:`WebView.state` reports only what BB itself asked for.
 
 Lifetime: the view closes when the display switches away, on
 ``unpin``, when nothing has played or been touched for
@@ -49,6 +59,7 @@ import pwd
 import re
 import shutil
 import stat
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,14 +126,36 @@ _ACTIVITY_JS = (
     "return JSON.stringify({playing,quiet_ms:Date.now()-window.__bbSeen})})()"
 )
 
-# Runs as the kiosk user. Wipes the profile, makes a private runtime dir,
-# then execs the browser with the DevTools pipe on fds 3 and 4. A shell
-# redirect is the only portable way to hand a child those exact fd
-# numbers across sudo, which closes every inherited fd above stderr.
+# Runs as the kiosk user. Empties its home (profile, NSS certificate
+# store, caches — everything a page could have left behind), then execs
+# the browser with the DevTools pipe on fds 3 and 4. A shell redirect is
+# the only portable way to hand a child those exact fd numbers across
+# sudo, which closes every inherited fd above stderr.
 _LAUNCH_SCRIPT = (
-    'rm -rf "$1" && mkdir -p "$1" "$2" && chmod 700 "$1" "$2" && '
-    'in="$3" out="$4" && shift 4 && exec "$@" 3<"$in" 4>"$out"'
+    'home="$1" in="$2" out="$3" && shift 3 && '
+    'find "$home" -mindepth 1 -delete && '
+    'mkdir -p "$home/profile" "$home/run" && '
+    'chmod 700 "$home/profile" "$home/run" && '
+    'exec "$@" 3<"$in" 4>"$out"'
 )
+
+# Runs as the kiosk user before every launch: is the network fence up?
+# A connect to loopback must be *rejected by the firewall* (host/net
+# unreachable, or not permitted) — "connection refused" means the packet
+# got through to a closed port, i.e. no fence.
+_FENCE_PROBE = (
+    "import errno,socket,sys\n"
+    "s=socket.socket();s.settimeout(3)\n"
+    "try:\n s.connect(('127.0.0.1',9))\n"
+    "except OSError as e:\n"
+    " sys.exit(0 if e.errno in (errno.EHOSTUNREACH,errno.ENETUNREACH,"
+    "errno.EACCES,errno.EPERM) else 3)\n"
+    "sys.exit(3)\n"
+)
+
+# AgentSpeakingDone is published from a finally block, but a view stuck
+# paused because one event went missing would be silent forever.
+_SPEAKING_MAX_SECONDS = 120.0
 
 
 # How often the view re-checks whether the room is quiet.
@@ -264,9 +297,9 @@ class WebView:
     """Owns the kiosk browser process and its DevTools connection.
 
     One instance per :class:`~boxbot.displays.manager.DisplayManager`.
-    ``on_exit`` is awaited when the browser goes away for any reason
-    other than :meth:`close` (crash, time limit) so the manager can put
-    a normal display back.
+    ``on_exit`` is awaited when the view closes *itself* (browser died,
+    idle, time limit) so the manager can put a normal display back. It
+    is not called for :meth:`close`.
     """
 
     def __init__(
@@ -296,12 +329,17 @@ class WebView:
         self._watch_task: asyncio.Task[None] | None = None
         self._limit_task: asyncio.Task[None] | None = None
         self._sync_task: asyncio.Task[None] | None = None
+        self._background: set[asyncio.Task[Any]] = set()
         self._closing = False
+        # Bumped by every open(). A self-close (idle, time limit) decided
+        # under an older epoch is stale: someone has asked for a new page
+        # since, and it must not be torn down.
+        self._epoch = 0
 
         self._target: WebTarget | None = None
-        self._title: str = ""
         self._opened_at: float = 0.0
-        self._speaking = False
+        # Tracks speaker events, not page state: survives open/close.
+        self._speaking_since: float | None = None
         self._pause_until = 0.0
         self._paused = False
         # Set by media("pause"): stays paused until media("play").
@@ -309,6 +347,9 @@ class WebView:
         self._playing = False
         self._idle_seconds = 0.0
         self._last_active = 0.0
+        # True when the mic was muted *because* this view started
+        # playing (see switch_display); cleared with the view.
+        self.holds_mic_mute = False
 
     # ------------------------------------------------------------------
     # State
@@ -319,13 +360,16 @@ class WebView:
         return self._proc is not None and self._proc.returncode is None
 
     def state(self) -> dict[str, Any] | None:
-        """What the view is showing, or ``None`` when closed."""
+        """What the view is showing, or ``None`` when closed.
+
+        Agent-facing, so it carries nothing the page controls — no title,
+        no page text. ``url`` is the one BB asked for, after policy.
+        """
         if not self.is_open or self._target is None:
             return None
         return {
             "url": self._target.url,
             "kind": self._target.kind,
-            "title": self._title,
             "playing": self._playing and not self._paused,
             "paused": self._paused,
             "audio": self._audio is not None and self._audio.running,
@@ -348,31 +392,40 @@ class WebView:
 
         Raises:
             WebViewError: the browser could not start or the page could
-                not load. The view is closed when this is raised.
+                not load. The view is closed when this is raised — and
+                equally when the call is cancelled part-way (a wake word
+                during page load cancels the agent's tool call).
         """
         if not self._config.enabled:
             raise WebViewError("web view is disabled (display.web.enabled)")
 
         async with self._lock:
+            self._epoch += 1
             try:
+                if self._proc is not None and not self.is_open:
+                    # The browser died and its watcher has not got the
+                    # lock yet: release the dead handles before reuse.
+                    await self._teardown()
                 if not self.is_open:
                     await self._launch()
                 await self._navigate(target)
-            except (WebViewError, CDPError, OSError) as e:
-                await self._teardown()
-                if isinstance(e, WebViewError):
-                    raise
-                raise WebViewError(f"web view failed: {e}") from e
+            except BaseException as e:
+                # Including CancelledError: a half-open browser has no
+                # idle clock and no time limit, so it must not survive.
+                await asyncio.shield(self._teardown())
+                if isinstance(e, (CDPError, OSError)):
+                    raise WebViewError(f"web view failed: {e}") from e
+                raise
 
             self._target = target
             self._opened_at = time.monotonic()
             # A fresh page starts playing; the sync loop pauses it again
             # within a tick if the room is not quiet.
-            self._speaking = False
             self._pause_until = 0.0
             self._paused = False
             self._user_paused = False
             self._playing = False
+            self.holds_mic_mute = False
             minutes = self._config.idle_minutes if idle_minutes is None else idle_minutes
             self._idle_seconds = 60.0 * max(1.0, min(minutes, self._config.max_minutes))
             self._last_active = time.monotonic()
@@ -389,8 +442,19 @@ class WebView:
         async with self._lock:
             await self._teardown()
 
+    async def _close_self(self, epoch: int, reason: str) -> bool:
+        """Close because the view decided to, unless a newer ``open()``
+        has superseded the decision. Returns whether it closed."""
+        async with self._lock:
+            if epoch != self._epoch or self._proc is None:
+                return False
+            await self._teardown()
+        await self._notify_exit(reason)
+        return True
+
     async def screenshot(self) -> bytes:
-        """PNG of what the browser window is showing right now."""
+        """PNG of the browser window. For developers and tests only —
+        never route this to the agent (see the module docstring)."""
         async with self._lock:
             if not self.is_open or self._cdp is None:
                 raise WebViewError("web view is not open")
@@ -407,20 +471,24 @@ class WebView:
     # Pause while the room is not quiet
     # ------------------------------------------------------------------
 
-    async def pause_now(self, grace: float = 2.0) -> None:
+    def pause_now(self, grace: float = 2.0) -> None:
         """Pause immediately (wake word heard).
 
         ``grace`` keeps the pause in force while the voice session
         catches up to ACTIVE; after that the sync loop decides.
+
+        Not a coroutine on purpose: this runs inside event-bus handlers
+        that the voice pipeline awaits, and a slow renderer must never
+        hold up the wake word or the start of speech.
         """
         self._pause_until = time.monotonic() + grace
-        await self._set_paused(True)
+        self._set_paused(True)
 
-    async def set_speaking(self, speaking: bool) -> None:
+    def set_speaking(self, speaking: bool) -> None:
         """Track TTS playback: media stays paused while BB talks."""
-        self._speaking = speaking
+        self._speaking_since = time.monotonic() if speaking else None
         if speaking:
-            await self._set_paused(True)
+            self._set_paused(True)
 
     async def media(self, action: str) -> dict[str, Any]:
         """Explicit play / pause, as asked for by a person.
@@ -435,7 +503,7 @@ class WebView:
             raise WebViewError("web view is not open")
         if action == "pause":
             self._user_paused = True
-            await self._set_paused(True)
+            self._set_paused(True)
         else:
             self._user_paused = False
             self._pause_until = 0.0
@@ -446,8 +514,12 @@ class WebView:
         state = self.state()
         return state if state is not None else {}
 
+    def _is_speaking(self) -> bool:
+        since = self._speaking_since
+        return since is not None and time.monotonic() - since < _SPEAKING_MAX_SECONDS
+
     def _wants_pause(self) -> bool:
-        if self._user_paused or self._speaking:
+        if self._user_paused or self._is_speaking():
             return True
         if time.monotonic() < self._pause_until:
             return True
@@ -457,11 +529,17 @@ class WebView:
             logger.debug("web view listening probe failed", exc_info=True)
             return False
 
-    async def _set_paused(self, paused: bool) -> None:
+    def _set_paused(self, paused: bool) -> None:
+        """Flip the pause state. The audio gate follows ``_paused`` at
+        once; the page is told in the background."""
         if not self.is_open or paused == self._paused:
             return
         self._paused = paused
-        await self._evaluate(_PAUSE_JS if paused else _RESUME_JS)
+        task = asyncio.ensure_future(
+            self._evaluate(_PAUSE_JS if paused else _RESUME_JS)
+        )
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     async def _sync_loop(self) -> None:
         """Keep playback in step with the room, and close when idle."""
@@ -472,26 +550,23 @@ class WebView:
             # room and the only thing that closes an idle page; one bad
             # tick must not end it.
             try:
-                await self._set_paused(self._wants_pause())
+                self._set_paused(self._wants_pause())
                 now = time.monotonic()
                 if now < next_activity_check:
                     continue
                 next_activity_check = now + _ACTIVITY_INTERVAL
+                epoch = self._epoch
                 await self._check_activity()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("web view sync tick failed")
                 continue
-            if time.monotonic() - self._last_active > self._idle_seconds:
-                break
-        else:
-            return
-
-        logger.info("Web view idle for %.0fs; closing", self._idle_seconds)
-        self._sync_task = None
-        await self.close()
-        await self._notify_exit("nothing playing — idle timeout")
+            if time.monotonic() - self._last_active <= self._idle_seconds:
+                continue
+            logger.info("Web view idle for %.0fs; closing", self._idle_seconds)
+            if await self._close_self(epoch, "nothing playing — idle timeout"):
+                return
 
     async def _check_activity(self) -> None:
         """Refresh ``_last_active``: something is playing, someone just
@@ -514,7 +589,12 @@ class WebView:
             self._last_active = time.monotonic()
 
     async def _evaluate(self, expression: str) -> Any:
-        """Run ``expression`` in the page. Best-effort: ``None`` on failure."""
+        """Run ``expression`` in the page. Best-effort: ``None`` on failure.
+
+        The result comes from the page's own JavaScript world, so a
+        hostile page can lie in it. It is only ever used to decide when
+        to close the view — never shown to the agent.
+        """
         cdp = self._cdp
         if cdp is None:
             return None
@@ -534,7 +614,15 @@ class WebView:
     # Launch
     # ------------------------------------------------------------------
 
+    def _privilege_drop(self) -> str:
+        drop = self._config.privilege_drop
+        return "sudo" if drop == "auto" else drop
+
     async def _launch(self) -> None:
+        if self._privilege_drop() == "sudo":
+            # setfacl / sudo round-trips: keep them off the event loop.
+            await asyncio.to_thread(self._prepare_session)
+
         # Before the browser starts, so its first sound has somewhere to go.
         audio_sink = (
             SINK_NAME if self._audio is not None and await self._audio.start()
@@ -542,11 +630,8 @@ class WebView:
         )
         argv, ctl_in, ctl_out = self._build_launch(audio_sink)
 
-        # O_RDWR so neither side blocks in open() waiting for its peer:
-        # a FIFO opened read-only or write-only waits for the other end.
-        write_fd = os.open(ctl_in, os.O_RDWR | os.O_CLOEXEC)
-        read_fd = os.open(ctl_out, os.O_RDWR | os.O_CLOEXEC)
-        self._fds = [write_fd, read_fd]
+        self._fds = [self._open_fifo(ctl_in), self._open_fifo(ctl_out)]
+        write_fd, read_fd = self._fds
 
         logger.info("Launching web view: %s", " ".join(argv[:6]) + " …")
         self._closing = False
@@ -596,6 +681,71 @@ class WebView:
                 ) from e
             raise WebViewError(f"browser did not come up: {e}") from e
 
+    @staticmethod
+    def _open_fifo(path: str) -> int:
+        """Open one end of the control pipe.
+
+        ``O_RDWR`` so neither side blocks in ``open()`` waiting for its
+        peer. ``O_NONBLOCK`` so a stalled browser can never block the
+        event loop in ``write()``. ``O_NOFOLLOW`` plus the ``fstat``
+        check so the path is the FIFO this process just created and not
+        something swapped in under it.
+        """
+        fd = os.open(
+            path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise WebViewError(f"{path} is not a FIFO")
+        return fd
+
+    def _session_paths(self) -> tuple[str, str, str]:
+        """``(runtime_dir, wayland_socket, pulse_socket)`` of this session."""
+        runtime_dir = (
+            os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        ).rstrip("/")
+        wayland = os.environ.get("WAYLAND_DISPLAY") or "wayland-0"
+        wayland_socket = wayland if os.path.isabs(wayland) else f"{runtime_dir}/{wayland}"
+        return runtime_dir, wayland_socket, f"{runtime_dir}/pulse/native"
+
+    def _prepare_session(self) -> None:
+        """Everything that must hold before the browser may start as the
+        kiosk user. Blocking; runs in a worker thread. Raises
+        :class:`WebViewError` — launch is refused, never degraded."""
+        user = self._config.user
+        try:
+            pwd.getpwnam(user)
+        except KeyError as e:
+            raise WebViewError(
+                f"web view user '{user}' does not exist — run "
+                "scripts/setup-sandbox.sh on the box"
+            ) from e
+
+        try:
+            # A browser left over from an unclean stop. Nothing else ever
+            # runs as this user. pkill exits 1 when there is nothing to kill.
+            self._as_kiosk("pkill", "-KILL", "-U", user)
+
+            probe = self._as_kiosk("python3", "-c", _FENCE_PROBE)
+            if probe.returncode != 0:
+                raise WebViewError(
+                    "web view network fence is not active (the kiosk user "
+                    "can reach local addresses) — run scripts/setup-sandbox.sh "
+                    "on the box"
+                )
+
+            runtime_dir, wayland_socket, _ = self._session_paths()
+            self._grant_session_access(user, runtime_dir, wayland_socket)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise WebViewError(f"web view session setup failed: {e}") from e
+
+    def _as_kiosk(self, *argv: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(
+            ["sudo", "-n", "-u", self._config.user, "--", *argv],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=10, check=False,
+        )
+
     def _build_launch(
         self, audio_sink: str | None = None,
     ) -> tuple[list[str], str, str]:
@@ -614,51 +764,38 @@ class WebView:
         if browser is None:
             raise WebViewError(f"browser '{cfg.browser}' is not installed")
 
-        drop = cfg.privilege_drop
-        if drop == "auto":
-            drop = "sudo"
-        if drop == "sudo":
-            try:
-                pwd.getpwnam(cfg.user)
-            except KeyError as e:
-                raise WebViewError(
-                    f"web view user '{cfg.user}' does not exist — run "
-                    "scripts/setup-sandbox.sh on the box"
-                ) from e
-
+        drop = self._privilege_drop()
         state_dir = Path(cfg.state_dir)
         ctl_dir = state_dir / "ctl"
+        home = state_dir / "home"
         ctl_in = ctl_dir / "to_browser"
         ctl_out = ctl_dir / "from_browser"
         try:
-            ctl_dir.mkdir(parents=True, exist_ok=True)
+            if drop == "none":
+                # Dev / tests: one user owns everything. On the box these
+                # exist already, with ownership only root can arrange.
+                ctl_dir.mkdir(parents=True, exist_ok=True)
+                home.mkdir(parents=True, exist_ok=True)
             for fifo in (ctl_in, ctl_out):
                 with contextlib.suppress(FileNotFoundError):
-                    if not stat.S_ISFIFO(fifo.lstat().st_mode):
-                        raise WebViewError(f"{fifo} exists and is not a FIFO")
                     fifo.unlink()
-                # The directory's default ACL (setup-sandbox.sh) extends
-                # these to the kiosk user; nobody else can open them.
                 os.mkfifo(fifo, 0o660)
+                # mkfifo honours the umask; the kiosk user reaches these
+                # through the directory's setgid group and needs both bits.
+                os.chmod(fifo, 0o660)
         except OSError as e:
             raise WebViewError(
                 f"cannot prepare web view control dir {ctl_dir}: {e} — run "
                 "scripts/setup-sandbox.sh on the box"
             ) from e
 
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-        wayland = os.environ.get("WAYLAND_DISPLAY") or "wayland-0"
-        wayland_socket = wayland if os.path.isabs(wayland) else f"{runtime_dir}/{wayland}"
-        pulse_socket = f"{runtime_dir}/pulse/native"
-        if drop == "sudo":
-            self._grant_session_access(cfg.user, runtime_dir, wayland_socket)
-
+        _, wayland_socket, pulse_socket = self._session_paths()
         width, height = self._size
         browser_argv = [
             browser,
             "--kiosk",
             "--remote-debugging-pipe",
-            f"--user-data-dir={state_dir / 'profile'}",
+            f"--user-data-dir={home / 'profile'}",
             f"--window-size={width},{height}",
             "--window-position=0,0",
             "--ozone-platform-hint=auto",
@@ -675,13 +812,16 @@ class WebView:
             "--password-store=basic",
             "--autoplay-policy=no-user-gesture-required",
             "--overscroll-history-navigation=0",
+            # No second window: the view drives, pauses and times out
+            # exactly one page.
+            "--block-new-web-contents",
             *cfg.extra_args,
             "about:blank",
         ]
         env = {
-            "HOME": str(state_dir),
+            "HOME": str(home),
             "PATH": "/usr/local/bin:/usr/bin:/bin",
-            "XDG_RUNTIME_DIR": str(state_dir / "run"),
+            "XDG_RUNTIME_DIR": str(home / "run"),
             "WAYLAND_DISPLAY": wayland_socket,
             "LANG": os.environ.get("LANG", "C.UTF-8"),
         }
@@ -693,8 +833,7 @@ class WebView:
         argv = [
             "env", "-i", *(f"{k}={v}" for k, v in env.items()),
             "sh", "-c", _LAUNCH_SCRIPT, "boxbot-web-view",
-            str(state_dir / "profile"), str(state_dir / "run"),
-            str(ctl_in), str(ctl_out),
+            str(home), str(ctl_in), str(ctl_out),
             *browser_argv,
         ]
         if drop == "sudo":
@@ -708,8 +847,17 @@ class WebView:
         The runtime dir is a tmpfs recreated at every login, so the ACLs
         cannot be installed once by the setup script. The service user
         owns these paths, so no privilege is needed to grant them.
+
+        Traversing the runtime dir would also expose every world-writable
+        socket in it. The native PipeWire sockets are the dangerous ones
+        (full graph access: record any node, rewire anything), so they
+        are closed to other users here; the browser only ever needs the
+        PulseAudio socket.
         """
-        import subprocess
+        for name in ("pipewire-0", "pipewire-0-manager"):
+            path = f"{runtime_dir}/{name}"
+            if os.path.exists(path):
+                os.chmod(path, 0o600)
 
         grants = [
             (runtime_dir, "x", True),
@@ -765,9 +913,6 @@ class WebView:
                 with contextlib.suppress(asyncio.CancelledError, CDPError):
                     await loaded
 
-        title = await self._evaluate("document.title")
-        self._title = title[:200] if isinstance(title, str) else ""
-
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------
@@ -776,18 +921,16 @@ class WebView:
         if self._limit_task is not None:
             self._limit_task.cancel()
         self._limit_task = asyncio.create_task(
-            self._enforce_limit(), name="web-view-limit",
+            self._enforce_limit(self._epoch), name="web-view-limit",
         )
 
-    async def _enforce_limit(self) -> None:
+    async def _enforce_limit(self, epoch: int) -> None:
         """Close the view after ``max_minutes`` — a forgotten video must
         not play all night."""
-        await asyncio.sleep(max(1, self._config.max_minutes) * 60)
-        logger.info("Web view reached its %d-minute limit; closing",
+        await asyncio.sleep(self._config.max_minutes * 60)
+        logger.info("Web view reached its %g-minute limit; closing",
                     self._config.max_minutes)
-        self._limit_task = None
-        await self.close()
-        await self._notify_exit("time limit reached")
+        await self._close_self(epoch, "time limit reached")
 
     async def _watch_exit(self, proc: asyncio.subprocess.Process) -> None:
         """Clean up and tell the manager when the browser dies on its own."""
@@ -795,10 +938,15 @@ class WebView:
         if self._closing or proc is not self._proc:
             return
         logger.warning("Web view browser exited unexpectedly (code %s)", code)
-        self._watch_task = None
+        # A dead browser never answers and (the pipe being O_RDWR) never
+        # produces EOF: fail the calls in flight now, so whoever holds
+        # the lock stops waiting on them.
+        if self._cdp is not None:
+            self._cdp.close()
         async with self._lock:
-            if proc is self._proc:
-                await self._teardown()
+            if proc is not self._proc:
+                return  # an open() already cleaned up and moved on
+            await self._teardown()
         await self._notify_exit(f"browser exited (code {code})")
 
     async def _notify_exit(self, reason: str) -> None:
@@ -820,18 +968,22 @@ class WebView:
                 task.cancel()
 
         proc, cdp = self._proc, self._cdp
-        if proc is not None and proc.returncode is None:
-            if cdp is not None:
-                with contextlib.suppress(CDPError):
-                    await cdp.call("Browser.close", timeout=2.0)
-            if not await self._wait_exit(proc, 3.0):
-                # Signal the whole session: under sudo the browser is a
-                # grandchild, and sudo relays the signal to it.
-                self._signal(proc, 15)
+        if proc is not None:
+            if proc.returncode is None:
+                if cdp is not None:
+                    with contextlib.suppress(CDPError):
+                        await cdp.call("Browser.close", timeout=2.0)
                 if not await self._wait_exit(proc, 3.0):
-                    self._signal(proc, 9)
-                    await self._wait_exit(proc, 2.0)
-                    await self._kill_strays()
+                    # Signal the whole session: under sudo the browser is
+                    # a grandchild, and sudo relays the signal to it.
+                    self._signal(proc, 15)
+                    if not await self._wait_exit(proc, 3.0):
+                        self._signal(proc, 9)
+                        await self._wait_exit(proc, 2.0)
+            # Whatever the browser left running as the kiosk user —
+            # helpers that outlived it, or anything a page managed to
+            # start — goes with it.
+            await self._kill_strays()
 
         if self._audio is not None:
             await self._audio.stop()
@@ -845,12 +997,11 @@ class WebView:
         self._cdp = None
         self._session_id = None
         self._target = None
-        self._title = ""
         self._paused = False
         self._user_paused = False
         self._playing = False
-        self._speaking = False
         self._pause_until = 0.0
+        self.holds_mic_mute = False
 
     @staticmethod
     async def _wait_exit(proc: asyncio.subprocess.Process, timeout: float) -> bool:
@@ -866,15 +1017,14 @@ class WebView:
             os.killpg(proc.pid, signum)
 
     async def _kill_strays(self) -> None:
-        """Last resort after SIGKILL: sudo itself died, so a browser running
-        as the kiosk user may be orphaned where this process cannot signal
-        it. Nothing else ever runs as that user."""
-        cfg = self._config
-        if cfg.privilege_drop not in ("auto", "sudo"):
+        """Kill every process of the kiosk user. Nothing else ever runs
+        as that user, and this process cannot signal them directly."""
+        if self._privilege_drop() != "sudo":
             return
+        user = self._config.user
         try:
             killer = await asyncio.create_subprocess_exec(
-                "sudo", "-n", "-u", cfg.user, "--", "pkill", "-KILL", "-U", cfg.user,
+                "sudo", "-n", "-u", user, "--", "pkill", "-KILL", "-U", user,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,

@@ -151,25 +151,42 @@ so it is fenced separately from both the main process and the sandbox:
 - **Own OS user** (`boxbot-kiosk`, created by `setup-sandbox.sh`): no
   access to `.env`, the project tree, `data/`, or the sandbox. Launch
   is refused if the user is missing — there is no fallback to the
-  service user.
+  service user. Every process of that user is killed when the view
+  closes.
 - **No listener:** boxBot drives the browser over a FIFO pair
-  (`--remote-debugging-pipe`), never a debugging port. Only the service
-  user and the kiosk user can open the FIFOs.
-- **URL policy:** `https` on public hostnames only. No IPs, LAN names,
-  ports, or credentials — a link cannot aim the browser at the router
-  or Home Assistant. Downloads are denied.
-- **Throwaway profile:** wiped at every launch; no cookies or logins
-  persist.
-- **Not an agent input:** page pixels are never attached to the agent's
-  context. Web text reaches the agent only through `web_search`'s
-  content firewall.
+  (`--remote-debugging-pipe`), never a debugging port. The FIFOs live
+  in a directory owned by the service user; the kiosk user can open
+  them but cannot add, remove or replace entries, and boxBot opens them
+  `O_NOFOLLOW`.
+- **URL policy:** `https` on public hostnames only — no IPs, LAN names,
+  ports, or credentials. This vets the link BB was handed. It cannot
+  vet what the page does next (redirects, scripts, a DNS name that
+  resolves to a private address), which is what the next item is for.
+- **Network fence (kernel):** an nftables rule keyed on the kiosk uid
+  rejects everything it sends to loopback, RFC 1918, link-local, CGNAT
+  and multicast ranges (IPv4 and IPv6); DNS is the only exception. A
+  page cannot reach the router, Home Assistant, or the box itself no
+  matter how it gets the address. Installed by `setup-sandbox.sh` as
+  `boxbot-kiosk-firewall.service`; every launch probes for it and
+  refuses to start the browser if loopback is reachable.
+- **Throwaway home:** the kiosk user's whole home — profile,
+  certificate store, caches — is emptied at every launch. Downloads
+  and popup windows are denied.
+- **Not an agent input:** nothing the page controls reaches the agent's
+  context: not pixels, not the page title. Web text reaches the agent
+  only through `web_search`'s content firewall.
 
-To draw on the screen and play sound, the kiosk user is granted the
-service user's Wayland and audio sockets (ACLs set at launch). It can
-therefore see the screen and use the audio server; it cannot reach
-anything on disk. The touchscreen stays live while a page is open, so a
-person at the box can follow links — physical presence, same trust as
-the buttons.
+Residual exposure, accepted: to draw on the screen and play sound the
+kiosk user is granted the session's Wayland socket and PulseAudio
+socket (ACLs set at launch). A browser fully compromised to that uid
+could therefore capture or draw on the screen and play or record
+through the audio server. It cannot reach the native PipeWire sockets
+(closed to other users at launch), cannot load PulseAudio modules
+(disabled by `setup-sandbox.sh`), and cannot reach anything on disk or
+on the LAN. A hostile page can also lie to the idle check and stay up
+until the `max_minutes` ceiling. The touchscreen stays live while a
+page is open, so a person at the box can follow links — physical
+presence, same trust as the buttons.
 
 ### Package Installation (Out-of-Band Approval)
 

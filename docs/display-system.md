@@ -926,7 +926,8 @@ Sound: the speaker HAL owns the output device exclusively, so the
 browser plays into a PipeWire null sink and `displays/web_audio.py`
 records that sink into `Speaker.feed()`. Web audio therefore shares the
 TTS path, including the AEC reference; it trails the picture by about
-the speaker's buffer depth. The view keeps one invariant: media plays
+the speaker's buffer depth. `Speaker.is_playing` stays speech-only, so
+a wake word over a video is not treated as a barge-in on TTS. The view keeps one invariant: media plays
 only while the mic's utterance pipeline is closed and BB is not
 speaking. `WakeWordHeard` pauses immediately; a 4 Hz poll of the voice
 session resumes it when the session is muted, dormant, or ended.

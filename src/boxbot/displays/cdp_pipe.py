@@ -34,7 +34,7 @@ class CDPPipe:
 
     ``write_fd`` carries commands to the browser; ``read_fd`` carries its
     replies and events. The caller owns both fds and closes them after
-    :meth:`close`.
+    :meth:`close`. ``write_fd`` should be non-blocking.
     """
 
     def __init__(self, write_fd: int, read_fd: int) -> None:
@@ -94,11 +94,23 @@ class CDPPipe:
 
         future: asyncio.Future[dict[str, Any]] = self._loop.create_future()
         self._pending[call_id] = future
+        data = json.dumps(message).encode() + b"\0"
         try:
-            os.write(self._write_fd, json.dumps(message).encode() + b"\0")
+            # The fd is non-blocking: a browser that has stopped reading
+            # must surface as an error here, never as an event loop
+            # stuck in write().
+            written = os.write(self._write_fd, data)
+        except BlockingIOError as e:
+            self._pending.pop(call_id, None)
+            raise CDPError("devtools pipe is full: browser not reading") from e
         except OSError as e:
             self._pending.pop(call_id, None)
             raise CDPError(f"devtools write failed: {e}") from e
+        if written != len(data):
+            # A torn frame would desynchronise every message after it.
+            self._pending.pop(call_id, None)
+            self.close()
+            raise CDPError("devtools write was cut short")
 
         try:
             reply = await asyncio.wait_for(future, timeout)

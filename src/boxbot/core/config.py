@@ -289,14 +289,15 @@ class WebViewConfig(BaseModel):
     # refused if the user does not exist. "none": run as the service
     # user — dev machines only, never on the box.
     privilege_drop: Literal["auto", "sudo", "none"] = "auto"
-    # Profile, runtime dir and control FIFOs. Owned by ``user``.
+    # ``home/`` (the browser's throwaway home, owned by ``user``) and
+    # ``ctl/`` (control FIFOs, owned by the service user).
     state_dir: str = "/var/lib/boxbot-kiosk"
     # The view closes itself once nothing has played and nobody has
     # touched the page for this long. ``switch_display('web', args=
     # {'idle_minutes': N})`` overrides it per page.
-    idle_minutes: float = 5
+    idle_minutes: float = Field(default=5, gt=0)
     # Hard ceiling: the view closes after this long no matter what.
-    max_minutes: int = 120
+    max_minutes: float = Field(default=120, gt=0)
     # Seconds to wait for the browser to start / a page to load.
     launch_timeout: int = 20
     load_timeout: int = 20

@@ -520,11 +520,18 @@ class TestSpeaker:
         await spk.fade_volume(0.0, 50)
         assert spk.get_volume() == pytest.approx(0.0, abs=0.02)
 
-    def test_is_playing_property(self):
+    @pytest.mark.asyncio
+    async def test_is_playing_property(self):
+        """True only for play()/play_stream() audio — they hold the
+        playback lock while it is outstanding. Live-fed audio (a web
+        video's soundtrack) is queued without it and is not "BB talking"."""
         spk = self._make_speaker()
+        spk._playback_lock = asyncio.Lock()
         assert spk.is_playing is False
         spk._queue.append(np.zeros((1024, 1), dtype=np.int16))
-        assert spk.is_playing is True
+        assert spk.is_playing is False
+        async with spk._playback_lock:
+            assert spk.is_playing is True
 
     @patch("boxbot.hardware.speaker._SD_AVAILABLE", False)
     def test_is_available_false_without_sounddevice(self):

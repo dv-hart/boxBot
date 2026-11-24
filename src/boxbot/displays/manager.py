@@ -507,16 +507,18 @@ class DisplayManager:
 
     async def _on_wake_word(self, event: Any) -> None:
         """Someone is addressing BB: silence the web view right away."""
+        # These three handlers sit on the voice pipeline's publish
+        # path. They only flip state; nothing here waits on the browser.
         if self._web_view is not None:
-            await self._web_view.pause_now()
+            self._web_view.pause_now()
 
     async def _on_agent_speaking(self, event: Any) -> None:
         if self._web_view is not None:
-            await self._web_view.set_speaking(True)
+            self._web_view.set_speaking(True)
 
     async def _on_agent_speaking_done(self, event: Any) -> None:
         if self._web_view is not None:
-            await self._web_view.set_speaking(False)
+            self._web_view.set_speaking(False)
 
     # ------------------------------------------------------------------
     # Web view (the reserved ``web`` display)
@@ -541,6 +543,20 @@ class DisplayManager:
                 speaker=self._speaker,
             )
         return self._web_view
+
+    def note_web_mic_muted(self) -> None:
+        """Record that the mic was muted because the web view started
+        playing. The voice session keeps that mute across BB's own
+        speech for as long as the view is open."""
+        if self._web_view is not None and self._web_view.is_open:
+            self._web_view.holds_mic_mute = True
+
+    def web_holds_mic_mute(self) -> bool:
+        return (
+            self._web_view is not None
+            and self._web_view.is_open
+            and self._web_view.holds_mic_mute
+        )
 
     async def web_media(self, action: str) -> dict[str, Any]:
         """Play or pause the web view's media. Raises ``WebViewError``."""
@@ -571,11 +587,12 @@ class DisplayManager:
                 list(self._rotation_displays), self._rotation_interval,
             )
             return
-        fallback = next(
-            (n for n in ("clock", "picture") if n in self._specs), None,
-        )
-        if fallback is not None:
-            await self.switch(fallback, pin=False)
+        preferred = [n for n in ("clock", "picture") if n in self._specs]
+        others = sorted(n for n in self._specs if n != WEB_DISPLAY)
+        for fallback in preferred + others:
+            if await self.switch(fallback, pin=False):
+                return
+        logger.warning("No display to fall back to after the web view closed")
 
     def get_web_state(self) -> dict[str, Any] | None:
         """What the web view is showing, or ``None`` when it is closed."""
@@ -891,6 +908,12 @@ class DisplayManager:
                 await self._leave_web()
                 self.last_switch_error = str(e)
                 return False
+            except BaseException:
+                # Cancelled mid-launch (the wake word cancels the agent's
+                # tool call). The view has closed itself; do not leave
+                # the "Opening…" card pinned over nothing.
+                await asyncio.shield(self._leave_web())
+                raise
         return True
 
     # ------------------------------------------------------------------

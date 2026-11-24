@@ -11,12 +11,15 @@ probe report media playing / a recent touch.
 
 Behaviour switches, read from the navigated URL's host:
 - ``fail.example.com``  → Page.navigate returns an errorText
-- ``crash.example.com`` → the process exits right after navigating
+- ``crash.example.com`` → the page loads, then the process dies 0.3 s later
+- ``slow.example.com``  → Page.navigate is never answered
 """
 
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 
@@ -24,7 +27,9 @@ def main() -> int:
     profile = next(
         a.split("=", 1)[1] for a in sys.argv if a.startswith("--user-data-dir=")
     )
-    log = Path(profile).parent / "commands.log"
+    # <state_dir>/home/profile → the log lives in <state_dir>, outside
+    # the home that the launch wrapper wipes.
+    log = Path(profile).parent.parent / "commands.log"
     reader = os.fdopen(3, "rb", buffering=0)
     buffer = b""
 
@@ -55,17 +60,17 @@ def main() -> int:
             elif method == "Page.navigate":
                 if "fail.example.com" in params["url"]:
                     reply["result"] = {"errorText": "net::ERR_NAME_NOT_RESOLVED"}
+                if "slow.example.com" in params["url"]:
+                    time.sleep(3600)
                 send(reply)
-                if "crash.example.com" in params["url"]:
-                    return 7
                 send({"method": "Page.loadEventFired", "sessionId": "S1",
                       "params": {"timestamp": 1}})
+                if "crash.example.com" in params["url"]:
+                    threading.Timer(0.3, os._exit, [7]).start()
                 continue
             elif method == "Runtime.evaluate":
                 expression = params["expression"]
-                if expression == "document.title":
-                    value = "Fake Page"
-                elif "__bbSeen" in expression:
+                if "__bbSeen" in expression:
                     # Tests flip these by touching files beside the log.
                     value = json.dumps({
                         "playing": (log.parent / "playing").exists(),

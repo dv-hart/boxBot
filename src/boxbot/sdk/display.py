@@ -193,7 +193,7 @@ def get_active() -> dict[str, Any]:
               "next_in_sec": null,           # ~time until next tick (None if inactive)
           },
           "web": None | {                    # set while the `web` display's
-              "url", "kind", "title",        #   browser is on screen
+              "url", "kind",                 #   browser is on screen
               "playing", "paused", "audio",
               "open_seconds", "closes_if_idle_seconds",
           },

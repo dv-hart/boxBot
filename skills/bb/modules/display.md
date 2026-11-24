@@ -49,9 +49,10 @@ switch_display("web", args={"url": "https://en.wikipedia.org/wiki/Otter"})
   listening; resumes on its own after. Opening it on a voice
   conversation mutes the mic (result `mic_muted: true`) — wake word
   re-engages. Speak *before* you open it, not after.
-- State: `bb.display.get_active()["web"]` → `{url, kind, title, playing,
+- State: `bb.display.get_active()["web"]` → `{url, kind, playing,
   paused, audio, open_seconds, closes_if_idle_seconds}` or `None`.
-  `audio: false` = showing silently (no speaker path). `screenshot()` errors while it is open —
+  `audio: false` = showing silently (no speaker path). Nothing from
+  the page itself (title, text) is ever reported. `screenshot()` errors while it is open —
   page pixels never enter your context.
 - A web image → download to workspace, show with `picture` (no browser).
 

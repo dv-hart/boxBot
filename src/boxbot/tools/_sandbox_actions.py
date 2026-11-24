@@ -2599,16 +2599,16 @@ async def _handle_display_action(
                 }
             web = mgr.get_web_state()
             if web is not None:
-                # The frame buffer is hidden behind the browser, and the
-                # browser's pixels are raw web content: they do not go
+                # The frame buffer is hidden behind the browser, and
+                # nothing the page controls — pixels, title, text — goes
                 # into the agent's context (web text reaches it only
-                # through web_search's content firewall).
+                # through web_search's content firewall). The URL is the
+                # one the agent itself supplied.
                 return {
                     "status": "error",
                     "error": (
                         "web view is on screen; its page is not captured. "
-                        f"Showing: {web['title'] or web['url']} "
-                        f"(paused={web['paused']}). "
+                        f"Showing: {web['url']} (paused={web['paused']}). "
                         "State: bb.display.get_active()['web']."
                     ),
                 }

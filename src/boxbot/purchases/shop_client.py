@@ -136,7 +136,7 @@ def _product_url(url: Any, shop: str) -> str | None:
         return None
     if parsed.scheme != "https" or (parsed.hostname or "").lower() != shop:
         return None
-    if parsed.port or parsed.username:
+    if parsed.port or parsed.username is not None or parsed.password is not None:
         return None
     return url
 
@@ -156,7 +156,8 @@ def _image_url(url: Any) -> str | None:
         parsed = urlparse(url)
         if parsed.scheme != "https" or not parsed.hostname:
             return None
-        if parsed.port or parsed.username:
+        # ``is not None``: an empty username ("https://:pw@host") is falsy.
+        if parsed.port or parsed.username is not None or parsed.password is not None:
             return None
     except ValueError:
         return None

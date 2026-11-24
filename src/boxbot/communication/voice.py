@@ -320,10 +320,12 @@ class VoiceSession:
         return self._audio_capture is not None and self._audio_capture.is_muted
 
     def _web_view_holds_mute(self) -> bool:
-        """True iff the mic is muted and a web view is on screen.
+        """True iff the mic is muted *because* a web view is playing.
 
         See ``boxbot.displays.web_view``: media plays only while the mic
-        is closed, so agent speech must not reopen it mid-video.
+        is closed, so agent speech must not reopen it mid-video. A mute
+        the agent placed for any other reason keeps its normal contract
+        (speech reopens the mic) even with a page on screen.
         """
         if not self.is_mic_muted:
             return False
@@ -331,7 +333,7 @@ class VoiceSession:
             from boxbot.displays.manager import get_display_manager
 
             mgr = get_display_manager()
-            return mgr is not None and mgr.get_web_state() is not None
+            return mgr is not None and mgr.web_holds_mic_mute()
         except Exception:
             logger.debug("web view state check failed", exc_info=True)
             return False
@@ -1222,10 +1224,10 @@ class VoiceSession:
                 # Outside ACTIVE we only put back what we took, and
                 # never unmute — muting was a deliberate agent choice.
                 #
-                # Exception: a web view the agent opened is playing. Its
-                # audio is not echo-cancelled, so reopening the mic would
-                # feed the video back as room speech — the mute placed
-                # when the view opened stays until the wake word.
+                # Exception: the mic was muted because a web view started
+                # playing. The view pauses whenever the mic is open, so
+                # reopening it here would stop the video every time BB
+                # says a word — that mute stays until the wake word.
                 if self._audio_capture is not None and self._microphone is not None:
                     if (
                         self._state is VoiceSessionState.ACTIVE

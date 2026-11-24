@@ -495,19 +495,28 @@ CHANGES+=("Installed seccomp profile")
 # The ``web`` display runs Chromium as its own system user so web
 # content never executes next to .env. boxBot reaches it only through
 # ``sudo -n -u $KIOSK_USER`` and a FIFO pair in $KIOSK_DIR/ctl. See
-# src/boxbot/displays/web_view.py.
+# src/boxbot/displays/web_view.py and docs/security.md.
 
 echo ""
 echo "--- Configuring web view user ---"
 
 KIOSK_USER="${BOXBOT_KIOSK_USER:-boxbot-kiosk}"
 KIOSK_DIR="${BOXBOT_KIOSK_DIR:-/var/lib/boxbot-kiosk}"
+KIOSK_FENCE_RULES="/etc/boxbot/kiosk-firewall.nft"
+KIOSK_FENCE_UNIT="boxbot-kiosk-firewall.service"
 KIOSK_READY=0
+NFT="$(command -v nft || true)"
+[[ -z "$NFT" && -x /usr/sbin/nft ]] && NFT=/usr/sbin/nft
 
 if ! command -v setfacl &>/dev/null; then
     echo "setfacl not found — install it (sudo apt install acl) and re-run."
     echo "The web display stays unavailable until then."
     CHANGES+=("Web view NOT configured: setfacl missing")
+elif [[ -z "$NFT" ]]; then
+    echo "nft not found — install it (sudo apt install nftables) and re-run."
+    echo "The web display stays unavailable until then: without the"
+    echo "network fence a web page could reach devices on your LAN."
+    CHANGES+=("Web view NOT configured: nftables missing")
 else
     if id "$KIOSK_USER" &>/dev/null; then
         echo "User $KIOSK_USER already exists."
@@ -521,19 +530,98 @@ else
         CHANGES+=("Created system user: $KIOSK_USER")
     fi
 
-    # State dir: profile + runtime dir (kiosk-owned, wiped per launch)
-    # and ctl/ (control FIFOs, created by $REAL_USER at each launch).
-    $SUDO mkdir -p "$KIOSK_DIR/ctl"
-    $SUDO chown "$KIOSK_USER:$KIOSK_USER" "$KIOSK_DIR" "$KIOSK_DIR/ctl"
-    $SUDO chmod 750 "$KIOSK_DIR"
-    $SUDO chmod 770 "$KIOSK_DIR/ctl"
-    # $REAL_USER may enter the state dir and manage ctl/. The default
-    # ACL hands each new FIFO to the kiosk user and nobody else.
-    $SUDO setfacl -m "u:$REAL_USER:x" "$KIOSK_DIR"
-    $SUDO setfacl -m "u:$REAL_USER:rwx" "$KIOSK_DIR/ctl"
-    $SUDO setfacl -d -m "u:$KIOSK_USER:rw,u:$REAL_USER:rw" "$KIOSK_DIR/ctl"
+    # GPU render node, so video is not decoded and composited in
+    # software. Deliberately NOT ``video``: that group owns the camera.
+    if getent group render &>/dev/null; then
+        if ! id -nG "$KIOSK_USER" | tr ' ' '\n' | grep -qx render; then
+            $SUDO usermod -aG render "$KIOSK_USER"
+            CHANGES+=("Added $KIOSK_USER to render group")
+        fi
+    fi
+
+    # Layout — nothing here is writable by the kiosk user except home/:
+    #   $KIOSK_DIR        root-owned, so the kiosk user cannot rename or
+    #                     replace ctl/ or home/ themselves
+    #   $KIOSK_DIR/ctl    owned by $REAL_USER, setgid group $KIOSK_USER,
+    #                     no group write: the kiosk user can open the
+    #                     control FIFOs boxBot creates there but cannot
+    #                     add, remove or swap entries
+    #   $KIOSK_DIR/home   the browser's home; emptied at every launch
+    $SUDO mkdir -p "$KIOSK_DIR/ctl" "$KIOSK_DIR/home"
+    $SUDO chown root:root "$KIOSK_DIR"
+    $SUDO chmod 755 "$KIOSK_DIR"
+    $SUDO setfacl -b "$KIOSK_DIR" "$KIOSK_DIR/ctl"
+    $SUDO setfacl -k "$KIOSK_DIR/ctl"
+    $SUDO chown "$REAL_USER:$KIOSK_USER" "$KIOSK_DIR/ctl"
+    $SUDO chmod 2750 "$KIOSK_DIR/ctl"
+    $SUDO chown "$KIOSK_USER:$KIOSK_USER" "$KIOSK_DIR/home"
+    $SUDO chmod 700 "$KIOSK_DIR/home"
     echo "Web view state dir: $KIOSK_DIR"
     CHANGES+=("Web view state dir ready: $KIOSK_DIR")
+
+    # Network fence. boxBot checks the first URL, but only the kernel
+    # can bound where a page goes after that (redirects, scripts,
+    # DNS names that resolve to private addresses). Everything the
+    # kiosk user sends to loopback or a private range is rejected.
+    # DNS is the one exception: the resolver is usually the router.
+    KIOSK_UID="$(id -u "$KIOSK_USER")"
+    $SUDO mkdir -p "$(dirname "$KIOSK_FENCE_RULES")"
+    $SUDO tee "$KIOSK_FENCE_RULES" >/dev/null <<NFTEOF
+# Written by boxBot scripts/setup-sandbox.sh — do not edit; re-run it.
+table inet boxbot_kiosk
+delete table inet boxbot_kiosk
+table inet boxbot_kiosk {
+    chain output {
+        type filter hook output priority filter; policy accept;
+        meta skuid != $KIOSK_UID return
+        meta l4proto { tcp, udp } th dport 53 accept
+        ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } reject with icmpx type admin-prohibited
+        ip6 daddr { ::1, ::ffff:0:0/96, fc00::/7, fe80::/10, ff00::/8 } reject with icmpx type admin-prohibited
+    }
+}
+NFTEOF
+    $SUDO tee "/etc/systemd/system/$KIOSK_FENCE_UNIT" >/dev/null <<UNITEOF
+[Unit]
+Description=boxBot web view network fence (no LAN for $KIOSK_USER)
+Before=boxbot.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$NFT -f $KIOSK_FENCE_RULES
+ExecStop=$NFT delete table inet boxbot_kiosk
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable "$KIOSK_FENCE_UNIT" &>/dev/null
+    $SUDO systemctl restart "$KIOSK_FENCE_UNIT"
+    echo "Web view network fence loaded ($KIOSK_FENCE_UNIT)."
+    CHANGES+=("Web view network fence active for uid $KIOSK_UID")
+
+    # The browser plays sound through the session's PulseAudio socket.
+    # That protocol can also load server modules — including one that
+    # opens a TCP listener. Nothing on the box needs that; turn it off.
+    PULSE_DROPIN="$HOME/.config/pipewire/pipewire-pulse.conf.d/10-boxbot-no-module-loading.conf"
+    if [[ ! -f "$PULSE_DROPIN" ]]; then
+        mkdir -p "$(dirname "$PULSE_DROPIN")"
+        cat > "$PULSE_DROPIN" <<'PULSEEOF'
+# Written by boxBot scripts/setup-sandbox.sh.
+pulse.properties = {
+    pulse.allow-module-loading = false
+}
+PULSEEOF
+        if XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart pipewire-pulse &>/dev/null; then
+            echo "PulseAudio module loading disabled."
+            CHANGES+=("PulseAudio module loading disabled for this session")
+        else
+            echo "NOTE: could not restart pipewire-pulse; the module-loading"
+            echo "      lock takes effect at next login/reboot."
+        fi
+    fi
+
     KIOSK_READY=1
 
     if ! command -v chromium &>/dev/null; then
@@ -648,28 +736,83 @@ rm -f "$SECRET_PROBE" 2>/dev/null
 verify "Sandbox CAN read a staged secrets file (group boxbot, 0640)" "should_succeed" "$rc"
 
 if [[ $KIOSK_READY -eq 1 ]]; then
+    AS_KIOSK="sudo -n -u $KIOSK_USER"
+
     # Test 12: boxBot can become the kiosk user without a password —
-    # this is how the browser is launched.
-    sudo -n -u "$KIOSK_USER" true &>/dev/null && rc=0 || rc=$?
+    # this is how the browser is launched. Every test below depends on
+    # it, so they only run (and only count) if it holds.
+    $AS_KIOSK true &>/dev/null && rc=0 || rc=$?
     verify "Can run commands as $KIOSK_USER (sudo -n)" "should_succeed" "$rc"
 
-    # Test 13: Kiosk user CANNOT read .env
-    if [[ -f "$PROJECT_DIR/.env" ]]; then
-        sudo -n -u "$KIOSK_USER" cat "$PROJECT_DIR/.env" &>/dev/null && rc=0 || rc=$?
-        verify "Kiosk user cannot read .env" "should_fail" "$rc"
+    if [[ $rc -eq 0 ]]; then
+        # Test 13: Kiosk user CANNOT read .env
+        if [[ -f "$PROJECT_DIR/.env" ]]; then
+            $AS_KIOSK cat "$PROJECT_DIR/.env" &>/dev/null && rc=0 || rc=$?
+            verify "Kiosk user cannot read .env" "should_fail" "$rc"
+        fi
+
+        # Test 14: Kiosk user CAN open a control FIFO boxBot creates
+        KIOSK_PROBE="$KIOSK_DIR/ctl/.verify_fifo"
+        rm -f "$KIOSK_PROBE" 2>/dev/null
+        mkfifo "$KIOSK_PROBE" 2>/dev/null && chmod 660 "$KIOSK_PROBE" || true
+        $AS_KIOSK test -r "$KIOSK_PROBE" -a -w "$KIOSK_PROBE" &>/dev/null && rc=0 || rc=$?
+        verify "Kiosk user CAN open boxBot's control FIFOs" "should_succeed" "$rc"
+
+        # Test 15: ...but CANNOT remove or replace them (no symlink swap)
+        $AS_KIOSK rm -f "$KIOSK_PROBE" &>/dev/null
+        [[ -p "$KIOSK_PROBE" ]] && rc=1 || rc=0
+        verify "Kiosk user cannot remove control FIFOs" "should_fail" "$rc"
+        $AS_KIOSK ln -s /etc/hostname "$KIOSK_DIR/ctl/.verify_link" &>/dev/null && rc=0 || rc=$?
+        rm -f "$KIOSK_DIR/ctl/.verify_link" 2>/dev/null
+        verify "Kiosk user cannot create entries in ctl/" "should_fail" "$rc"
+        rm -f "$KIOSK_PROBE" 2>/dev/null
+
+        # Test 16: the fence rejects loopback and the LAN gateway...
+        fence_probe() {
+            $AS_KIOSK python3 -c '
+import errno, socket, sys
+s = socket.socket(); s.settimeout(3)
+try:
+    s.connect((sys.argv[1], int(sys.argv[2])))
+except OSError as e:
+    blocked = (errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EACCES, errno.EPERM)
+    sys.exit(0 if e.errno in blocked else 3)
+sys.exit(3)' "$1" "$2" &>/dev/null
+        }
+        fence_probe 127.0.0.1 9 && rc=0 || rc=$?
+        verify "Fence blocks kiosk user from loopback" "should_succeed" "$rc"
+        GATEWAY="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+        if [[ -n "$GATEWAY" ]]; then
+            fence_probe "$GATEWAY" 80 && rc=0 || rc=$?
+            verify "Fence blocks kiosk user from the LAN gateway ($GATEWAY)" "should_succeed" "$rc"
+        fi
+
+        # Test 17: ...and still lets it reach the internet.
+        $AS_KIOSK python3 -c '
+import socket
+socket.create_connection(("1.1.1.1", 443), 6).close()' &>/dev/null && rc=0 || rc=$?
+        verify "Kiosk user CAN reach the public internet" "should_succeed" "$rc"
+
+        # Test 18: Kiosk user CANNOT use the native PipeWire socket once
+        # boxBot has closed it (done at each browser launch; checked
+        # here against the same chmod so a regression shows up now).
+        PW_SOCK="/run/user/$(id -u)/pipewire-0"
+        if [[ -S "$PW_SOCK" ]]; then
+            chmod 600 "$PW_SOCK" "$PW_SOCK-manager" 2>/dev/null || true
+            setfacl -m "u:$KIOSK_USER:x" "/run/user/$(id -u)" 2>/dev/null || true
+            $AS_KIOSK python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$PW_SOCK" &>/dev/null && rc=0 || rc=$?
+            verify "Kiosk user cannot connect to native PipeWire" "should_fail" "$rc"
+        fi
     fi
 
-    # Test 14: Kiosk user CAN open a control FIFO boxBot creates
-    KIOSK_PROBE="$KIOSK_DIR/ctl/.verify_fifo"
-    rm -f "$KIOSK_PROBE" 2>/dev/null
-    mkfifo -m 660 "$KIOSK_PROBE" 2>/dev/null || true
-    sudo -n -u "$KIOSK_USER" test -r "$KIOSK_PROBE" -a -w "$KIOSK_PROBE" &>/dev/null && rc=0 || rc=$?
-    rm -f "$KIOSK_PROBE" 2>/dev/null
-    verify "Kiosk user CAN open boxBot's control FIFOs" "should_succeed" "$rc"
-
-    # Test 15: Sandbox user CANNOT reach the browser's control FIFOs
-    $AS_SANDBOX ls "$KIOSK_DIR/ctl" &>/dev/null && rc=0 || rc=$?
-    verify "Sandbox cannot access $KIOSK_DIR/ctl" "should_fail" "$rc"
+    # Test 19: Sandbox user CANNOT reach the browser's control FIFOs.
+    # Only meaningful if the sandbox user can run commands at all.
+    if $AS_SANDBOX true &>/dev/null; then
+        $AS_SANDBOX ls "$KIOSK_DIR/ctl" &>/dev/null && rc=0 || rc=$?
+        verify "Sandbox cannot access $KIOSK_DIR/ctl" "should_fail" "$rc"
+    fi
 fi
 
 echo ""

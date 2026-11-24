@@ -547,7 +547,22 @@ class TestWebView:
         argv, _, _ = view._build_launch("boxbot_kiosk")
         assert "--mute-audio" not in argv
         assert "PULSE_SINK=boxbot_kiosk" in argv
-        assert any(a.startswith("PULSE_SERVER=unix:") for a in argv)
+        # The browser's own socket, never the session's pulse directory.
+        assert f"PULSE_SERVER=unix:{tmp_path}/kiosk/pulse/native" in argv
+
+    async def test_missing_audio_socket_means_silent_not_broken(self, tmp_path):
+        """A speaker is available but setup has not provided the
+        browser's audio socket: open muted, do not start capturing."""
+        speaker = FakeSpeaker()
+        view = WebView(
+            make_config(tmp_path), listening_probe=lambda: False, speaker=speaker,
+        )
+        try:
+            state = await view.open(normalize_url("https://example.com/"))
+            assert state["audio"] is False
+            assert not view._audio.running
+        finally:
+            await view.close()
 
     async def test_page_load_failure_closes_the_view(self, tmp_path):
         view = WebView(make_config(tmp_path), listening_probe=lambda: False)

@@ -546,14 +546,16 @@ else
     #                     no group write: the kiosk user can open the
     #                     control FIFOs boxBot creates there but cannot
     #                     add, remove or swap entries
+    #   $KIOSK_DIR/pulse  same ownership as ctl/: holds the PulseAudio
+    #                     socket pipewire-pulse opens for the browser
     #   $KIOSK_DIR/home   the browser's home; emptied at every launch
-    $SUDO mkdir -p "$KIOSK_DIR/ctl" "$KIOSK_DIR/home"
+    $SUDO mkdir -p "$KIOSK_DIR/ctl" "$KIOSK_DIR/pulse" "$KIOSK_DIR/home"
     $SUDO chown root:root "$KIOSK_DIR"
     $SUDO chmod 755 "$KIOSK_DIR"
     $SUDO setfacl -b "$KIOSK_DIR" "$KIOSK_DIR/ctl"
     $SUDO setfacl -k "$KIOSK_DIR/ctl"
-    $SUDO chown "$REAL_USER:$KIOSK_USER" "$KIOSK_DIR/ctl"
-    $SUDO chmod 2750 "$KIOSK_DIR/ctl"
+    $SUDO chown "$REAL_USER:$KIOSK_USER" "$KIOSK_DIR/ctl" "$KIOSK_DIR/pulse"
+    $SUDO chmod 2750 "$KIOSK_DIR/ctl" "$KIOSK_DIR/pulse"
     $SUDO chown "$KIOSK_USER:$KIOSK_USER" "$KIOSK_DIR/home"
     $SUDO chmod 700 "$KIOSK_DIR/home"
     echo "Web view state dir: $KIOSK_DIR"
@@ -606,26 +608,42 @@ UNITEOF
     echo "Web view network fence loaded ($KIOSK_FENCE_UNIT)."
     CHANGES+=("Web view network fence active for uid $KIOSK_UID")
 
-    # The browser plays sound through the session's PulseAudio socket.
-    # That protocol can also load server modules — including one that
-    # opens a TCP listener. Nothing on the box needs that; turn it off.
-    PULSE_DROPIN="$HOME/.config/pipewire/pipewire-pulse.conf.d/10-boxbot-no-module-loading.conf"
-    if [[ ! -f "$PULSE_DROPIN" ]]; then
-        mkdir -p "$(dirname "$PULSE_DROPIN")"
-        cat > "$PULSE_DROPIN" <<'PULSEEOF'
-# Written by boxBot scripts/setup-sandbox.sh.
+    # Sound. The browser gets its own PulseAudio socket rather than the
+    # session's: libpulse re-secures $XDG_RUNTIME_DIR/pulse to 0700 on
+    # every client connect, which silently drops any ACL granted there.
+    # pipewire-pulse is told to listen on a second socket in a directory
+    # the kiosk user enters by group, with clients on it marked
+    # restricted. Module loading (which could open a TCP listener) is
+    # turned off for everyone; nothing on the box needs it.
+    PULSE_DROPIN_DIR="$HOME/.config/pipewire/pipewire-pulse.conf.d"
+    PULSE_DROPIN="$PULSE_DROPIN_DIR/10-boxbot-web-view.conf"
+    PULSE_WANT="$(cat <<PULSEEOF
+# Written by boxBot scripts/setup-sandbox.sh — do not edit; re-run it.
 pulse.properties = {
     pulse.allow-module-loading = false
+    server.address = [
+        "unix:native"
+        { address = "unix:$KIOSK_DIR/pulse/native" client.access = "restricted" }
+    ]
 }
 PULSEEOF
-        if XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart pipewire-pulse &>/dev/null; then
-            echo "PulseAudio module loading disabled."
-            CHANGES+=("PulseAudio module loading disabled for this session")
-        else
-            echo "NOTE: could not restart pipewire-pulse; the module-loading"
-            echo "      lock takes effect at next login/reboot."
-        fi
+)"
+    mkdir -p "$PULSE_DROPIN_DIR"
+    rm -f "$PULSE_DROPIN_DIR/10-boxbot-no-module-loading.conf"
+    if [[ ! -f "$PULSE_DROPIN" || "$(cat "$PULSE_DROPIN")" != "$PULSE_WANT" ]]; then
+        printf '%s\n' "$PULSE_WANT" > "$PULSE_DROPIN"
+        CHANGES+=("Wrote PulseAudio config for the web view")
     fi
+    # Restart unconditionally: cheap, and the socket must exist now.
+    if XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart pipewire-pulse &>/dev/null; then
+        sleep 1
+        echo "Web view audio socket: $KIOSK_DIR/pulse/native"
+    else
+        echo "NOTE: could not restart pipewire-pulse; web view sound starts"
+        echo "      working at next login/reboot."
+    fi
+    # Access granted by an earlier version; the browser no longer uses it.
+    setfacl -x "u:$KIOSK_USER" "/run/user/$(id -u)/pulse" "/run/user/$(id -u)/pulse/native" &>/dev/null || true
 
     KIOSK_READY=1
 
@@ -824,7 +842,21 @@ s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$PW_SOCK" &>/dev/nul
         fi
     fi
 
-    # Test 19: Sandbox user CANNOT reach the browser's control FIFOs.
+    if $AS_KIOSK true &>/dev/null; then
+        # Test 19: Kiosk user CAN reach its own audio socket, and CANNOT
+        # reach the session's.
+        unix_connect() {
+            $AS_KIOSK python3 -c '
+import socket, sys
+socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$1" &>/dev/null
+        }
+        unix_connect "$KIOSK_DIR/pulse/native" && rc=0 || rc=$?
+        verify "Kiosk user CAN connect to the web view audio socket" "should_succeed" "$rc"
+        unix_connect "/run/user/$(id -u)/pulse/native" && rc=0 || rc=$?
+        verify "Kiosk user cannot connect to the session audio socket" "should_fail" "$rc"
+    fi
+
+    # Test 20: Sandbox user CANNOT reach the browser's control FIFOs.
     # Only meaningful if the sandbox user can run commands at all.
     if $AS_SANDBOX true &>/dev/null; then
         $AS_SANDBOX ls "$KIOSK_DIR/ctl" &>/dev/null && rc=0 || rc=$?

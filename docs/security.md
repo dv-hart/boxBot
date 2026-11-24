@@ -177,14 +177,16 @@ so it is fenced separately from both the main process and the sandbox:
   context: not pixels, not the page title. Web text reaches the agent
   only through `web_search`'s content firewall.
 
-Residual exposure, accepted: to draw on the screen and play sound the
-kiosk user is granted the session's Wayland socket and PulseAudio
-socket (ACLs set at launch). A browser fully compromised to that uid
-could therefore capture or draw on the screen and play or record
-through the audio server. It cannot reach the native PipeWire sockets
-(closed to other users at launch), cannot load PulseAudio modules
-(disabled by `setup-sandbox.sh`), and cannot reach anything on disk or
-on the LAN. A hostile page can also lie to the idle check and stay up
+Residual exposure, accepted: to draw on the screen the kiosk user is
+granted the session's Wayland socket (ACL set at launch), and for
+sound it gets a PulseAudio socket of its own, opened by pipewire-pulse
+with `client.access = "restricted"` in a directory only it and the
+service user can enter. A browser fully compromised to that uid could
+therefore capture or draw on the screen and use the audio server
+through that socket. It cannot reach the session's own PulseAudio
+socket or the native PipeWire sockets (closed to other users at
+launch), cannot load PulseAudio modules (disabled by
+`setup-sandbox.sh`), and cannot reach anything on disk or on the LAN. A hostile page can also lie to the idle check and stay up
 until the `max_minutes` ceiling. The touchscreen stays live while a
 page is open, so a person at the box can follow links — physical
 presence, same trust as the buttons.

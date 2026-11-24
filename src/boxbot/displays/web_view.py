@@ -645,10 +645,15 @@ class WebView:
             await asyncio.to_thread(self._prepare_session)
 
         # Before the browser starts, so its first sound has somewhere to go.
-        audio_sink = (
-            SINK_NAME if self._audio is not None and await self._audio.start()
-            else None
-        )
+        audio_sink = None
+        if self._audio is not None:
+            if not stat.S_ISSOCK(self._stat_mode(self._pulse_socket())):
+                logger.warning(
+                    "web view audio off: %s missing — run "
+                    "scripts/setup-sandbox.sh on the box", self._pulse_socket(),
+                )
+            elif await self._audio.start():
+                audio_sink = SINK_NAME
         argv, ctl_in, ctl_out = self._build_launch(audio_sink)
 
         self._fds = [self._open_fifo(ctl_in), self._open_fifo(ctl_out)]
@@ -750,14 +755,34 @@ class WebView:
             raise WebViewError(f"{path} is not a FIFO")
         return fd
 
-    def _session_paths(self) -> tuple[str, str, str]:
-        """``(runtime_dir, wayland_socket, pulse_socket)`` of this session."""
+    def _session_paths(self) -> tuple[str, str]:
+        """``(runtime_dir, wayland_socket)`` of this session."""
         runtime_dir = (
             os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
         ).rstrip("/")
         wayland = os.environ.get("WAYLAND_DISPLAY") or "wayland-0"
         wayland_socket = wayland if os.path.isabs(wayland) else f"{runtime_dir}/{wayland}"
-        return runtime_dir, wayland_socket, f"{runtime_dir}/pulse/native"
+        return runtime_dir, wayland_socket
+
+    def _pulse_socket(self) -> str:
+        """The PulseAudio socket set aside for the browser.
+
+        Not the session's own ``$XDG_RUNTIME_DIR/pulse/native``: every
+        libpulse client re-secures that directory to 0700 when it
+        connects, silently revoking any ACL granted on it (seen on the
+        box: the browser played, and nothing reached the sink).
+        ``setup-sandbox.sh`` has pipewire-pulse listen on this second,
+        restricted-access socket in a directory the kiosk user can
+        enter by group.
+        """
+        return str(Path(self._config.state_dir) / "pulse" / "native")
+
+    @staticmethod
+    def _stat_mode(path: str) -> int:
+        try:
+            return os.stat(path).st_mode
+        except OSError:
+            return 0
 
     def _prepare_session(self) -> None:
         """Everything that must hold before the browser may start as the
@@ -785,7 +810,7 @@ class WebView:
                     "on the box"
                 )
 
-            runtime_dir, wayland_socket, _ = self._session_paths()
+            runtime_dir, wayland_socket = self._session_paths()
             self._grant_session_access(user, runtime_dir, wayland_socket)
         except (OSError, subprocess.SubprocessError) as e:
             raise WebViewError(f"web view session setup failed: {e}") from e
@@ -840,7 +865,7 @@ class WebView:
                 "scripts/setup-sandbox.sh on the box"
             ) from e
 
-        _, wayland_socket, pulse_socket = self._session_paths()
+        _, wayland_socket = self._session_paths()
         width, height = self._size
         browser_argv = [
             browser,
@@ -880,7 +905,7 @@ class WebView:
             "LANG": os.environ.get("LANG", "C.UTF-8"),
         }
         if audio_sink is not None:
-            env["PULSE_SERVER"] = f"unix:{pulse_socket}"
+            env["PULSE_SERVER"] = f"unix:{self._pulse_socket()}"
             env["PULSE_SINK"] = audio_sink
         else:
             browser_argv.insert(-1, "--mute-audio")
@@ -896,7 +921,7 @@ class WebView:
 
     @staticmethod
     def _grant_session_access(user: str, runtime_dir: str, wayland_socket: str) -> None:
-        """Let the kiosk user reach this session's compositor and audio.
+        """Let the kiosk user reach this session's compositor.
 
         The runtime dir is a tmpfs recreated at every login, so the ACLs
         cannot be installed once by the setup script. The service user
@@ -905,35 +930,24 @@ class WebView:
         Traversing the runtime dir would also expose every world-writable
         socket in it. The native PipeWire sockets are the dangerous ones
         (full graph access: record any node, rewire anything), so they
-        are closed to other users here; the browser only ever needs the
-        PulseAudio socket.
+        are closed to other users here. Sound does not go through this
+        directory at all — see :meth:`_pulse_socket`.
         """
         for name in ("pipewire-0", "pipewire-0-manager"):
             path = f"{runtime_dir}/{name}"
             if os.path.exists(path):
                 os.chmod(path, 0o600)
 
-        grants = [
-            (runtime_dir, "x", True),
-            (wayland_socket, "rw", True),
-            (f"{runtime_dir}/pulse", "x", False),
-            (f"{runtime_dir}/pulse/native", "rw", False),
-        ]
-        for path, perms, required in grants:
+        for path, perms in ((runtime_dir, "x"), (wayland_socket, "rw")):
             if not os.path.exists(path):
-                if required:
-                    raise WebViewError(f"{path} not found — is the desktop session up?")
-                continue
+                raise WebViewError(f"{path} not found — is the desktop session up?")
             result = subprocess.run(
                 ["setfacl", "-m", f"u:{user}:{perms}", path],
                 capture_output=True, text=True, timeout=5, check=False,
             )
             if result.returncode != 0:
                 detail = result.stderr.strip() or f"exit {result.returncode}"
-                if required:
-                    raise WebViewError(f"setfacl on {path} failed: {detail}")
-                logger.warning("web view: setfacl on %s failed: %s (no audio?)",
-                               path, detail)
+                raise WebViewError(f"setfacl on {path} failed: {detail}")
 
     # ------------------------------------------------------------------
     # Navigate

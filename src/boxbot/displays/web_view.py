@@ -61,6 +61,7 @@ import shutil
 import stat
 import subprocess
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -334,7 +335,8 @@ class WebView:
         self._watch_task: asyncio.Task[None] | None = None
         self._limit_task: asyncio.Task[None] | None = None
         self._sync_task: asyncio.Task[None] | None = None
-        self._background: set[asyncio.Task[Any]] = set()
+        self._background: set[asyncio.Future[Any]] = set()
+        self._stderr_tail: deque[str] = deque(maxlen=6)
         self._closing = False
         # Bumped by every open(). A self-close (idle, time limit) decided
         # under an older epoch is stale: someone has asked for a new page
@@ -558,11 +560,7 @@ class WebView:
         if not self.is_open or paused == self._paused:
             return
         self._paused = paused
-        task = asyncio.ensure_future(
-            self._evaluate(_PAUSE_JS if paused else _RESUME_JS)
-        )
-        self._background.add(task)
-        task.add_done_callback(self._background.discard)
+        self._spawn(self._evaluate(_PAUSE_JS if paused else _RESUME_JS))
 
     async def _sync_loop(self) -> None:
         """Keep playback in step with the room, and close when idle."""
@@ -662,9 +660,11 @@ class WebView:
             *argv,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
+        self._stderr_tail.clear()
+        self._spawn(self._drain_stderr(self._proc))
         self._cdp = CDPPipe(write_fd, read_fd)
         self._cdp.start()
         self._watch_task = asyncio.create_task(
@@ -698,11 +698,39 @@ class WebView:
             await self._cdp.call("Browser.setDownloadBehavior", {"behavior": "deny"})
         except CDPError as e:
             if self._proc.returncode is not None:
+                await asyncio.sleep(0.05)   # let the last stderr lines land
+                detail = " | ".join(self._stderr_tail) or "no output"
                 raise WebViewError(
                     "browser exited during startup "
-                    f"(exit code {self._proc.returncode})"
+                    f"(exit code {self._proc.returncode}): {detail}"
                 ) from e
             raise WebViewError(f"browser did not come up: {e}") from e
+
+    def _spawn(self, coro: Awaitable[Any]) -> None:
+        """Run ``coro`` in the background, holding a reference to it."""
+        task = asyncio.ensure_future(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _drain_stderr(self, proc: asyncio.subprocess.Process) -> None:
+        """Keep the browser's last few stderr lines.
+
+        Read continuously so the pipe can never fill and stall the
+        browser. The lines are the browser's own startup diagnostics
+        ("Missing X server", sandbox errors); they go to the log and
+        into a launch-failure message, nowhere else.
+        """
+        assert proc.stderr is not None
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    return
+                text = line.decode(errors="replace").strip()
+                if text:
+                    self._stderr_tail.append(text[:300])
+        except (asyncio.CancelledError, ValueError, OSError):
+            return
 
     @staticmethod
     def _open_fifo(path: str) -> int:
@@ -821,7 +849,10 @@ class WebView:
             f"--user-data-dir={home / 'profile'}",
             f"--window-size={width},{height}",
             "--window-position=0,0",
-            "--ozone-platform-hint=auto",
+            # Explicit: the browser starts from an empty environment
+            # (env -i), so there is no XDG_SESSION_TYPE for "auto" to
+            # read and Chromium would fall back to X11 and exit.
+            "--ozone-platform=wayland",
             "--no-first-run",
             "--no-default-browser-check",
             "--noerrdialogs",

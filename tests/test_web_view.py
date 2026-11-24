@@ -593,6 +593,24 @@ class TestWebView:
         assert reasons == ["time limit reached"]
         assert not view.is_open
 
+    async def test_startup_failure_says_why(self, tmp_path):
+        """"exit code 1" alone cost a deploy cycle: the browser's own
+        last words belong in the error."""
+        browser = tmp_path / "broken-browser"
+        browser.write_text("#!/bin/sh\necho 'Missing X server or $DISPLAY' >&2\nexit 1\n")
+        browser.chmod(0o755)
+        view = WebView(make_config(tmp_path, browser=str(browser), launch_timeout=3))
+        with pytest.raises(WebViewError, match="exit code 1.*Missing X server"):
+            await view.open(normalize_url("https://example.com/"))
+        assert not view.is_open
+
+    async def test_browser_is_told_to_use_wayland(self, tmp_path):
+        """It starts from an empty environment, so it cannot detect the
+        session type itself."""
+        argv, _, _ = WebView(make_config(tmp_path))._build_launch()
+        assert "--ozone-platform=wayland" in argv
+        assert argv[:2] == ["env", "-i"]
+
     async def test_missing_browser_is_a_clear_error(self, tmp_path):
         view = WebView(make_config(tmp_path, browser="no-such-browser-xyz"))
         with pytest.raises(WebViewError, match="not installed"):

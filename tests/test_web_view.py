@@ -331,6 +331,36 @@ class TestWebView:
         assert proc.returncode is not None
         assert view._fds == [] and view._cdp is None
 
+    async def test_second_cancel_cannot_cut_the_teardown_short(self, tmp_path):
+        """Two wake words in a row: the lock must stay held until the
+        teardown is really finished, or it would go on to close the
+        browser a later open() launches."""
+        view = WebView(make_config(tmp_path), listening_probe=lambda: False)
+        real_teardown = view._teardown
+        finished: list[bool] = []
+
+        async def slow_teardown() -> None:
+            await asyncio.sleep(0.4)
+            await real_teardown()
+            finished.append(True)
+
+        view._teardown = slow_teardown  # type: ignore[method-assign]
+        task = asyncio.ensure_future(
+            view.open(normalize_url("https://slow.example.com/"))
+        )
+        await wait_for(lambda: any(
+            c["method"] == "Page.navigate" for c in commands(tmp_path)
+        ))
+        task.cancel()
+        await asyncio.sleep(0.1)
+        task.cancel()                       # lands mid-teardown
+        await asyncio.sleep(0.05)
+        assert view._lock.locked() and not finished
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished == [True]
+        assert not view._lock.locked() and not view.is_open
+
     async def test_stale_self_close_spares_a_newer_page(self, tmp_path):
         """Idle/limit decided to close, then someone opened a new page
         before the close got the lock: the new page stays."""

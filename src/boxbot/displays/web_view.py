@@ -133,6 +133,9 @@ _ACTIVITY_JS = (
 # sudo, which closes every inherited fd above stderr.
 _LAUNCH_SCRIPT = (
     'home="$1" in="$2" out="$3" && shift 3 && '
+    # A page that got as far as this uid could chmod its droppings to
+    # make the wipe fail, and with it every later launch.
+    'chmod -R u+rwX "$home" && '
     'find "$home" -mindepth 1 -delete && '
     'mkdir -p "$home/profile" "$home/run" && '
     'chmod 700 "$home/profile" "$home/run" && '
@@ -154,8 +157,9 @@ _FENCE_PROBE = (
 )
 
 # AgentSpeakingDone is published from a finally block, but a view stuck
-# paused because one event went missing would be silent forever.
-_SPEAKING_MAX_SECONDS = 120.0
+# paused because one event went missing would be silent forever. Far
+# longer than any spoken reply, so real speech never outlasts it.
+_SPEAKING_MAX_SECONDS = 600.0
 
 
 # How often the view re-checks whether the room is quiet.
@@ -412,7 +416,7 @@ class WebView:
             except BaseException as e:
                 # Including CancelledError: a half-open browser has no
                 # idle clock and no time limit, so it must not survive.
-                await asyncio.shield(self._teardown())
+                await self._teardown_uninterruptible()
                 if isinstance(e, (CDPError, OSError)):
                     raise WebViewError(f"web view failed: {e}") from e
                 raise
@@ -441,6 +445,24 @@ class WebView:
         """Close the browser. Safe to call when nothing is open."""
         async with self._lock:
             await self._teardown()
+
+    async def _teardown_uninterruptible(self) -> None:
+        """Run ``_teardown`` to completion even if this task is cancelled
+        again meanwhile. Caller holds the lock.
+
+        A bare ``shield`` is not enough: a second cancel (another wake
+        word) would end the wait, the lock would be released, and the
+        still-running teardown would then close whatever the *next*
+        ``open()`` had just launched.
+        """
+        teardown = asyncio.ensure_future(self._teardown())
+        while not teardown.done():
+            try:
+                await asyncio.shield(teardown)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                logger.exception("web view teardown failed")
 
     async def _close_self(self, epoch: int, reason: str) -> bool:
         """Close because the view decided to, unless a newer ``open()``

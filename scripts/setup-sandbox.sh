@@ -564,6 +564,9 @@ else
     # DNS names that resolve to private addresses). Everything the
     # kiosk user sends to loopback or a private range is rejected.
     # DNS is the one exception: the resolver is usually the router.
+    # IPv6 is rejected outright: on a v6 LAN every device has a global
+    # address that no fixed list of "private" prefixes covers, and the
+    # browser falls back to IPv4 at once.
     KIOSK_UID="$(id -u "$KIOSK_USER")"
     $SUDO mkdir -p "$(dirname "$KIOSK_FENCE_RULES")"
     $SUDO tee "$KIOSK_FENCE_RULES" >/dev/null <<NFTEOF
@@ -576,15 +579,17 @@ table inet boxbot_kiosk {
         meta skuid != $KIOSK_UID return
         meta l4proto { tcp, udp } th dport 53 accept
         ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } reject with icmpx type admin-prohibited
-        ip6 daddr { ::1, ::ffff:0:0/96, fc00::/7, fe80::/10, ff00::/8 } reject with icmpx type admin-prohibited
+        meta nfproto ipv6 reject with icmpx type admin-prohibited
     }
 }
 NFTEOF
     $SUDO tee "/etc/systemd/system/$KIOSK_FENCE_UNIT" >/dev/null <<UNITEOF
 [Unit]
 Description=boxBot web view network fence (no LAN for $KIOSK_USER)
-Before=boxbot.service network-pre.target
-Wants=network-pre.target
+# After nftables.service: Debian's default ruleset begins with
+# "flush ruleset", which would wipe this table if it loaded later.
+After=nftables.service
+Before=boxbot.service
 
 [Service]
 Type=oneshot
@@ -759,7 +764,8 @@ if [[ $KIOSK_READY -eq 1 ]]; then
         verify "Kiosk user CAN open boxBot's control FIFOs" "should_succeed" "$rc"
 
         # Test 15: ...but CANNOT remove or replace them (no symlink swap)
-        $AS_KIOSK rm -f "$KIOSK_PROBE" &>/dev/null
+        # (rm is expected to be refused; do not let set -e end the run.)
+        $AS_KIOSK rm -f "$KIOSK_PROBE" &>/dev/null || true
         [[ -p "$KIOSK_PROBE" ]] && rc=1 || rc=0
         verify "Kiosk user cannot remove control FIFOs" "should_fail" "$rc"
         $AS_KIOSK ln -s /etc/hostname "$KIOSK_DIR/ctl/.verify_link" &>/dev/null && rc=0 || rc=$?
@@ -771,7 +777,8 @@ if [[ $KIOSK_READY -eq 1 ]]; then
         fence_probe() {
             $AS_KIOSK python3 -c '
 import errno, socket, sys
-s = socket.socket(); s.settimeout(3)
+family = socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET
+s = socket.socket(family); s.settimeout(3)
 try:
     s.connect((sys.argv[1], int(sys.argv[2])))
 except OSError as e:
@@ -781,7 +788,9 @@ sys.exit(3)' "$1" "$2" &>/dev/null
         }
         fence_probe 127.0.0.1 9 && rc=0 || rc=$?
         verify "Fence blocks kiosk user from loopback" "should_succeed" "$rc"
-        GATEWAY="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+        fence_probe ::1 9 && rc=0 || rc=$?
+        verify "Fence blocks kiosk user from IPv6" "should_succeed" "$rc"
+        GATEWAY="$( (ip -4 route show default 2>/dev/null || true) | awk 'NR==1 {print $3}')"
         if [[ -n "$GATEWAY" ]]; then
             fence_probe "$GATEWAY" 80 && rc=0 || rc=$?
             verify "Fence blocks kiosk user from the LAN gateway ($GATEWAY)" "should_succeed" "$rc"

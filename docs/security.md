@@ -163,7 +163,7 @@ so it is fenced separately from both the main process and the sandbox:
   vet what the page does next (redirects, scripts, a DNS name that
   resolves to a private address), which is what the next item is for.
 - **Network fence (kernel):** an nftables rule keyed on the kiosk uid
-  rejects everything it sends to loopback, RFC 1918, link-local, CGNAT
+  drops everything it sends to loopback, RFC 1918, link-local, CGNAT
   and multicast ranges, and all IPv6 (LAN devices have global v6
   addresses no prefix list covers); DNS is the only exception. A
   page cannot reach the router, Home Assistant, or the box itself no

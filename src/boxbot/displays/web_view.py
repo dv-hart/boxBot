@@ -143,16 +143,17 @@ _LAUNCH_SCRIPT = (
 )
 
 # Runs as the kiosk user before every launch: is the network fence up?
-# A connect to loopback must be *rejected by the firewall* (host/net
-# unreachable, or not permitted) — "connection refused" means the packet
-# got through to a closed port, i.e. no fence.
+# The fence drops the packet in the kernel's output hook, which makes a
+# UDP send fail at once with EPERM. Without the fence the same send
+# succeeds (UDP to a closed port reports nothing). Measured on the box;
+# TCP is no use here — a dropped SYN just times out, slowly, and looks
+# like any unreachable host.
 _FENCE_PROBE = (
-    "import errno,socket,sys\n"
-    "s=socket.socket();s.settimeout(3)\n"
-    "try:\n s.connect(('127.0.0.1',9))\n"
-    "except OSError as e:\n"
-    " sys.exit(0 if e.errno in (errno.EHOSTUNREACH,errno.ENETUNREACH,"
-    "errno.EACCES,errno.EPERM) else 3)\n"
+    "import socket,sys\n"
+    "s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n"
+    "try:\n s.connect(('127.0.0.1',9));s.send(b'x')\n"
+    "except PermissionError:\n sys.exit(0)\n"
+    "except OSError:\n sys.exit(4)\n"
     "sys.exit(3)\n"
 )
 

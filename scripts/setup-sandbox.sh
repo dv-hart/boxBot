@@ -562,7 +562,7 @@ else
     # Network fence. boxBot checks the first URL, but only the kernel
     # can bound where a page goes after that (redirects, scripts,
     # DNS names that resolve to private addresses). Everything the
-    # kiosk user sends to loopback or a private range is rejected.
+    # kiosk user sends to loopback or a private range is dropped.
     # DNS is the one exception: the resolver is usually the router.
     # IPv6 is rejected outright: on a v6 LAN every device has a global
     # address that no fixed list of "private" prefixes covers, and the
@@ -578,8 +578,8 @@ table inet boxbot_kiosk {
         type filter hook output priority filter; policy accept;
         meta skuid != $KIOSK_UID return
         meta l4proto { tcp, udp } th dport 53 accept
-        ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } reject with icmpx type admin-prohibited
-        meta nfproto ipv6 reject with icmpx type admin-prohibited
+        ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } drop
+        meta nfproto ipv6 drop
     }
 }
 NFTEOF
@@ -773,17 +773,20 @@ if [[ $KIOSK_READY -eq 1 ]]; then
         verify "Kiosk user cannot create entries in ctl/" "should_fail" "$rc"
         rm -f "$KIOSK_PROBE" 2>/dev/null
 
-        # Test 16: the fence rejects loopback and the LAN gateway...
+        # Test 16: the fence drops loopback, IPv6 and the LAN gateway.
+        # Same probe boxBot runs before each launch: a UDP send the
+        # kernel refuses with EPERM. (Without the fence it succeeds.)
         fence_probe() {
             $AS_KIOSK python3 -c '
-import errno, socket, sys
+import socket, sys
 family = socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET
-s = socket.socket(family); s.settimeout(3)
+s = socket.socket(family, socket.SOCK_DGRAM)
 try:
-    s.connect((sys.argv[1], int(sys.argv[2])))
-except OSError as e:
-    blocked = (errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EACCES, errno.EPERM)
-    sys.exit(0 if e.errno in blocked else 3)
+    s.connect((sys.argv[1], int(sys.argv[2]))); s.send(b"x")
+except PermissionError:
+    sys.exit(0)
+except OSError:
+    sys.exit(4)
 sys.exit(3)' "$1" "$2" &>/dev/null
         }
         fence_probe 127.0.0.1 9 && rc=0 || rc=$?
@@ -794,6 +797,11 @@ sys.exit(3)' "$1" "$2" &>/dev/null
         if [[ -n "$GATEWAY" ]]; then
             fence_probe "$GATEWAY" 80 && rc=0 || rc=$?
             verify "Fence blocks kiosk user from the LAN gateway ($GATEWAY)" "should_succeed" "$rc"
+            # ...and TCP too: the connection must not be established.
+            $AS_KIOSK python3 -c '
+import socket, sys
+socket.create_connection((sys.argv[1], 80), 2).close()' "$GATEWAY" &>/dev/null && rc=0 || rc=$?
+            verify "Kiosk user cannot open TCP to the LAN gateway" "should_fail" "$rc"
         fi
 
         # Test 17: ...and still lets it reach the internet.

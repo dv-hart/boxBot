@@ -95,6 +95,8 @@ from boxbot.core.conversation import (
     ConversationState,
     GenerationResult,
     SpokenSegment,
+    has_speaker_label,
+    speaker_labels,
 )
 from boxbot.core.events import (
     AgentSpeaking,
@@ -356,15 +358,72 @@ def _voice_tier_thresholds() -> tuple[float, float]:
     )
 
 
+def _identity_certainty(info: dict[str, Any] | None) -> str:
+    """``confirmed`` | ``uncertain`` | ``unknown`` for one identity entry.
+
+    Reads the entry's own ``certainty`` (see ``TranscriptReady``). An
+    entry without one is the older event shape: derive it from
+    source + tier — named on an ``agent_identify`` claim or a ``high``
+    match, a candidate on any other named match. A name is required
+    for anything but ``unknown``.
+    """
+    info = info or {}
+    has_name = bool(info.get("person_name"))
+    certainty = info.get("certainty")
+    if certainty in ("confirmed", "uncertain", "unknown"):
+        return certainty if has_name else "unknown"
+    if not has_name:
+        return "unknown"
+    if (
+        info.get("source") == "agent_identify"
+        or info.get("voice_tier") == "high"
+    ):
+        return "confirmed"
+    if info.get("voice_tier") not in (None, "unknown"):
+        return "uncertain"
+    return "unknown"
+
+
+def _addressed_identity(
+    identities: dict[str, dict[str, Any]] | None,
+    transcript: str | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """(label, entry) for the speaker a voice turn is with.
+
+    A transcript can hold several lines from different speakers. The
+    turn is with the LAST line's speaker — the most recent thing said
+    to the box is what gets answered. Its ``[Label]`` keys the identity
+    block. A label the block does not describe yields ``(label, None)``
+    (nothing known — never borrow another entry). No labelled line (or
+    no transcript): the block's last entry.
+    """
+    identities = identities or {}
+    labels = speaker_labels(transcript) if transcript else []
+    if labels:
+        label = labels[-1]
+        info = identities.get(label)
+        if info is None:
+            for candidate in identities.values():
+                if (candidate or {}).get("label") == label:
+                    info = candidate
+                    break
+        return label, info
+    if not identities:
+        return None, None
+    key = next(reversed(identities))
+    info = identities[key] or {}
+    return str(info.get("label") or key), info
+
+
 def _render_identity_section(
     identities: dict[str, dict[str, Any]] | None,
 ) -> str:
-    """Render the per-session identity block for the dynamic context.
+    """Render the speaker-identity block for the dynamic context.
 
-    Surfaces voice (and, when present, visual) ReID tiers + scores per
-    speaker so the agent can pick the right behavior — address by name on
-    high, verify on medium, never guess on unknown. Cloud matching
-    yields exactly those three tiers; the legend's cut-offs are read
+    One line per speaker of the latest utterance, keyed by the exact
+    ``[Label]`` its transcript lines carry, with the certainty spelled
+    out — so the agent addresses by name when confirmed, verifies on a
+    maybe, and never guesses on unknown. The legend's cut-offs are read
     from config, not written here.
 
     Returns an empty string if there's nothing to render.
@@ -373,57 +432,58 @@ def _render_identity_section(
         return ""
 
     lines: list[str] = []
-    for display_label, info in identities.items():
+    for key, info in identities.items():
+        info = info or {}
+        label = info.get("label") or key
+        certainty = _identity_certainty(info)
+        person_name = info.get("person_name")
+        source = info.get("source", "unknown")
         voice_tier = info.get("voice_tier", "unknown")
         voice_score = info.get("voice_score")
         visual_tier = info.get("visual_tier")
         visual_score = info.get("visual_score")
-        person_name = info.get("person_name")
-        source = info.get("source", "unknown")
 
-        voice_bit = f"voice: {voice_tier}"
+        evidence: list[str] = []
+        if source in ("agent_identify", "session_anchor"):
+            evidence.append("identify_person claim")
         if isinstance(voice_score, (int, float)) and voice_tier != "unknown":
-            voice_bit += f" ({voice_score:.2f})"
-
-        visual_bit = ""
+            evidence.append(f"voice {voice_score:.2f}")
         if visual_tier:
-            visual_bit = f"   visual: {visual_tier}"
+            bit = f"visual {visual_tier}"
             if isinstance(visual_score, (int, float)) and visual_tier != "unknown":
-                visual_bit += f" ({visual_score:.2f})"
+                bit += f" {visual_score:.2f}"
+            evidence.append(bit)
+        tail = f" ({', '.join(evidence)})" if evidence else ""
 
-        # Headline per speaker
-        if person_name and source == "agent_identify":
-            headline = f"- {display_label}  → confirmed as {person_name}"
-        elif person_name and voice_tier == "high":
-            headline = f"- {display_label}  → likely {person_name}"
-        elif person_name and voice_tier != "unknown":
-            headline = f"- {display_label}  → possibly {person_name}"
+        if certainty == "confirmed":
+            lines.append(f"- [{label}] → {person_name}, confirmed{tail}")
+        elif certainty == "uncertain":
+            lines.append(
+                f"- [{label}] → maybe {person_name}, unverified{tail}"
+            )
         else:
-            headline = f"- {display_label}  → not recognized"
-
-        lines.append(headline)
-        lines.append(f"    {voice_bit}{visual_bit}")
+            lines.append(f"- [{label}] → unknown voice{tail}")
 
     try:
         confirmed, maybe = _voice_tier_thresholds()
-        high_range = f"voice ≥{confirmed:.2f}"
-        medium_range = f"{maybe:.2f}–{confirmed:.2f}"
-        unknown_range = f"<{maybe:.2f}"
+        confirmed_range = f"voice ≥{confirmed:.2f}, or"
+        maybe_range = f" ({maybe:.2f}–{confirmed:.2f})"
+        unknown_range = f" (<{maybe:.2f})"
     except Exception:
-        # No config (bare unit tests): tiers still mean what they say.
+        # No config (bare unit tests): labels still mean what they say.
         logger.debug("voice thresholds unavailable for legend", exc_info=True)
-        high_range, medium_range, unknown_range = (
-            "voice match", "weaker match", "no match",
-        )
+        confirmed_range, maybe_range, unknown_range = "voice match, or", "", ""
 
     guidance = (
         "\n"
-        "Voice tiers:\n"
-        f"- high ({high_range}) or confirmed: use their name.\n"
-        f"- medium ({medium_range}): soft-verify — \"Sarah, right?\" Then\n"
-        "  identify_person with the confirmed or corrected name.\n"
-        f"- unknown ({unknown_range}): do NOT guess a name. Serve the\n"
-        "  request; `onboarding` §1 covers asking who they are."
+        "Labels = transcript line prefixes, set per utterance:\n"
+        f"- [Name] confirmed ({confirmed_range} the voice an\n"
+        "  identify_person claim bound): use the name.\n"
+        f"- [Name?] maybe{maybe_range}: do NOT act on identity. Soft-verify\n"
+        "  if it matters (\"Sarah, right?\"); once they confirm,\n"
+        "  identify_person(name, ref=\"Name?\").\n"
+        f"- [Speaker X] unknown{unknown_range}: do NOT guess a name. Serve\n"
+        "  the request; `onboarding` §1 covers asking who they are."
     )
 
     return "## People in this session\n" + "\n".join(lines) + "\n" + guidance
@@ -3133,7 +3193,17 @@ class BoxBotAgent:
         # Who said THIS utterance — from its own identity block, not
         # from whoever perception saw most recently (an unrecognised
         # speaker used to be presented as "Speaking with: Jacob").
-        person_name = self._voice_speaker_name(event.speaker_identities)
+        # Named only when that utterance's attribution is confirmed; a
+        # maybe ("[Jacob?]") or unknown voice leaves the turn unnamed.
+        person_name = self._voice_speaker_name(
+            event.speaker_identities, transcript,
+        )
+        speaker_label, _ = _addressed_identity(
+            event.speaker_identities, transcript,
+        )
+        # No identity block at all: the name (if any) is the presence
+        # guess — fine for the header, not for picking a text recipient.
+        speaker_guessed = bool(person_name) and not event.speaker_identities
         participants: set[str] | None = {person_name} if person_name else None
         conv = await self._get_or_create_conversation(
             channel="voice",
@@ -3171,6 +3241,8 @@ class BoxBotAgent:
             speaker_name=person_name,
             source="user",
             human=True,
+            speaker_label=speaker_label,
+            speaker_guessed=speaker_guessed,
             context={
                 "voice_session_id": voice_session_id,
                 "speaker_identities": dict(event.speaker_identities or {}),
@@ -3974,9 +4046,9 @@ class BoxBotAgent:
             + "\n".join(f"- {line}" for line in context_lines)
         )
 
-        # Per-session identity block (voice + visual ReID tiers). Lets the
-        # agent decide when to address by name (high), verify (medium/low),
-        # or load the onboarding skill (unknown).
+        # Speaker-identity block for the latest utterance. Lets the
+        # agent address by name (confirmed), verify (maybe), or serve
+        # and onboard (unknown).
         identity_section = _render_identity_section(
             self._latest_speaker_identities
         )
@@ -3998,7 +4070,11 @@ class BoxBotAgent:
             channel == "voice"
             and self._latest_speaker_identities
             and any(
-                (info or {}).get("voice_tier") == "unknown"
+                # Certainty, not tier: a maybe-band match ("[Jacob?]")
+                # is someone probably known — verify, don't onboard —
+                # and a claim-confirmed speaker can carry tier
+                # "unknown" in the older event shape.
+                _identity_certainty(info) == "unknown"
                 for info in self._latest_speaker_identities.values()
             )
             and not (conv is not None and self._is_followup_turn(conv))
@@ -6331,7 +6407,8 @@ class BoxBotAgent:
         """Build a human-readable transcript from message history.
 
         Renders:
-        - User turns with speaker labels.
+        - User turns with speaker labels (their own when the turn has
+          one, else ``person_name``).
         - Assistant text blocks (private internal notes — thought + observations)
           as ``[boxBot thought]:`` / ``[boxBot observed]:`` lines so memory
           extraction sees them but downstream readers know they're private.
@@ -6349,13 +6426,21 @@ class BoxBotAgent:
         user_label = person_name or "User"
         lines: list[str] = []
 
+        def _labelled(text: str) -> str:
+            # Thread turns already carry who spoke — the sender label
+            # on text channels, per-utterance labels on voice. Label
+            # only bare text (same rule as render_thread_text).
+            if has_speaker_label(text):
+                return text
+            return f"[{user_label}]: {text}"
+
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
 
             if role == "user":
                 if isinstance(content, str):
-                    lines.append(f"[{user_label}]: {content}")
+                    lines.append(_labelled(content))
                 elif isinstance(content, list):
                     # Tool results — summarise
                     for block in content:
@@ -6372,7 +6457,7 @@ class BoxBotAgent:
                                     # final_turn nudge) — not speech.
                                     lines.append(text)
                                 elif text:
-                                    lines.append(f"[{user_label}]: {text}")
+                                    lines.append(_labelled(text))
 
             elif role == "assistant":
                 if isinstance(content, str):
@@ -6565,16 +6650,24 @@ class BoxBotAgent:
         return name
 
     def _voice_speaker_name(
-        self, identities: dict[str, dict[str, Any]] | None,
+        self,
+        identities: dict[str, dict[str, Any]] | None,
+        transcript: str | None = None,
     ) -> str | None:
-        """Name of the speaker of one voice utterance, or None.
+        """Name of the speaker a voice turn is with, or None.
 
-        Reads the utterance's own identity block. The first entry is
-        the first speaker heard; they count as recognised on a ``high``
-        voice match or an ``agent_identify`` claim — the same bar the
-        voice session uses to put a name on the transcript label. An
-        unrecognised first speaker yields None even when someone else
-        is known to be around.
+        Reads the utterance's own identity block. Named only when the
+        entry's ``certainty`` is ``confirmed`` (own cloud match, or the
+        voice an ``identify_person`` claim was bound to). ``uncertain``
+        ("[Jacob?]") and ``unknown`` ("[Speaker A]") yield None even
+        when someone else is known to be around — the transcript line
+        already shows the candidate. Entries without ``certainty``
+        (older event shape) fall back to source/tier, see
+        ``_identity_certainty``.
+
+        Several lines / speakers in one transcript: the LAST line's
+        speaker decides (``_addressed_identity``); confirmed → their
+        name, anything else → None.
 
         Empty block (identity service down, no diarization segment):
         nothing is known about this utterance, so fall back to the
@@ -6582,13 +6675,9 @@ class BoxBotAgent:
         """
         if not identities:
             return self._get_most_recent_person()
-        info = next(iter(identities.values())) or {}
-        name = info.get("person_name")
-        if name and (
-            info.get("source") == "agent_identify"
-            or info.get("voice_tier") == "high"
-        ):
-            return str(name)
+        _, info = _addressed_identity(identities, transcript)
+        if info and _identity_certainty(info) == "confirmed":
+            return str(info["person_name"])
         return None
 
     def _speaker_for_conversation(self, conv: Conversation) -> str | None:

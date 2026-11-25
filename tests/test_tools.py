@@ -257,6 +257,137 @@ class TestMessageTool:
         assert result["valid_recipients"] == ["Jacob"]
 
 
+class TestMessageCurrentSpeaker:
+    """``to="current_speaker"`` is the attributed speaker of the latest
+    human input — never an arbitrary conversation participant.
+
+    Regression: the tool took the first element of ``conv.participants``
+    (a set). Production logged "voice → Erik" while Jacob was speaking;
+    with channel="text" that would have texted the wrong person.
+    """
+
+    @staticmethod
+    def _conv(channel="voice", **kw):
+        fields = dict(
+            conversation_id="conv-1", channel=channel,
+            participants={"Erik", "Jacob"},
+            record_segment=lambda _seg: None, delivered_messages=0,
+            delivered=[], speaker_resolved=True, current_speaker=None,
+            current_speaker_label=None, speaker_guessed=False,
+        )
+        fields.update(kw)
+        conv = SimpleNamespace(**fields)
+        conv.note_delivered = lambda **k: conv.delivered.append(k)
+        return conv
+
+    async def _send(self, conv, channel, to="current_speaker"):
+        from boxbot.core.output_dispatcher import DispatchResult
+        from boxbot.tools.builtins.message import MessageTool
+
+        dispatch = AsyncMock(return_value=[DispatchResult(
+            to="x", channel="voice" if channel == "speak" else "text",
+            status="delivered",
+        )])
+        with patch(
+            "boxbot.core.output_dispatcher.dispatch_outputs", new=dispatch,
+        ), patch(
+            "boxbot.tools._tool_context.get_current_conversation",
+            return_value=conv,
+        ):
+            out = json.loads(await MessageTool().execute(
+                to=to, channel=channel, content="On it.",
+            ))
+        return out, dispatch
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel", ["speak", "text"])
+    async def test_uses_the_confirmed_speaker_not_a_participant(
+        self, mock_config, channel,
+    ):
+        conv = self._conv(current_speaker="Jacob", current_speaker_label="Jacob")
+        for _ in range(5):  # set order must not matter
+            out, dispatch = await self._send(conv, channel)
+            assert out["status"] == "delivered"
+            assert dispatch.await_args.kwargs["current_speaker"] == "Jacob"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("label", ["Speaker A", "Jacob?"])
+    async def test_text_to_unconfirmed_speaker_is_refused(
+        self, mock_config, label,
+    ):
+        conv = self._conv(current_speaker_label=label)
+        out, dispatch = await self._send(conv, "text")
+
+        assert out["status"] == "error"
+        assert label in out["message"]
+        assert "registered user's name" in out["message"]
+        dispatch.assert_not_awaited()
+        assert conv.delivered == [] and conv.delivered_messages == 0
+
+    @pytest.mark.asyncio
+    async def test_speak_to_unconfirmed_speaker_still_goes_out(
+        self, mock_config,
+    ):
+        conv = self._conv(current_speaker_label="Speaker A")
+        out, dispatch = await self._send(conv, "speak")
+
+        assert out["status"] == "delivered"
+        kwargs = dispatch.await_args.kwargs
+        assert kwargs["current_speaker"] is None
+        assert kwargs["current_speaker_label"] == "Speaker A"
+
+    @pytest.mark.asyncio
+    async def test_named_recipient_is_unaffected(self, mock_config):
+        conv = self._conv(current_speaker_label="Speaker A")
+        out, dispatch = await self._send(conv, "text", to="Jacob")
+
+        assert out["status"] == "delivered"
+        dispatch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_presence_guess_is_spoken_to_but_not_texted(
+        self, mock_config,
+    ):
+        conv = self._conv(current_speaker="Jacob", speaker_guessed=True)
+        out, dispatch = await self._send(conv, "text")
+        assert out["status"] == "error"
+        dispatch.assert_not_awaited()
+
+        out, dispatch = await self._send(conv, "speak")
+        assert out["status"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_text_channel_sender_is_the_current_speaker(
+        self, mock_config,
+    ):
+        conv = self._conv(
+            "signal", participants={"Carina"}, current_speaker="Carina",
+        )
+        out, dispatch = await self._send(conv, "text")
+        assert out["status"] == "delivered"
+        assert dispatch.await_args.kwargs["current_speaker"] == "Carina"
+
+    @pytest.mark.asyncio
+    async def test_before_any_human_input_only_a_sole_participant_counts(
+        self, mock_config,
+    ):
+        """Trigger runs: for_person is the one participant."""
+        conv = self._conv(
+            "trigger", speaker_resolved=False, participants={"Jacob"},
+        )
+        out, dispatch = await self._send(conv, "text")
+        assert out["status"] == "delivered"
+        assert dispatch.await_args.kwargs["current_speaker"] == "Jacob"
+
+        for participants in (set(), {"Erik", "Jacob"}):
+            conv = self._conv(
+                "trigger", speaker_resolved=False, participants=participants,
+            )
+            out, dispatch = await self._send(conv, "text")
+            assert out["status"] == "error"
+            dispatch.assert_not_awaited()
+
+
 class TestTriggerMessageBudget:
     """A wake cycle nobody is waiting on gets a fixed number of
     deliveries. Past it the tool refuses and points at ``final_turn``.

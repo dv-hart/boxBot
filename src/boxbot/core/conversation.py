@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -74,6 +75,23 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # State + helpers
 # ---------------------------------------------------------------------------
+
+
+# ``[Label]: text`` — how an attributed line starts. Voice transcript
+# lines carry their utterance's own label; text-channel turns carry the
+# sender's name. (``[trigger] ...`` and ``[Presence update: ...]`` have
+# no ``]:`` and do not match.)
+_SPEAKER_LABEL_RE = re.compile(r"^\[([^\[\]\n]+)\]:(?:\s|$)", re.MULTILINE)
+
+
+def has_speaker_label(text: str) -> bool:
+    """True if ``text`` starts with a ``[Label]:`` speaker prefix."""
+    return _SPEAKER_LABEL_RE.match(text.lstrip()) is not None
+
+
+def speaker_labels(text: str) -> list[str]:
+    """Labels of the ``[Label]:`` lines in ``text``, in order."""
+    return _SPEAKER_LABEL_RE.findall(text)
 
 
 class ConversationState(Enum):
@@ -213,6 +231,15 @@ class Conversation:
         # may fall back to presence.
         self.current_speaker: str | None = None
         self.speaker_resolved: bool = False
+        # Transcript label of the latest human voice utterance
+        # ("Jacob", "Jacob?", "Speaker A") — for logs and delivery
+        # records when ``current_speaker`` is None. Never a recipient.
+        self.current_speaker_label: str | None = None
+        # True when ``current_speaker`` is a presence guess (utterance
+        # carried no identity block) rather than an attribution. Good
+        # enough to address the room by name, not to pick a text
+        # recipient.
+        self.speaker_guessed: bool = False
         # Persistent conversations don't use a silence timer — the
         # agent's extraction sweep handles end-of-life. We still hold
         # the field so debug/logging code can read it; setting it to 0
@@ -398,6 +425,8 @@ class Conversation:
         source: str = "user",
         context: dict[str, Any] | None = None,
         human: bool = False,
+        speaker_label: str | None = None,
+        speaker_guessed: bool = False,
     ) -> None:
         """Accept new input and drive (or queue against) the generation cycle.
 
@@ -439,6 +468,11 @@ class Conversation:
                 from a registered number, a voice transcript). Records
                 the utterance in :attr:`exchange_log`. Machine-written
                 inputs (triggers, presence updates) leave it False.
+            speaker_label: Voice only — the transcript label of the
+                utterance's speaker ("Jacob?", "Speaker A"); kept for
+                logs when ``speaker_name`` is None.
+            speaker_guessed: ``speaker_name`` is a presence guess, not
+                an attribution of this input.
         """
         cleaned = (text or "").strip()
         if not cleaned:
@@ -463,6 +497,8 @@ class Conversation:
             if human:
                 self.current_speaker = speaker_name or None
                 self.speaker_resolved = True
+                self.current_speaker_label = speaker_label or None
+                self.speaker_guessed = bool(speaker_guessed and speaker_name)
                 self.exchange_log.append({
                     "speaker": "person",
                     "name": speaker_name,
@@ -1195,9 +1231,20 @@ class Conversation:
             # Triggers inject as a system/user-style prompt so the model
             # understands this is an automated wake, not a spoken line.
             return {"role": "user", "content": f"[trigger] {text}"}
+        if (
+            getattr(self, "channel", None) == "voice"
+            and has_speaker_label(text)
+        ):
+            # A voice transcript arrives with one ``[Label]:`` per line
+            # already — each utterance's own attribution ("Jacob",
+            # "Jacob?", "Speaker A"). Prefixing the turn's speaker on
+            # top produced "[Jacob]: [Speaker A]: ..." and
+            # "[Erik]: [Erik]: ...". Voice only: on a text channel the
+            # sender label is the authenticated identity, and a body
+            # that happens to start with "[x]: " must not replace it.
+            return {"role": "user", "content": text}
         if speaker_name:
-            # Voice attribution keeps the label format used elsewhere
-            # so the model sees consistent speaker tags.
+            # One sender label (text channels; unlabelled voice text).
             return {"role": "user", "content": f"[{speaker_name}]: {text}"}
         return {"role": "user", "content": text}
 

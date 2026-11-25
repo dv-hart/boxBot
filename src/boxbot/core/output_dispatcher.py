@@ -337,6 +337,7 @@ async def dispatch_outputs(
     conversation_id: str,
     channel_context: str,
     current_speaker: str | None,
+    current_speaker_label: str | None = None,
     segment_recorder: Optional[SegmentRecorder] = None,
 ) -> list[DispatchResult]:
     """Dispatch each output entry to its appropriate channel.
@@ -356,7 +357,12 @@ async def dispatch_outputs(
             ``_dispatch_voice``), and widens the filler filter on
             ``"trigger"`` (see ``_is_degenerate_content``).
         current_speaker: The human the agent is addressing by default.
-            Used to resolve ``to: "current_speaker"``.
+            Used to resolve ``to: "current_speaker"``. None when the
+            speaker is not a confirmed person.
+        current_speaker_label: Voice transcript label of that speaker
+            ("Speaker A", "Jacob?"). Names the target of SPEECH in logs
+            and results when ``current_speaker`` is None. Never a text
+            recipient.
         segment_recorder: If provided, called with a ``SpokenSegment``
             BEFORE each delivery so the conversation's interrupt-and-
             fold logic can see a partial record if the task is cancelled
@@ -417,7 +423,13 @@ async def dispatch_outputs(
         # Resolve "current_speaker" alias
         resolved_to = to
         if to == "current_speaker":
-            resolved_to = current_speaker or "unknown"
+            if current_speaker:
+                resolved_to = current_speaker
+            elif channel == "voice" and current_speaker_label:
+                # The room speaker reaches them whoever they are.
+                resolved_to = current_speaker_label
+            else:
+                resolved_to = "unknown"
 
         if channel == "voice":
             segment = SpokenSegment(

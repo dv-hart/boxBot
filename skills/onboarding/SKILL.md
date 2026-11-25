@@ -3,7 +3,7 @@ name: onboarding
 description: How to onboard people to boxBot — voice first-meeting (Person), first-admin bootstrap, admin-initiated user registration (User), welcoming a freshly-registered user.
 when_to_use: |
   Load when ANY of:
-    - "People in this session" shows a speaker with voice_tier "unknown" AND
+    - "People in this session" shows an unknown voice (`[Speaker X]`) AND
       that speaker is addressing you directly.
     - Pending `setup:` todos — a fresh device with no admin.
     - A registered admin asks to add a new user.
@@ -28,13 +28,13 @@ admin.
 
 ## §1 — Voice first-meeting (Person)
 
-**Applies when:** a speaker is addressing you in voice, their
-`voice_tier` is `unknown`, and you have no registered name for them.
+**Applies when:** a speaker is addressing you in voice, their lines
+are labelled `[Speaker X]` (unknown voice), and you have no registered
+name for them.
 
-**Does not apply to:** `high` matches (use their name); `medium`
-matches (soft-verify the suggested name instead); speakers talking to
-each other; anyone already introduced this session (`source:
-agent_identify` in the identity block).
+**Does not apply to:** `[Name]` lines (confirmed — use their name);
+`[Name?]` lines (maybe — soft-verify the suggested name instead, then
+`identify_person(name, ref="Name?")`); speakers talking to each other.
 
 **Their request comes first.** Not knowing a name never blocks,
 delays, or replaces what they asked for.

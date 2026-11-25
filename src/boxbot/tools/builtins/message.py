@@ -115,6 +115,31 @@ def _resolve_attachments(raw: Any) -> tuple[list[str], str | None]:
     return resolved, None
 
 
+def _resolve_current_speaker(conv: Any) -> tuple[str | None, str | None, bool]:
+    """(name, label, text_ok) for ``to="current_speaker"`` in ``conv``.
+
+    ``name`` — the person the latest human input was attributed to
+    (``Conversation.current_speaker``): the sender on a text channel,
+    the confirmed speaker of the last voice utterance; None for an
+    unknown / maybe ("Jacob?") voice. Before any human input (trigger
+    run, relay-seeded room) it is the conversation's sole participant,
+    or None when there is not exactly one — never an arbitrary pick.
+
+    ``label`` — the voice transcript label of that speaker, for logs.
+
+    ``text_ok`` — ``name`` may receive a text. False without a name,
+    and for a presence guess (utterance with no identity block).
+    """
+    label = getattr(conv, "current_speaker_label", None)
+    if getattr(conv, "speaker_resolved", False):
+        name = conv.current_speaker or None
+        guessed = bool(getattr(conv, "speaker_guessed", False))
+        return name, label, bool(name) and not guessed
+    participants = sorted(p for p in (conv.participants or ()) if p)
+    name = participants[0] if len(participants) == 1 else None
+    return name, label, bool(name)
+
+
 class MessageTool(Tool):
     """Send one message to one recipient through one channel."""
 
@@ -317,12 +342,32 @@ class MessageTool(Tool):
                 "reason_code": BUDGET_SPENT,
             })
 
-        # Resolve current_speaker from the conversation's participants.
-        # Mirrors how _publish_started picks primary_person.
-        current_speaker: str | None = None
-        for p in conv.participants:
-            current_speaker = p
-            break
+        current_speaker, speaker_label, text_ok = _resolve_current_speaker(
+            conv
+        )
+        if (
+            to == "current_speaker"
+            and dispatcher_channel == "text"
+            and not text_ok
+        ):
+            # Never guess who a text goes to. (An arbitrary element of
+            # conv.participants used to stand in here — a voice turn
+            # with Jacob could text Erik.)
+            logger.warning(
+                "Refusing text to current_speaker: speaker not confirmed "
+                "(conv=%s chan=%s label=%s)",
+                conv.conversation_id, conv.channel, speaker_label,
+            )
+            who = f" ('{speaker_label}')" if speaker_label else ""
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    "not sent: the current speaker" + who + " is not a "
+                    "confirmed person, so a text has no recipient. Set "
+                    "`to` to a registered user's name. To answer whoever "
+                    "is in the room use channel=\"speak\"."
+                ),
+            })
 
         results = await dispatch_outputs(
             [{"to": to, "channel": dispatcher_channel, "content": content,
@@ -330,6 +375,7 @@ class MessageTool(Tool):
             conversation_id=conv.conversation_id,
             channel_context=conv.channel,
             current_speaker=current_speaker,
+            current_speaker_label=speaker_label,
             segment_recorder=conv.record_segment,
         )
 

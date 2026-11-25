@@ -242,6 +242,39 @@ class TestDispatchOutputs:
         assert [r.status for r in results] == ["delivered"]
 
     @pytest.mark.asyncio
+    async def test_voice_to_unnamed_speaker_targets_their_label(
+        self, fake_voice,
+    ):
+        """An unknown / maybe speaker is still answered out loud; the
+        result names the transcript label, not a guessed person."""
+        results = await dispatch_outputs(
+            [{"to": "current_speaker", "channel": "voice", "content": "Sure."}],
+            conversation_id="c1",
+            channel_context="voice",
+            current_speaker=None,
+            current_speaker_label="Speaker A",
+        )
+        assert fake_voice.spoken == ["Sure."]
+        assert [(r.status, r.to) for r in results] == [
+            ("delivered", "Speaker A"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_text_never_goes_to_a_speaker_label(
+        self, fake_voice, fake_auth, fake_whatsapp,
+    ):
+        results = await dispatch_outputs(
+            [{"to": "current_speaker", "channel": "text", "content": "Link."}],
+            conversation_id="c1",
+            channel_context="voice",
+            current_speaker=None,
+            current_speaker_label="Jacob?",
+        )
+        assert [(r.status, r.to) for r in results] == [("dropped", "unknown")]
+        assert "registered user's name" in results[0].reason
+        assert fake_whatsapp.sent == []
+
+    @pytest.mark.asyncio
     async def test_voice_to_room(self, fake_voice):
         await dispatch_outputs(
             [{"to": "room", "channel": "voice", "content": "Timer done."}],

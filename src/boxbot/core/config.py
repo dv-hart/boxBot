@@ -676,6 +676,30 @@ class PerceptionConfig(BaseModel):
     voice_confirmed_threshold: float = 0.55
     voice_maybe_threshold: float = 0.44
     voice_cloud_topk: int = 3
+    # Session-local speaker labelling + commit gate ("store only when
+    # certain" — docs/voice-id-redesign.md, 2026-11 addendum).
+    # An identify_person claim binds to an *anchor* (the utterances that
+    # carried it), not to the anonymous bucket. A later utterance inherits
+    # the claimed name only at ≥ this top-k cosine to the anchor. Same
+    # operating point as voice_confirmed_threshold: the anchor is a small
+    # same-session cloud scored the same way.
+    voice_anchor_threshold: float = 0.55
+    # ...and is STORED to the claimed person's voiceprint only at ≥ this.
+    # Stricter than the label threshold: two people talking in one
+    # utterance score ~0.8x a clean one against either voice, which can
+    # scrape past 0.55 but not 0.60. Needs on-device calibration.
+    voice_anchor_commit_threshold: float = 0.60
+    # Grouping of unrecognized voices into Speaker A/B/… refs. Labels
+    # only — nothing commits on this — so it sits at the liberal "maybe"
+    # point, above the measured impostor EER (0.36).
+    voice_session_cluster_threshold: float = 0.44
+    voice_session_max_refs: int = 6
+    # Commit gate: a self-matched utterance is stored only if it beats the
+    # next-best enrolled person by this much (and clears confirmed).
+    voice_commit_margin: float = 0.10
+    # Utterances shorter than this never reach a voiceprint (noisy
+    # embeddings). 0 disables.
+    voice_commit_min_seconds: float = 2.0
     # Cloud-based VISUAL matching (docs/plans/person-id-overhaul.md). Mirrors
     # the voice cloud model: score = provenance-weighted mean of the top-k
     # cosine to a person's visual embedding cloud. Middle-road defaults —

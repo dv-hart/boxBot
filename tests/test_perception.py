@@ -878,15 +878,23 @@ class TestEnrollmentAdmission:
     async def test_voice_visual_agree_admits_both(self, manager, cloud_store):
         pid = await cloud_store.create_person("Jacob")
         manager.buffer_visual_embedding("Person A", _unit())
+        # Commit gate (2026-11): the claim alone no longer admits voice —
+        # the utterance must itself have matched Jacob's cloud ≥ confirmed
+        # with a margin. One that did, one with no evidence.
+        manager.buffer_voice_embedding(
+            "Person A", _unit(192),
+            best_person_id=pid, best_score=0.7, runner_up_score=0.2,
+        )
         manager.buffer_voice_embedding("Person A", _unit(192))
         manager.mark_admission(
             "Person A", person_id=pid, person_name="Jacob",
             source="voice_visual_agree", score=0.8,
         )
-        await manager.commit_session()
+        summary = await manager.commit_session()
 
         assert await cloud_store.count_visual_embeddings(pid) == 1
         assert len(await cloud_store.get_voice_embeddings(pid)) == 1
+        assert summary["Person A"]["voice_dropped_low"] == 1
 
     @pytest.mark.asyncio
     async def test_reid_only_claim_held_back(self, manager, cloud_store):

@@ -50,8 +50,10 @@ speakers talking to each other; anyone already introduced this session
    "Brian"). If they decline, drop it. Never demand a name.
 
 3. **Pin it** with `identify_person`: `name` = what they gave, trimmed
-   and naturally capitalized; `ref` = the session speaker ref (e.g.
-   `"Speaker A"`).
+   and naturally capitalized; `ref` = the bracketed label on the line
+   where they said it (e.g. `"Speaker A"`). Call it right away — it
+   binds to that label's most recent voice. Result `mixed_voices: true`
+   = more than one voice under the label: ask who is who, don't assume.
 
    | Outcome | Say |
    |---------|-----|

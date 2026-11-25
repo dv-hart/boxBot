@@ -1113,6 +1113,12 @@ class VoiceSession:
         for raw_label, display_name in label_map.items():
             self._speaker_identities.setdefault(raw_label, display_name)
         self._latest_speaker_identities = identity_block
+        # THIS utterance's attribution wins over the session-sticky map.
+        # With diarization off every utterance is SPEAKER_00, so the
+        # sticky entry (first label, or the last SpeakerIdentified name)
+        # would otherwise prefix every later line with one person's name
+        # no matter who spoke.
+        transcript_labels = {**self._speaker_identities, **label_map}
 
         self._annotate_wake_outcome(
             outcome="transcript",
@@ -1125,7 +1131,7 @@ class VoiceSession:
         transcript = self._build_attributed_transcript(
             stt_result,
             diarization_result,
-            speaker_identities=self._speaker_identities if self._speaker_identities else None,
+            speaker_identities=transcript_labels or None,
         )
 
         # Build speaker segments data for the event
@@ -1470,13 +1476,16 @@ class VoiceSession:
 
         Returns:
             (label_map, identity_block)
-            label_map: {raw_pyannote_label: display_name} — e.g. either
-                {"SPEAKER_00": "Jacob"} (high-confidence match) or
-                {"SPEAKER_00": "Speaker A"} (otherwise). Used to rewrite
+            label_map: {raw_pyannote_label: display_name} for THIS
+                utterance — {"SPEAKER_00": "Jacob"} (certain),
+                {"SPEAKER_00": "Jacob?"} (maybe band — uncertain) or
+                {"SPEAKER_00": "Speaker A"} (unknown). Used to prefix
                 the transcript.
             identity_block: {display_name: {person_id, person_name,
-                voice_tier, voice_score, source}} — the per-speaker
-                identity snapshot surfaced on TranscriptReady.
+                voice_tier, voice_score, source, certainty, label,
+                enroll_ref}} — keyed by the same label the transcript
+                uses; surfaced on TranscriptReady. See
+                ``TranscriptReady`` for field meanings.
         """
         label_map: dict[str, str] = {}
         identity_block: dict[str, dict[str, Any]] = {}
@@ -1547,73 +1556,99 @@ class VoiceSession:
                     "voice_tier": "unknown",
                     "voice_score": 0.0,
                     "source": "unknown",
+                    "certainty": "unknown",
+                    "label": display,
+                    "enroll_ref": display,
                 })
                 seen_raw.add(raw)
                 continue
             seen_raw.add(raw)
 
-            # Run voice ReID (cloud match) if we have the machinery
+            # Score against every enrolled cloud (best first). The full
+            # ranking — not just the winner — feeds the commit gate's
+            # margin check.
+            ranked: list[tuple[str, str, float]] = []
             if voice_reid is not None and voice_centroids:
                 try:
-                    match = voice_reid.match_cloud(embedding, voice_centroids)
+                    ranked = voice_reid.rank_clouds(embedding, voice_centroids)
                 except Exception:
                     logger.debug("Voice ReID match failed", exc_info=True)
-                    match = None
-            else:
-                match = None
 
-            # Decide the display label:
-            # - high-confidence match → use the matched person's name
-            # - everything else → stable anonymous "Speaker X"
-            if match is not None and match.tier == "high" and match.person_name:
-                display = match.person_name
-            else:
+            # Per-utterance attribution (enrollment.attribute_voice):
+            #   own cloud match ≥ confirmed → that person, whatever claims
+            #     exist on any bucket;
+            #   close to an identify_person anchor → the claimed name;
+            #   maybe band → "Name?" (uncertain — a candidate, not a fact);
+            #   otherwise a session-local anonymous voice (Speaker A/B/…).
+            # A claim binds to the voice that made it, never to a whole
+            # bucket — incident 2026-11-24, docs/voice-id-redesign.md.
+            # The same call buffers the embedding under the right ref and
+            # seeds that ref's claim, so the agent's identify_person ref
+            # (the transcript label) always resolves.
+            attribution: Any = None
+            if enrollment is not None:
+                try:
+                    start = getattr(seg, "start", None)
+                    end = getattr(seg, "end", None)
+                    duration = (
+                        float(end) - float(start)
+                        if isinstance(start, (int, float))
+                        and isinstance(end, (int, float))
+                        else None
+                    )
+                    attribution = enrollment.attribute_voice(
+                        embedding, ranked, duration=duration,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Voice attribution failed", exc_info=True,
+                    )
+
+            if attribution is None:
+                # Identity core unavailable — label-only.
                 display = self._assign_display_label(raw)
-            # Key enrollment by the display label, not the raw pyannote
-            # label. With diarization off every utterance is SPEAKER_00, so
-            # keying by raw would pile a whole multi-speaker session onto
-            # one ref and commit it all to one person. Keying by display
-            # buffers each identity separately (a confirmed person, or a
-            # stable anonymous "Speaker X") and makes the agent's
-            # identify_person ref match the buffer key. See
-            # docs/voice-id-redesign.md.
-            enroll_ref = display
+                label_map[raw] = display
+                identity_block.setdefault(display, {
+                    "person_id": None,
+                    "person_name": None,
+                    "voice_tier": "unknown",
+                    "voice_score": 0.0,
+                    "source": "unknown",
+                    "certainty": "unknown",
+                    "label": display,
+                    "enroll_ref": display,
+                })
+                continue
+
+            display = attribution.label
             label_map[raw] = display
 
-            # Build the identity entry for this speaker
+            # Identity entry for this utterance's speaker. ``label`` is
+            # exactly what the transcript line is prefixed with;
+            # ``certainty`` says whether ``person_name`` is a fact
+            # ("confirmed") or only a candidate ("uncertain").
             entry: dict[str, Any] = {
-                "person_id": match.person_id if match else None,
-                "person_name": match.person_name if match else None,
-                "voice_tier": match.tier if match else "unknown",
-                "voice_score": float(match.confidence) if match else 0.0,
-                "source": "voice_reid_match" if match and match.person_id else "unknown",
+                "person_id": attribution.person_id,
+                "person_name": attribution.person_name,
+                "voice_tier": attribution.voice_tier,
+                "voice_score": float(attribution.voice_score),
+                "source": attribution.source,
+                "certainty": attribution.certainty,
+                "label": display,
+                "enroll_ref": attribution.ref,
             }
-
-            # If enrollment has an agent-established claim for this ref,
-            # that trumps ReID — the agent has explicitly said who this is.
-            if enrollment is not None:
-                claim = enrollment.get_claim(enroll_ref)
-                if claim and claim.source == "agent_identify" and claim.name:
-                    # Prefer the display_label to the person's actual name
-                    # in the transcript so we don't confuse the model if it
-                    # was told "I'm Carina" but the claim is "Sarah" after a
-                    # correction. Keep identity_block pointing to the claim.
-                    display = claim.name
-                    label_map[raw] = display
-                    entry["person_id"] = claim.person_id
-                    entry["person_name"] = claim.name
-                    entry["source"] = "agent_identify"
 
             identity_block[display] = entry
 
-            # Publish SpeakerIdentified for confident attributions —
+            # Publish SpeakerIdentified for certain attributions only —
             # the single publisher for both device classes (the visual
             # pipeline's transcript handler no longer publishes it).
             # Consumers (agent recently-seen names, live speaker maps)
             # want name+label; confidence rides along.
-            if entry["person_id"] and entry["person_name"] and (
-                entry["voice_tier"] == "high"
-                or entry["source"] == "agent_identify"
+            if (
+                entry["person_id"]
+                and entry["person_name"]
+                and entry["certainty"] == "confirmed"
             ):
                 try:
                     await get_event_bus().publish(
@@ -1628,27 +1663,6 @@ class VoiceSession:
                 except Exception:
                     logger.debug(
                         "SpeakerIdentified publish failed", exc_info=True,
-                    )
-
-            # Buffer the embedding + seed the session claim so commit at
-            # session end routes correctly. Uses the raw pyannote label as
-            # the stable ref key within the session (not the display label).
-            if enrollment is not None:
-                try:
-                    enrollment.buffer_voice_embedding(enroll_ref, embedding)
-                    if match is not None:
-                        enrollment.on_reid_match(
-                            enroll_ref,
-                            "voice",
-                            person_id=match.person_id,
-                            person_name=match.person_name,
-                            tier=match.tier,
-                            score=float(match.confidence),
-                        )
-                except Exception:
-                    logger.debug(
-                        "Enrollment buffer/seed failed for ref=%s", enroll_ref,
-                        exc_info=True,
                     )
 
         return label_map, identity_block

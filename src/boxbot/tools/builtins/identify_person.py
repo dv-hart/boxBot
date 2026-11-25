@@ -36,13 +36,12 @@ logger = logging.getLogger(__name__)
 
 
 _OUTCOME_MESSAGES = {
-    "create": "Created a new person record for '{name}'. Embeddings from this session will commit to them at session end.",
-    "confirm": "Confirmed '{ref}' as '{name}'. Session embeddings will reinforce the existing record.",
-    "no_op": "Already had '{ref}' as '{name}'; nothing changed.",
+    "create": "Created a new person record for '{name}'.",
+    "confirm": "Confirmed '{ref}' as '{name}'.",
+    "no_op": "Already had '{ref}' as '{name}'.",
     "correct": (
         "Corrected: '{ref}' was previously believed to be someone else "
-        "and is now recorded as '{name}'. Embeddings from this session "
-        "commit to '{name}'."
+        "and is now recorded as '{name}'."
     ),
     "rename": (
         "Treated '{name}' as a new person for this session (prior claim "
@@ -51,6 +50,29 @@ _OUTCOME_MESSAGES = {
         "name), call identify_person with action=\"rename\" instead."
     ),
 }
+
+
+def _binding_message(name: str, ref: str, anchored: int, other_voice: int) -> str:
+    """Say what the claim was actually bound to (voice anchor)."""
+    if anchored == 0:
+        return (
+            f"No voice buffered under '{ref}' — nothing bound to a voice "
+            f"(visual embeddings, if any, still commit at session end)."
+        )
+    bound = (
+        f"Bound '{name}' to the voice of the most recent '{ref}' "
+        f"utterance ({anchored} matching utterance"
+        f"{'' if anchored == 1 else 's'}). Only lines in that voice will "
+        f"be labelled '{name}' or stored to their voiceprint."
+    )
+    if other_voice:
+        bound += (
+            f" WARNING: '{ref}' also held {other_voice} utterance"
+            f"{'' if other_voice == 1 else 's'} in a DIFFERENT voice — "
+            f"more than one person was speaking under that label. Those "
+            f"stay unlabelled. If unsure who said the name, ask again."
+        )
+    return bound
 
 
 class IdentifyPersonTool(Tool):
@@ -62,7 +84,11 @@ class IdentifyPersonTool(Tool):
         "in the [Present: ...] header.\n"
         "- identify (default): bind a session speaker to a person. First "
         "meeting (\"I'm Erik\") or correction (\"I'm actually Sarah\"). "
-        "Needs `name` + `ref`. Embeddings commit at voice-session end.\n"
+        "Needs `name` + `ref`. Binds to the VOICE of the ref's most "
+        "recent utterance, not every line under that label — call it "
+        "right after they say who they are. Later lines carry the name "
+        "only when the voice matches. Result `mixed_voices: true` = the "
+        "label held more than one voice: ask who is who, don't assume.\n"
         "- rename: change a person's name (\"call me Jake\"). Needs "
         "`name` (current) + `new_name`. Metadata only. Errors if "
         "`new_name` already belongs to someone else.\n"
@@ -94,9 +120,9 @@ class IdentifyPersonTool(Tool):
             "ref": {
                 "type": "string",
                 "description": (
-                    "identify only. Stable pyannote label from the "
-                    "speaker_identities block. Unsure: use the bracketed "
-                    "transcript label (e.g. 'Speaker A')."
+                    "identify only. The bracketed transcript label of "
+                    "the line where they identified themselves (e.g. "
+                    "'Speaker A', 'Jacob?')."
                 ),
             },
             "new_name": {
@@ -169,6 +195,10 @@ class IdentifyPersonTool(Tool):
             "Recorded '{ref}' as '{name}' (outcome: {outcome}).",
         ).format(name=name, ref=ref, outcome=outcome)
 
+        anchored = int(result.get("voice_utterances_anchored", 0) or 0)
+        other_voice = int(result.get("voice_utterances_other_voice", 0) or 0)
+        message = f"{message} {_binding_message(name, ref, anchored, other_voice)}"
+
         body = {
             "status": result.get("status", "ok"),
             "outcome": outcome,
@@ -176,6 +206,9 @@ class IdentifyPersonTool(Tool):
             "ref": ref,
             "person_id": result.get("person_id"),
             "embeddings_buffered": result.get("embeddings_buffered", 0),
+            "voice_utterances_anchored": anchored,
+            "voice_utterances_other_voice": other_voice,
+            "mixed_voices": bool(result.get("mixed_voices", False)),
             "prior_claim_name": result.get("prior_claim_name"),
             "prior_claim_source": result.get("prior_claim_source"),
             "message": message,

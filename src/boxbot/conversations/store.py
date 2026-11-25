@@ -551,6 +551,35 @@ class ConversationStore:
             await db.rollback()
             raise
 
+    async def replace_turn(
+        self,
+        conversation_id: str,
+        *,
+        before: dict[str, Any],
+        after: dict[str, Any],
+    ) -> bool:
+        """Rewrite the newest stored turn equal to ``before`` as ``after``.
+
+        For attaching turn metadata decided after the turn was written
+        (the per-turn context block the agent sends with a user turn).
+        Matched by value, newest first, because the in-memory thread
+        does not track ``turn_index``. Does not bump
+        ``last_activity_at_iso`` — nothing was said. Returns False when
+        no stored turn matches.
+        """
+        db = self._require_db()
+        cursor = await db.execute(
+            "UPDATE conversation_turns SET content_json = ? "
+            "WHERE id = ("
+            "  SELECT id FROM conversation_turns "
+            "  WHERE conversation_id = ? AND content_json = ? "
+            "  ORDER BY turn_index DESC LIMIT 1"
+            ")",
+            (json.dumps(after), conversation_id, json.dumps(before)),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
     async def append_turns(
         self,
         conversation_id: str,

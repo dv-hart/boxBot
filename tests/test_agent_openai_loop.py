@@ -197,6 +197,7 @@ async def test_generate_dispatches_to_openai_loop_for_gpt_model(
     conv.conversation_id = "conv-1"
     conv.current_context = None
     conv.injected_memories_block = ""
+    conv.annotate_last_turn = AsyncMock()
 
     async def _blocks(**kw):
         return []
@@ -305,6 +306,7 @@ async def test_generate_keeps_text_channels_on_the_anthropic_loop(
     conv.channel = "whatsapp"
     conv.conversation_id = "conv-2"
     conv.current_context = None
+    conv.annotate_last_turn = AsyncMock()
 
     async def _blocks(**kw):
         return []

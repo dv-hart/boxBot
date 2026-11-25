@@ -319,6 +319,7 @@ async def test_max_turns_follows_the_channel(
         thread=[{"role": "user", "content": "wake"}],
         current_context={},
         set_state=lambda _s: None,
+        annotate_last_turn=AsyncMock(),
     )
 
     cfg = mock_config.agent

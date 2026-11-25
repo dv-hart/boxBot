@@ -87,7 +87,10 @@ def _message_tokens(msg: Message) -> int:
     # but they DO ship, every call, so the budget that decides when to
     # compact must count them or the thread silently outgrows the real
     # wire size by ~2-4k tokens per bundle-bearing turn.
-    extra = _est_tokens(str(msg.get("prefetch_text") or ""))
+    # Same for the per-turn context block (``turn_context``).
+    extra = _est_tokens(str(msg.get("prefetch_text") or "")) + _est_tokens(
+        str(msg.get("turn_context") or "")
+    )
     content = msg.get("content")
     if isinstance(content, str):
         return extra + _est_tokens(content)

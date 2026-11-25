@@ -9,12 +9,10 @@ closes that hole with one call to the conversation's own model:
     cached thread  +  [the new utterance, the doc menus, "which?"]
 
 The prefix is what the reply call is about to send (same system
-prompt, tools, response format, bare history). The provider prompt
-cache covers it up to the previous cycle's user turn — that turn went
-out with a wire-only context prefix and is replayed bare, so the
-previous cycle's tail is read uncached here. The reply would have paid
-for that tail anyway; the gate pays it first and leaves the cache warm
-for the reply. Output is a few tokens.
+prompt, tools, response format, and the thread in wire form — every
+user turn with the context block it was first sent with). The wire
+thread is append-only, so the provider prompt cache covers all of it
+but the previous reply's last assistant turn. Output is a few tokens.
 
 The model only *names* docs. Names are validated against the menus the
 selector lanes build and the bodies are read from disk — never taken

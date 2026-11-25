@@ -582,6 +582,46 @@ class Conversation:
             "at": time.time(),
         })
 
+    async def annotate_last_turn(self, key: str, value: Any) -> None:
+        """Set (or, for a falsy ``value``, clear) turn metadata on the
+        newest thread entry and write it through to the store.
+
+        Used by the agent to record the per-turn context block it is
+        about to send with that turn, so later requests — including
+        ones after a restart — replay the turn byte-for-byte. Metadata
+        only: ``content`` is never touched, so transcript readers are
+        unaffected. A failed store write is logged and swallowed; the
+        restored thread then replays this turn without the block (one
+        prompt-cache miss, nothing worse).
+        """
+        if not self._thread:
+            return
+        turn = self._thread[-1]
+        if turn.get(key) == value or (not value and key not in turn):
+            return
+        before = dict(turn)
+        if value:
+            turn[key] = value
+        else:
+            turn.pop(key, None)
+        if self._store is None:
+            return
+        try:
+            replaced = await self._store.replace_turn(
+                self.conversation_id, before=before, after=dict(turn),
+            )
+            if not replaced:
+                logger.warning(
+                    "Conversation %s: no stored turn matched for %r "
+                    "annotation; a restored thread will replay it bare",
+                    self.conversation_id, key,
+                )
+        except Exception:
+            logger.exception(
+                "Conversation %s: failed to persist %r turn annotation",
+                self.conversation_id, key,
+            )
+
     def drain_pending_inputs(self) -> list[dict[str, Any]]:
         """Return queued utterances and clear the queue.
 

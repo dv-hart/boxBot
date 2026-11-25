@@ -5,8 +5,9 @@ Per-turn dynamics (clock, presence, counts) at position zero busted the
 provider prompt cache for the whole request on every turn (measured:
 cross-turn cache_read always 0). The system prompt is now static-only
 (persona + docs + system memory, which only changes post-conversation);
-the dynamic block rides the last user message at wire-build time and is
-never written to the thread.
+the dynamic block rides the user message it was built for, stored as
+``turn_context`` turn metadata and merged at wire-build time (see
+test_append_only_thread.py for the cross-turn property).
 """
 
 from __future__ import annotations

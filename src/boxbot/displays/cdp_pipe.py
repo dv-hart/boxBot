@@ -6,7 +6,8 @@ by a NUL byte. This is the only control channel to the kiosk browser —
 there is no debugging TCP port, so nothing listens on the network.
 
 Only what :mod:`boxbot.displays.web_view` needs: send a command, await
-its reply, and wait for a named event.
+its reply, wait for a named event, and be told about events that can
+arrive at any time (a crashed page).
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,9 @@ class CDPPipe:
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._event_waiters: list[tuple[str, str | None, asyncio.Future[dict[str, Any]]]] = []
+        self._listeners: dict[
+            str, list[Callable[[dict[str, Any], str | None], None]]
+        ] = {}
         self._buffer = bytearray()
         self._closed = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -52,6 +56,23 @@ class CDPPipe:
         self._loop = asyncio.get_running_loop()
         os.set_blocking(self._read_fd, False)
         self._loop.add_reader(self._read_fd, self._on_readable)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def on_event(
+        self,
+        method: str,
+        callback: Callable[[dict[str, Any], str | None], None],
+    ) -> None:
+        """Call ``callback(params, session_id)`` for every ``method``
+        event until the pipe closes.
+
+        The callback runs inside the pipe's read handler: it must not
+        block, and must hand anything slow to a task of its own.
+        """
+        self._listeners.setdefault(method, []).append(callback)
 
     def close(self) -> None:
         """Stop reading and fail every outstanding call."""
@@ -72,6 +93,7 @@ class CDPPipe:
             if not future.done():
                 future.set_exception(error)
         self._event_waiters.clear()
+        self._listeners.clear()
 
     async def call(
         self,
@@ -195,6 +217,14 @@ class CDPPipe:
             return
         session_id = message.get("sessionId")
         params = message.get("params")
+        for callback in list(self._listeners.get(method, ())):
+            try:
+                callback(
+                    params if isinstance(params, dict) else {},
+                    session_id if isinstance(session_id, str) else None,
+                )
+            except Exception:
+                logger.exception("devtools event handler for %s failed", method)
         for entry in list(self._event_waiters):
             want_method, want_session, future = entry
             if want_method != method or future.done():

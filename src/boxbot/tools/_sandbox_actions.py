@@ -2539,6 +2539,8 @@ async def _handle_display_action(
                 "rotation": mgr.get_rotation_state(),
                 # Non-null while the kiosk browser is on screen.
                 "web": mgr.get_web_state(),
+                # Why it last closed by itself (fixed strings), if it did.
+                "web_closed": mgr.get_web_exit(),
             }
 
         if sub == "web_media":

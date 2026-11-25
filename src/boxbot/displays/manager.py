@@ -333,6 +333,9 @@ class DisplayManager:
         self._web_view: WebView | None = None
         self._speaker: Any | None = None
         self.last_switch_error: str | None = None
+        # Why the web view last closed by itself, and when (monotonic).
+        # One of the view's fixed EXIT_* strings — never page text.
+        self._web_exit: tuple[str, float] | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -567,7 +570,11 @@ class DisplayManager:
         )
 
     async def web_media(self, action: str) -> dict[str, Any]:
-        """Play or pause the web view's media. Raises ``WebViewError``."""
+        """Play, pause or restart the web view's media.
+
+        Returns the view's state plus ``result`` (see
+        :meth:`WebView.media`). Raises ``WebViewError``.
+        """
         if self._web_view is None:
             raise WebViewError("web view is not open")
         return await self._web_view.media(action)
@@ -577,9 +584,23 @@ class DisplayManager:
             await self._web_view.close()
 
     async def _on_web_view_exit(self, reason: str) -> None:
-        """The browser went away on its own (crash, time limit)."""
+        """The view closed by itself (media ended, idle, time limit,
+        crash). ``reason`` is one of its fixed ``EXIT_*`` strings."""
         logger.info("Web view closed: %s", reason)
+        self._web_exit = (reason, time.monotonic())
         await self._leave_web()
+
+    def get_web_exit(self) -> dict[str, Any] | None:
+        """Why the web view last closed by itself, or ``None``.
+
+        Agent-facing ("the video went away — why?"). Cleared when a
+        page is opened again; a switch away by the agent is not
+        recorded, since the agent knows about that one.
+        """
+        if self._web_exit is None:
+            return None
+        reason, when = self._web_exit
+        return {"reason": reason, "seconds_ago": int(time.monotonic() - when)}
 
     async def _leave_web(self) -> None:
         """Put a normal display back after the web view is gone.
@@ -907,6 +928,7 @@ class DisplayManager:
         )
 
         if web_target is not None:
+            self._web_exit = None
             try:
                 await self._get_web_view().open(
                     web_target, idle_minutes=args.get("idle_minutes"),

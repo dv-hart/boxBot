@@ -126,6 +126,8 @@ display:
     idle_minutes: 5
     # Hard ceiling: closes after this many minutes no matter what
     max_minutes: 120
+    # Closes this many seconds after its video ended (0 = wait for idle)
+    close_after_end_seconds: 10
 
 # ── Hardware ──────────────────────────────────────────────────────────
 hardware:

@@ -173,9 +173,17 @@ so it is fenced separately from both the main process and the sandbox:
 - **Throwaway home:** the kiosk user's whole home — profile,
   certificate store, caches — is emptied at every launch. Downloads
   and popup windows are denied.
-- **Not an agent input:** nothing the page controls reaches the agent's
-  context: not pixels, not the page title. Web text reaches the agent
-  only through `web_search`'s content firewall.
+- **Not an agent input:** no text or pixels the page controls reach
+  the agent's context: not the page title, not a URL the page went
+  to, not an error message. Web text reaches the agent only through
+  `web_search`'s content firewall. The one thing read from the page
+  is playback state, as a fixed set of typed values — position and
+  duration in seconds, and ended / stalled / playing booleans — each
+  type-checked and clamped in the main process (`parse_probe`). A
+  hostile page can make them wrong; it cannot put words in them. The
+  reason a view closed by itself is one of a fixed list of strings
+  written by boxBot. Browser stderr goes to the log file only
+  (control characters stripped, rate-limited), never to the agent.
 
 Residual exposure, accepted: to draw on the screen the kiosk user is
 granted the session's Wayland socket (ACL set at launch), and for
@@ -187,7 +195,8 @@ through that socket. It cannot reach the session's own PulseAudio
 socket or the native PipeWire sockets (closed to other users at
 launch), cannot load PulseAudio modules (disabled by
 `setup-sandbox.sh`), and cannot reach anything on disk or on the LAN. A hostile page can also lie to the idle check and stay up
-until the `max_minutes` ceiling. The touchscreen stays live while a
+until the `max_minutes` ceiling, or claim its media ended and be
+closed early. The touchscreen stays live while a
 page is open, so a person at the box can follow links — physical
 presence, same trust as the buttons.
 

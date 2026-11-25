@@ -77,7 +77,11 @@ CREATE TABLE IF NOT EXISTS purchases (
     order_ref TEXT,
     note TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    subtotal_cents INTEGER,
+    shipping_cents INTEGER,
+    tax_cents INTEGER,
+    delivery TEXT
 )""",
     """\
 CREATE TABLE IF NOT EXISTS decisions (
@@ -112,7 +116,16 @@ _COLUMNS = (
     "id, shop, items, total_cents, currency, reason, requested_by, "
     "channel_key, status, "
     "decision, checkout_id, continue_url, complete_after, link_sent_at, "
-    "order_ref, note, created_at, updated_at"
+    "order_ref, note, created_at, updated_at, "
+    "subtotal_cents, shipping_cents, tax_cents, delivery"
+)
+# Columns added after the first release: (name, type). Added to an
+# existing database on open; old rows read back NULL.
+_ADDED_COLUMNS = (
+    ("subtotal_cents", "INTEGER"),
+    ("shipping_cents", "INTEGER"),
+    ("tax_cents", "INTEGER"),
+    ("delivery", "TEXT"),
 )
 _UPDATABLE = {
     "decision", "complete_after", "link_sent_at", "order_ref", "note",
@@ -164,6 +177,11 @@ class PurchaseStore:
         await db.execute("PRAGMA journal_mode=WAL")
         for statement in _DDL:
             await db.execute(statement)
+        cursor = await db.execute("PRAGMA table_info(purchases)")
+        have = {row[1] for row in await cursor.fetchall()}
+        for name, kind in _ADDED_COLUMNS:
+            if name not in have:
+                await db.execute(f"ALTER TABLE purchases ADD COLUMN {name} {kind}")
         await db.commit()
         return db
 
@@ -185,6 +203,10 @@ class PurchaseStore:
         channel_key: str | None,
         checkout_id: str,
         continue_url: str | None,
+        subtotal_cents: int | None = None,
+        shipping_cents: int | None = None,
+        tax_cents: int | None = None,
+        delivery: str | None = None,
     ) -> dict[str, Any]:
         """Insert a purchase in ``review`` and return its row."""
         purchase_id = uuid.uuid4().hex[:8]
@@ -194,11 +216,12 @@ class PurchaseStore:
             await db.execute(
                 "INSERT INTO purchases (id, shop, items, total_cents, "
                 "currency, reason, requested_by, channel_key, status, "
-                "checkout_id, continue_url, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'review', ?, ?, ?, ?)",
+                "checkout_id, continue_url, created_at, updated_at, "
+                "subtotal_cents, shipping_cents, tax_cents, delivery) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'review', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (purchase_id, shop, json.dumps(items), total_cents, currency,
                  reason, requested_by, channel_key, checkout_id, continue_url,
-                 now, now),
+                 now, now, subtotal_cents, shipping_cents, tax_cents, delivery),
             )
             await db.commit()
         finally:
@@ -383,6 +406,18 @@ class PurchaseStore:
             return cursor.rowcount > 0
         finally:
             await db.close()
+
+    async def approved_shops(self) -> list[str]:
+        """Every store an admin has approved by text, oldest first."""
+        db = await self._get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT shop FROM approved_shops ORDER BY approved_at, shop"
+            )
+            rows = await cursor.fetchall()
+        finally:
+            await db.close()
+        return [r[0] for r in rows]
 
     async def shop_approved(self, shop: str) -> bool:
         """True when an admin has approved ``shop`` by text command."""

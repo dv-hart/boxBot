@@ -204,6 +204,69 @@ closed early. The touchscreen stays live while a
 page is open, so a person at the box can follow links — physical
 presence, same trust as the buttons.
 
+### Shopping (ids, cart, product images)
+
+The agent shops by short result id. `bb.purchases.find` returns slim
+rows (`a1`, `a2`, …); the full catalogue row — variant id, store
+domain, price, image URL — stays in a main-process cache keyed by the
+conversation the tool call runs in. The key comes from the tool call's
+own context, never from the sandbox payload, so an id from one
+conversation resolves to nothing in another. Sessions expire after 30
+idle minutes, are capped in number and size, and are dropped when the
+conversation ends. Product cards and the cart screen are drawn from
+that cache: display args carry only an opaque view token, so a title,
+price, or seller on the screen is the catalogue's, not something the
+model typed. Merchant text is sanitised (`plain_text`) and rendered as
+text only.
+
+- **Cart and quote move nothing.** A cart is in-memory state. A quote
+  builds a store checkout to read shipping and tax — only at an
+  *approved* store, because creating a checkout hands the store the
+  household's saved contact and delivery details. It creates no
+  purchase record and texts nobody. Hourly ceiling
+  (`purchases.max_quotes_per_hour`).
+- **One definition of "approved".** `purchases.allowed_shops` (config)
+  ∪ stores an admin approved by their own `allow shop <domain>` text.
+  Every path — quote, send, product-feed read — asks the same function.
+  Automatic purchase stays narrower: config list only.
+- **Send is propose.** `send` runs each store's lines through the
+  existing proposal path (rules, isolated checker, review link or veto
+  window). Money still moves only by an admin paying from the link on
+  their phone, or inside the configured automatic limits.
+- **Voice identity authorises nothing.** The requester recorded and
+  shown to admins is the transport ("voice at the box, 4:12 pm"), never
+  a name the perception stack attached to a voice.
+- **Cancel is open to anyone, and local.** Cancelling stops boxBot's
+  own purchase row; the store's checkout link stays payable. So when a
+  purchase whose link was sent is cancelled by the agent, the main
+  process texts the admins a fixed-format "ignore the earlier link"
+  notice (rate-limited). A changed cart sent again cancels the earlier
+  purchase and its one text is marked as a replacement.
+
+**Product images — a deliberate, bounded exception.** The main process
+otherwise never fetches a URL that came from a store. To put a photo
+on a product card it does, in `boxbot.purchases.images`, under these
+limits:
+
+| Bound | Value |
+|---|---|
+| Switch | `purchases.fetch_product_images` (default true) |
+| Scheme / port | `https`, default port, no userinfo |
+| Host | exact match on `purchases.product_image_hosts` (default `["cdn.shopify.com"]`) |
+| Redirects | not followed automatically; ≤2 hops, each re-checked against the same host list |
+| Content type | `image/jpeg`, `image/png`, `image/webp` |
+| Size | 3 MB, enforced while streaming (and on `Content-Length`) |
+| Time | 8 s per request, 12 s per screen |
+| Decode | pixel-count cap, then re-encoded to a plain JPEG (≤800 px) — metadata dropped; the raw download is never written to disk |
+| Request | GET, no cookies, no credentials, fixed User-Agent |
+| Source of the URL | the main-process result cache only — the sandbox cannot name a URL to fetch |
+| Cache | `data/workspace/tmp/product-images/<sha256>.jpg`, pruned to 300 files |
+
+The product blocks open image files from that cache directory only.
+Cards render at once with a placeholder and redraw when the image
+lands. Residual risk: an image decoder bug reachable from an
+allow-listed CDN; widening the host list widens that surface.
+
 ### Package Installation (Out-of-Band Approval)
 
 The sandbox **cannot install packages**. This is enforced by four

@@ -1244,10 +1244,10 @@ class PurchasesConfig(BaseModel):
 
     # Store domains the household trusts, e.g.
     # ["www.cottagedoorpress.com"]. Only these qualify for automatic
-    # purchase and for ``bb.purchases.store_products``. A checkout at
-    # any other store needs an admin's "allow shop <domain>" text first
-    # (good for 24 hours, review only). Bare hostnames; anything else
-    # is rejected at load.
+    # purchase. A checkout (or product-feed read) at any other store
+    # needs an admin's "allow shop <domain>" text first (review only,
+    # until "block shop <domain>"). Bare hostnames; anything else is
+    # rejected at load.
     allowed_shops: list[str] = Field(default_factory=list)
 
     # Automatic purchase only when the request arrived as a text from a
@@ -1268,12 +1268,34 @@ class PurchasesConfig(BaseModel):
     # Ceiling on checkouts the agent may build per rolling 24 hours.
     max_proposals_per_day: int = Field(default=20, ge=1)
 
+    # Ceiling on cart quotes per rolling hour. A quote builds a real
+    # store checkout (to read shipping and tax) but creates no purchase
+    # and texts nobody.
+    max_quotes_per_hour: int = Field(default=12, ge=1)
+
+    # Product photos on the screen. When true the main process downloads
+    # a catalogue image itself — the one place it fetches a URL that
+    # came from a store — from these hosts only, https only, size- and
+    # type-capped, re-encoded before use. See docs/security.md.
+    fetch_product_images: bool = True
+    product_image_hosts: list[str] = Field(
+        default_factory=lambda: ["cdn.shopify.com"]
+    )
+
     # Policy checker. None = ``models.large``.
     checker_model: str | None = None
     # Kept short: the sandbox script that proposed is still waiting
     # (see ``sandbox.timeout``). A timeout is a fail-closed "error".
     checker_timeout_seconds: float = 20.0
     policy: str = DEFAULT_PURCHASE_POLICY
+
+    @field_validator("product_image_hosts")
+    @classmethod
+    def _normalise_image_hosts(cls, value: list[str]) -> list[str]:
+        from boxbot.purchases.shop_client import normalize_shop
+
+        # Bare hostnames only: no wildcard, scheme, port or path.
+        return [normalize_shop(v) for v in value if v and v.strip()]
 
     @field_validator("allowed_shops")
     @classmethod

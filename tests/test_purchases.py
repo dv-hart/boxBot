@@ -126,7 +126,8 @@ class FakeShop:
 
     async def search(self, query, *, max_price_cents=None, limit=8):
         return [{"title": "Goldilocks", "variant_id": VARIANT, "shop": SHOP,
-                 "price_cents": 699}]
+                 "seller": "Example Books", "price_cents": 699,
+                 "currency": "USD", "available": True}]
 
     async def create_checkout(self, shop, items):
         if self.create_error:
@@ -266,8 +267,12 @@ async def env(purchases_cfg, store, shop, outbound, admins, monkeypatch):
     service._armed.clear()
     service._recent_proposals.clear()
     for window in (service._search_rate, service._feed_rate, service._propose_attempts,
-                   service._resend_rate, service._shop_ask_rate):
+                   service._resend_rate, service._shop_ask_rate,
+                   service._cancel_notice_rate):
         window._events.clear()
+    from boxbot.purchases import shopping
+
+    shopping.reset()
     service._shop_asked.clear()
     _skipped[0] = 0.0
     monkeypatch.setattr(service, "_sleep", _no_wait)
@@ -1279,7 +1284,8 @@ class TestProposeReview:
         assert "on your allow-list" in text
         (stated,) = [l for l in lines if l.startswith("boxBot's stated reason")]
         assert "(unverified)" in stated and stated.count('"') == 2
-        assert len(lines) == 8          # nothing injected a line of its own
+        assert len(lines) == 9          # nothing injected a line of its own
+        assert "Subtotal: $6.99 · Shipping: $5.99" in lines
         # What the agent gets back is sanitised the same way.
         assert "evil.example" not in json.dumps(out)
 
@@ -1303,7 +1309,9 @@ class TestProposeReview:
         with patch.object(checker, "check", side_effect=AssertionError):
             with pytest.raises(service.PurchaseError) as e:
                 await service.propose("evil-store.example.net", ITEMS, "why", conv=conv)
-        assert "not a store this household has approved" in str(e.value)
+        assert "is not approved yet" in str(e.value)
+        assert "an admin can approve it by text" in str(e.value)
+        assert "allowed_shops" not in str(e.value)     # not a config message
         assert env.shop.created == []           # nothing shared with the store
         assert await env.store.list() == []
         (text,) = texts(env.out)                # the admins are asked, once
@@ -1747,8 +1755,8 @@ class TestProposeAuto:
         hold_timers(self.monkeypatch)
         original = service._announce_auto
 
-        async def announce_then_sweep(row, facts, cfg):
-            sent = await original(row, facts, cfg)
+        async def announce_then_sweep(row, facts, cfg, replaces=None):
+            sent = await original(row, facts, cfg, replaces)
             await service._sweep_scheduled()      # lands in the gap
             await service.recover()
             return sent
@@ -2689,21 +2697,33 @@ class TestActionHandler:
         assert (await self.dispatch("list", purchase_status="paid"))["status"] == "error"
         assert (await self.dispatch("pay", id="x"))["status"] == "error"
 
-    async def test_store_products_requires_allow_listed_shop(self, env):
+    async def test_store_products_requires_an_approved_shop(self, env, monkeypatch):
+        fetched = []
+
+        async def feed(host, **kw):
+            fetched.append(host)
+            return []
+
+        monkeypatch.setattr(service, "fetch_store_products", feed)
         out = await self.dispatch("store_products", shop="evil.example.org")
-        assert out["status"] == "error" and "allowed_shops" in out["message"]
-        # An admin's text approval does not open the product feed either.
+        assert out["status"] == "error" and "not approved yet" in out["message"]
+        assert "allowed_shops" not in out["message"]
+        assert fetched == []                    # an agent-named host is not fetched
+        # One definition of "approved": the admin's text opens the feed too.
         await env.store.approve_shop("evil.example.org", approved_by=ADMIN)
         out = await self.dispatch("store_products", shop="evil.example.org")
-        assert out["status"] == "error"
+        assert out["status"] == "ok" and fetched == ["evil.example.org"]
 
     async def test_cancel_and_search(self, env):
         with patch.object(checker, "check", side_effect=deny):
             out = await self.dispatch("propose", shop=SHOP, items=ITEMS, reason="why")
         cancelled = await self.dispatch("cancel", id=out["purchase"]["id"])
         assert cancelled["purchase"]["status"] == "cancelled"
-        found = await self.dispatch("search", query="goldilocks")
-        assert found["results"][0]["variant_id"] == VARIANT
+        found = await self.dispatch("find", query="goldilocks")
+        assert found["results"][0]["id"] == "a1"
+        assert "variant_id" not in found["results"][0]
+        # The raw catalogue search is no longer an action.
+        assert (await self.dispatch("search", query="x"))["status"] == "error"
 
     async def test_no_action_can_approve_or_complete(self, env):
         with patch.object(checker, "check", side_effect=deny):
@@ -2861,8 +2881,10 @@ class TestSdk:
     def test_surface(self):
         import boxbot.sdk as bb
 
-        assert {"search", "store_products", "propose", "status", "list",
-                "send_review_link", "cancel"} <= set(dir(bb.purchases))
+        assert {"find", "show", "stores", "store_products", "cart", "send",
+                "propose", "status", "list", "send_review_link",
+                "cancel"} <= set(dir(bb.purchases))
+        assert not hasattr(bb.purchases, "search")
         for forbidden in ("approve", "complete", "pay", "checkout_url"):
             assert not hasattr(bb.purchases, forbidden)
 

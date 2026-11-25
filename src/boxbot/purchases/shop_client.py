@@ -145,8 +145,9 @@ def _image_url(url: Any) -> str | None:
     """A product image URL, only if it is a plain https URL.
 
     Unlike the product page it need not be on the store's own host —
-    Shopify serves images from its CDN. The sandbox downloads it; the
-    main process never fetches it.
+    Shopify serves images from its CDN. Nothing here fetches it. The
+    one place the main process does is :mod:`boxbot.purchases.images`,
+    which accepts only allow-listed image hosts (see docs/security.md).
     """
     if not isinstance(url, str) or len(url) > 600:
         return None
@@ -296,10 +297,71 @@ def summarize_search(result: dict[str, Any], limit: int) -> list[dict[str, Any]]
                 ),
                 "rating": _number(rating.get("value")),
                 "rating_count": _int(rating.get("count")),
+                # What tells same-titled offers apart (edition, format,
+                # size). Main-process only: bb.purchases.find turns
+                # these into the row's ``variant`` label.
+                "product_title": plain_text(product.get("title")),
+                "options": _option_values(variant, product),
+                "handle": _handle(product.get("handle"), variant.get("url")),
             })
             if len(rows) >= limit:
                 return rows
     return rows
+
+
+_NO_OPTION = ("", "default", "default title", "title")
+
+
+def _option_values(variant: dict[str, Any], product: dict[str, Any]) -> list[str]:
+    """Up to three short option values ("Hardcover", "2019") for a variant.
+
+    Reads whichever of the usual shapes the catalogue sends: a list of
+    ``{"name", "value"}`` objects or bare strings under ``options`` /
+    ``selected_options``, or a ``{name: value}`` mapping. Falls back to
+    the variant's own title when it differs from the product's.
+    """
+    values: list[str] = []
+    for key in ("selected_options", "options"):
+        raw = variant.get(key)
+        entries: list[Any]
+        if isinstance(raw, dict):
+            entries = list(raw.values())
+        elif isinstance(raw, list):
+            entries = raw
+        else:
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                entry = entry.get("value") or entry.get("label")
+            if isinstance(entry, (str, int)) and not isinstance(entry, bool):
+                text = plain_text(entry, 30)
+                if text.lower() not in _NO_OPTION and text not in values:
+                    values.append(text)
+        if values:
+            break
+    if not values:
+        own = variant.get("title")
+        if isinstance(own, str) and own.strip() and own != product.get("title"):
+            text = plain_text(own, 30)
+            # A long variant title is the product's title again, not an option.
+            if text.lower() not in _NO_OPTION and len(own.strip()) <= 30:
+                values.append(text)
+    return values[:3]
+
+
+def _handle(handle: Any, url: Any) -> str | None:
+    """The product handle — given, or the ``/products/<handle>`` URL segment."""
+    if isinstance(handle, str) and _HANDLE_RE.match(handle):
+        return handle[:80]
+    if isinstance(url, str) and len(url) <= 600:
+        try:
+            path = urlparse(url).path
+        except ValueError:
+            return None
+        m = re.search(r"/products/([A-Za-z0-9][A-Za-z0-9_-]{0,200})/?$", path)
+        if m is not None:
+            return m.group(1).lower()[:80]
+    return None
 
 
 def _int(value: Any) -> int | None:
@@ -356,6 +418,7 @@ def summarize_checkout(checkout: dict[str, Any]) -> dict[str, Any]:
             })
     totals = checkout.get("totals")
     return {
+        "delivery": selected_delivery(checkout),
         "checkout_id": checkout.get("id"),
         "status": checkout.get("status") if isinstance(checkout.get("status"), str) else None,
         "currency": _currency(checkout.get("currency")),
@@ -385,6 +448,92 @@ def summarize_checkout(checkout: dict[str, Any]) -> dict[str, Any]:
             for m in _dicts(checkout.get("messages"))
         ],
         "expires_at": checkout.get("expires_at"),
+    }
+
+
+def _option_amount(option: dict[str, Any]) -> int | None:
+    for key in ("amount", "price", "total"):
+        value = option.get(key)
+        if isinstance(value, dict):
+            value = value.get("amount")
+        if _int(value) is not None:
+            return value
+    return _amount(option.get("totals"), "total")
+
+
+def selected_delivery(checkout: dict[str, Any]) -> dict[str, Any] | None:
+    """``{"name", "cents"}`` of the delivery option the store selected.
+
+    Read from ``fulfillment.methods[].groups[].options[]`` (or options
+    directly on a method), picking the option named by
+    ``selected_option_id`` or flagged ``selected``. None when the
+    checkout exposes no options or more than one is selected — nothing
+    is guessed, and nothing here ever *chooses* an option.
+    """
+    chosen: list[dict[str, Any]] = []
+    for method in _dicts(_dict(checkout.get("fulfillment")).get("methods")):
+        for holder in [method, *_dicts(method.get("groups"))]:
+            wanted = holder.get("selected_option_id")
+            for option in _dicts(holder.get("options")):
+                if option.get("selected") is True or (
+                    isinstance(wanted, str) and option.get("id") == wanted
+                ):
+                    chosen.append(option)
+    if len(chosen) != 1:
+        return None
+    option = chosen[0]
+    name = plain_text(
+        option.get("title") or option.get("name") or option.get("label"), 40,
+    )
+    return {"name": name or None, "cents": _option_amount(option)}
+
+
+_SHAPE_KEEP = ("type", "amount", "quantity", "selected", "price", "total")
+
+
+def _shape(value: Any, depth: int = 0) -> Any:
+    """``value`` with every free-text string replaced by ``"str"``.
+
+    Keeps the structure, numbers, booleans and ``type`` tags; drops
+    addresses entirely. For logging what a checkout's fulfilment block
+    looks like without logging who or where it ships to.
+    """
+    if depth > 6:
+        return "…"
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in list(value.items())[:30]:
+            if key == "destinations":
+                out[key] = len(item) if isinstance(item, list) else "?"
+            elif key in _SHAPE_KEEP and isinstance(item, (str, int, bool)):
+                out[str(key)] = item if not isinstance(item, str) else item[:40]
+            else:
+                out[str(key)[:40]] = _shape(item, depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_shape(item, depth + 1) for item in value[:10]]
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    return "str"
+
+
+def checkout_cost_shape(checkout: dict[str, Any]) -> dict[str, Any]:
+    """The cost-bearing structure of a checkout, safe to log.
+
+    Every ``totals`` entry (type + amount only) and the shape of the
+    ``fulfillment`` block — option counts, amounts, which is selected —
+    with all free text and every destination removed.
+    """
+    totals = [
+        {"type": plain_text(t.get("type"), 40), "amount": _int(t.get("amount"))}
+        for t in _dicts(checkout.get("totals"))
+    ]
+    return {
+        "totals": totals,
+        "fulfillment": _shape(_dict(checkout.get("fulfillment"))),
+        "line_count": len(_dicts(checkout.get("line_items"))),
     }
 
 
@@ -629,10 +778,10 @@ async def fetch_store_products(
 ) -> list[dict[str, Any]]:
     """Read ``https://<shop>/products.json`` and return matching variants.
 
-    The caller must have checked ``shop`` against the configured
-    allow-list first — this fetches a host named by the agent, so the
-    allow-list is what keeps it from being pointed at arbitrary
-    addresses. Redirects are not followed.
+    The caller must have checked that ``shop`` is an approved store
+    first (``service.shop_is_approved``) — this fetches a host named by
+    the agent, so that check is what keeps it from being pointed at
+    arbitrary addresses. Redirects are not followed.
     """
     host = normalize_shop(shop)
     terms = [t for t in (query or "").lower().split() if t]
@@ -709,6 +858,14 @@ async def fetch_store_products(
                         ),
                         "rating": None,
                         "rating_count": None,
+                        "product_title": plain_text(product.get("title")),
+                        "options": _option_values(
+                            {"title": variant.get("title"), "options": [
+                                variant.get(k) for k in ("option1", "option2", "option3")
+                            ]},
+                            product,
+                        ),
+                        "handle": _handle(product.get("handle"), None),
                     })
                     if len(rows) >= limit:
                         return rows

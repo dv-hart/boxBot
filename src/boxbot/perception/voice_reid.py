@@ -152,6 +152,38 @@ class VoiceReID:
             tier=tier,
         )
 
+    def rank_clouds(
+        self,
+        embedding: np.ndarray,
+        clouds: dict[str, tuple[str, np.ndarray]],
+        *,
+        topk: int | None = None,
+    ) -> list[tuple[str, str, float]]:
+        """Score an embedding against every person's cloud.
+
+        Returns ``[(person_id, name, score), ...]`` sorted best-first,
+        where score is the mean top-k cosine to that person's stored
+        embeddings (same scoring as :meth:`match_cloud`). Callers that
+        need the runner-up — the enrollment commit gate's margin check —
+        use this instead of ``match_cloud``.
+        """
+        k_top = topk if topk is not None else self._topk
+        if not clouds:
+            return []
+        q = embedding.astype(np.float32).flatten()
+        qn = np.linalg.norm(q)
+        if qn > 0:
+            q = q / qn
+        ranked: list[tuple[str, str, float]] = []
+        for person_id, (name, vecs) in clouds.items():
+            if vecs.size == 0:
+                continue
+            sims = vecs @ q
+            k = min(k_top, sims.shape[0])
+            ranked.append((person_id, name, float(np.sort(sims)[-k:].mean())))
+        ranked.sort(key=lambda r: r[2], reverse=True)
+        return ranked
+
     def match_cloud(
         self,
         embedding: np.ndarray,
@@ -181,29 +213,12 @@ class VoiceReID:
         maybe = maybe_threshold if maybe_threshold is not None else self._maybe
         k_top = topk if topk is not None else self._topk
 
-        if not clouds:
+        ranked = self.rank_clouds(embedding, clouds, topk=k_top)
+        if not ranked:
             return MatchResult(
                 person_id=None, person_name=None, confidence=0.0, tier="unknown",
             )
-
-        q = embedding.astype(np.float32).flatten()
-        qn = np.linalg.norm(q)
-        if qn > 0:
-            q = q / qn
-
-        best_id: str | None = None
-        best_name: str | None = None
-        best_score = -1.0
-        for person_id, (name, vecs) in clouds.items():
-            if vecs.size == 0:
-                continue
-            sims = vecs @ q
-            k = min(k_top, sims.shape[0])
-            score = float(np.sort(sims)[-k:].mean())
-            if score > best_score:
-                best_score = score
-                best_id = person_id
-                best_name = name
+        best_id, best_name, best_score = ranked[0]
 
         if best_score >= confirmed:
             tier = "high"

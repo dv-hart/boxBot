@@ -472,8 +472,12 @@ Example: Jacob introduces his friend → agent calls
 
 On receiving an `identify_person` call:
 
-1. Look up all voice embeddings tagged with `ref` from the current
-   diarization session
+1. Bind the claim to a **voice anchor**, not to `ref`'s whole bucket:
+   the most recent utterance under `ref` (the one that carried the
+   self-identification) plus buffered utterances that agree with it.
+   Only anchor-consistent utterances take the name or reach the
+   voiceprint — see "Speaker labelling and the commit gate" in
+   [voice-id-redesign.md](voice-id-redesign.md)
 2. Look up all visual crops associated with `ref` via DOA/timing from
    the current session
 3. If `name` exists: merge into existing person's cloud

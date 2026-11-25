@@ -318,20 +318,29 @@ class ConversationInterruptRequested(Event):
 class TranscriptReady(Event):
     """Attributed transcript ready for agent processing.
 
-    ``speaker_identities`` is a per-session identity block the agent can
-    use to decide how to address each speaker. Keys are the display
-    labels used in ``transcript`` (e.g. ``"Speaker A"``). Each value is
-    a dict with the best current belief about that label::
+    ``speaker_identities`` describes who spoke THIS utterance (built
+    fresh per utterance — not a session roster). Keys are exactly the
+    labels used in ``transcript`` (``"Jacob"``, ``"Jacob?"``,
+    ``"Speaker A"``). Each value::
 
         {
-          "person_id": "p_...",     # or None if unrecognized
-          "person_name": "Jacob",   # or None if unrecognized
-          "voice_tier": "medium",   # high / medium / low / unknown
-          "voice_score": 0.74,      # raw cosine similarity
+          "label": "Jacob?",        # == the key == the transcript prefix
+          "certainty": "uncertain", # confirmed | uncertain | unknown
+          "person_id": "p_...",     # None if unknown; a CANDIDATE when
+          "person_name": "Jacob",   #   certainty == "uncertain"
+          "voice_tier": "medium",   # high / medium / unknown
+          "voice_score": 0.48,      # the cosine that decided it
+          "source": "voice_reid_match" | "agent_identify"
+                    | "session_anchor" | "unknown",
+          "enroll_ref": "Jacob?",   # ref identify_person binds (the
+                                    #   label also resolves)
           "visual_tier": "high",    # optional; present if fusion available
           "visual_score": 0.88,
-          "source": "voice_reid_match" | "agent_identify" | "unknown"
         }
+
+    Treat ``person_name`` as the speaker only when ``certainty ==
+    "confirmed"`` (own cloud match ≥ confirmed, or the utterance matches
+    the voice an ``identify_person`` claim was bound to).
 
     Source: Communication (VoiceSession)
     Consumers: Agent

@@ -130,3 +130,65 @@ live) so recognition works from boot. Creates the Carina person record.
 | `communication/voice.py`, `diarization.py` | Stage 2: whole-utterance, no pipeline |
 | `perception/fusion.py`, `pipeline.py` | Stage 2: per-utterance tiers/attribution |
 | `perception/enrollment.py` | Stage 2: intrinsic gates, per-utterance admission |
+
+## Speaker labelling and the commit gate (2026-11)
+
+**Incident (2026-11-24).** Adult (enrolled, scores 0.45–0.66) and child
+(unenrolled) talked in one session. Every utterance under 0.55 fell into
+one anonymous ref, "Speaker A". The child said his name; the agent
+pinned it on "Speaker A". From then on every sub-threshold utterance —
+the adult's included — was shown as the child, and at session end all
+17 embeddings in the bucket went into the child's voiceprint.
+
+**Rule: tag and store only what is certain.** A claim binds to a voice,
+never to a bucket.
+
+Per utterance (`EnrollmentManager.attribute_voice`, a few dot products):
+
+| # | Condition | Label | certainty |
+|---|---|---|---|
+| 1 | own cloud match ≥ confirmed (0.55) | `Jacob` | confirmed |
+| 2 | ≥ `voice_anchor_threshold` (0.55) to an `identify_person` anchor, and no other enrolled person scores as high | claimed name | confirmed |
+| 3 | best of (cloud, anchor) ≥ maybe (0.44) | `Jacob?` | uncertain |
+| 4 | otherwise: nearest anonymous session voice ≥ `voice_session_cluster_threshold` (0.44), else a new one (≤ `voice_session_max_refs`, then `Speaker ?`) | `Speaker A` / `B` / … | unknown |
+
+Rule 1 beats rule 2 ("own match beats claim"), with one exception: an
+anchor the agent made by *correcting away from* person X may outrank a
+confirmed match to X when the utterance is at least as close to the
+anchor ("I'm actually Sarah").
+
+**Anchor.** On `identify_person(name, ref)`: seed = the most recent
+utterance under `ref`; other buffered utterances join if cosine to the
+seed ≥ `voice_anchor_threshold`. At most top-k vectors, fixed for the
+session (no growth → plain mean, no best-of-many bias, no drift).
+Utterances under the ref with cosine < cluster threshold to the seed are
+reported to the agent as a different voice (`mixed_voices`).
+
+**Commit gate** (`commit_session`). A voice embedding is written only if
+
+- (a) it carried an agent claim and is anchor-consistent at
+  `voice_anchor_commit_threshold` (0.60 — stricter than the label
+  threshold; overlapped speech scores ~0.8× a clean utterance), or
+- (b) its ref has an admitting claim (`agent_identify` /
+  `voice_visual_agree`) for P and the utterance itself matched P's
+  existing cloud ≥ confirmed with ≥ `voice_commit_margin` (0.10) over the
+  next-best person (provenance `voice_reid`, not an anchor);
+
+and its duration ≥ `voice_commit_min_seconds` (2.0). Everything else is
+dropped; counts are logged per ref (committed / dropped-low /
+dropped-conflict / dropped-short). Passive voice matches still never
+grow a cloud.
+
+**Traceability.** `voice_embeddings.session_id` records the committing
+voice session. `CloudStore.delete_voice_embeddings_by_session(person_id,
+session_id)` undoes one session and recomputes the centroid (Python API
+only).
+
+**Eviction.** `_enforce_voice_cap` used to ignore provenance, and its age
+term pushed the oldest `agent_identify` rows out first. Non-anchor rows
+now go before any anchor row; anchors are still evictable so the cap
+holds.
+
+**Not built.** The intrinsic single-speaker check (sub-window agreement)
+above. All thresholds here are reasoned from the 2026-05 measurements,
+not calibrated on overlapped or child speech.

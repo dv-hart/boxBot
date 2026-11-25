@@ -46,6 +46,9 @@ PROVENANCE_AGENT_IDENTIFY = "agent_identify"
 PROVENANCE_VOICE_VISUAL_AGREE = "voice_visual_agree"
 PROVENANCE_VOICE_DOA = "voice_doa"
 PROVENANCE_VISUAL_REID = "visual_reid"
+# Voice utterance that independently matched the person's existing cloud
+# (≥ confirmed, clear margin) under an admitting claim. Not an anchor.
+PROVENANCE_VOICE_REID = "voice_reid"
 PROVENANCE_CONTEXT_INFERRED = "context_inferred"
 PROVENANCE_SEED = "seed"
 PROVENANCE_LEGACY = "legacy"
@@ -57,6 +60,7 @@ PROVENANCE_WEIGHT: dict[str, float] = {
     PROVENANCE_VOICE_VISUAL_AGREE: 2.0,
     PROVENANCE_VOICE_DOA: 1.5,
     PROVENANCE_VISUAL_REID: 1.0,
+    PROVENANCE_VOICE_REID: 1.0,
     PROVENANCE_CONTEXT_INFERRED: 0.7,
     PROVENANCE_SEED: 1.0,
     PROVENANCE_LEGACY: 1.0,
@@ -112,6 +116,9 @@ CREATE TABLE IF NOT EXISTS voice_embeddings (
     provenance TEXT NOT NULL DEFAULT 'legacy',
     confidence REAL,
     source_ref TEXT,
+    -- Voice session that committed this row (NULL for seed/legacy rows).
+    -- Lets a bad session be undone: delete_voice_embeddings_by_session.
+    session_id TEXT,
     FOREIGN KEY (person_id) REFERENCES persons(id)
 );
 
@@ -235,6 +242,14 @@ class CloudStore:
                     f"ALTER TABLE {table} ADD COLUMN source_ref TEXT"
                 )
                 logger.info("Migrated %s: added source_ref column", table)
+        # session_id on voice_embeddings (traceability / per-session undo).
+        async with db.execute("PRAGMA table_info(voice_embeddings)") as cur:
+            voice_cols = {row[1] async for row in cur}
+        if "session_id" not in voice_cols:
+            await db.execute(
+                "ALTER TABLE voice_embeddings ADD COLUMN session_id TEXT"
+            )
+            logger.info("Migrated voice_embeddings: added session_id column")
         # reconciled flag on visual_embeddings (NEXT-C dream judge watermark).
         async with db.execute("PRAGMA table_info(visual_embeddings)") as cur:
             vcols = {row[1] async for row in cur}
@@ -765,6 +780,7 @@ class CloudStore:
         provenance: str = PROVENANCE_LEGACY,
         confidence: float | None = None,
         source_ref: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         """Add a voice embedding to a person's cloud.
 
@@ -778,6 +794,8 @@ class CloudStore:
         Args:
             person_id: Person to add embedding for.
             embedding: Float32 embedding vector (typically 192-dim).
+            session_id: Voice session that produced it, if any — the key
+                :meth:`delete_voice_embeddings_by_session` undoes by.
 
         Returns:
             The generated embedding ID, or ``""`` if the embedding was
@@ -800,10 +818,10 @@ class CloudStore:
         await db.execute(
             """INSERT INTO voice_embeddings
                (id, person_id, embedding, timestamp,
-                provenance, confidence, source_ref)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                provenance, confidence, source_ref, session_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (emb_id, person_id, _embedding_to_blob(embedding), now,
-             provenance, confidence, source_ref),
+             provenance, confidence, source_ref, session_id),
         )
         await db.commit()
 
@@ -831,6 +849,47 @@ class CloudStore:
             async for row in cursor:
                 results.append((row["id"], _blob_to_embedding(row["embedding"])))
         return results
+
+    async def delete_voice_embeddings_by_session(
+        self, person_id: str, session_id: str
+    ) -> int:
+        """Undo one voice session's contribution to a person's voiceprint.
+
+        Deletes every voice embedding of ``person_id`` that was committed
+        by ``session_id`` and recomputes (or clears) the voice centroid.
+        Rows from other sessions, and seed/legacy rows with no session id,
+        are untouched. Python API only — not exposed to the agent.
+
+        Returns:
+            Number of rows deleted.
+        """
+        if not session_id:
+            raise ValueError("session_id is required")
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "DELETE FROM voice_embeddings "
+            "WHERE person_id = ? AND session_id = ?",
+            (person_id, session_id),
+        )
+        deleted = cursor.rowcount or 0
+        await db.commit()
+        if deleted:
+            centroid = await self.recompute_voice_centroid(person_id)
+            if centroid is None:
+                # Nothing usable left — don't leave a centroid built
+                # from the rows we just removed.
+                await db.execute(
+                    "UPDATE centroids SET voice_centroid = NULL, "
+                    "updated_at = ? WHERE person_id = ?",
+                    (_now_iso(), person_id),
+                )
+                await db.commit()
+            logger.info(
+                "Deleted %d voice embedding(s) for person %s from "
+                "session %s",
+                deleted, person_id, session_id,
+            )
+        return deleted
 
     # ------------------------------------------------------------------
     # Centroids
@@ -1103,21 +1162,31 @@ class CloudStore:
 
         Distance is to *neighbours*, never the global mean, so genuine
         per-condition modes are preserved.
+
+        Anchor provenances (agent-confirmed) are evicted last: every
+        non-anchor row goes before any anchor row.
         """
         db = self._ensure_db()
         # Ordered oldest-first so index → age rank.
-        embeddings = await self.get_voice_embeddings(person_id)
-        count = len(embeddings)
+        async with db.execute(
+            """SELECT id, embedding, provenance FROM voice_embeddings
+               WHERE person_id = ? ORDER BY timestamp ASC""",
+            (person_id,),
+        ) as cursor:
+            rows = [
+                (r["id"], _blob_to_embedding(r["embedding"]), r["provenance"])
+                async for r in cursor
+            ]
+        count = len(rows)
         if count <= max_count:
             return
 
         low_water = max(1, int(max_count * 0.9))
         n_evict = count - low_water
 
-        ids = [eid for eid, _ in embeddings]
         vecs = np.stack([
             (e / np.linalg.norm(e)) if np.linalg.norm(e) > 0 else e
-            for _, e in embeddings
+            for _, e, _ in rows
         ]).astype(np.float32)
 
         sims = vecs @ vecs.T
@@ -1132,8 +1201,18 @@ class CloudStore:
         age = 1.0 - np.arange(count) / max(1, count - 1)
         evict_score = isolation + 0.3 * age
 
-        evict_idx = np.argsort(evict_score)[-n_evict:]
-        ids_to_delete = [ids[i] for i in evict_idx]
+        # Non-anchor rows go first; agent-confirmed anchors are shed only
+        # when nothing else is left to evict (the age term used to push
+        # the oldest anchors out ahead of newer auto-admitted rows).
+        # Unlike the visual cap, anchors are not immune: agent_identify is
+        # the main voice admission path, so immunity would void the cap.
+        order = sorted(
+            range(count),
+            key=lambda i: (
+                rows[i][2] in ANCHOR_PROVENANCES, -float(evict_score[i]),
+            ),
+        )
+        ids_to_delete = [rows[i][0] for i in order[:n_evict]]
         for emb_id in ids_to_delete:
             await db.execute(
                 "DELETE FROM voice_embeddings WHERE id = ?", (emb_id,)

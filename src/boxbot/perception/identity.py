@@ -142,7 +142,9 @@ class IdentityService:
         if self._enrollment is None:
             return
         try:
-            summary = await self._enrollment.commit_session()
+            summary = await self._enrollment.commit_session(
+                session_id=event.conversation_id or None
+            )
             logger.info(
                 "Enrollment committed on voice session end (%s): %s",
                 event.conversation_id, summary,

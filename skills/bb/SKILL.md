@@ -36,7 +36,7 @@ handle the failure instead of dying.
 | `bb.skill` | Create skills at runtime. | Teach yourself a recurring workflow. |
 | `bb.integrations` | List, call, create, update, delete data pipes. Read execution logs. | Fresh external data, or registering a new pipe. **Calendar lives here**: `bb.integrations.get("calendar", action="list_upcoming_events", …)`. |
 | `bb.packages` | Request a PyPI install; check status. | A script needs a new dependency. Admin approves out-of-band; returns `pending` immediately — check back with `status()`. |
-| `bb.purchases` | Search products, propose a purchase, check status. | A person asks you to buy something. You propose; the main process decides — admin gets a review link, or it buys within household limits. Workflow: `purchasing` skill. |
+| `bb.purchases` | find → cart → send by short id; show cards, quote totals, cancel. | A person asks you to find or buy something. Main process draws the screens and decides — admin gets a review link, or it buys within household limits. Workflow: `purchasing` skill. |
 | `bb.secrets` | Store credentials (write-only), list names, pass to scripts/integrations as env vars. | User pasted an API key; an integration declared a secret; a script needs a credential. |
 
 ## Deeper docs

@@ -34,17 +34,25 @@ from boxbot.prefetch.request import PrefetchRequest, _tail_lines
 from boxbot.prefetch.sources import SourceRun
 
 NOTES = '{"thought":"working","observations":[],"final_turn":false}'
+# A tool-less reply that ends the turn. (``final_turn: false`` with no
+# tool call draws one nudge — see test_unfinished_nudge_stays_append_only.)
+DONE = '{"thought":"done","observations":[],"final_turn":true}'
 OPENAI_MODEL = "gpt-5.6-luna"
 CLAUDE_MODEL = "claude-opus-4-7"
 BUNDLE = "## Prefetched context\nlocks doc"
 
+
+# Script step: a tool-less reply whose note says ``final_turn: false``.
+UNFINISHED = ("", "unfinished")
 
 # ---------------------------------------------------------------------------
 # Provider fakes
 # ---------------------------------------------------------------------------
 
 
-def _oa_completion(*, tool: tuple[str, str] | None = None) -> Any:
+def _oa_completion(
+    *, tool: tuple[str, str] | None = None, notes: str = DONE,
+) -> Any:
     tool_calls = None
     if tool is not None:
         call_id, name = tool
@@ -55,7 +63,7 @@ def _oa_completion(*, tool: tuple[str, str] | None = None) -> Any:
     return SimpleNamespace(
         choices=[SimpleNamespace(
             message=SimpleNamespace(
-                content=None if tool else NOTES,
+                content=None if tool else notes,
                 tool_calls=tool_calls, refusal=None,
             ),
             finish_reason="tool_calls" if tool else "stop",
@@ -65,8 +73,12 @@ def _oa_completion(*, tool: tuple[str, str] | None = None) -> Any:
     )
 
 
-def _claude_response(*, tool: tuple[str, str] | None = None) -> Any:
-    content: list[Any] = [SimpleNamespace(type="text", text=NOTES)]
+def _claude_response(
+    *, tool: tuple[str, str] | None = None, notes: str = DONE,
+) -> Any:
+    content: list[Any] = [
+        SimpleNamespace(type="text", text=NOTES if tool else notes),
+    ]
     if tool is not None:
         call_id, name = tool
         content.append(SimpleNamespace(
@@ -99,7 +111,10 @@ class _Recorder:
         if self.before_reply is not None:
             hook, self.before_reply = self.before_reply, None
             await hook()
-        return self._make(tool=self.script.pop(0))
+        step = self.script.pop(0)
+        if step == UNFINISHED:
+            return self._make(tool=None, notes=NOTES)
+        return self._make(tool=step)
 
 
 def _serialized(messages: list[dict[str, Any]]) -> list[str]:
@@ -771,3 +786,33 @@ async def test_system_prompt_says_the_latest_block_is_current(openai_agent):
     assert "top of the latest user" not in section
     # Still static: two builds are byte-identical.
     assert await agent._build_system_prompt_blocks() == [block]
+
+
+# ---------------------------------------------------------------------------
+# The final_turn nudge is an ordinary appended message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fixture", ["openai_agent", "claude_agent"])
+async def test_unfinished_nudge_stays_append_only(fixture, request):
+    """A tool-less ``final_turn: false`` reply draws one nudge. The
+    nudge is appended, never spliced, and replays byte-identically on
+    the next user turn."""
+    agent, rec = request.getfixturevalue(fixture)
+    conv = _make_conv(agent)
+
+    await _say(conv, rec, "find a titanic book", script=[UNFINISHED, None])
+    await _say(conv, rec, "thanks", script=[None])
+    await conv.end()
+
+    assert len(rec.requests) == 3
+    _assert_append_only(rec.requests)
+
+    nudged = rec.requests[1]["messages"][-1]
+    assert nudged["role"] == "user"
+    assert "final_turn was false but you called no tool" in json.dumps(nudged)
+    # Stored in the thread, so the next turn's prefix contains it.
+    assert sum(
+        "final_turn was false" in json.dumps(m)
+        for m in rec.requests[2]["messages"]
+    ) == 1

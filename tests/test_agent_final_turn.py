@@ -606,3 +606,205 @@ async def test_openai_malformed_arguments_override_the_flag(openai_agent):
     _messages, turns = await _run_openai(openai_agent)
 
     assert turns == 2
+
+
+# ---------------------------------------------------------------------------
+# ``final_turn: false`` with NO tool call — one nudge, then the turn ends
+#
+# The loop only continues on a tool call, so a tool-less response used to
+# end the turn even when its note said work remained (observed: "asked a
+# question, waiting", or a planned step never issued). Parametrised over
+# both API loops.
+# ---------------------------------------------------------------------------
+
+
+NUDGE_MARK = "final_turn was false but you called no tool"
+
+
+def _idle(final_turn: bool | None, backend: str) -> Any:
+    """A tool-less response carrying only a note."""
+    if backend == "openai":
+        return _completion(
+            content=_notes(final_turn), tool_calls=None, finish_reason="stop",
+        )
+    return _response(_text_block(_notes(final_turn)), stop_reason="end_turn")
+
+
+def _tool(backend: str, name: str = "execute_script") -> Any:
+    """A tool-call response with no end-of-turn flag."""
+    if backend == "openai":
+        return _completion(
+            content=None,
+            tool_calls=[SimpleNamespace(
+                id="c1", type="function",
+                function=SimpleNamespace(name=name, arguments="{}"),
+            )],
+            finish_reason="tool_calls",
+        )
+    return _response(_text_block(_notes(False)), _tool_use_block(name, "c1"))
+
+
+@pytest.fixture(params=["anthropic", "openai"])
+def loop(request, openai_agent):
+    """(backend, agent, create-mock, run) for each API loop."""
+    backend = request.param
+    if backend == "openai":
+        create = openai_agent._openai_client.chat.completions.create
+        run = _run_openai
+    else:
+        create = openai_agent._client.messages.create
+        run = _run
+    return backend, openai_agent, create, run
+
+
+def _nudges(messages: list[dict[str, Any]]) -> int:
+    return sum(
+        1 for m in messages
+        if m.get("role") == "user" and NUDGE_MARK in json.dumps(m)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["voice", "whatsapp", "signal"])
+async def test_unfinished_toolless_response_is_nudged_once(
+    loop, channel, caplog,
+):
+    backend, agent, create, run = loop
+    create.side_effect = [_idle(False, backend), _idle(True, backend)]
+
+    with caplog.at_level("INFO", logger="boxbot.core.agent"):
+        messages, turns = await run(agent, channel=channel)
+
+    assert turns == 2
+    assert _nudges(messages) == 1
+    # The nudge is the user turn right after the unfinished note.
+    assert messages[2]["role"] == "user"
+    assert NUDGE_MARK in messages[2]["content"][0]["text"]
+    assert any("nudging once" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_second_toolless_unfinished_response_ends_the_turn(loop):
+    """At most one nudge per turn — no loop on a model that won't budge."""
+    backend, agent, create, run = loop
+    create.side_effect = [_idle(False, backend), _idle(False, backend)]
+
+    messages, turns = await run(agent, channel="voice")
+
+    assert turns == 2
+    assert create.await_count == 2
+    assert _nudges(messages) == 1
+    assert messages[-1]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_nudged_model_can_do_the_work_it_claimed(loop):
+    backend, agent, create, run = loop
+    create.side_effect = [
+        _idle(False, backend), _tool(backend), _idle(True, backend),
+    ]
+
+    messages, turns = await run(agent, channel="voice")
+
+    assert turns == 3
+    assert _nudges(messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_second_nudge_after_work_resumes(loop):
+    """Nudge → tool → tool-less ``false`` again: still one nudge."""
+    backend, agent, create, run = loop
+    create.side_effect = [
+        _idle(False, backend), _tool(backend), _idle(False, backend),
+    ]
+
+    messages, turns = await run(agent, channel="voice")
+
+    assert turns == 3
+    assert _nudges(messages) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [True, None])
+async def test_finished_or_unflagged_toolless_response_is_not_nudged(
+    loop, flag,
+):
+    """``true`` is done; a missing flag claims nothing."""
+    backend, agent, create, run = loop
+    create.side_effect = [_idle(flag, backend)]
+
+    messages, turns = await run(agent, channel="voice")
+
+    assert turns == 1
+    assert _nudges(messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_is_never_nudged(loop, caplog):
+    """Wake cycles are silent by default and nobody is waiting: a nudge
+    there is an invitation to message a human. The run just ends."""
+    backend, agent, create, run = loop
+    create.side_effect = [_idle(False, backend)]
+
+    with caplog.at_level("INFO", logger="boxbot.core.agent"):
+        messages, turns = await run(agent, channel="trigger")
+
+    assert turns == 1
+    assert create.await_count == 1
+    assert _nudges(messages) == 0
+    assert any("without a nudge" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_no_nudge_into_the_message_only_cap_turn(loop):
+    """The next turn would offer only ``message`` — "call the tool"
+    would be false, and the only thing left to do is talk."""
+    backend, agent, create, run = loop
+    create.side_effect = [_tool(backend), _idle(False, backend)]
+
+    messages, turns = await run(agent, channel="voice", max_turns=3)
+
+    assert turns == 2
+    assert _nudges(messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_no_nudge_when_input_is_already_queued(loop):
+    """Someone spoke mid-turn: the conversation runs a fresh generation
+    for that input the moment this one returns, so don't spend a round
+    trip on a nudge first."""
+    from boxbot.core.conversation import Conversation
+
+    backend, agent, create, run = loop
+    conv = Conversation(
+        conversation_id="conv-test", channel="voice",
+        channel_key="voice:room", generate_fn=AsyncMock(),
+        silence_timeout=0,
+    )
+    conv._pending_inputs = [{"role": "user", "content": "[Erik]: yes"}]
+    agent._conversations["conv-test"] = conv
+    create.side_effect = [_idle(False, backend)]
+
+    messages, turns = await run(agent, channel="voice")
+
+    assert turns == 1
+    assert _nudges(messages) == 0
+    # Left for the post-turn drain, not swallowed.
+    assert conv._pending_inputs == [{"role": "user", "content": "[Erik]: yes"}]
+
+
+def test_nudge_renders_as_a_system_line_in_the_transcript():
+    """Extraction must not read the nudge as something a person said."""
+    from boxbot.core.agent import _unfinished_nudge
+
+    transcript = BoxBotAgent._build_transcript(
+        [
+            {"role": "user", "content": "[Erik]: find a book"},
+            {"role": "user", "content": [
+                {"type": "text", "text": _unfinished_nudge()},
+            ]},
+        ],
+        "Erik",
+    )
+    assert "[Erik]: [system]" not in transcript
+    assert "\n[system] final_turn was false" in transcript

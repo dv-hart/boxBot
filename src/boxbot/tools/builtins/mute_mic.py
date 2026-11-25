@@ -1,17 +1,20 @@
 """mute_mic tool — drop further mic input on the current voice conversation.
 
-Use when the agent wants to ignore the room without ending the
-conversation: garbled / empty / unrelated transcripts arriving while a
-task is in flight, ambient side-conversation, etc. The wake word stays
-armed throughout — anyone in the room can re-engage by saying it.
+For sustained talk that is clearly not meant for BB (TV, a long
+side-conversation). The wake word stays armed throughout — anyone in
+the room can re-engage by saying it.
+
+Refused (``status: "not_muted"``, mic left open) when BB has already
+spoken in the current turn: BB just addressed the room, so a person is
+about to answer, and a muted mic would force them to say the wake word
+to do it. The signal is ``Conversation.spoke_this_turn``.
 
 The mute persists until one of:
 - The agent emits ``message(channel="speak")`` — the speech handler
-  unmutes at TTS-end before re-attaching audio_capture. The agent
-  speaking implies it is engaging the room and wants follow-up.
+  unmutes at TTS-end before re-attaching audio_capture.
 - The conversation ends naturally (silence_timeout, etc.). Teardown
   resets audio_capture state.
-- The wake word fires and starts a fresh session.
+- The wake word fires (re-engages the session or starts a fresh one).
 
 No-op on non-voice conversations (WhatsApp, trigger-fired) — there is
 no live mic to mute there.
@@ -35,13 +38,16 @@ class MuteMicTool(Tool):
     description = (
         "Drop mic input on the current voice conversation. No effect on "
         "text or trigger conversations.\n"
-        "Wake word stays armed — the room re-engages you by saying it. "
-        "Auto-clears on your next message(channel=\"speak\") or at "
-        "conversation end. Also drops utterances queued while you thought.\n"
-        "Background noise or unrelated speech mid-task: mute immediately, "
-        "same turn.\n"
-        "Never pair with message(channel=\"speak\") in one turn — speech "
-        "reopens the mic and cancels the mute."
+        "Only for sustained talk clearly not meant for you: TV, people "
+        "talking among themselves at length.\n"
+        "Never after you asked something or a reply is plausible — they "
+        "could not answer without the wake word. Never on one garbled "
+        "fragment. Unsure: stay silent, do not mute; the mic sleeps on "
+        "its own.\n"
+        "Refused (status \"not_muted\") if you already spoke this turn.\n"
+        "Muted: wake word stays armed. Clears when you next speak, on "
+        "the wake word, or at conversation end. Also drops utterances "
+        "queued while you thought."
     )
     parameters = {
         "type": "object",
@@ -50,7 +56,7 @@ class MuteMicTool(Tool):
                 "type": "string",
                 "description": (
                     "Why. Recorded for extraction and debugging. e.g. "
-                    "\"ambient chatter\", \"unrelated interruption\"."
+                    "\"TV audio\", \"long side-conversation\"."
                 ),
             },
         },
@@ -78,6 +84,24 @@ class MuteMicTool(Tool):
                 "message": (
                     f"mute_mic is a no-op on '{conv.channel}' "
                     "conversations (no live mic)"
+                ),
+            })
+
+        # BB spoke in this turn → someone is about to answer. Muting
+        # now would make them say the wake word to reply (observed:
+        # question asked, mic muted, room left talking to a dead mic).
+        if getattr(conv, "spoke_this_turn", False):
+            logger.info(
+                "mute_mic: refused — BB already spoke this turn "
+                "(conv=%s reason=%s)",
+                conv.conversation_id, reason or "<none>",
+            )
+            return json.dumps({
+                "status": "not_muted",
+                "message": (
+                    "Not muted: you spoke this turn, so a reply may be "
+                    "coming. Mic stays open. Nothing else to do: end "
+                    "the turn."
                 ),
             })
 
@@ -111,7 +135,7 @@ class MuteMicTool(Tool):
             "status": "muted",
             "reason": reason,
             "message": (
-                "Microphone muted. Will auto-unmute on your next "
-                "message(speak), or when the conversation ends."
+                "Mic muted; wake word still armed. Clears when you "
+                "next speak, on the wake word, or at conversation end."
             ),
         })

@@ -36,14 +36,15 @@ switch_display("web", args={"url": "https://en.wikipedia.org/wiki/Otter"})
   | Cause | When |
   | --- | --- |
   | you | `switch_display` to anything else, or `bb.display.unpin()` |
-  | idle | nothing playing + nobody touching the page for 5 min. Per page: `args.idle_minutes` (a recipe someone cooks from → 30) |
+  | idle | nothing playing for 5 min. Per page: `args.idle_minutes` (a recipe someone cooks from → 30) |
   | hard limit | 2 h |
 
   Then rotation resumes. A video that ended, or one you paused, is idle.
 - `bb.display.web_media("pause")` holds until `web_media("play")`.
   `"play"` also starts a video that loaded without autoplaying
-  (YouTube links autoplay). No seek, no clicking: page needs a tap →
-  the person taps the screen.
+  (YouTube links autoplay). No seek, no clicking, and the screen has
+  no touch input: never tell anyone to tap or press play. Still not
+  playing after `"play"` → open a different link, or say you can't.
 - **Sound vs. mic.** Media plays only while the room is quiet: pauses
   when the wake word fires, while you speak, and while the mic is
   listening; resumes on its own after. Opening it on a voice

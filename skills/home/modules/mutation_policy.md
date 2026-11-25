@@ -62,7 +62,7 @@ Mirrors the existing package-install approval flow:
      - close_cover
    ```
 2. `call_service` on a gated action pauses, emits an approval request
-   (admin text YES, or screen tap), proceeds only on explicit approval.
+   (admin text YES), proceeds only on explicit approval.
 3. Denial closes the call with a clean error. Timeout (~30s) does too.
 
 That replaces the domain denylist with per-action gates. Until then:

@@ -79,6 +79,9 @@ class AudioCapture:
             logger.debug("AudioCapture already started, skipping re-registration")
             return
         self._microphone = microphone
+        # Clean slate on attach: nothing buffered while detached may
+        # carry into this capture window.
+        self.reset()
         self._consumer_handle = microphone.add_consumer(  # type: ignore[attr-defined]
             self._on_audio_chunk, name="audio_capture",
         )
@@ -160,8 +163,20 @@ class AudioCapture:
         # affected — the user can still wake BB while muted.
         if self._muted:
             return
+        # Detached: the microphone's dispatch loop can still deliver a
+        # chunk it had already dequeued when stop() ran. Processing it
+        # would re-arm ``_is_speaking`` with a ``_speech_start`` from the
+        # old session; the next attach then measures its first chunk
+        # against that stale start and force-finalizes a bogus
+        # "max duration" utterance (observed: 837.1s on wake).
+        if self._consumer_handle is None:
+            return
         self._sample_rate = chunk.sample_rate
         speech_prob = await self._vad.process_chunk(chunk)
+        # stop()/mute() may have run while VAD was awaited — same race,
+        # one await later.
+        if self._consumer_handle is None or self._muted:
+            return
         chunk_duration_ms = (chunk.frames / chunk.sample_rate) * 1000
 
         is_speech = speech_prob > self._vad._config.threshold

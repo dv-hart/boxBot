@@ -206,6 +206,13 @@ class Conversation:
         self.channel = channel            # "voice" | "whatsapp" | "trigger"
         self.channel_key = channel_key    # "voice:room", "whatsapp:+1...", etc.
         self.participants: set[str] = set(participants or ())
+        # Who the transport attributed the LATEST human input to; None
+        # when it could not name them (unrecognised voice).
+        # ``speaker_resolved`` separates "unrecognised" from "no human
+        # input yet" (trigger runs, relay-seeded rooms), where callers
+        # may fall back to presence.
+        self.current_speaker: str | None = None
+        self.speaker_resolved: bool = False
         # Persistent conversations don't use a silence timer — the
         # agent's extraction sweep handles end-of-life. We still hold
         # the field so debug/logging code can read it; setting it to 0
@@ -353,6 +360,22 @@ class Conversation:
         return self._pending_segments
 
     @property
+    def has_pending_inputs(self) -> bool:
+        """True while utterances are queued for the agent loop."""
+        return bool(self._pending_inputs)
+
+    @property
+    def spoke_this_turn(self) -> bool:
+        """True once BB has spoken aloud in the current generation cycle.
+
+        Read off ``_pending_segments``, which the dispatcher fills on
+        every ``speak`` delivery and the conversation clears at each
+        cycle boundary. ``mute_mic`` refuses while this is set: BB just
+        said something to the room, so a person is about to answer.
+        """
+        return any(seg.channel == "voice" for seg in self._pending_segments)
+
+    @property
     def is_generating(self) -> bool:
         return (
             self._generation_task is not None
@@ -438,6 +461,8 @@ class Conversation:
                 self.participants.add(speaker_name)
 
             if human:
+                self.current_speaker = speaker_name or None
+                self.speaker_resolved = True
                 self.exchange_log.append({
                     "speaker": "person",
                     "name": speaker_name,

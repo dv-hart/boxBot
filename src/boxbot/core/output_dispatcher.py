@@ -237,7 +237,9 @@ INTERNAL_NOTES_SCHEMA: dict[str, Any] = {
 class ParsedNotes:
     """Result of parsing one agent text block as internal notes."""
 
-    __slots__ = ("thought", "observations", "final_turn", "raw")
+    __slots__ = (
+        "thought", "observations", "final_turn", "declared_unfinished", "raw",
+    )
 
     def __init__(
         self,
@@ -245,10 +247,15 @@ class ParsedNotes:
         observations: list[str],
         raw: str,
         final_turn: bool = False,
+        declared_unfinished: bool = False,
     ) -> None:
         self.thought = thought
         self.observations = observations
         self.final_turn = final_turn
+        # The note said ``final_turn: false`` in so many words — the
+        # model believes work remains. Distinct from a missing flag,
+        # which reads as ``final_turn`` False too but claims nothing.
+        self.declared_unfinished = declared_unfinished
         self.raw = raw
 
 
@@ -265,6 +272,7 @@ def _notes_from_dict(data: dict[str, Any], raw: str) -> ParsedNotes:
         observations=observations,
         raw=raw,
         final_turn=bool(data.get("final_turn")),
+        declared_unfinished=data.get("final_turn") is False,
     )
 
 

@@ -343,6 +343,19 @@ async def _stage_signal_image(
     return dest
 
 
+def _voice_tier_thresholds() -> tuple[float, float]:
+    """(confirmed, maybe) cloud-match thresholds from the live config.
+
+    The same two values ``VoiceReID.match_cloud`` tiers on — the legend
+    the agent reads must not drift from what produced the tier.
+    """
+    perception = get_config().perception
+    return (
+        float(perception.voice_confirmed_threshold),
+        float(perception.voice_maybe_threshold),
+    )
+
+
 def _render_identity_section(
     identities: dict[str, dict[str, Any]] | None,
 ) -> str:
@@ -350,7 +363,9 @@ def _render_identity_section(
 
     Surfaces voice (and, when present, visual) ReID tiers + scores per
     speaker so the agent can pick the right behavior — address by name on
-    high, verify on medium/low, defer to the onboarding skill on unknown.
+    high, verify on medium, never guess on unknown. Cloud matching
+    yields exactly those three tiers; the legend's cut-offs are read
+    from config, not written here.
 
     Returns an empty string if there's nothing to render.
     """
@@ -381,7 +396,7 @@ def _render_identity_section(
             headline = f"- {display_label}  → confirmed as {person_name}"
         elif person_name and voice_tier == "high":
             headline = f"- {display_label}  → likely {person_name}"
-        elif person_name and voice_tier in ("medium", "low"):
+        elif person_name and voice_tier != "unknown":
             headline = f"- {display_label}  → possibly {person_name}"
         else:
             headline = f"- {display_label}  → not recognized"
@@ -389,17 +404,26 @@ def _render_identity_section(
         lines.append(headline)
         lines.append(f"    {voice_bit}{visual_bit}")
 
+    try:
+        confirmed, maybe = _voice_tier_thresholds()
+        high_range = f"voice ≥{confirmed:.2f}"
+        medium_range = f"{maybe:.2f}–{confirmed:.2f}"
+        unknown_range = f"<{maybe:.2f}"
+    except Exception:
+        # No config (bare unit tests): tiers still mean what they say.
+        logger.debug("voice thresholds unavailable for legend", exc_info=True)
+        high_range, medium_range, unknown_range = (
+            "voice match", "weaker match", "no match",
+        )
+
     guidance = (
         "\n"
-        "Address each speaker by tier:\n"
-        "- high (voice ≥0.85, or confirmed): use their name. No hedging.\n"
-        "- medium (0.70-0.85): soft-verify first — \"Hey Sarah — correct me\n"
-        "  if that's wrong?\" They confirm: identify_person to pin it. They\n"
-        "  correct: identify_person with the corrected name.\n"
-        "- low (0.60-0.70): weak match. Don't assume. Ask who they are, or\n"
-        "  load the `onboarding` skill if they're newly addressing you.\n"
-        "- unknown: a first meeting. Load `onboarding` for the procedure.\n"
-        "  Do NOT guess a name."
+        "Voice tiers:\n"
+        f"- high ({high_range}) or confirmed: use their name.\n"
+        f"- medium ({medium_range}): soft-verify — \"Sarah, right?\" Then\n"
+        "  identify_person with the confirmed or corrected name.\n"
+        f"- unknown ({unknown_range}): do NOT guess a name. Serve the\n"
+        "  request; `onboarding` §1 covers asking who they are."
     )
 
     return "## People in this session\n" + "\n".join(lines) + "\n" + guidance
@@ -439,6 +463,22 @@ def _agent_facing_channel(channel: str) -> str:
     return channel
 
 
+def _mic_sleep_clause() -> str:
+    """" The mic sleeps on its own after N s." — N from the live config.
+
+    ``voice.post_response_idle_seconds``; empty when the timer is
+    disabled (0) or no config is loaded. Config is fixed for the life
+    of the process, so the static prompt stays byte-stable.
+    """
+    try:
+        seconds = float(get_config().voice.post_response_idle_seconds)
+    except Exception:
+        return ""
+    if seconds <= 0:
+        return ""
+    return f" The mic sleeps on its own after {seconds:g} s."
+
+
 def _prompt_etiquette() -> str:
     """Return the multi-speaker + delivery-mechanics section.
 
@@ -462,9 +502,10 @@ def _prompt_etiquette() -> str:
         "  room, what people are doing, things said). Memory\n"
         "  extraction reads these afterward. Optional.\n"
         "- `final_turn` — required. `true` on the response that finishes\n"
-        "  task; `false` if work remains. When a `message` call is your\n"
-        "  final step, set `final_turn: true` on that call — saves a\n"
-        "  round trip.\n"
+        "  the task. `false` only beside a tool call in the same response\n"
+        "  — no tool call, nothing runs. Waiting for a person's answer is\n"
+        "  `true`. When a `message` call is your final step, set\n"
+        "  `final_turn: true` on that call — saves a round trip.\n"
         "- `thought` and `observations` are PRIVATE. Your text reaches\n"
         "  nobody.\n"
         "\n"
@@ -514,12 +555,35 @@ def _prompt_etiquette() -> str:
         "kids' shows, song lyrics, and half-heard side conversations should\n"
         "not change your course.\n"
         "\n"
-        "## Muting the mic — be DECISIVE\n"
+        "## Muting the mic — rarely\n"
         "\n"
-        "The rule: **active task AND the next transcript is unrelated to it\n"
-        "→ `mute_mic` on the SAME turn.** Do not wait for a second\n"
-        "confirming turn. Muting does NOT\n"
-        "interrupt tools already in flight.\n"
+        "`mute_mic` only for sustained talk clearly not meant for you: the\n"
+        "TV, people talking among themselves at length. Muted, the room\n"
+        "cannot reach you without the wake word.\n"
+        "\n"
+        "Never mute:\n"
+        "- after you asked something;\n"
+        "- when a reply to you is plausible;\n"
+        "- on a single garbled or unrelated fragment.\n"
+        "\n"
+        "Unsure: stay silent, do not mute."
+        + _mic_sleep_clause() + "\n"
+        "\n"
+        "## Act, don't ask\n"
+        "\n"
+        "Looking up, searching, showing something on the screen,\n"
+        "comparing: do it, then say what you did. No permission question\n"
+        "first.\n"
+        "\n"
+        "Ask first only when the answer changes an irreversible or costly\n"
+        "action: buying, sending for payment, deleting, messaging someone\n"
+        "else.\n"
+        "\n"
+        "After speaking a question: `final_turn: true` on that response,\n"
+        "then wait. No more tools, no mute.\n"
+        "\n"
+        "The screen is display-only — no touch. Never tell anyone to tap,\n"
+        "touch, or click it.\n"
         "\n"
         "## Ending a turn early: final_turn\n"
         "\n"
@@ -650,6 +714,12 @@ def _render_static_system_prompt(name: str, wake_word: str) -> str:
     if skills.strip():
         parts.append(skills.strip())
     return "\n\n".join(parts)
+
+
+# How long a perception sighting keeps someone eligible as the
+# presence-based speaker guess (_get_most_recent_person). Same span
+# _get_present_people calls "present".
+_RECENT_PERSON_WINDOW_S = 300.0
 
 
 # Matches an Anthropic 400 saying a tool_result image exceeded the API
@@ -1055,6 +1125,22 @@ def _turn_cap_notice(max_turns: int) -> str:
         "X but couldn't verify it worked\"). Do "
         "not attempt further work — anything other "
         "than ``message`` will be blocked."
+    )
+
+
+def _unfinished_nudge() -> str:
+    """Sent once when a tool-less response says ``final_turn: false``.
+
+    The loop only continues on a tool call, so such a response used to
+    end the turn silently while the model believed it was still working
+    (it had "asked and is waiting", or planned a step it never issued).
+    Shared by both API loops so the wording stays identical.
+    """
+    return (
+        "[system] final_turn was false but you called no tool. Nothing "
+        "is running. Either call the tool now, or reply with "
+        "final_turn: true. Waiting for a person's answer = "
+        "final_turn: true. Do not repeat anything already said."
     )
 
 
@@ -1806,6 +1892,7 @@ class BoxBotAgent:
             conv_id = self._conversation_by_key.get("voice:room")
             conv = self._conversations.get(conv_id) if conv_id else None
             self._current_voice_session_id = None
+        self._reset_voice_session_identity()
         if conv is not None:
             logger.info(
                 "Voice session %s ended — ending room conversation %s",
@@ -2175,7 +2262,14 @@ class BoxBotAgent:
             # transcript lands. This utterance is a FIRST turn — it
             # must not be gated or deduped against the old thread.
             conv = None
-        person = self._get_most_recent_person()
+        # Identity is not resolved yet (that is what the draft races).
+        # Best guess: whoever spoke last in this same conversation,
+        # else a recently-seen person. A wrong guess is caught at
+        # TranscriptReady (person drift → salvage or discard).
+        person = (
+            self._speaker_for_conversation(conv) if conv is not None
+            else self._get_most_recent_person()
+        )
         try:
             req = prefetch_layer.PrefetchRequest(
                 # First utterance of a session has no conversation yet;
@@ -2878,6 +2972,11 @@ class BoxBotAgent:
                 self._latest_speaker_identities.pop(old)
             )
 
+        # Live conversations' current-speaker attribution.
+        for conv in list(self._conversations.values()):
+            if conv.current_speaker == old:
+                conv.current_speaker = new
+
         # Voice adapter's own session maps.
         try:
             from boxbot.communication.voice import get_voice_session
@@ -2995,10 +3094,17 @@ class BoxBotAgent:
             for label, name in self._speaker_identities.items():
                 transcript = transcript.replace(f"[{label}]:", f"[{name}]:")
 
+        voice_session_id = event.conversation_id
+        if voice_session_id != self._current_voice_session_id:
+            # New session: the identity block and label map on the books
+            # describe whoever spoke LAST session. Without this an
+            # utterance that resolves no identities (no diarization
+            # segment) rendered the previous speaker under "People in
+            # this session".
+            self._reset_voice_session_identity()
         if event.speaker_identities:
             self._latest_speaker_identities = dict(event.speaker_identities)
 
-        voice_session_id = event.conversation_id
         logger.info(
             "Transcript ready (voice_session=%s): %s",
             voice_session_id, transcript[:100],
@@ -3024,7 +3130,10 @@ class BoxBotAgent:
                 await old_conv.end(reason="voice_session_changed")
         self._current_voice_session_id = voice_session_id
 
-        person_name = self._get_most_recent_person()
+        # Who said THIS utterance — from its own identity block, not
+        # from whoever perception saw most recently (an unrecognised
+        # speaker used to be presented as "Speaking with: Jacob").
+        person_name = self._voice_speaker_name(event.speaker_identities)
         participants: set[str] | None = {person_name} if person_name else None
         conv = await self._get_or_create_conversation(
             channel="voice",
@@ -3579,7 +3688,7 @@ class BoxBotAgent:
         initial_message = str(conv.thread[-1].get("content") or "")
 
         context = conv.current_context
-        person_name = self._get_most_recent_person()
+        person_name = self._speaker_for_conversation(conv)
 
         system_prompt_blocks = await self._build_system_prompt_blocks()
 
@@ -3905,10 +4014,10 @@ class BoxBotAgent:
             else:
                 sections.append(
                     "## Onboarding skill (auto-loaded — unknown speaker present)\n"
-                    "An unknown speaker is in this conversation; the full\n"
-                    "onboarding skill is included below so you don't need\n"
-                    "to call `load_skill(\"onboarding\")` first. Apply §1\n"
-                    "(voice first-meeting) if they address you directly.\n\n"
+                    "Skill body below; no `load_skill(\"onboarding\")` needed.\n"
+                    "They asked for something: do it first. Ask their name in\n"
+                    "the same reply or after the task (§1) — never a reply\n"
+                    "that is only the name question.\n\n"
                     + skill_body
                 )
 
@@ -4122,6 +4231,13 @@ class BoxBotAgent:
         ``GenerationResult.completed_cleanly`` is set to ``False`` when
         the cap was hit.
 
+        Tool-less ``final_turn: false``: the loop continues only on a
+        tool call, so a note claiming unfinished work with no call
+        would end the turn silently. Such a response gets ONE appended
+        ``[system]`` user message (:func:`_unfinished_nudge`) and one
+        more round; see :meth:`_unfinished_nudge_due` for when not
+        (trigger runs, the cap turn, queued input).
+
         Args:
             conversation_id: Conversation ID for logging.
             channel: Active conversation channel (voice / whatsapp / trigger),
@@ -4171,6 +4287,9 @@ class BoxBotAgent:
         # the cap, the post-loop fallback dispatches a hardcoded closing
         # line so the user is never left hanging.
         final_turn_message_dispatched = False
+        # One "you said unfinished but called nothing" nudge per cycle —
+        # see _unfinished_nudge_due.
+        nudged_unfinished = False
 
         while turn_count < max_turns:
             turn_count += 1
@@ -4409,6 +4528,26 @@ class BoxBotAgent:
                 )
                 break
 
+            # --- end_turn with ``final_turn: false``: the model thinks
+            # work remains but issued no tool call. One nudge, then a
+            # second tool-less response ends the turn as before.
+            if self._unfinished_nudge_due(
+                notes,
+                conversation_id=conversation_id,
+                channel=channel,
+                turn_count=turn_count,
+                max_turns=max_turns,
+                already_nudged=nudged_unfinished,
+            ):
+                nudged_unfinished = True
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _unfinished_nudge()},
+                    ],
+                })
+                continue
+
             # --- end_turn (and any other terminal reason): we're done.
             break
 
@@ -4630,6 +4769,60 @@ class BoxBotAgent:
             out.append(turn)
         return out
 
+    def _unfinished_nudge_due(
+        self,
+        notes: ParsedNotes | None,
+        *,
+        conversation_id: str,
+        channel: str,
+        turn_count: int,
+        max_turns: int,
+        already_nudged: bool,
+    ) -> bool:
+        """Should a tool-less response get the one ``final_turn`` nudge?
+
+        Yes only when the note explicitly said ``final_turn: false``
+        (a missing flag claims nothing) and none of these hold:
+
+        | case | why not |
+        |---|---|
+        | already nudged this cycle | one nudge; then the turn ends |
+        | ``trigger`` channel | wake cycles are silent by default and
+          nobody is waiting; a nudge is a prompt to produce *something*,
+          and the cheapest something is a message to a human |
+        | next turn is the cap's ``message``-only turn | "call the tool"
+          would be a lie there, and the cap has its own notice |
+        | input queued mid-turn | the conversation starts a fresh
+          generation for it as soon as this one returns |
+        """
+        if notes is None or notes.final_turn or not notes.declared_unfinished:
+            return False
+        if already_nudged:
+            logger.info(
+                "Tool-less final_turn=false again after the nudge on "
+                "turn %d (conv=%s); ending the turn",
+                turn_count, conversation_id,
+            )
+            return False
+        if channel == "trigger":
+            logger.info(
+                "Tool-less final_turn=false on turn %d of a trigger run "
+                "(conv=%s); ending without a nudge",
+                turn_count, conversation_id,
+            )
+            return False
+        if turn_count + 1 >= max_turns:
+            return False
+        conv = self._conversations.get(conversation_id)
+        if conv is not None and conv.has_pending_inputs:
+            return False
+        logger.info(
+            "Tool-less response with final_turn=false on turn %d "
+            "(conv=%s chan=%s); nudging once",
+            turn_count, conversation_id, channel,
+        )
+        return True
+
     def _drain_pending_into(
         self,
         conversation_id: str,
@@ -4685,7 +4878,8 @@ class BoxBotAgent:
         happens per call in ``agent_openai_adapter``.
 
         What carries over unchanged: the turn cap and its final-turn
-        ``message``-only tool filter, the penultimate-turn heads-up,
+        ``message``-only tool filter, the penultimate-turn heads-up, the
+        one-shot nudge on a tool-less ``final_turn: false``,
         ``latency`` marks/spans, inject-don't-interrupt drain, tool
         dispatch through :meth:`_process_tool_calls`, the max-turns
         fallback, and per-turn cost rows.
@@ -4743,6 +4937,7 @@ class BoxBotAgent:
 
         turn_count = 0
         final_turn_message_dispatched = False
+        nudged_unfinished = False
 
         while turn_count < max_turns:
             turn_count += 1
@@ -4961,6 +5156,25 @@ class BoxBotAgent:
                     turn_count, conversation_id,
                 )
                 break
+
+            # ``final_turn: false`` with no tool call — one nudge, see
+            # _agent_loop.
+            if self._unfinished_nudge_due(
+                notes,
+                conversation_id=conversation_id,
+                channel=channel,
+                turn_count=turn_count,
+                max_turns=max_turns,
+                already_nudged=nudged_unfinished,
+            ):
+                nudged_unfinished = True
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _unfinished_nudge()},
+                    ],
+                })
+                continue
 
             break
 
@@ -6153,7 +6367,11 @@ class BoxBotAgent:
                                 )
                             else:
                                 text = block.get("text", "")
-                                if text:
+                                if text.startswith("[system]"):
+                                    # Loop-authored notice (turn cap,
+                                    # final_turn nudge) — not speech.
+                                    lines.append(text)
+                                elif text:
                                     lines.append(f"[{user_label}]: {text}")
 
             elif role == "assistant":
@@ -6326,14 +6544,66 @@ class BoxBotAgent:
             return None
 
     def _get_most_recent_person(self) -> str | None:
-        """Return the name of the most recently seen person.
+        """Return the name of the most recently seen person, if recent.
 
-        Used to infer the speaker when a wake word is heard without
-        explicit speaker identification.
+        A presence-based *guess* at who BB is dealing with, for cases
+        with no attributed human input (trigger runs, a transcript the
+        identity service could not label). Entries older than
+        ``_RECENT_PERSON_WINDOW_S`` do not count: ``_present_people`` is
+        never pruned, so without the window a person seen hours ago
+        was still "the speaker" of every later session.
 
         Returns:
             The name of the most recently detected person, or None.
         """
         if not self._present_people:
             return None
-        return max(self._present_people, key=self._present_people.get)
+        name = max(self._present_people, key=self._present_people.get)
+        age = (datetime.now() - self._present_people[name]).total_seconds()
+        if age > _RECENT_PERSON_WINDOW_S:
+            return None
+        return name
+
+    def _voice_speaker_name(
+        self, identities: dict[str, dict[str, Any]] | None,
+    ) -> str | None:
+        """Name of the speaker of one voice utterance, or None.
+
+        Reads the utterance's own identity block. The first entry is
+        the first speaker heard; they count as recognised on a ``high``
+        voice match or an ``agent_identify`` claim — the same bar the
+        voice session uses to put a name on the transcript label. An
+        unrecognised first speaker yields None even when someone else
+        is known to be around.
+
+        Empty block (identity service down, no diarization segment):
+        nothing is known about this utterance, so fall back to the
+        recent-presence guess.
+        """
+        if not identities:
+            return self._get_most_recent_person()
+        info = next(iter(identities.values())) or {}
+        name = info.get("person_name")
+        if name and (
+            info.get("source") == "agent_identify"
+            or info.get("voice_tier") == "high"
+        ):
+            return str(name)
+        return None
+
+    def _speaker_for_conversation(self, conv: Conversation) -> str | None:
+        """Who the current turn of ``conv`` is with.
+
+        Once a human input has landed, the transport's attribution of
+        the latest one is the answer — including None for a voice it
+        could not name. Before that (trigger runs, relay-seeded rooms)
+        fall back to the recent-presence guess.
+        """
+        if getattr(conv, "speaker_resolved", False):
+            return conv.current_speaker
+        return self._get_most_recent_person()
+
+    def _reset_voice_session_identity(self) -> None:
+        """Drop identity state scoped to one voice session."""
+        self._latest_speaker_identities = {}
+        self._speaker_identities = {}

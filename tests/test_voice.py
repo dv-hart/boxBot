@@ -848,24 +848,97 @@ class TestAudioCapture:
         vad.process_chunk = AsyncMock(return_value=speech_prob)
         return vad
 
-    def _make_capture(self, vad=None, **config_kwargs):
+    def _make_capture(self, vad=None, attached=True, **config_kwargs):
         from boxbot.communication.audio_capture import AudioCapture
 
         if vad is None:
             vad = self._make_vad_mock()
         config = self._make_config(**config_kwargs)
-        return AudioCapture(vad, config)
+        capture = AudioCapture(vad, config)
+        if attached:
+            # Chunks are only processed while attached to a microphone.
+            capture._consumer_handle = 1
+        return capture
 
     @pytest.mark.asyncio
     async def test_start_registers_consumer(self):
-        capture = self._make_capture()
+        capture = self._make_capture(attached=False)
         mic = MagicMock()
         await capture.start(mic)
         mic.add_consumer.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_chunk_while_detached_is_ignored(self):
+        """A chunk the mic delivers after stop() must not re-arm capture."""
+        vad = self._make_vad_mock(speech_prob=0.9)
+        capture = self._make_capture(vad=vad, attached=False)
+        callback = AsyncMock()
+        capture.set_utterance_callback(callback)
+
+        await capture._on_audio_chunk(make_speech_chunk(timestamp=100.0))
+
+        vad.process_chunk.assert_not_awaited()
+        assert capture._is_speaking is False
+        assert capture._speech_start == 0.0
+        assert len(capture._buffer) == 0
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_late_chunk_after_stop_does_not_poison_next_session(self):
+        """Regression: "Utterance hit max duration (837.1s)" on wake.
+
+        A straggler chunk after stop() used to set ``_is_speaking`` with
+        the old session's timestamp; the first chunk of the next session
+        then measured its duration from that stale start and
+        force-finalized at once.
+        """
+        vad = self._make_vad_mock(speech_prob=0.9)
+        capture = self._make_capture(
+            vad=vad, attached=False, max_utterance_duration=30,
+        )
+        callback = AsyncMock()
+        capture.set_utterance_callback(callback)
+        mic = MagicMock()
+        mic.add_consumer.return_value = 7
+
+        await capture.start(mic)
+        await capture._on_audio_chunk(make_speech_chunk(timestamp=100.0))
+        assert capture._is_speaking is True
+        await capture.stop()
+
+        # Straggler from the old session, delivered after detach.
+        await capture._on_audio_chunk(make_speech_chunk(timestamp=100.1))
+        assert capture._is_speaking is False
+
+        # Next wake, 837 s later.
+        await capture.start(mic)
+        await capture._on_audio_chunk(make_speech_chunk(timestamp=937.1))
+
+        callback.assert_not_called()
+        assert capture._is_speaking is True
+        assert capture._speech_start == 937.1
+
+    @pytest.mark.asyncio
+    async def test_stop_during_vad_await_drops_the_chunk(self):
+        """stop() landing while VAD is awaited: the chunk is discarded."""
+        capture = self._make_capture(attached=False)
+        mic = MagicMock()
+        mic.add_consumer.return_value = 7
+        await capture.start(mic)
+
+        async def vad_then_stop(chunk):
+            await capture.stop()
+            return 0.9
+
+        capture._vad.process_chunk = AsyncMock(side_effect=vad_then_stop)
+        await capture._on_audio_chunk(make_speech_chunk(timestamp=50.0))
+
+        assert capture._is_speaking is False
+        assert len(capture._buffer) == 0
+
+    @pytest.mark.asyncio
     async def test_stop_unregisters_consumer(self):
-        capture = self._make_capture()
+        capture = self._make_capture(attached=False)
         mic = MagicMock()
         await capture.start(mic)
         await capture.stop()

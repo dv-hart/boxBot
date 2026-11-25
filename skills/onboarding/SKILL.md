@@ -3,9 +3,8 @@ name: onboarding
 description: How to onboard people to boxBot — voice first-meeting (Person), first-admin bootstrap, admin-initiated user registration (User), welcoming a freshly-registered user.
 when_to_use: |
   Load when ANY of:
-    - "People in this session" shows a speaker with voice_tier "unknown" (or a
-      low-confidence match you won't guess on) AND that speaker is addressing
-      you directly.
+    - "People in this session" shows a speaker with voice_tier "unknown" AND
+      that speaker is addressing you directly.
     - Pending `setup:` todos — a fresh device with no admin.
     - A registered admin asks to add a new user.
     - A `[REGISTRATION] <code>` message arrives — a freshly registered user's
@@ -30,24 +29,36 @@ admin.
 ## §1 — Voice first-meeting (Person)
 
 **Applies when:** a speaker is addressing you in voice, their
-`voice_tier` is `unknown` (or `low` and you won't guess), and you have
-no registered name for them.
+`voice_tier` is `unknown`, and you have no registered name for them.
 
-**Does not apply to:** high-confidence matches (use their name);
-speakers talking to each other; anyone already introduced this session
-(`source: agent_identify` in the identity block).
+**Does not apply to:** `high` matches (use their name); `medium`
+matches (soft-verify the suggested name instead); speakers talking to
+each other; anyone already introduced this session (`source:
+agent_identify` in the identity block).
 
-1. **Ask their name.** One voice output to `"current_speaker"`. Short
-   and natural. Do not explain what you are.
+**Their request comes first.** Not knowing a name never blocks,
+delays, or replaces what they asked for.
 
-   - "Hi — I don't think we've met. I'm Jarvis. What's your name?"
-   - "Hey there — I don't recognize your voice yet. Who am I talking to?"
-   - "Hi! I haven't caught your name before. What should I call you?"
+1. **Serve, then ask.** One voice output to `"current_speaker"`.
 
-   End the turn. Wait.
+   | They said | You do |
+   |-----------|--------|
+   | A request or question | Do it. Ask the name in the same reply, after the answer — or at the end of the task. |
+   | A greeting only, nothing to act on | Greet, ask the name. |
+
+   - "Found a few Titanic books — the top one's on the screen. By the
+     way, who am I talking to?"
+   - "It's 4:15. I don't think we've met — what's your name?"
+   - Greeting only: "Hi — I don't think we've met. I'm Jarvis. What's
+     your name?"
+
+   Never end a turn on the name question alone when a request was
+   made. Ask once per session. Short and natural; do not explain what
+   you are.
 
 2. **Extract the name** ("[Speaker A]: I'm Brian", "My name is Brian",
-   "Brian"). If they decline, drop it. Never demand a name.
+   "Brian"). No answer, or they decline: drop it and carry on. Never
+   demand a name, never ask again.
 
 3. **Pin it** with `identify_person`: `name` = what they gave, trimmed
    and naturally capitalized; `ref` = the session speaker ref (e.g.
@@ -64,7 +75,8 @@ speakers talking to each other; anyone already introduced this session
    `identify_person(action="rename", name="Brian", new_name="Bri")` —
    not a new identify.
 
-4. **Continue.** They spoke up for a reason — ask what you can do.
+4. **Continue** what they asked for. Nothing pending: ask what you can
+   do.
 
 ---
 

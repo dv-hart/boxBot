@@ -28,7 +28,10 @@ def _make_capture():
     # Pretend VAD always reports speech so a non-muted chunk would
     # definitely accumulate.
     vad.process_chunk = AsyncMock(return_value=0.99)
-    return AudioCapture(vad, TurnDetectionConfig())
+    capture = AudioCapture(vad, TurnDetectionConfig())
+    # Chunks are only processed while attached to a microphone.
+    capture._consumer_handle = 1
+    return capture
 
 
 def _make_speech_chunk(frames: int = 1024) -> AudioChunk:
@@ -205,6 +208,125 @@ async def test_mute_mic_tool_no_op_outside_conversation(monkeypatch):
     _tool_context.current_conversation.set(None)
     result = json.loads(await MuteMicTool().execute())
     assert result["status"] == "noop"
+
+
+# ---------------------------------------------------------------------------
+# Guard: no mute after BB spoke this turn
+# ---------------------------------------------------------------------------
+
+
+def _real_voice_conversation():
+    from boxbot.core.conversation import Conversation
+
+    return Conversation(
+        conversation_id="conv_guard",
+        channel="voice",
+        channel_key="voice:room",
+        generate_fn=AsyncMock(),
+        silence_timeout=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mute_mic_refused_after_speaking_this_turn(monkeypatch):
+    """BB asked the room something this turn — the mic must stay open."""
+    from boxbot.core.conversation import SpokenSegment
+    from boxbot.tools.builtins.mute_mic import MuteMicTool
+
+    session = MagicMock()
+    session.mute_mic = MagicMock(return_value=True)
+    conv = _real_voice_conversation()
+    conv._pending_inputs = [{"role": "user", "content": "[Erik]: yes"}]
+    conv.record_segment(SpokenSegment(
+        channel="voice", to="Erik", content="Did Eric mean the Titanic books?",
+    ))
+    _patch_conversation(monkeypatch, conv)
+    _patch_voice_session(monkeypatch, session)
+
+    result = json.loads(await MuteMicTool().execute(reason="waiting"))
+
+    assert result["status"] == "not_muted"
+    assert "error" not in result
+    session.mute_mic.assert_not_called()
+    # The answer that is already queued must survive.
+    assert conv._pending_inputs == [{"role": "user", "content": "[Erik]: yes"}]
+
+
+@pytest.mark.asyncio
+async def test_mute_mic_refusal_does_not_hold_the_turn_open(monkeypatch):
+    """The refusal is not an error: ``final_turn`` beside it still ends
+    the loop (``_tool_results_ok``)."""
+    from boxbot.core.agent import _tool_results_ok
+    from boxbot.core.conversation import SpokenSegment
+    from boxbot.tools.builtins.mute_mic import MuteMicTool
+
+    conv = _real_voice_conversation()
+    conv.record_segment(SpokenSegment(channel="voice", to="room", content="Hi?"))
+    _patch_conversation(monkeypatch, conv)
+    _patch_voice_session(monkeypatch, MagicMock())
+
+    raw = await MuteMicTool().execute()
+    assert _tool_results_ok([{"type": "tool_result", "content": raw}])
+
+
+@pytest.mark.asyncio
+async def test_mute_mic_allowed_when_only_a_text_went_out(monkeypatch):
+    """A text to an absent person is not speech to the room."""
+    from boxbot.core.conversation import SpokenSegment
+    from boxbot.tools.builtins.mute_mic import MuteMicTool
+
+    session = MagicMock()
+    session.mute_mic = MagicMock(return_value=True)
+    conv = _real_voice_conversation()
+    conv.record_segment(SpokenSegment(channel="text", to="Sarah", content="hi"))
+    _patch_conversation(monkeypatch, conv)
+    _patch_voice_session(monkeypatch, session)
+
+    result = json.loads(await MuteMicTool().execute(reason="TV audio"))
+
+    assert result["status"] == "muted"
+    session.mute_mic.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_mute_mic_allowed_on_a_later_silent_turn(monkeypatch):
+    """The guard is per turn: speech from an earlier turn does not block
+    muting sustained chatter in a later one."""
+    from boxbot.core.conversation import GenerationResult, SpokenSegment
+    from boxbot.tools.builtins.mute_mic import MuteMicTool
+
+    conv = _real_voice_conversation()
+
+    async def speak_once(c):
+        c.record_segment(SpokenSegment(channel="voice", to="room", content="Hi"))
+        assert c.spoke_this_turn is True
+        return GenerationResult()
+
+    conv._generate_fn = speak_once
+    await conv.handle_input("[Speaker A]: hello", source="user")
+    await conv._generation_task
+    assert conv.spoke_this_turn is False
+
+    session = MagicMock()
+    session.mute_mic = MagicMock(return_value=True)
+    _patch_conversation(monkeypatch, conv)
+    _patch_voice_session(monkeypatch, session)
+
+    result = json.loads(await MuteMicTool().execute(reason="TV audio"))
+    assert result["status"] == "muted"
+    await conv.end(reason="test")
+
+
+def test_mute_mic_description_points_the_right_way():
+    """The old text warned that speaking cancels the mute; the real
+    failure is muting when a reply is due."""
+    from boxbot.tools.builtins.mute_mic import MuteMicTool
+
+    desc = MuteMicTool.description
+    assert "Never after you asked something" in desc
+    assert "not_muted" in desc
+    assert "Never pair with" not in desc
+    assert "mute immediately" not in desc
 
 
 # ---------------------------------------------------------------------------

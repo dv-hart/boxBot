@@ -919,15 +919,54 @@ on top of the pygame surface (`displays/web_view.py`, driven over
 `displays/cdp_pipe.py`). It closes — and the screen goes back to
 rotation — on a switch to any other display, on `unpin()`, when nothing
 has played or been touched for `display.web.idle_minutes` (per page:
-`args.idle_minutes`), at the `display.web.max_minutes` ceiling, or if
-the browser dies.
+`args.idle_minutes`), `display.web.close_after_end_seconds` after its
+media ended, at the `display.web.max_minutes` ceiling, or if the
+browser dies or its page crashes (`Inspector.targetCrashed` /
+`Target.targetCrashed`). When it closes by itself the reason — one of
+the fixed `EXIT_*` strings in `web_view.py` — is kept by the manager
+and readable as `get_active()["web_closed"]`.
+
+Playback state: every 2 s the view runs one probe script in the page
+and gets back, for the primary media element (a `<video>` over an
+`<audio>`, then longest duration, then document order): position,
+duration, paused, ended, `readyState`, `networkState`, `MediaError`
+code and frame counters. `parse_probe()` keeps only finite numbers and
+real booleans, clamped; nothing else from the page survives. From
+those the view derives what `WebView.state()` reports:
+
+| Field | Meaning |
+| --- | --- |
+| `playing` | media running and not held, ended or stalled |
+| `paused` / `paused_by` | boxBot's own hold: `listening` (mic open, or wake word just heard), `speaking` (TTS), `user` (`web_media("pause")`). Never the page's pause button |
+| `ended` | primary media at its end and nothing else playing |
+| `stalled` | not held, not paused in the page, not ended, and position unchanged over 3 probes — or 3 probes unanswered |
+| `position`, `duration` | whole seconds, `None` when unknown |
+
+`ended` and `stalled` stay set while playback is held, because the
+agent only reads state during a conversation. `web_media("play")`
+restarts ended media from 0 and reports `result: "deferred"` when the
+room is not quiet (it then starts on resume); `web_media("restart")`
+reloads the opened URL. End-of-media close: the grace runs only while
+ended persists and nothing holds the view, so a playlist is not closed
+between items and a "play that again" conversation is not cut off. It
+is skipped for a page opened with its own `idle_minutes`.
+
+Telemetry (all in the main log, rate-limited, numbers and fixed words
+only): each pause / resume with its reason and the number of elements
+the page script touched; `playing` / `stalled` / `ended` transitions
+with the probe's numbers; `web view evaluate failed` at WARNING; the
+browser's own stderr under the logger
+`boxbot.displays.web_view.browser` (cleaned, 300 chars a line, 30
+lines a minute); audio capture counters every 30 s.
 
 Sound: the speaker HAL owns the output device exclusively, so the
 browser plays into a PipeWire null sink and `displays/web_audio.py`
 records that sink into `Speaker.feed()`. Web audio therefore shares the
 TTS path, including the AEC reference; it trails the picture by about
 the speaker's buffer depth. `Speaker.is_playing` stays speech-only, so
-a wake word over a video is not treated as a barge-in on TTS. The view keeps one invariant: media plays
+a wake word over a video is not treated as a barge-in on TTS. If
+`pw-record` exits while the view is open it is restarted once; after a
+second exit the view stays up silently and reports `audio: false`. The view keeps one invariant: media plays
 only while the mic's utterance pipeline is closed and BB is not
 speaking. `WakeWordHeard` pauses immediately; a 4 Hz poll of the voice
 session resumes it when the session is muted, dormant, or ended.

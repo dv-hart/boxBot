@@ -36,24 +36,49 @@ switch_display("web", args={"url": "https://en.wikipedia.org/wiki/Otter"})
   | Cause | When |
   | --- | --- |
   | you | `switch_display` to anything else, or `bb.display.unpin()` |
-  | idle | nothing playing + nobody touching the page for 5 min. Per page: `args.idle_minutes` (a recipe someone cooks from → 30) |
+  | video ended | 10 s after the end (playlist: after the last item). Not with `args.idle_minutes` set |
+  | idle | nothing playing for 5 min. Per page: `args.idle_minutes` (a recipe someone cooks from → 30) |
   | hard limit | 2 h |
+  | failure | page crashed / browser died |
 
-  Then rotation resumes. A video that ended, or one you paused, is idle.
-- `bb.display.web_media("pause")` holds until `web_media("play")`.
-  `"play"` also starts a video that loaded without autoplaying
-  (YouTube links autoplay). No seek, no clicking: page needs a tap →
-  the person taps the screen.
+  Then rotation resumes. A video you paused is idle. Closed by itself →
+  `get_active()["web_closed"]` = `{reason, seconds_ago}`.
+- **No touch input exists. Never tell a person to tap, click or touch
+  the screen.** No seek, no clicking. You are the only control:
+
+  | `bb.display.web_media(…)` | Does |
+  | --- | --- |
+  | `"pause"` | holds until `"play"` |
+  | `"play"` | resume; start a video that did not autoplay; replay one that ended |
+  | `"restart"` | reload the URL from the start |
+
+  Returns web state + `result`: `paused` / `playing` / `restarted` /
+  `deferred`. `deferred` = room not quiet; starts by itself when it
+  is. Do not call again.
 - **Sound vs. mic.** Media plays only while the room is quiet: pauses
   when the wake word fires, while you speak, and while the mic is
   listening; resumes on its own after. Opening it on a voice
   conversation mutes the mic (result `mic_muted: true`) — wake word
   re-engages. Speak *before* you open it, not after.
-- State: `bb.display.get_active()["web"]` → `{url, kind, playing,
-  paused, audio, open_seconds, closes_if_idle_seconds}` or `None`.
-  `audio: false` = showing silently (no speaker path). Nothing from
-  the page itself (title, text) is ever reported. `screenshot()` errors while it is open —
-  page pixels never enter your context.
+- State: `bb.display.get_active()["web"]` → dict, or `None` when closed.
+  Also `url`, `kind`, `open_seconds`, `closes_if_idle_seconds`.
+
+  | Field | Meaning | Do |
+  | --- | --- | --- |
+  | `playing` | running, audible now | — |
+  | `paused` + `paused_by` | **your** hold, not the player's. `"listening"` (mic open) / `"speaking"` (you) → normal, lifts by itself when the room is quiet. `"user"` → `web_media("pause")` was called | `"user"` only: `web_media("play")` |
+  | `ended` | video played to its end | offer to replay (`web_media("play")`; still `ended` → `"restart"`) or pick another |
+  | `stalled` | should be running, not moving | `web_media("restart")`, or reopen the URL |
+  | `position`, `duration` | seconds; `None` = unknown | — |
+  | `audio` | `false` = showing silently (no speaker path) | — |
+
+  You only read this mid-conversation, so `paused: true` /
+  `paused_by: "listening"` is what a healthy video looks like — check
+  `ended` / `stalled` before concluding anything. All of `playing`,
+  `paused`, `ended`, `stalled` false → not started: `web_media("play")`.
+  Nothing else from the page (title, text) is ever reported.
+  `screenshot()` errors while it is open — page pixels never enter
+  your context.
 - A web image → download to workspace, show with `picture` (no browser).
 
 ## Product display — switch_display('product', args): one item with image + price
@@ -80,9 +105,9 @@ All args optional strings except `title`. `image` = workspace path.
 | Call | Returns | Purpose |
 | --- | --- | --- |
 | `bb.display.list()` | `[{name, source}, …]` | enumerate |
-| `bb.display.get_active()` | `{name, args, theme, pinned, rotation, web}` | what's on screen + pin/rotation state |
+| `bb.display.get_active()` | `{name, args, theme, pinned, rotation, web, web_closed}` | what's on screen + pin/rotation state |
 | `bb.display.unpin()` | `{pinned, rotation}` | release pin, resume rotation |
-| `bb.display.web_media("play"\|"pause")` | web state | play / pause the `web` display |
+| `bb.display.web_media("play"\|"pause"\|"restart")` | web state + `result` | control the `web` display |
 | `bb.display.set_rotation(displays=, interval=)` | `{pinned, rotation}` | configure idle rotation (clears pin) |
 | `bb.display.screenshot()` | `{path, attached, name}` | live screen → PNG, attached |
 | `bb.display.load(name)` | `dict` | read a spec for editing |

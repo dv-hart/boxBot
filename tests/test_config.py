@@ -58,6 +58,27 @@ class TestDefaultConfig:
         cfg = BoxBotConfig()
         assert "picture" in cfg.display.idle_displays
 
+    def test_web_view_closes_ten_seconds_after_media_ends(self):
+        cfg = BoxBotConfig()
+        assert cfg.display.web.close_after_end_seconds == 10
+        # 0 switches it off; a negative grace is a typo, not a setting.
+        assert DisplayConfig(web={"close_after_end_seconds": 0}).web.close_after_end_seconds == 0
+        with pytest.raises(ValueError):
+            DisplayConfig(web={"close_after_end_seconds": -1})
+
+    def test_example_config_matches_the_web_view_defaults(self):
+        import yaml
+
+        example = yaml.safe_load(
+            (Path(__file__).parent.parent / "config" / "config.example.yaml").read_text()
+        )
+        web = example["display"]["web"]
+        assert web["close_after_end_seconds"] == 10
+        from boxbot.core.config import WebViewConfig
+
+        assert set(web) <= set(WebViewConfig.model_fields)
+        DisplayConfig(web=web)
+
     def test_default_camera_resolution(self):
         cfg = BoxBotConfig()
         assert cfg.camera.resolution == [1280, 720]

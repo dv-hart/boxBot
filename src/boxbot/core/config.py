@@ -298,6 +298,12 @@ class WebViewConfig(BaseModel):
     idle_minutes: float = Field(default=5, gt=0)
     # Hard ceiling: the view closes after this long no matter what.
     max_minutes: float = Field(default=120, gt=0)
+    # A video that played to its end leaves a dim still on screen. The
+    # view closes this many seconds after its media ended (and stayed
+    # ended — the next playlist item cancels it). 0 disables: ended
+    # media then waits for ``idle_minutes``. Not applied to a page
+    # opened with its own ``idle_minutes``.
+    close_after_end_seconds: float = Field(default=10, ge=0)
     # Seconds to wait for the browser to start / a page to load.
     launch_timeout: int = 20
     load_timeout: int = 20

@@ -50,7 +50,7 @@ Discovery::
 Control::
 
     bb.display.unpin()                         # release pin, resume rotation
-    bb.display.web_media("pause")              # play / pause the web display
+    bb.display.web_media("pause")              # play / pause / restart the web display
     bb.display.set_rotation(displays=[...],    # configure idle rotation
                             interval=30)       #   (also clears pin)
 
@@ -194,8 +194,17 @@ def get_active() -> dict[str, Any]:
           },
           "web": None | {                    # set while the `web` display's
               "url", "kind",                 #   browser is on screen
-              "playing", "paused", "audio",
+              "playing",                     # running and audible now
+              "paused",                      # BB is holding playback...
+              "paused_by",                   #   None | "listening" | "speaking" | "user"
+              "ended", "stalled",            # media finished / stuck
+              "position", "duration",        # seconds, None if unknown
+              "audio",
               "open_seconds", "closes_if_idle_seconds",
+          },
+          "web_closed": None | {             # the web display last closed
+              "reason",                      #   by itself: "media ended",
+              "seconds_ago",                 #   idle, time limit, crash
           },
         }
 
@@ -241,15 +250,20 @@ def set_rotation(
 
 
 def web_media(action: str) -> dict[str, Any]:
-    """Play or pause media in the ``web`` display's browser.
+    """Play, pause or restart media in the ``web`` display's browser.
 
     Args:
         action: ``"pause"`` — hold until the next ``"play"`` (the
             automatic pause while people talk lifts on its own; this
-            one does not). ``"play"`` — resume, or start a video the
-            page loaded without autoplaying.
+            one does not). ``"play"`` — resume, start a video the page
+            loaded without autoplaying, or replay one that ended.
+            ``"restart"`` — reload the page from the start (a stalled
+            or broken player).
 
-    Returns the web state (same shape as ``get_active()["web"]``).
+    Returns the web state (same shape as ``get_active()["web"]``) plus
+    ``"result"``: ``"paused"`` | ``"playing"`` | ``"restarted"`` |
+    ``"deferred"``. Deferred = the room is not quiet (``paused_by`` says
+    why); playback starts by itself when it is. Do not call again.
 
     Raises:
         RuntimeError: If the web display is not on screen.

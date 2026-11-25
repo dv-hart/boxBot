@@ -32,8 +32,10 @@ class SwitchDisplayTool(Tool):
         "(autoplays) or any public https page, in a browser over the "
         "screen. Has sound: pauses while you speak or listen, so on "
         "voice it mutes the mic (wake word re-engages). Closes itself "
-        "after 5 idle min (args.idle_minutes to change); close now: "
-        "switch to another display."
+        "10 s after a video ends or after 5 idle min (args.idle_minutes "
+        "to change); close now: switch to another display. No touch "
+        "input exists — never tell anyone to tap the screen; control "
+        "playback with bb.display.web_media."
     )
     parameters = {
         "type": "object",

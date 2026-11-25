@@ -108,6 +108,10 @@ Neither store is committed; both are gitignored.
 ### Local Data
 - Person embeddings stored locally in `data/` (gitignored)
 - Photos stored locally in `data/photos/` (gitignored)
+- Photo people labels and the household roster (names + one-line
+  appearance notes) live only in `data/photos/photos.db`. The roster and
+  the sender's caption are sent with the existing per-photo small-model
+  tagging call (`photos.infer_people`); nothing else new leaves the box
 - Memory database stored locally (gitignored)
 - Optional encrypted cloud backup (S3, disabled by default)
 

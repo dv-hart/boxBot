@@ -5,9 +5,12 @@ Photo search shares the same backend as the search_photos core tool.
 Usage:
     from boxbot_sdk import photos
 
-    results = photos.search(query="beach sunset", tags=["vacation"])
+    results = photos.search(query="Zara at the beach")
     for p in results:
-        print(f"{p.id}: {p.description}")
+        print(p)                      # id, description, people + confidence
+    photos.search(query="Zara", show=True)   # find + put on screen
+
+    photos.set_people("photo_123", names=["Zara"])   # human-confirmed
 
     photos.set_tags("photo_123", tags=["family", "beach"])
     photos.add_to_slideshow("photo_123")
@@ -56,8 +59,31 @@ class PhotoRecord:
         return self._data.get("tags", [])
 
     @property
-    def people(self) -> list[str]:
+    def people(self) -> list[dict[str, Any]]:
+        """``[{name, confidence}]`` — confirmed | certain | likely."""
         return self._data.get("people", [])
+
+    @property
+    def names(self) -> list[str]:
+        """Names only. Check ``people`` for confidence before asserting."""
+        return [p.get("name", "") for p in self.people]
+
+    @property
+    def unsure(self) -> list[Any]:
+        """Weak tagger guesses — not people until a human confirms."""
+        return self._data.get("unsure", [])
+
+    @property
+    def source(self) -> str:
+        return self._data.get("source", "")
+
+    @property
+    def sender(self) -> str | None:
+        return self._data.get("sender")
+
+    @property
+    def score(self) -> float | None:
+        return self._data.get("score")
 
     @property
     def file_path(self) -> str:
@@ -65,14 +91,34 @@ class PhotoRecord:
 
     @property
     def created_at(self) -> str:
-        return self._data.get("created_at", "")
+        return self._data.get("created_at") or self._data.get("created", "")
 
     @property
     def in_slideshow(self) -> bool:
         return self._data.get("in_slideshow", False)
 
     def __repr__(self) -> str:
-        return f"PhotoRecord(id={self.id!r}, description={self.description!r})"
+        who = [
+            p.get("name", "") if p.get("confidence") in ("confirmed", "certain")
+            else f"{p.get('name', '')} ({p.get('confidence')})"
+            for p in self.people
+        ]
+        return (
+            f"PhotoRecord(id={self.id!r}, description={self.description!r}, "
+            f"people={who!r}, tags={self.tags!r}, "
+            f"created={self.created_at[:10]!r})"
+        )
+
+
+class PhotoResults(list):
+    """Search results: a list of ``PhotoRecord`` plus search metadata.
+
+    ``hint`` — set when nothing matched: which filter to drop or how to
+    rephrase. ``shown`` — photos put on screen (``show=True`` only).
+    """
+
+    hint: str | None = None
+    shown: int | None = None
 
 
 class StorageInfo:
@@ -107,32 +153,56 @@ class StorageInfo:
 def search(query: str | None = None, *,
            tags: list[str] | None = None,
            people: list[str] | None = None,
-           limit: int = 10) -> list[PhotoRecord]:
-    """Search photos.
+           date_from: str | None = None,
+           date_to: str | None = None,
+           source: str | None = None,
+           in_slideshow: bool | None = None,
+           limit: int | None = None,
+           show: bool = False) -> PhotoResults:
+    """Search photos. Same backend and defaults as the search_photos tool.
 
     Args:
-        query: Text search query.
-        tags: Filter by tags.
-        people: Filter by people in photo.
-        limit: Maximum results.
+        query: What to find — a person's name works ("Zara", "Zara at
+            the beach"). None = newest first.
+        tags: Hard filter; photo must carry all of them.
+        people: Names; soft match across people labels, tags, description.
+        date_from / date_to: ISO dates.
+        source: "whatsapp", "signal", "camera", "upload".
+        in_slideshow: Filter by slideshow membership.
+        limit: Max results (backend default 10, max 100).
+        show: Also put the results on the 7" screen (one call).
 
     Returns:
-        List of PhotoRecord objects sorted by relevance.
+        ``PhotoResults`` (a list) sorted by relevance. Empty → ``.hint``.
     """
-    payload: dict[str, Any] = {"limit": limit}
+    payload: dict[str, Any] = {}
     if query is not None:
         v.require_str(query, "query")
         payload["query"] = query
-    if tags is not None:
-        v.require_list(tags, "tags")
-        payload["tags"] = tags
-    if people is not None:
-        v.require_list(people, "people")
-        payload["people"] = people
-    v.require_int(limit, "limit", min_val=1, max_val=100)
+    for key, value in (("tags", tags), ("people", people)):
+        if value is not None:
+            v.require_list(value, key)
+            for item in value:
+                v.require_str(item, key)
+            payload[key] = value
+    for key, value in (("date_from", date_from), ("date_to", date_to),
+                       ("source", source)):
+        if value is not None:
+            v.require_str(value, key)
+            payload[key] = value
+    if in_slideshow is not None:
+        payload["in_slideshow"] = v.require_bool(in_slideshow, "in_slideshow")
+    if limit is not None:
+        v.require_int(limit, "limit", min_val=1, max_val=100)
+        payload["limit"] = limit
+    if show:
+        payload["show"] = v.require_bool(show, "show")
 
     resp = _check(_transport.request("photos.search", payload, timeout=30))
-    return [PhotoRecord(r) for r in resp.get("results", [])]
+    results = PhotoResults(PhotoRecord(r) for r in resp.get("results", []))
+    results.hint = resp.get("hint")
+    results.shown = resp.get("shown")
+    return results
 
 
 def get(photo_id: str) -> PhotoRecord:
@@ -197,9 +267,9 @@ def ingest(
             ``"camera"``, or ``"upload"``. Stored on the photo for
             filtering later.
         sender: Person who sent it, if known.
-        caption: Optional human-supplied description; used as the
-            initial photo description until the small-model tagger
-            replaces it.
+        caption: Optional human-supplied caption, verbatim. The tagger
+            reads it to name household people (a caption naming someone
+            on the roster = "certain"); also the fallback description.
 
     Returns the new photo's ID.
     """
@@ -269,7 +339,9 @@ def set_tags(photo_id: str, *, tags: list[str]) -> None:
 
 
 def set_person(photo_id: str, *, person_index: int, name: str) -> None:
-    """Tag a person in a photo.
+    """Rename one existing person slot (marks it human-confirmed).
+
+    To add or remove people use ``set_people``.
 
     Args:
         photo_id: Photo ID.
@@ -284,6 +356,86 @@ def set_person(photo_id: str, *, person_index: int, name: str) -> None:
         "person_index": person_index,
         "name": name,
     }, timeout=30))
+
+
+# --- People: human confirmation ---
+
+def set_people(photo_id: str, *, names: list[str]) -> list[str]:
+    """Set the human-confirmed people on a photo (replaces all labels).
+
+    Add, remove or correct in one call. Only after a human said who is
+    in the photo: the result is stored as confirmed and the tagger never
+    changes it again. ``names=[]`` = nobody from the household.
+
+    Returns the stored names (household spelling).
+    """
+    v.require_str(photo_id, "photo_id")
+    v.require_list(names, "names")
+    for name in names:
+        v.require_str(name, "name")
+    resp = _check(_transport.request("photos.set_people", {
+        "id": photo_id,
+        "names": names,
+    }, timeout=30))
+    return resp.get("people", [])
+
+
+def confirm_people(photo_id: str) -> list[str]:
+    """Mark a photo's current certain/likely labels human-confirmed.
+
+    Use when a human agreed with the labels as they stand. ``unsure``
+    suggestions are dropped. Returns the confirmed names.
+    """
+    v.require_str(photo_id, "photo_id")
+    resp = _check(_transport.request(
+        "photos.confirm_people", {"id": photo_id}, timeout=30))
+    return resp.get("people", [])
+
+
+def unconfirmed(limit: int = 20) -> list[PhotoRecord]:
+    """Photos with likely/unsure people no human has reviewed, newest first.
+
+    Each record's ``people`` items carry ``basis`` (the tagger's reason);
+    ``unsure`` is ``[{name, basis}]``.
+    """
+    v.require_int(limit, "limit", min_val=1, max_val=100)
+    resp = _check(_transport.request(
+        "photos.unconfirmed", {"limit": limit}, timeout=30))
+    return [PhotoRecord(r) for r in resp.get("results", [])]
+
+
+# --- Household roster (who the tagger may name) ---
+
+def roster() -> list[dict[str, Any]]:
+    """The household roster: ``[{name, note, person_id}]``."""
+    resp = _check(_transport.request("photos.roster", {}, timeout=30))
+    return resp.get("roster", [])
+
+
+def set_roster(name: str, *, note: str) -> dict[str, Any]:
+    """Add or update a roster entry.
+
+    Args:
+        name: Person's name. Matched to a known person case-insensitively
+            (their spelling wins); a person the box has never met is fine.
+        note: One line, max 200 chars: how to recognise them in a photo
+            (age, hair, glasses, usual context).
+
+    Returns ``{name, note, linked}`` — ``linked`` = tied to a known person.
+    """
+    v.require_str(name, "name")
+    v.require_str(note, "note", allow_empty=True)
+    return _check(_transport.request("photos.set_roster", {
+        "name": name,
+        "note": note,
+    }, timeout=30))
+
+
+def remove_from_roster(name: str) -> None:
+    """Remove a roster entry (existing photo labels are kept)."""
+    v.require_str(name, "name")
+    _check(_transport.request(
+        "photos.remove_from_roster", {"name": name}, timeout=30))
 
 
 # --- Slideshow management ---

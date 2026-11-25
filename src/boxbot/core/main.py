@@ -496,8 +496,26 @@ async def _init_photo_intake(photo_store: Any) -> Any:
     """Initialise and start the photo intake pipeline."""
     from boxbot.photos.intake import IntakePipeline, set_intake_pipeline
 
-    pipeline = IntakePipeline(photo_store)
+    from boxbot.core.config import get_config
+
+    # People inference (photos.infer_people): the small-model tagger
+    # names household people from the caption + the roster stored in the
+    # photo store. No detector needed.
+    infer_people = bool(get_config().photos.infer_people)
+    pipeline = IntakePipeline(photo_store, infer_people=infer_people)
     await pipeline.start()
+    if infer_people:
+        roster = await pipeline.load_roster()
+        if roster:
+            logger.info(
+                "Photo people inference on (%d on roster)", len(roster)
+            )
+        else:
+            logger.warning(
+                "Photo people inference on but the household roster is "
+                "empty — no one will be named until bb.photos.set_roster "
+                "adds people"
+            )
     # Publish so sandbox action handlers (bb.photos.ingest) can reach
     # the live pipeline without DI plumbing.
     set_intake_pipeline(pipeline)

@@ -60,7 +60,15 @@ class PhotoRecord:
     deleted_at: str | None
     updated_at: str
     tags: list[str] = field(default_factory=list)
+    # People named in the photo. Each dict: label, person_id, bbox_*,
+    # confidence ("confirmed" | "certain" | "likely"), source, basis.
     people: list[dict[str, Any]] = field(default_factory=list)
+    # Tagger guesses too weak to count as a person (confidence "unsure").
+    # Same dict shape as ``people``. Never matched by search.
+    suggestions: list[dict[str, Any]] = field(default_factory=list)
+    # Set once a human has reviewed the people on this photo. The tagger
+    # (ingest and backfill) never touches a reviewed photo again.
+    people_confirmed_at: str | None = None
 
 
 @dataclass
@@ -127,6 +135,17 @@ CREATE TABLE IF NOT EXISTS photo_people (
     bbox_h          REAL
 );
 
+-- Household roster shown to the small-model tagger: one row per person,
+-- with a one-line appearance/context note. ``person_id`` links to the
+-- perception persons table when a record exists there (optional — a
+-- person the box has never seen or heard can still be on the roster).
+CREATE TABLE IF NOT EXISTS people_notes (
+    name            TEXT PRIMARY KEY COLLATE NOCASE,
+    note            TEXT NOT NULL DEFAULT '',
+    person_id       TEXT,
+    updated_at      TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_photos_deleted
     ON photos(deleted_at);
 CREATE INDEX IF NOT EXISTS idx_photos_slideshow
@@ -139,32 +158,35 @@ CREATE INDEX IF NOT EXISTS idx_photo_people_person
     ON photo_people(person_id);
 """
 
+# Columns added after first release — applied idempotently on open
+# (same additive pattern as memory/store.py::_migrate_columns).
+_COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
+    # confidence: confirmed (human) | certain | likely | unsure (tagger)
+    ("photo_people", "confidence", "TEXT NOT NULL DEFAULT 'likely'"),
+    # source: human | tagger | detector
+    ("photo_people", "source", "TEXT NOT NULL DEFAULT 'detector'"),
+    # basis: the tagger's one-line reason ("caption names her", …)
+    ("photo_people", "basis", "TEXT NOT NULL DEFAULT ''"),
+    ("photos", "people_confirmed_at", "TEXT"),
+]
+
+# Confidence levels, strongest first. "unsure" rows are suggestions, not
+# people: they are kept for review but never count as a person.
+CONFIDENCE_LEVELS = ("confirmed", "certain", "likely", "unsure")
+PERSON_CONFIDENCES = ("confirmed", "certain", "likely")
+
+# Standalone FTS5 table over description + tags + people labels, kept in
+# sync from Python (``_reindex_photo``). Keyed by the photo id in an
+# UNINDEXED column rather than by the photos rowid — ``photos`` has a
+# TEXT primary key, so its implicit rowid is not stable across VACUUM.
+_FTS_COLUMNS = ("photo_id", "description", "tags", "people")
 _FTS_SCHEMA_SQL = """\
 CREATE VIRTUAL TABLE IF NOT EXISTS photos_fts USING fts5(
+    photo_id UNINDEXED,
     description,
-    content='photos',
-    content_rowid='rowid'
+    tags,
+    people
 );
-"""
-
-# Triggers to keep the FTS index in sync with the photos table.
-_FTS_TRIGGERS_SQL = """\
-CREATE TRIGGER IF NOT EXISTS photos_ai AFTER INSERT ON photos BEGIN
-    INSERT INTO photos_fts(rowid, description)
-    VALUES (new.rowid, new.description);
-END;
-
-CREATE TRIGGER IF NOT EXISTS photos_ad AFTER DELETE ON photos BEGIN
-    INSERT INTO photos_fts(photos_fts, rowid, description)
-    VALUES ('delete', old.rowid, old.description);
-END;
-
-CREATE TRIGGER IF NOT EXISTS photos_au AFTER UPDATE OF description ON photos BEGIN
-    INSERT INTO photos_fts(photos_fts, rowid, description)
-    VALUES ('delete', old.rowid, old.description);
-    INSERT INTO photos_fts(rowid, description)
-    VALUES (new.rowid, new.description);
-END;
 """
 
 
@@ -215,8 +237,8 @@ class PhotoStore:
         await self._db.execute("PRAGMA foreign_keys=ON")
 
         await self._db.executescript(_SCHEMA_SQL)
-        await self._db.executescript(_FTS_SCHEMA_SQL)
-        await self._db.executescript(_FTS_TRIGGERS_SQL)
+        await self._migrate_columns()
+        await self._migrate_fts()
         await self._db.commit()
         logger.info("Photo store initialized at %s", self._db_path)
 
@@ -225,6 +247,51 @@ class PhotoStore:
         if self._db:
             await self._db.close()
             self._db = None
+
+    async def _migrate_columns(self) -> None:
+        """Apply additive ALTER TABLE migrations idempotently."""
+        db = self._ensure_db()
+        for table, col, col_type in _COLUMN_MIGRATIONS:
+            try:
+                await db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"
+                )
+            except aiosqlite.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
+
+    async def _migrate_fts(self) -> None:
+        """Create the FTS table, replacing the description-only v1 index.
+
+        v1 was an external-content table over ``photos.description``
+        maintained by triggers. v2 also indexes tags and people labels.
+        When the v1 shape (or no table) is found, the triggers and table
+        are dropped, the v2 table is created, and the index is rebuilt
+        once from the live rows.
+        """
+        db = self._ensure_db()
+        cols: list[str] = []
+        async with db.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'photos_fts'"
+        ) as cursor:
+            exists = await cursor.fetchone() is not None
+        if exists:
+            async with db.execute("PRAGMA table_info(photos_fts)") as cursor:
+                cols = [row["name"] async for row in cursor]
+        if tuple(cols) == _FTS_COLUMNS:
+            return
+
+        for trigger in ("photos_ai", "photos_ad", "photos_au"):
+            await db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        await db.execute("DROP TABLE IF EXISTS photos_fts")
+        await db.executescript(_FTS_SCHEMA_SQL)
+        await self.rebuild_fts_index()
+        if exists:
+            logger.info(
+                "Migrated photos FTS index: now covers description, "
+                "tags and people"
+            )
 
     def _ensure_db(self) -> aiosqlite.Connection:
         if self._db is None:
@@ -306,23 +373,10 @@ class PhotoStore:
                 )
 
         # Associate people
-        if people:
-            for person in people:
-                await db.execute(
-                    """INSERT INTO photo_people
-                       (photo_id, person_id, label, bbox_x, bbox_y, bbox_w, bbox_h)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        pid,
-                        person.get("person_id"),
-                        person["label"],
-                        person.get("bbox_x"),
-                        person.get("bbox_y"),
-                        person.get("bbox_w"),
-                        person.get("bbox_h"),
-                    ),
-                )
+        for person in people or []:
+            await self._insert_person(pid, person)
 
+        await self._reindex_photo(pid)
         await db.commit()
         logger.debug("Created photo %s (%s)", pid, filename)
         return pid
@@ -379,6 +433,8 @@ class PhotoStore:
             f"UPDATE photos SET {', '.join(fields)} WHERE id = ?",
             values,
         )
+        if description is not None and result.rowcount > 0:
+            await self._reindex_photo(photo_id)
         await db.commit()
         return result.rowcount > 0
 
@@ -467,6 +523,9 @@ class PhotoStore:
         await db.execute("DELETE FROM photo_people WHERE photo_id = ?", (photo_id,))
         await db.execute("DELETE FROM photo_tags WHERE photo_id = ?", (photo_id,))
         await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+        await db.execute(
+            "DELETE FROM photos_fts WHERE photo_id = ?", (photo_id,)
+        )
         await db.commit()
 
         # Delete the file from disk
@@ -565,6 +624,7 @@ class PhotoStore:
             "UPDATE photos SET updated_at = ? WHERE id = ?",
             (_now_iso(), photo_id),
         )
+        await self._reindex_photo(photo_id)
         await db.commit()
         return True
 
@@ -611,6 +671,8 @@ class PhotoStore:
         await db.execute("DELETE FROM photo_tags WHERE tag_id = ?", (source_id,))
         # Delete source tag
         await db.execute("DELETE FROM tags WHERE id = ?", (source_id,))
+        for pid in photo_ids:
+            await self._reindex_photo(pid)
         await db.commit()
 
         logger.info("Merged tag '%s' into '%s' (%d photos)", source_name, target_name, count)
@@ -629,6 +691,15 @@ class PhotoStore:
             "UPDATE tags SET name = ? WHERE name = ?",
             (new_name, old_name),
         )
+        if result.rowcount > 0:
+            async with db.execute(
+                "SELECT pt.photo_id FROM photo_tags pt "
+                "JOIN tags t ON t.id = pt.tag_id WHERE t.name = ?",
+                (new_name,),
+            ) as cursor:
+                affected = [r["photo_id"] async for r in cursor]
+            for pid in affected:
+                await self._reindex_photo(pid)
         await db.commit()
         return result.rowcount > 0
 
@@ -655,8 +726,15 @@ class PhotoStore:
             row = await cursor.fetchone()
             count = row["cnt"]
 
+        async with db.execute(
+            "SELECT photo_id FROM photo_tags WHERE tag_id = ?", (tag_id,)
+        ) as cursor:
+            affected = [r["photo_id"] async for r in cursor]
+
         await db.execute("DELETE FROM photo_tags WHERE tag_id = ?", (tag_id,))
         await db.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+        for pid in affected:
+            await self._reindex_photo(pid)
         await db.commit()
 
         logger.info("Deleted tag '%s' (%d associations)", name, count)
@@ -690,10 +768,49 @@ class PhotoStore:
     # People
     # ------------------------------------------------------------------
 
+    async def _insert_person(
+        self, photo_id: str, person: dict[str, Any]
+    ) -> None:
+        """Insert one photo_people row. Does not commit or reindex."""
+        db = self._ensure_db()
+        confidence = person.get("confidence") or "likely"
+        if confidence not in CONFIDENCE_LEVELS:
+            raise ValueError(f"unknown confidence: {confidence!r}")
+        await db.execute(
+            """INSERT INTO photo_people
+               (photo_id, person_id, label, bbox_x, bbox_y, bbox_w, bbox_h,
+                confidence, source, basis)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                photo_id,
+                person.get("person_id"),
+                person["label"],
+                person.get("bbox_x"),
+                person.get("bbox_y"),
+                person.get("bbox_w"),
+                person.get("bbox_h"),
+                confidence,
+                person.get("source") or "detector",
+                str(person.get("basis") or ""),
+            ),
+        )
+
     async def update_people(
-        self, photo_id: str, people: list[dict[str, Any]]
+        self,
+        photo_id: str,
+        people: list[dict[str, Any]],
+        *,
+        human_confirmed: bool = False,
     ) -> bool:
         """Replace all people annotations on a photo.
+
+        Each dict needs ``label``; optional ``person_id``, ``bbox_*``,
+        ``confidence``, ``source``, ``basis``. With ``human_confirmed``
+        every row is written as ``confidence="confirmed"`` /
+        ``source="human"`` and the photo is marked reviewed, which locks
+        it against the tagger (see :meth:`apply_inferred_people`). An
+        empty list with ``human_confirmed`` records "nobody from the
+        household is in this photo".
 
         Returns True if the photo exists.
         """
@@ -710,27 +827,144 @@ class PhotoStore:
         )
 
         for person in people:
+            row = dict(person)
+            if human_confirmed:
+                row["confidence"] = "confirmed"
+                row["source"] = "human"
+            await self._insert_person(photo_id, row)
+
+        now = _now_iso()
+        if human_confirmed:
             await db.execute(
-                """INSERT INTO photo_people
-                   (photo_id, person_id, label, bbox_x, bbox_y, bbox_w, bbox_h)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    photo_id,
-                    person.get("person_id"),
-                    person["label"],
-                    person.get("bbox_x"),
-                    person.get("bbox_y"),
-                    person.get("bbox_w"),
-                    person.get("bbox_h"),
-                ),
+                "UPDATE photos SET updated_at = ?, people_confirmed_at = ? "
+                "WHERE id = ?",
+                (now, now, photo_id),
             )
+        else:
+            await db.execute(
+                "UPDATE photos SET updated_at = ? WHERE id = ?",
+                (now, photo_id),
+            )
+        await self._reindex_photo(photo_id)
+        await db.commit()
+        return True
+
+    async def apply_inferred_people(
+        self, photo_id: str, inferred: list[dict[str, Any]]
+    ) -> bool:
+        """Write the tagger's people inference for a photo.
+
+        Replaces earlier tagger rows only, so re-running is idempotent.
+        Rows from other sources (detector, human) are kept, and an
+        inferred name already present from another source is dropped.
+        A photo a human has reviewed is left untouched.
+
+        Returns True if rows were written, False if the photo is missing
+        or human-confirmed.
+        """
+        db = self._ensure_db()
+        async with db.execute(
+            "SELECT people_confirmed_at FROM photos WHERE id = ?", (photo_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or row["people_confirmed_at"]:
+            return False
+
+        await db.execute(
+            "DELETE FROM photo_people WHERE photo_id = ? AND source = 'tagger'",
+            (photo_id,),
+        )
+        async with db.execute(
+            "SELECT label FROM photo_people WHERE photo_id = ?", (photo_id,)
+        ) as cursor:
+            taken = {r["label"].casefold() async for r in cursor}
+
+        for person in inferred:
+            key = str(person["label"]).casefold()
+            if key in taken:
+                continue
+            taken.add(key)
+            await self._insert_person(photo_id, {**person, "source": "tagger"})
 
         await db.execute(
             "UPDATE photos SET updated_at = ? WHERE id = ?",
             (_now_iso(), photo_id),
         )
+        await self._reindex_photo(photo_id)
         await db.commit()
         return True
+
+    async def list_unconfirmed_people(
+        self, *, limit: int = 20
+    ) -> list[PhotoRecord]:
+        """Photos whose people still need a human look, newest first.
+
+        A photo qualifies when no human has reviewed it and it carries at
+        least one ``likely`` or ``unsure`` label.
+        """
+        db = self._ensure_db()
+        records: list[PhotoRecord] = []
+        async with db.execute(
+            """SELECT p.* FROM photos p
+               WHERE p.deleted_at IS NULL
+                 AND p.people_confirmed_at IS NULL
+                 AND EXISTS (
+                     SELECT 1 FROM photo_people pp
+                     WHERE pp.photo_id = p.id
+                       AND pp.confidence IN ('likely', 'unsure'))
+               ORDER BY p.created_at DESC LIMIT ?""",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            records.append(await self._row_to_record(row))
+        return records
+
+    # ------------------------------------------------------------------
+    # Household roster (people_notes)
+    # ------------------------------------------------------------------
+
+    async def list_people_notes(self) -> list[dict[str, Any]]:
+        """The household roster: ``[{name, note, person_id}]`` by name."""
+        db = self._ensure_db()
+        out: list[dict[str, Any]] = []
+        async with db.execute(
+            "SELECT name, note, person_id FROM people_notes "
+            "ORDER BY name COLLATE NOCASE"
+        ) as cursor:
+            async for row in cursor:
+                out.append({
+                    "name": row["name"],
+                    "note": row["note"],
+                    "person_id": row["person_id"],
+                })
+        return out
+
+    async def set_person_note(
+        self, name: str, note: str, *, person_id: str | None = None
+    ) -> None:
+        """Add or replace a roster entry (name match is case-insensitive)."""
+        db = self._ensure_db()
+        await db.execute(
+            """INSERT INTO people_notes (name, note, person_id, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                   name = excluded.name,
+                   note = excluded.note,
+                   person_id = excluded.person_id,
+                   updated_at = excluded.updated_at""",
+            (name, note, person_id, _now_iso()),
+        )
+        await db.commit()
+
+    async def delete_person_note(self, name: str) -> bool:
+        """Remove a roster entry. Returns True if one was removed."""
+        db = self._ensure_db()
+        result = await db.execute(
+            "DELETE FROM people_notes WHERE name = ?", (name,)
+        )
+        await db.commit()
+        return result.rowcount > 0
 
     async def repoint_person(
         self,
@@ -758,6 +992,20 @@ class PhotoStore:
                 "UPDATE photo_people SET person_id = ? WHERE person_id = ?",
                 (new_person_id, old_person_id),
             )
+        if new_label is not None:
+            # Keep the roster on the same name as the perception record.
+            await db.execute(
+                "UPDATE OR IGNORE people_notes SET name = ?, person_id = ? "
+                "WHERE person_id = ?",
+                (new_label, new_person_id, old_person_id),
+            )
+        async with db.execute(
+            "SELECT DISTINCT photo_id FROM photo_people WHERE person_id = ?",
+            (new_person_id,),
+        ) as affected_cursor:
+            affected = [r["photo_id"] async for r in affected_cursor]
+        for pid in affected:
+            await self._reindex_photo(pid)
         await db.commit()
         if cursor.rowcount:
             logger.info(
@@ -861,11 +1109,45 @@ class PhotoStore:
     # ------------------------------------------------------------------
 
     async def rebuild_fts_index(self) -> None:
-        """Rebuild the FTS5 index from the photos table."""
+        """Rebuild the FTS5 index from the photos, tags and people tables."""
         db = self._ensure_db()
-        await db.execute("INSERT INTO photos_fts(photos_fts) VALUES('rebuild')")
+        await db.execute("DELETE FROM photos_fts")
+        async with db.execute("SELECT id FROM photos") as cursor:
+            photo_ids = [row["id"] async for row in cursor]
+        for pid in photo_ids:
+            await self._reindex_photo(pid)
         await db.commit()
-        logger.info("Rebuilt photos FTS index")
+        logger.info("Rebuilt photos FTS index (%d photos)", len(photo_ids))
+
+    async def _reindex_photo(self, photo_id: str) -> None:
+        """Refresh one photo's FTS row. Does not commit."""
+        db = self._ensure_db()
+        await db.execute(
+            "DELETE FROM photos_fts WHERE photo_id = ?", (photo_id,)
+        )
+        async with db.execute(
+            "SELECT description FROM photos WHERE id = ?", (photo_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return
+        async with db.execute(
+            "SELECT t.name FROM tags t JOIN photo_tags pt ON t.id = pt.tag_id "
+            "WHERE pt.photo_id = ?",
+            (photo_id,),
+        ) as cursor:
+            tags = [r["name"] async for r in cursor]
+        async with db.execute(
+            "SELECT label FROM photo_people "
+            "WHERE photo_id = ? AND confidence != 'unsure'",
+            (photo_id,),
+        ) as cursor:
+            people = [r["label"] async for r in cursor]
+        await db.execute(
+            "INSERT INTO photos_fts (photo_id, description, tags, people) "
+            "VALUES (?, ?, ?, ?)",
+            (photo_id, row["description"], " ".join(tags), " ".join(people)),
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -887,20 +1169,29 @@ class PhotoStore:
             async for tag_row in cursor:
                 tags.append(tag_row["name"])
 
-        # Fetch people
+        # Fetch people; "unsure" rows are suggestions, not people.
         people: list[dict[str, Any]] = []
+        suggestions: list[dict[str, Any]] = []
         async with db.execute(
-            "SELECT * FROM photo_people WHERE photo_id = ?", (photo_id,)
+            "SELECT * FROM photo_people WHERE photo_id = ? ORDER BY id",
+            (photo_id,),
         ) as cursor:
             async for person_row in cursor:
-                people.append({
+                entry = {
                     "label": person_row["label"],
                     "person_id": person_row["person_id"],
                     "bbox_x": person_row["bbox_x"],
                     "bbox_y": person_row["bbox_y"],
                     "bbox_w": person_row["bbox_w"],
                     "bbox_h": person_row["bbox_h"],
-                })
+                    "confidence": person_row["confidence"],
+                    "source": person_row["source"],
+                    "basis": person_row["basis"],
+                }
+                if entry["confidence"] == "unsure":
+                    suggestions.append(entry)
+                else:
+                    people.append(entry)
 
         return PhotoRecord(
             id=photo_id,
@@ -918,6 +1209,8 @@ class PhotoStore:
             updated_at=row["updated_at"],
             tags=tags,
             people=people,
+            suggestions=suggestions,
+            people_confirmed_at=row["people_confirmed_at"],
         )
 
     async def _get_photo_raw(self, photo_id: str) -> aiosqlite.Row | None:

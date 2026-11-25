@@ -1,8 +1,10 @@
 """search_photos tool — search and retrieve photos from the photo library.
 
-Routes to the shared photo search backend (boxbot.photos.search). Two modes:
-search (ranked results with metadata) and get (full details for a single
-photo). Uses lazy imports since the photo system may not be built yet.
+Routes to the shared photo search backend (boxbot.photos.search) — the
+same backend and defaults as ``bb.photos.search``. Two modes: search
+(ranked slim rows, optionally shown on screen) and get (full details for
+a single photo). Uses lazy imports since the photo system may not be
+built yet.
 """
 
 from __future__ import annotations
@@ -21,10 +23,15 @@ class SearchPhotosTool(Tool):
 
     name = "search_photos"
     description = (
-        "Photo library. Modes: 'search' (ranked text match, filterable by "
-        "tags, people, date range, source), 'get' (full detail by "
-        "photo_id). To put results on screen: "
-        "switch_display('picture', args={'image_ids': [...]})."
+        "Photo library. 'search': ranked; a person's name goes in query "
+        "(query='Zara', query='Zara at the beach'); no query = newest "
+        "first. show=true also puts the results on the screen — one call "
+        "for 'show us photos of X'. 'get': full detail by photo_id.\n"
+        "people[].confidence: confirmed/certain = say it plainly; likely "
+        "= inferred from appearance, say 'looks like'; `unsure` = a "
+        "guess, not a person — ask.\n"
+        "Empty results come with a hint; never show unrelated photos "
+        "instead."
     )
     parameters = {
         "type": "object",
@@ -37,8 +44,8 @@ class SearchPhotosTool(Tool):
             "query": {
                 "type": "string",
                 "description": (
-                    "Text match against photo descriptions. Required for "
-                    "'search'."
+                    "What to find: names, things, places. Matches people, "
+                    "tags, description. Optional."
                 ),
             },
             "photo_id": {
@@ -48,12 +55,15 @@ class SearchPhotosTool(Tool):
             "tags": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Filter by tags. AND.",
+                "description": "Hard filter: must have all tags.",
             },
             "people": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Filter by person names. AND.",
+                "description": (
+                    "Person names; must be mentioned in labels, tags or "
+                    "description. Prefer putting the name in query."
+                ),
             },
             "date_from": {
                 "type": "string",
@@ -77,7 +87,14 @@ class SearchPhotosTool(Tool):
             },
             "limit": {
                 "type": "integer",
-                "description": "Max results for 'search'. Default 20.",
+                "description": "Max results for 'search'. Default 10.",
+            },
+            "show": {
+                "type": "boolean",
+                "description": (
+                    "'search' only: also show the results on the screen "
+                    "(picture display). Default false."
+                ),
             },
         },
         "required": ["mode"],
@@ -130,7 +147,8 @@ class SearchPhotosTool(Tool):
             source=kwargs.get("source"),
             in_slideshow=kwargs.get("in_slideshow"),
             include_deleted=kwargs.get("include_deleted", False),
-            limit=kwargs.get("limit", 20),
+            limit=kwargs.get("limit"),
+            show=bool(kwargs.get("show", False)),
         )
 
         return json.dumps(result)

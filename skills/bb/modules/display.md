@@ -11,12 +11,12 @@ Output *you* need to see → `bb.workspace.view` / `bb.camera.capture` /
 `bb.photos.view`, not a display. Switches tear down data sources — max
 ~1/sec.
 
-## Built-in displays — clock / weather_simple / notice / picture / web / product + their args
+## Built-in displays — clock / weather_simple / notice / picture / web + their args
 
 `clock` · `weather_simple` · `notice` (`args.title` + `args.lines`) ·
 `picture` (`args.image_ids: [str, ...]` required; 1 id = static, 2+ =
 slideshow every `args.interval` sec, default 8; an id may be a
-workspace image path, e.g. `"tmp/cat.jpg"`) · `web` · `product` ·
+workspace image path, e.g. `"tmp/cat.jpg"`) · `web` ·
 everything in `displays/` and `data/displays/`. Enumerate:
 `bb.display.list()`.
 
@@ -56,24 +56,12 @@ switch_display("web", args={"url": "https://en.wikipedia.org/wiki/Otter"})
   page pixels never enter your context.
 - A web image → download to workspace, show with `picture` (no browser).
 
-## Product display — switch_display('product', args): one item with image + price
+## Product and cart screens — drawn by bb.purchases, not by you
 
-```python
-hit = bb.purchases.search("goldilocks board book", limit=5)[0]
-image = None
-if hit["image_url"]:
-    import requests
-    image = bb.workspace.write(
-        "tmp/product.jpg", requests.get(hit["image_url"], timeout=15).content,
-    )["path"]
-print(image)
-```
-```
-switch_display("product", args={"title": …, "price": "$11.99",
-    "seller": …, "detail": "4.8 stars (212)", "image": "tmp/product.jpg"})
-```
-
-All args optional strings except `title`. `image` = workspace path.
+`products` (numbered cards) and `cart` are drawn by the main process
+from result ids: `bb.purchases.find` / `show(ids)` / `cart(...)`. Do
+not `switch_display` to them or type product details into any display —
+titles, prices, sellers and photos come from the catalogue.
 
 ## Call signatures — every bb.display call (list, screenshot, load/save/preview, …)
 

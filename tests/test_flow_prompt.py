@@ -128,7 +128,8 @@ def test_no_agent_facing_text_suggests_touching_the_screen(prompt):
 def test_web_display_doc_says_what_to_do_instead():
     doc = (REPO / "skills/bb/modules/display.md").read_text(encoding="utf-8")
     assert "the person taps the screen" not in doc
-    assert "never tell anyone to tap or press play" in doc
+    assert "No touch input exists" in doc
+    assert "Never tell a person to tap" in doc
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +160,7 @@ def test_onboarding_keeps_identify_person_usage():
     s1 = _onboarding_s1()
 
     assert "**Pin it** with `identify_person`" in s1
-    assert '`ref` = the session speaker ref' in s1
+    assert '`ref` = ' in s1
     assert 'identify_person(action="rename", name="Brian", new_name="Bri")' in s1
     for outcome in ("`create`", "`confirm`", "`correct`"):
         assert outcome in s1

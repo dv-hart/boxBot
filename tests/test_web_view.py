@@ -1167,3 +1167,50 @@ class TestMicMuteForPlayback:
         ) is False
         await wired.switch("clock")
         assert VoiceSession._web_view_holds_mute(muted) is False
+
+    async def test_reopening_the_mic_ends_the_hold(self, wired):
+        """Wake word during a video, then the agent mutes on its own and
+        asks a question: that mute must not be taken for the playback
+        mute, or the answer is never heard (2026-11-24)."""
+        from types import SimpleNamespace
+
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+
+        class Capture:
+            is_muted = True
+
+            def unmute(self):
+                self.is_muted = False
+
+        wired.note_web_mic_muted()
+        session = SimpleNamespace(
+            _audio_capture=Capture(),
+            _microphone=None,
+            _state=VoiceSessionState.ACTIVE,
+            _release_web_view_mute=VoiceSession._release_web_view_mute,
+        )
+        VoiceSession.unmute_mic(session)
+        assert not wired.web_holds_mic_mute()
+        # The page is still open; a fresh mute is the agent's own.
+        assert VoiceSession._web_view_holds_mute(
+            SimpleNamespace(is_mic_muted=True)
+        ) is False
+
+    async def test_unmuting_an_open_mic_leaves_the_hold_alone(self, wired):
+        from types import SimpleNamespace
+
+        from boxbot.communication.voice import VoiceSession, VoiceSessionState
+
+        class Capture:
+            is_muted = False
+
+            def unmute(self):
+                pass
+
+        wired.note_web_mic_muted()
+        VoiceSession.unmute_mic(SimpleNamespace(
+            _audio_capture=Capture(), _microphone=None,
+            _state=VoiceSessionState.ACTIVE,
+            _release_web_view_mute=VoiceSession._release_web_view_mute,
+        ))
+        assert wired.web_holds_mic_mute()

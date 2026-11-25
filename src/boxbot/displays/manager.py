@@ -551,6 +551,14 @@ class DisplayManager:
         if self._web_view is not None and self._web_view.is_open:
             self._web_view.holds_mic_mute = True
 
+    def release_web_mic_mute(self) -> None:
+        """The mic was reopened (wake word, conversation end): the
+        playback mute is over. Any mute placed after this is the
+        agent's own and follows the normal contract — BB's next speech
+        reopens the mic — even though the page is still on screen."""
+        if self._web_view is not None:
+            self._web_view.holds_mic_mute = False
+
     def web_holds_mic_mute(self) -> bool:
         return (
             self._web_view is not None

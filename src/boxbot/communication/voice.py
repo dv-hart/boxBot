@@ -300,6 +300,8 @@ class VoiceSession:
             return
         was_muted = self._audio_capture.is_muted
         self._audio_capture.unmute()
+        if was_muted:
+            self._release_web_view_mute()
         if (
             was_muted
             and self._microphone is not None
@@ -318,6 +320,24 @@ class VoiceSession:
     def is_mic_muted(self) -> bool:
         """True iff the audio_capture is currently muted."""
         return self._audio_capture is not None and self._audio_capture.is_muted
+
+    @staticmethod
+    def _release_web_view_mute() -> None:
+        """Tell the web view its playback mute has ended.
+
+        Without this the hold outlives the mute it described: a later
+        ``mute_mic`` with a page still open would be mistaken for the
+        playback mute and survive BB's own speech, leaving a spoken
+        question with nobody listening for the answer.
+        """
+        try:
+            from boxbot.displays.manager import get_display_manager
+
+            mgr = get_display_manager()
+            if mgr is not None:
+                mgr.release_web_mic_mute()
+        except Exception:
+            logger.debug("web view mute release failed", exc_info=True)
 
     def _web_view_holds_mute(self) -> bool:
         """True iff the mic is muted *because* a web view is playing.

@@ -351,6 +351,17 @@ photos:
   max_intake_queue_depth: 100
   # Days to retain soft-deleted photos before permanent purge.
   soft_delete_retention_days: 30
+  # Small-model tagger names household people in new photos, using the
+  # sender's caption and the household roster (bb.photos.set_roster).
+  # The roster + caption are sent with the existing tagging call only.
+  # Labels are "certain" (caption names them), "likely" (appearance) or
+  # "unsure" (kept as a suggestion until a human confirms).
+  infer_people: true
+  # Photo search relevance floor (0-1). Results scoring below it are
+  # dropped, so an unrelated query returns nothing. A keyword hit scores
+  # >= 0.2, a person-name match >= 0.6; a meaning-only match needs
+  # embedding cosine >= ~0.33. Raise for stricter, 0 to disable.
+  search_min_score: 0.2
   slideshow:
     seconds_per_photo: 15
     transition: "fade"

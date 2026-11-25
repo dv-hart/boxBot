@@ -89,6 +89,11 @@ class TestDefaultConfig:
         cfg = BoxBotConfig()
         assert cfg.photos.storage_path == str(PHOTOS_DIR)
 
+    def test_default_photos_people_and_search(self):
+        cfg = BoxBotConfig()
+        assert cfg.photos.infer_people is True
+        assert cfg.photos.search_min_score == 0.2
+
 
 class TestConfigSingleton:
     """Test get_config() / load_config() singleton behavior."""

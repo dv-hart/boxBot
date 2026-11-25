@@ -23,8 +23,9 @@ Intake Pipeline
   ├── 1. Resize to max resolution (default 1920x1080)
   ├── 2. YOLO person detection (Hailo NPU)
   ├── 3. ReID matching for each detected person
-  ├── 4. Small model: description + tags
-  │      (receives person annotations + existing tag library)
+  ├── 4. Small model: description + tags + household people
+  │      (receives person annotations, existing tag library, and —
+  │       with photos.infer_people — sender, caption, household roster)
   ├── 5. Embed description (MiniLM, 384-dim)
   └── 6. Store image + metadata in SQLite
            │
@@ -63,6 +64,8 @@ Async intake pipeline — processes incoming photos when the system is idle:
 3. **Tagging** — send the (downscaled) image to the small model with any
    person annotations and the existing tag library. The model returns a
    1-2 sentence description and lowercase tags, preferring existing tags.
+   With `photos.infer_people` (default on) and a non-empty roster it also
+   names household people — see "People inference" below.
    Any failure (no API key, API error) degrades to the human-supplied
    caption so search still has something to match
 4. **Embedding** — embed the description text with MiniLM (384-dim) for
@@ -70,10 +73,12 @@ Async intake pipeline — processes incoming photos when the system is idle:
 5. **Storage** — re-check quota, save resized image to disk, write
    metadata to SQLite, add to slideshow by default
 
-**Status:** resize, tagging, embedding, and storage are live. Person
-detection runs only when an on-device `PeopleDetector` is injected at
-construction — wiring the perception-backed adapter (and validating Hailo
-contention against the live pipeline) is on-device follow-up work.
+**Status:** resize, tagging (incl. people inference), embedding, and
+storage are live. ReID person detection runs only when an on-device
+`PeopleDetector` is injected at construction — wiring the
+perception-backed adapter (and validating Hailo contention against the
+live pipeline) is on-device follow-up work. People labels do not depend
+on it.
 
 **Backpressure & quota:** `enqueue` rejects oversize sources, refuses to
 queue beyond `photos.max_intake_queue_depth`, and checks quota up front;
@@ -89,35 +94,71 @@ priority-preemption layer is still v1 — lock fairness only.)
 from the intake queue. The pipeline is fault-tolerant — a failure on one
 photo does not block the rest.
 
-### `search.py`
-Shared search backend used by both the `search_photos` tool and the
-`boxbot_sdk.photos.search()` function. Same DRY pattern as the memory
-search backend.
+### `people.py`
+Name / photo-id / note validation for the people handlers, and the
+mapping from a name onto the perception person record (case-insensitive;
+the perception spelling and `person_id` win when a record exists, and a
+person without one is still allowed).
 
-**Search pipeline:**
-```
-Query: "beach photos with Jacob"
-  │
-  ├─ 1. Hybrid retrieval on descriptions
-  │     Vector cosine similarity (MiniLM embeddings)
-  │     + SQLite FTS5 BM25 keyword matching
-  │     Combined score: 0.6 x vector + 0.4 x BM25
-  │     → candidate set
-  │
-  ├─ 2. Structured filters (applied on candidates)
-  │     Tags (AND logic), people, date range, source, slideshow membership
-  │
-  └─ 3. Return ranked results with metadata
-```
+### `backfill.py`
+`python3 -m boxbot.photos.backfill [--apply] [--limit N] [--photo ID]` —
+re-runs people inference over existing photos. Dry-run by default; one
+small-model call per photo; idempotent; skips human-confirmed photos;
+never touches descriptions or tags. No caption exists at backfill time,
+so labels come out `likely` at best and are meant to be reviewed
+(`bb.photos.unconfirmed()`).
+
+### `search.py`
+Shared search backend used by both the `search_photos` tool and
+`boxbot_sdk.photos.search()` — one function (`search_photos`), one set
+of defaults (`DEFAULT_LIMIT`).
+
+**Scoring** (query given), per photo:
+
+| Signal | Weight | Notes |
+|---|---|---|
+| vector | 0.6 x cosine(query, description) | negatives clipped to 0 |
+| keyword | 0.4 x (0.5 + 0.5 x normalised BM25) | FTS5 over description, tags, people; any literal hit earns >= 0.2 |
+| person | 1.0 x match | per name: confirmed/certain label 1.0, likely label 0.8, name in tags/description 0.6 |
+
+- A **person name is a soft match** across people labels, tags and
+  description — never a hard filter on `photo_people`. Names come from
+  `people=[...]` or from a roster/label name appearing in the query.
+  With `people=[...]` a photo must mention at least one of the names
+  somewhere. `unsure` suggestions never match.
+- **Relevance floor** — `photos.search_min_score` (default 0.2). Results
+  below it are dropped, so an unrelated query returns nothing. A keyword
+  hit (>= 0.2) and a name match (>= 0.6) always clear it; a meaning-only
+  match needs cosine >= ~0.33. No query and no people = newest first, no
+  floor.
+- **Query sanitising** — word tokens only, request filler ("photos",
+  "of", "show", ...) removed, each term quoted and OR-ed, so user
+  punctuation cannot produce an FTS syntax error. A real FTS fault is
+  logged with a traceback.
+- **Hard filters** — tags (AND), date range, source, slideshow.
+- **Empty result → `hint`, not a broadened result set.** The hint names
+  the single filter whose removal finds photos ("without tags: 3").
+  Broadening silently is the unsafe choice: with `show=True` the relaxed
+  set would go straight onto the screen as "photos of X".
+- **Rows are slim** — id, short description, tags, people (+confidence),
+  created date, source, sender, score. The full record is `get`.
+- **`show=True`** dispatches the `picture` display with the result ids in
+  the same call.
+
+**FTS index** — standalone FTS5 table `photos_fts(photo_id UNINDEXED,
+description, tags, people)`, maintained from `PhotoStore._reindex_photo`
+on every write that touches those fields. `PhotoStore.initialize()`
+migrates the old description-only external-content table (drops its
+triggers, recreates, rebuilds once).
 
 **DRY architecture:**
 ```
-src/boxbot/photos/search.py               <- search backend
+src/boxbot/photos/search.py                        <- search backend
     │
-    ├── src/boxbot/tools/search_photos.py  <- core tool (8th tool)
+    ├── src/boxbot/tools/builtins/search_photos.py <- core tool
     │     Agent calls directly during conversation.
     │
-    └── src/boxbot/sdk/photos.py           <- SDK function
+    └── src/boxbot/sdk/photos.py                   <- SDK function
           Sandbox scripts call boxbot_sdk.photos.search().
           Emits JSON action -> main process routes to search backend.
 ```
@@ -166,38 +207,65 @@ matching only, then discarded.
 
 The small model receives:
 - The image
-- Person annotations from ReID: `["Jacob (left)", "unknown person (center)"]`
+- Person annotations from ReID, when a detector is wired
 - The existing tag library (full list of current tags)
+- With people inference: the sender's name, the caption, and the
+  household roster
 
-**Instructions to the model:**
-- Write a 1-2 sentence description of the image. Include identified
-  people by name and describe the scene, activity, and setting. Keep it
-  concise but specific enough to be useful for search.
-- Select tags from the existing library that apply. Prefer existing tags.
-  Create new tags only when nothing in the library fits. New tags should
-  be lowercase, singular, and general enough for reuse (e.g., "beach"
-  not "myrtle-beach-trip-2026").
+It returns (forced tool call `describe_photo`) a 1-2 sentence
+description, lowercase tags (preferring the library), and `people`.
+New tags are created in the tag library automatically.
 
-**Model output (structured):**
-```json
-{
-  "description": "Jacob and an unknown person standing on a rocky beach at sunset. Ocean waves visible in the background.",
-  "tags": ["beach", "sunset", "outdoor"],
-  "new_tags": ["rocky"]
-}
-```
+### People inference (caption + household roster)
 
-New tags are created in the tag library automatically. The model's
-preference for existing tags keeps the library stable over time while
-still allowing growth.
+No face registration. The tagger names household people from context:
+the caption first, then appearance against a short roster.
 
-### Sender Context (WhatsApp)
+**Roster** — table `people_notes(name, note, person_id)` in `photos.db`:
+one row per household person with a one-line appearance/context note
+(age, hair, glasses, usual context). It lives in the photo store because the
+tagger is its only reader; a small validated table beats scraping
+free-text memories, and a person the box has never seen or heard still
+needs an entry. The agent edits it through `bb.photos.roster()` /
+`set_roster()` / `remove_from_roster()`. On write the name is matched to
+a perception person case-insensitively (their spelling and `person_id`
+are stored); identity renames/merges carry over via `repoint_person`.
+An empty roster means nobody is named.
 
-When a photo arrives via WhatsApp, the sender's identity is recorded as
-metadata (`sender` field) but is **not** used to assume who appears in
-the photo. The sender might be sending a photo of other people, a
-landscape, or a screenshot. Person identification relies solely on
-the ReID pipeline.
+**Rules** (prompt `_TAGGER_PEOPLE`, enforced again in code by
+`_parse_people`):
+- Only roster names — the tool schema's `name` is an enum of the roster
+  and anything else is dropped. Strangers are never named.
+- `certain` only when the **caption itself** names the person;
+  otherwise it is lowered to `likely`. Appearance is `likely` at best.
+- `unsure` is kept as a suggestion (`PhotoRecord.suggestions`), not as a
+  person: not searchable, not in the FTS index.
+- Caption, sender, roster notes and stored notes are untrusted data:
+  flattened to one bounded line, angle brackets neutralised, wrapped in
+  delimiters, and the prompt says to treat them as evidence only.
+
+**Storage** — `photo_people` gains `confidence`
+(`confirmed | certain | likely | unsure`), `source`
+(`human | tagger | detector`) and `basis`; `photos.people_confirmed_at`
+marks a human-reviewed photo.
+
+**Confirmation** — `bb.photos.unconfirmed()` lists unreviewed photos
+with `likely`/`unsure` labels; `confirm_people(id)` accepts the labels
+as they stand; `set_people(id, names=[...])` replaces them (add, remove,
+correct — no detected slot needed). Both mark the photo confirmed.
+`PhotoStore.apply_inferred_people` — the only path the tagger writes
+through — refuses a confirmed photo, so human labels are never
+overwritten.
+
+**Privacy** — labels and roster are household data and stay in
+`photos.db`. Nothing new leaves the box: the one existing small-model
+tagging call per photo now also carries the roster and the caption.
+
+### Sender Context
+
+The sender's identity is recorded as metadata (`sender`) and passed to
+the tagger as context (it helps read captions like "me and the kids"),
+but is never by itself evidence that the sender is in the photo.
 
 ## Tag Library
 

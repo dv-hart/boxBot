@@ -7,16 +7,62 @@ perception crops (ephemeral, never surface here).
 "What's in that photo?" → `view()` first — speak from pixels, not
 metadata.
 
-## Call signatures — search(query, tags, people, limit) / get(photo_id)
+## Find — search(query, tags, people, date_from, date_to, source, limit, show) / get(photo_id)
 
 ```python
-photos = bb.photos.search(query="snorlax plushie on kitchen table",
-                          tags=["indoor"], people=["Erik"], limit=10)
-p = bb.photos.get("abc123def456")   # full record; PhotosError if missing
+bb.photos.search(query="Zara", show=True)        # "show us photos of Zara" — one call
+photos = bb.photos.search(query="Zara at the beach")
+photos = bb.photos.search(limit=5)               # no query = newest first
+p = bb.photos.get("photo_abc123def456")          # full record; PhotosError if missing
 ```
 
-`search` → `PhotoRecord`s, hybrid-ranked (vector + BM25). Filters AND.
-No query = newest first.
+Person's name goes in `query`. Names match people labels, tags and
+description. `tags` = hard filter (AND). `people=[...]` = must mention
+one of them. Same backend + defaults as the `search_photos` tool
+(limit 10).
+
+Rows: `id, description (short), tags, people, created, source, sender,
+score`. `print(p)` shows people with confidence.
+
+| `people[].confidence` | Means | Say |
+|---|---|---|
+| `confirmed` | a human said so | plainly |
+| `certain` | sender's caption named them | plainly |
+| `likely` | inferred from appearance vs roster | "looks like Zara" |
+| `p.unsure` (names) | weak guess, not a person, never matched | ask |
+
+Nothing found → `[]` + `photos.hint` (which filter to drop, or
+rephrase). Results are never broadened for you — do NOT show unrelated
+photos; retry per the hint and say what you dropped. `show=True` on an
+empty result shows nothing (`photos.shown == 0`).
+
+## People — roster / set_roster / unconfirmed / confirm_people / set_people
+
+The small model names household people at ingest from the caption +
+the roster. Roster = who may be named, one line each on how to
+recognise them. Local to the box; roster + caption go only into the
+existing small-model tagging call.
+
+```python
+bb.photos.roster()                                   # [{name, note, person_id}]
+bb.photos.set_roster("Zara", note="<age, hair, glasses, usual context>")  # add / update
+bb.photos.remove_from_roster("Zara")
+
+for p in bb.photos.unconfirmed():                    # likely/unsure, unreviewed
+    print(p.id, p.people, p.unsure)                  # items carry `basis`
+bb.photos.confirm_people(photo_id)                   # human agreed with labels as-is
+bb.photos.set_people(photo_id, names=["Zara", "Erik"])   # human gave the names
+```
+
+- `set_people` REPLACES all names (add / remove / correct); `names=[]`
+  = nobody from the household. Works with no detected slot.
+- `confirm_people` / `set_people` only after a human told you. They
+  mark the photo `confirmed`; the tagger never changes it again.
+- When it matters who is in a photo (sending it on, a keepsake, a
+  `likely` you are about to assert), `view()` it and ask a human.
+- Empty roster = nobody gets named. New household member, or a child
+  grew/changed → update the note.
+- Names: letters, digits, space, `. ' -`, max 40. Note max 200.
 
 ## View — pixels attach to the tool result
 
@@ -35,38 +81,40 @@ workspace, photos, perception crops).
 photo_id = bb.photos.ingest(path,
                             source="whatsapp",        # mandatory
                             sender="Erik",            # optional
-                            caption="my new pokémon") # optional; seeds description
+                            caption="my new pokémon") # optional; pass it verbatim
 ```
 
-Copies bytes into `data/photos/`, runs detection + tagging, indexes,
-deletes the original. Ingest = worth keeping (family moments, "remember
+Copies bytes into `data/photos/`, tags (description, tags, roster
+people), indexes, deletes the original. Pass the sender's caption
+as-is: a caption naming a roster person → `certain`. Ingest = worth keeping (family moments, "remember
 this"). Memes/throwaway = view, respond, don't ingest — the inbound
 janitor reaps them (7-day TTL).
 
-## Show on the 7" screen — show_on_screen(photo_ids)
+## Show on the 7" screen — search(..., show=True) / show_on_screen(photo_ids)
 
 ```python
-bb.photos.show_on_screen([p.id for p in results[:5]])
+bb.photos.search(query="Zara", show=True)             # default recipe: find + show
+bb.photos.show_on_screen([p.id for p in photos[:5]])  # ids you already hold
 ```
 
 Dispatches the `picture` display — for humans in the room, does NOT
 attach to the tool result; pair with `view()` to see what you're
-showing. Headless → `{dispatched: False, reason: "display manager not
-running"}`. `picture` with no ids = slideshow over the
-`add_to_slideshow` set; empty set = "No photos yet."
+showing. Headless → nothing shown (`shown == 0` / `{dispatched: False,
+reason: "display manager not running"}`). `picture` with no ids =
+slideshow over the `add_to_slideshow` set; empty set = "No photos yet."
 
-## Metadata — update / set_tags (replaces) / set_person / merge_tags / rename_tag / delete_tag
+## Metadata — update / set_tags (replaces) / merge_tags / rename_tag / delete_tag
 
 ```python
 bb.photos.update(photo_id, description="Dad's 60th, Apr 2026")  # re-embeds for search
 bb.photos.set_tags(photo_id, tags=["family", "party"])          # REPLACES whole list
-bb.photos.set_person(photo_id, person_index=0, name="Erik")
 ```
 
 Add one tag = read-modify-write:
 `set_tags(id, tags=sorted(set(p.tags) | {"birthday"}))`.
-`set_person` labels an already-detected face slot; no faces detected =
-no slots = error → fall back to a name tag or the description.
+Who is in a photo → `set_people`, not a name tag.
+(`set_person(photo_id, person_index=, name=)` renames one existing
+slot; prefer `set_people`.)
 
 Tag vocabulary is flat, shared across all photos:
 `merge_tags("kids", into="children")` ·

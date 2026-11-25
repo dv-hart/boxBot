@@ -159,10 +159,10 @@ class TestTagging:
         )
         pipe = IntakePipeline(photo_store, anthropic_client=client)
         img = Image.new("RGB", (32, 24), (1, 2, 3))
-        desc, tags, new_tags = await pipe._generate_tags(img, [])
-        assert desc == "A dog on a beach."
-        assert tags == ["dog", "beach"]  # lowercased + deduped + blanks dropped
-        assert set(new_tags) == {"dog", "beach"}  # no prior library
+        tagged = await pipe._generate_tags(img, [])
+        assert tagged.description == "A dog on a beach."
+        assert tagged.tags == ["dog", "beach"]  # lowercased + deduped + blanks dropped
+        assert set(tagged.new_tags) == {"dog", "beach"}  # no prior library
         # the model actually got an image block
         sent = client.messages.calls[0]["messages"][0]["content"]
         assert any(b["type"] == "image" for b in sent)
@@ -174,9 +174,9 @@ class TestTagging:
         client = _FakeClient({"description": "x", "tags": ["beach", "dog"]})
         pipe = IntakePipeline(photo_store, anthropic_client=client)
         img = Image.new("RGB", (10, 10), (0, 0, 0))
-        _, tags, new_tags = await pipe._generate_tags(img, [])
-        assert set(tags) == {"beach", "dog"}
-        assert new_tags == ["dog"]  # beach already in library
+        tagged = await pipe._generate_tags(img, [])
+        assert set(tagged.tags) == {"beach", "dog"}
+        assert tagged.new_tags == ["dog"]  # beach already in library
 
     async def test_run_pipeline_uses_tagger(
         self, photo_store, tmp_path, mock_config

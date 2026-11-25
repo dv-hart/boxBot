@@ -829,6 +829,15 @@ class PhotosConfig(BaseModel):
     # the worker drains them.
     max_intake_queue_depth: int = 100
     soft_delete_retention_days: int = 30
+    # Let the small-model tagger name household people in a photo from
+    # the caption and the household roster (bb.photos.set_roster). The
+    # roster and caption ride along on the existing tagging call; nothing
+    # else leaves the box. Off = descriptions and tags only.
+    infer_people: bool = True
+    # Relevance floor for photo search: results scoring below it are
+    # dropped so an unrelated query returns nothing. See the scoring
+    # notes in photos/search.py. 0 disables the floor.
+    search_min_score: float = Field(default=0.2, ge=0.0, le=1.0)
     slideshow: SlideshowConfig = Field(default_factory=SlideshowConfig)
     backup: PhotoBackupConfig = Field(default_factory=PhotoBackupConfig)
 

@@ -434,15 +434,38 @@ async def _handle_photos_action(
     payload: dict[str, Any],
     ctx: ActionContext,
 ) -> dict[str, Any]:
+    from boxbot.photos.people import (
+        MAX_NAMES_PER_PHOTO,
+        MAX_ROSTER_SIZE,
+        canonical_person,
+        clean_note,
+        resolve_perception_person,
+        validate_person_name,
+        validate_photo_id,
+    )
     from boxbot.photos.search import (
         _record_to_dict,
+        _record_to_row,
         get_store,
         resolve_photo_path,
         search_photos,
     )
 
+    _BBOX_KEYS = ("bbox_x", "bbox_y", "bbox_w", "bbox_h")
+
     try:
         if action_type == "photos.search":
+            # Same backend and defaults as the search_photos tool.
+            for key in ("tags", "people"):
+                value = payload.get(key)
+                if value is not None and not (
+                    isinstance(value, list)
+                    and all(isinstance(v, str) for v in value)
+                ):
+                    return {
+                        "status": "error",
+                        "error": f"{key} must be a list of strings",
+                    }
             result = await search_photos(
                 mode="search",
                 query=payload.get("query"),
@@ -453,7 +476,8 @@ async def _handle_photos_action(
                 source=payload.get("source"),
                 in_slideshow=payload.get("in_slideshow"),
                 include_deleted=bool(payload.get("include_deleted", False)),
-                limit=int(payload.get("limit", 20)),
+                limit=payload.get("limit"),
+                show=bool(payload.get("show", False)),
             )
             if "error" in result:
                 return {"status": "error", "error": result["error"]}
@@ -664,16 +688,17 @@ async def _handle_photos_action(
         if action_type == "photos.set_person":
             pid = payload.get("id")
             idx = payload.get("person_index")
-            name = payload.get("name")
             if not pid:
                 return {"status": "error", "error": "photo id is required"}
-            if not isinstance(idx, int) or idx < 0:
+            if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
                 return {
                     "status": "error",
                     "error": "person_index must be a non-negative integer",
                 }
-            if not name:
-                return {"status": "error", "error": "name is required"}
+            try:
+                name = validate_person_name(payload.get("name"))
+            except ValueError as e:
+                return {"status": "error", "error": str(e)}
             store = await get_store()
             record = await store.get_photo(pid)
             if record is None:
@@ -684,12 +709,170 @@ async def _handle_photos_action(
                     "status": "error",
                     "error": (
                         f"person_index {idx} out of range "
-                        f"({len(people)} people in photo)"
+                        f"({len(people)} people in photo). To add a name "
+                        "use photos.set_people(photo_id, names=[...])."
                     ),
                 }
-            people[idx]["label"] = str(name)
-            await store.update_people(pid, people)
+            who = await canonical_person(store, name)
+            people[idx].update(
+                label=who["label"],
+                person_id=who["person_id"] or people[idx].get("person_id"),
+                confidence="confirmed",
+                source="human",
+            )
+            await store.update_people(pid, people + record.suggestions)
             return {"status": "ok", "id": pid, "person": people[idx]}
+
+        if action_type == "photos.set_people":
+            # The human-confirmed people on a photo: replaces every label
+            # (add / remove / correct in one call) and locks the photo
+            # against the tagger. An empty list = "nobody we know".
+            try:
+                pid = validate_photo_id(payload.get("id"))
+                raw_names = payload.get("names")
+                if not isinstance(raw_names, list):
+                    raise ValueError("names must be a list")
+                if len(raw_names) > MAX_NAMES_PER_PHOTO:
+                    raise ValueError(
+                        f"too many names (max {MAX_NAMES_PER_PHOTO})"
+                    )
+                names = [validate_person_name(n) for n in raw_names]
+            except ValueError as e:
+                return {"status": "error", "error": str(e)}
+            store = await get_store()
+            record = await store.get_photo(pid)
+            if record is None:
+                return {"status": "error", "error": f"photo {pid} not found"}
+            # Keep the detector's box for a person who stays on the photo.
+            prior = {
+                str(p["label"]).casefold(): p
+                for p in record.suggestions + record.people
+            }
+            rows: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for name in names:
+                who = await canonical_person(store, name)
+                key = who["label"].casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                old_row = prior.get(key, {})
+                rows.append({
+                    **{k: old_row.get(k) for k in _BBOX_KEYS},
+                    "label": who["label"],
+                    "person_id": who["person_id"] or old_row.get("person_id"),
+                    "basis": old_row.get("basis") or "",
+                })
+            await store.update_people(pid, rows, human_confirmed=True)
+            return {
+                "status": "ok",
+                "id": pid,
+                "people": [r["label"] for r in rows],
+                "confirmed": True,
+            }
+
+        if action_type == "photos.confirm_people":
+            # Accept the current certain/likely labels as they stand;
+            # "unsure" suggestions are discarded.
+            try:
+                pid = validate_photo_id(payload.get("id"))
+            except ValueError as e:
+                return {"status": "error", "error": str(e)}
+            store = await get_store()
+            record = await store.get_photo(pid)
+            if record is None:
+                return {"status": "error", "error": f"photo {pid} not found"}
+            await store.update_people(
+                pid, [dict(p) for p in record.people], human_confirmed=True
+            )
+            return {
+                "status": "ok",
+                "id": pid,
+                "people": [p["label"] for p in record.people],
+                "confirmed": True,
+            }
+
+        if action_type == "photos.unconfirmed":
+            limit = payload.get("limit", 20)
+            if (
+                not isinstance(limit, int)
+                or isinstance(limit, bool)
+                or not 1 <= limit <= 100
+            ):
+                return {"status": "error", "error": "limit must be 1-100"}
+            store = await get_store()
+            records = await store.list_unconfirmed_people(limit=limit)
+            return {
+                "status": "ok",
+                "results": [
+                    {
+                        **_record_to_row(r),
+                        "people": [
+                            {
+                                "name": p["label"],
+                                "confidence": p["confidence"],
+                                "basis": p["basis"],
+                            }
+                            for p in r.people
+                        ],
+                        "unsure": [
+                            {"name": p["label"], "basis": p["basis"]}
+                            for p in r.suggestions
+                        ],
+                    }
+                    for r in records
+                ],
+            }
+
+        # --- Household roster (who the tagger may name) ---
+
+        if action_type == "photos.roster":
+            store = await get_store()
+            return {"status": "ok", "roster": await store.list_people_notes()}
+
+        if action_type == "photos.set_roster":
+            try:
+                name = validate_person_name(payload.get("name"))
+                note = clean_note(payload.get("note", ""))
+            except ValueError as e:
+                return {"status": "error", "error": str(e)}
+            store = await get_store()
+            roster = await store.list_people_notes()
+            existing = next(
+                (r for r in roster if r["name"].casefold() == name.casefold()),
+                None,
+            )
+            if existing is None and len(roster) >= MAX_ROSTER_SIZE:
+                return {
+                    "status": "error",
+                    "error": f"roster is full (max {MAX_ROSTER_SIZE})",
+                }
+            # Take the perception record's spelling and id when one exists.
+            person = await resolve_perception_person(name)
+            if person is not None:
+                name, person_id = person["name"], person["id"]
+            else:
+                person_id = existing["person_id"] if existing else None
+            await store.set_person_note(name, note, person_id=person_id)
+            return {
+                "status": "ok",
+                "name": name,
+                "note": note,
+                "linked": person_id is not None,
+            }
+
+        if action_type == "photos.remove_from_roster":
+            try:
+                name = validate_person_name(payload.get("name"))
+            except ValueError as e:
+                return {"status": "error", "error": str(e)}
+            store = await get_store()
+            if not await store.delete_person_note(name):
+                return {
+                    "status": "error",
+                    "error": f"{name!r} is not on the roster",
+                }
+            return {"status": "ok", "name": name, "removed": True}
 
         if action_type == "photos.add_to_slideshow":
             pid = payload.get("id")

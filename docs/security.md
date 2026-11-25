@@ -200,7 +200,8 @@ socket or the native PipeWire sockets (closed to other users at
 launch), cannot load PulseAudio modules (disabled by
 `setup-sandbox.sh`), and cannot reach anything on disk or on the LAN. A hostile page can also lie to the idle check and stay up
 until the `max_minutes` ceiling, or claim its media ended and be
-closed early. The touchscreen stays live while a
+closed early. Reporting `stalled` to draw a `restart` buys no extra
+time: a reload keeps the original deadline. The touchscreen stays live while a
 page is open, so a person at the box can follow links — physical
 presence, same trust as the buttons.
 

@@ -557,10 +557,21 @@ class WebView:
         self._background: set[asyncio.Future[Any]] = set()
         self._stderr_tail: deque[str] = deque(maxlen=6)
         self._closing = False
-        # Bumped by every open(). A self-close (idle, time limit) decided
-        # under an older epoch is stale: someone has asked for a new page
-        # since, and it must not be torn down.
+        # Bumped by every page load (open() and reload). A self-close or
+        # a queued reload decided under an older epoch is stale: someone
+        # has asked for a new page since, and it must not be acted on.
         self._epoch = 0
+        # True while a page load holds the lock. A crash reported then
+        # cannot be pinned on the old page or the new one; see
+        # _on_target_crashed.
+        self._loading = False
+        self._crashed_in_load = False
+        # Bumped when ended media is told to play again: a probe sent
+        # before that describes playback that no longer exists.
+        self._playback_gen = 0
+        # time.monotonic() at which the hard limit closes the view. Set
+        # by open() only; a reload keeps it.
+        self._limit_at = 0.0
 
         self._target: WebTarget | None = None
         self._opened_at: float = 0.0
@@ -685,34 +696,17 @@ class WebView:
             raise WebViewError("web view is disabled (display.web.enabled)")
 
         async with self._lock:
-            self._epoch += 1
-            try:
-                if self._proc is not None and not self.is_open:
-                    # The browser died and its watcher has not got the
-                    # lock yet: release the dead handles before reuse.
-                    await self._teardown()
-                if not self.is_open:
-                    await self._launch()
-                await self._navigate(target)
-            except BaseException as e:
-                # Including CancelledError: a half-open browser has no
-                # idle clock and no time limit, so it must not survive.
-                await self._teardown_uninterruptible()
-                if isinstance(e, (CDPError, OSError)):
-                    raise WebViewError(f"web view failed: {e}") from e
-                raise
-
-            self._target = target
+            await self._load(target, may_launch=True)
+            # Every open() starts a new hard limit — including one that
+            # only navigates the running browser to a different (or the
+            # same) URL: it is a deliberate switch_display('web', url)
+            # by the agent, never something the page can cause. A reload
+            # (media("restart")) goes through _reload and does not.
             self._opened_at = time.monotonic()
-            # A fresh page starts playing; the sync loop pauses it again
-            # within a tick if the room is not quiet.
-            self._pause_until = 0.0
-            self._reset_page_state()
             self.holds_mic_mute = False
             self._close_on_end = idle_minutes is None
             minutes = self._config.idle_minutes if idle_minutes is None else idle_minutes
             self._idle_seconds = 60.0 * max(1.0, min(minutes, self._config.max_minutes))
-            self._last_active = time.monotonic()
             self._restart_limit_timer()
             if self._sync_task is None:
                 self._sync_task = asyncio.create_task(
@@ -720,6 +714,60 @@ class WebView:
                 )
             state = self.state()
             return state if state is not None else {}
+
+    async def _load(self, target: WebTarget, *, may_launch: bool) -> None:
+        """Navigate to ``target`` under a new epoch. Caller holds the lock.
+
+        ``may_launch=False`` is the reuse-only path: the caller has
+        checked, with the lock held, that the browser is running, and
+        nothing here will start one.
+
+        On any failure — including cancellation — the view is torn down
+        before the exception leaves.
+        """
+        self._epoch += 1
+        self._loading = True
+        self._crashed_in_load = False
+        try:
+            if may_launch:
+                if self._proc is not None and not self.is_open:
+                    # The browser died and its watcher has not got the
+                    # lock yet: release the dead handles before reuse.
+                    await self._teardown()
+                if not self.is_open:
+                    await self._launch()
+            await self._navigate(target)
+            if self._crashed_in_load:
+                await self._confirm_page_alive()
+        except BaseException as e:
+            # Including CancelledError: a half-open browser has no
+            # idle clock and no time limit, so it must not survive.
+            await self._teardown_uninterruptible()
+            if isinstance(e, (CDPError, OSError)):
+                raise WebViewError(f"web view failed: {e}") from e
+            raise
+        finally:
+            self._loading = False
+
+        self._target = target
+        # A fresh page starts playing; the sync loop pauses it again
+        # within a tick if the room is not quiet.
+        self._pause_until = 0.0
+        self._reset_page_state()
+        self._last_active = time.monotonic()
+
+    async def _confirm_page_alive(self) -> None:
+        """A crash was reported during this load. If it was the page
+        being left, the navigation replaced it and the new page answers;
+        if it was the new page, nothing does."""
+        assert self._cdp is not None
+        try:
+            await self._cdp.call(
+                "Runtime.evaluate", {"expression": "1", "returnByValue": True},
+                session_id=self._session_id, timeout=5.0,
+            )
+        except CDPError as e:
+            raise WebViewError("page crashed while loading") from e
 
     async def close(self) -> None:
         """Close the browser. Safe to call when nothing is open."""
@@ -760,15 +808,32 @@ class WebView:
         self._last_position = None
         self._phase = None
 
-    async def _close_self(self, epoch: int, reason: str) -> bool:
-        """Close because the view decided to, unless a newer ``open()``
-        has superseded the decision. Returns whether it closed."""
+    async def _close_self(self, epoch: int | None, reason: str) -> bool:
+        """Close because the view decided to. Returns whether it closed.
+
+        The decision was made before waiting for the lock, so it is
+        checked again once the lock is held: a newer page load
+        (``epoch``; ``None`` for the time limit, which outlives reloads)
+        or a reason that no longer holds leaves the view alone.
+        """
         async with self._lock:
-            if epoch != self._epoch or self._proc is None:
+            if self._proc is None or (epoch is not None and epoch != self._epoch):
+                return False
+            if not self._close_still_due(reason):
                 return False
             await self._teardown()
         await self._notify_exit(reason)
         return True
+
+    def _close_still_due(self, reason: str) -> bool:
+        """Does ``reason`` for a self-close hold right now?"""
+        if reason == EXIT_ENDED:
+            return self._end_grace_over()     # replayed / held meanwhile
+        if reason == EXIT_IDLE:
+            return self._idle_expired()
+        if reason == EXIT_LIMIT:
+            return self._limit_reached()
+        return True                           # crash: the epoch says it all
 
     async def screenshot(self) -> bytes:
         """PNG of the browser window. For developers and tests only —
@@ -832,7 +897,8 @@ class WebView:
             self._set_paused(True, PAUSED_USER)
             result = "paused"
         elif action == "restart":
-            await self._reload()
+            # The epoch as of this request, read before any await.
+            await self._reload(self._epoch)
             result = "restarted"
         else:
             self._user_paused = False
@@ -866,28 +932,36 @@ class WebView:
         state["result"] = result
         return state
 
-    async def _reload(self) -> None:
+    async def _reload(self, epoch: int) -> None:
         """Load the page BB opened again, from the start.
 
-        A fresh :meth:`open` of the same target: new epoch (so a close
-        decided about the old load cannot land on this one), fresh
-        clocks, same idle allowance. If the reload fails the view is
-        closed and the owner told, as for any other self-close.
+        Reuse only: this never launches a browser. ``epoch`` is the one
+        the request was made under. If, once the lock is held, the view
+        has closed (ended, idle, limit, crash — the owner has put
+        another display back) or loaded something else, the request is
+        void and nothing is touched.
+
+        New epoch (a close decided about the old load cannot land on
+        this one) and a fresh idle clock; the idle allowance, the mic
+        mute, ``open_seconds`` and the hard time limit carry over — a
+        page that reports ``stalled`` must not earn itself more time.
+        If the reload fails the view is closed and the owner told, as
+        for any other self-close.
         """
-        target = self._target
-        if target is None or not self.is_open:
-            raise WebViewError("web view is not open")
-        idle_minutes = None if self._close_on_end else self._idle_seconds / 60.0
-        holds_mic_mute = self.holds_mic_mute
+        load_failed = False
         try:
-            await self.open(target, idle_minutes=idle_minutes)
-        except BaseException:
-            # open() has torn the browser down. In the background, so a
-            # cancelled tool call still hands the screen back.
-            self._spawn(self._notify_exit(EXIT_RELOAD_FAILED))
-            raise
-        # Same view, same playback: a mic muted for it stays muted.
-        self.holds_mic_mute = holds_mic_mute
+            async with self._lock:
+                target = self._target
+                if target is None or not self.is_open or epoch != self._epoch:
+                    raise WebViewError("web view is not open")
+                load_failed = True        # until _load returns: it tears down
+                await self._load(target, may_launch=False)
+                load_failed = False
+        finally:
+            if load_failed:
+                # In the background, so a cancelled tool call still
+                # hands the screen back.
+                self._spawn(self._notify_exit(EXIT_RELOAD_FAILED))
 
     def _is_speaking(self) -> bool:
         since = self._speaking_since
@@ -943,6 +1017,7 @@ class WebView:
         self._ended_since = None
         if replay:
             self._ended = False
+            self._playback_gen += 1
 
     async def _apply_pause(self, script: str, paused: bool, reason: str | None) -> None:
         touched = _count(await self._evaluate(script), _MAX_ELEMENTS)
@@ -996,7 +1071,7 @@ class WebView:
                 if await self._close_self(epoch, EXIT_ENDED):
                     return
                 continue
-            if time.monotonic() - self._last_active <= self._idle_seconds:
+            if not self._idle_expired():
                 continue
             logger.info("Web view idle for %.0fs; closing", self._idle_seconds)
             if await self._close_self(epoch, EXIT_IDLE):
@@ -1015,6 +1090,17 @@ class WebView:
             and time.monotonic() - self._ended_since >= grace
         )
 
+    def _idle_expired(self) -> bool:
+        """Nothing played or was touched for the idle allowance, and BB
+        is not holding the view for the room (a wake word since the
+        last probe counts)."""
+        if self._paused and not self._user_paused:
+            return False
+        return time.monotonic() - self._last_active > self._idle_seconds
+
+    def _limit_reached(self) -> bool:
+        return time.monotonic() >= self._limit_at
+
     async def _check_activity(self, epoch: int | None = None) -> None:
         """Ask the page how it is doing.
 
@@ -1023,9 +1109,12 @@ class WebView:
         (a conversation must not run the idle clock down) — and the
         playback picture behind :meth:`state`.
         """
+        playback_gen = self._playback_gen
         raw = await self._evaluate(_ACTIVITY_JS)
         if not self.is_open or (epoch is not None and epoch != self._epoch):
             return  # the answer is about a page that has been replaced
+        if playback_gen != self._playback_gen:
+            return  # ...or about media that has been replayed since
         probe = parse_probe(raw)
         self._playing = probe.playing
         touched = probe.quiet_ms is not None and (
@@ -1131,10 +1220,22 @@ class WebView:
                 return
         elif params.get("targetId") != self._page_target_id:   # Target.targetCrashed
             return
+        code = _number(params.get("errorCode"), -2 ** 31, 2 ** 31)
+        if self._loading:
+            # A page load holds the lock and has already taken the next
+            # epoch. The event may be the page being left dying late:
+            # closing under the new epoch would kill the page being
+            # loaded for it. The load checks the new page itself.
+            self._crashed_in_load = True
+            logger.warning(
+                "Web view page crashed during a page load (renderer exit "
+                "code %s); checking the new page", code,
+            )
+            return
         logger.warning(
-            "Web view page crashed (renderer exit code %s); closing",
-            _number(params.get("errorCode"), -2 ** 31, 2 ** 31),
+            "Web view page crashed (renderer exit code %s); closing", code,
         )
+        # Not loading, so this epoch is the page the event is about.
         self._spawn(self._close_self(self._epoch, EXIT_CRASHED))
 
     async def _evaluate(self, expression: str) -> Any:
@@ -1558,19 +1659,23 @@ class WebView:
     # ------------------------------------------------------------------
 
     def _restart_limit_timer(self) -> None:
+        """Start the hard limit over. open() only — never a reload."""
         if self._limit_task is not None:
             self._limit_task.cancel()
+        self._limit_at = time.monotonic() + self._config.max_minutes * 60
         self._limit_task = asyncio.create_task(
-            self._enforce_limit(self._epoch), name="web-view-limit",
+            self._enforce_limit(), name="web-view-limit",
         )
 
-    async def _enforce_limit(self, epoch: int) -> None:
+    async def _enforce_limit(self) -> None:
         """Close the view after ``max_minutes`` — a forgotten video must
-        not play all night."""
-        await asyncio.sleep(self._config.max_minutes * 60)
+        not play all night. Not tied to a page epoch: reloads do not
+        move the deadline, and an open() replaces this task."""
+        while (remaining := self._limit_at - time.monotonic()) > 0:
+            await asyncio.sleep(remaining)
         logger.info("Web view reached its %g-minute limit; closing",
                     self._config.max_minutes)
-        await self._close_self(epoch, EXIT_LIMIT)
+        await self._close_self(None, EXIT_LIMIT)
 
     async def _watch_exit(self, proc: asyncio.subprocess.Process) -> None:
         """Clean up and tell the manager when the browser dies on its own."""

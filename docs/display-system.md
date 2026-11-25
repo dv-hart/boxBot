@@ -946,7 +946,11 @@ those the view derives what `WebView.state()` reports:
 agent only reads state during a conversation. `web_media("play")`
 restarts ended media from 0 and reports `result: "deferred"` when the
 room is not quiet (it then starts on resume); `web_media("restart")`
-reloads the opened URL. End-of-media close: the grace runs only while
+reloads the opened URL in the running browser — it never launches one
+(view already closed → "web view is not open") and does not move the
+`max_minutes` deadline; only `switch_display('web', url)` starts a new
+one. Every self-close re-checks its reason once it holds the view's
+lock, so a replay, wake word or new page that got in first wins. End-of-media close: the grace runs only while
 ended persists and nothing holds the view, so a playlist is not closed
 between items and a "play that again" conversation is not cut off. It
 is skipped for a page opened with its own `idle_minutes`.

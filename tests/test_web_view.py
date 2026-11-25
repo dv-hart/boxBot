@@ -399,9 +399,15 @@ class TestWebView:
             await view.open(normalize_url("https://example.com/a"))
             stale = view._epoch
             await view.open(normalize_url("https://example.com/b"))
-            assert await view._close_self(stale, "nothing playing — idle timeout") is False
+            assert await view._close_self(stale, "page crashed") is False
             assert view.is_open and reasons == []
-            assert await view._close_self(view._epoch, "time limit reached") is True
+            # A reason that does not hold once the lock is held closes
+            # nothing either, whatever the epoch.
+            assert await view._close_self(view._epoch, "nothing playing — idle timeout") is False
+            assert await view._close_self(None, "time limit reached") is False
+            assert view.is_open and reasons == []
+            view._limit_at = 0.0
+            assert await view._close_self(None, "time limit reached") is True
             assert not view.is_open and reasons == ["time limit reached"]
         finally:
             await view.close()
@@ -1565,6 +1571,321 @@ class TestPlaybackState:
                 view._epoch += 1                       # ...a new open() is under way
             await asyncio.sleep(0.2)
             assert view.is_open and reasons == []
+        finally:
+            await view.close()
+
+
+# ---------------------------------------------------------------------------
+# Decisions that wait for the lock (review 2026-11-25)
+# ---------------------------------------------------------------------------
+
+
+def launches(tmp_path: Path) -> int:
+    return sum(1 for c in commands(tmp_path) if c["method"] == "Target.getTargets")
+
+
+def navigated(tmp_path: Path) -> list[str]:
+    return [
+        c["params"]["url"] for c in commands(tmp_path) if c["method"] == "Page.navigate"
+    ]
+
+
+class TestQueuedDecisions:
+    """Everything here is "decided, then waited for the lock": by the
+    time the lock is held the decision must still be true."""
+
+    async def _view(self, tmp_path, monkeypatch=None, *, interval=None, **config):
+        if interval is not None:
+            from boxbot.displays import web_view as module
+
+            monkeypatch.setattr(module, "_ACTIVITY_INTERVAL", interval)
+        reasons: list[str] = []
+
+        async def on_exit(reason: str) -> None:
+            reasons.append(reason)
+
+        view = WebView(
+            make_config(tmp_path, **config), on_exit=on_exit,
+            listening_probe=lambda: False,
+        )
+        (tmp_path / "kiosk").mkdir(exist_ok=True)
+        return view, reasons
+
+    # -- restart must only ever reuse ---------------------------------------
+
+    async def test_queued_restart_launches_nothing_after_a_self_close(self, tmp_path):
+        """A self-close holds the lock while a restart waits behind it.
+        The owner has put a normal display back: no browser may return."""
+        view, reasons = await self._view(tmp_path)
+        try:
+            await view.open(normalize_url("https://example.com/a"))
+            async with view._lock:
+                closer = asyncio.ensure_future(
+                    view._close_self(view._epoch, "page crashed"))
+                await asyncio.sleep(0)                 # queued on the lock
+                restart = asyncio.ensure_future(view.media("restart"))
+                await asyncio.sleep(0.05)              # queued behind it
+            assert await closer is True
+            with pytest.raises(WebViewError, match="web view is not open"):
+                await restart
+            await asyncio.sleep(0.1)
+            assert not view.is_open and view._proc is None
+            assert launches(tmp_path) == 1
+            assert navigated(tmp_path) == ["https://example.com/a"]
+            assert reasons == ["page crashed"]         # and no "reload failed"
+        finally:
+            await view.close()
+
+    async def test_queued_restart_does_not_touch_a_newer_page(self, tmp_path):
+        """switch_display('web', b) got the lock first: the restart was
+        about a, and a must not come back over b."""
+        view, reasons = await self._view(tmp_path)
+        try:
+            await view.open(normalize_url("https://example.com/a"))
+            async with view._lock:
+                reopen = asyncio.ensure_future(
+                    view.open(normalize_url("https://example.com/b")))
+                await asyncio.sleep(0)
+                restart = asyncio.ensure_future(view.media("restart"))
+                await asyncio.sleep(0.05)
+            await reopen
+            with pytest.raises(WebViewError, match="web view is not open"):
+                await restart
+            assert view.is_open and view.state()["url"] == "https://example.com/b"
+            assert navigated(tmp_path) == ["https://example.com/a", "https://example.com/b"]
+            await asyncio.sleep(0.1)
+            assert reasons == []
+        finally:
+            await view.close()
+
+    async def test_restart_cancelled_while_queued_reports_no_exit(self, tmp_path):
+        view, reasons = await self._view(tmp_path)
+        try:
+            await view.open(normalize_url("https://example.com/a"))
+            async with view._lock:
+                restart = asyncio.ensure_future(view.media("restart"))
+                await asyncio.sleep(0.05)
+                restart.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await restart
+            await asyncio.sleep(0.1)
+            assert view.is_open and reasons == []      # nothing was closed
+        finally:
+            await view.close()
+
+    # -- restart and the hard limit -----------------------------------------
+
+    async def test_restart_does_not_extend_the_time_limit(self, tmp_path):
+        """A page can report 'stalled' whenever it likes, and stalled
+        means restart: that must not buy a fresh max_minutes."""
+        (tmp_path / "kiosk").mkdir()
+        (tmp_path / "kiosk" / "playing").touch()   # keeps idle out of it
+        view, reasons = await self._view(tmp_path, max_minutes=0.02)   # 1.2 s
+        clock = asyncio.get_running_loop().time
+        try:
+            await view.open(normalize_url("https://example.com/"))
+            opened, opened_at = clock(), view._opened_at
+            for _ in range(3):
+                await asyncio.sleep(0.25)
+                state = await view.media("restart")
+                assert state["result"] == "restarted"
+            assert view._opened_at == opened_at
+            assert len(navigated(tmp_path)) == 4
+            await wait_for(lambda: bool(reasons))
+            assert reasons == ["time limit reached"]
+            assert not view.is_open
+            # Counted from the open, not from the last restart (0.75 s in).
+            assert clock() - opened < 1.7
+        finally:
+            await view.close()
+
+    async def test_opening_another_url_starts_a_new_limit(self, tmp_path):
+        view, reasons = await self._view(tmp_path)
+        try:
+            await view.open(normalize_url("https://example.com/a"))
+            opened_at, limit_at = view._opened_at, view._limit_at
+            await asyncio.sleep(0.05)
+            await view.open(normalize_url("https://example.com/b"))
+            assert view._opened_at > opened_at and view._limit_at > limit_at
+        finally:
+            await view.close()
+
+    # -- self-closes re-check their reason under the lock ---------------------
+
+    def _intercept_close(self, view, wanted: str, meanwhile):
+        """Run ``meanwhile`` between the sync loop's decision to close
+        for ``wanted`` and the close itself getting the lock."""
+        real_close = view._close_self
+        outcome: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+        async def close(epoch, reason):
+            if reason != wanted or outcome.done():
+                return await real_close(epoch, reason)
+            await meanwhile()
+            closed = await real_close(epoch, reason)
+            outcome.set_result(closed)
+            return closed
+
+        view._close_self = close  # type: ignore[method-assign]
+        return outcome
+
+    async def test_replay_between_end_decision_and_close_keeps_the_view(
+        self, tmp_path, monkeypatch,
+    ):
+        set_ended(tmp_path)
+        view, reasons = await self._view(
+            tmp_path, monkeypatch, interval=0.1, close_after_end_seconds=0.3,
+        )
+        try:
+            await view.open(normalize_url("https://example.com/"))
+
+            async def replay() -> None:
+                # "Play that again", just as the grace ran out.
+                (tmp_path / "kiosk" / "playing").touch()
+                set_media(tmp_path, t=0.3)
+                state = await view.media("play")
+                assert state["result"] == "restarted"
+
+            outcome = self._intercept_close(view, "media ended", replay)
+            assert await asyncio.wait_for(outcome, 5) is False
+            await asyncio.sleep(0.6)
+            assert view.is_open and reasons == []
+            assert view.state()["ended"] is False
+        finally:
+            await view.close()
+
+    async def test_wake_word_between_end_decision_and_close_keeps_the_view(
+        self, tmp_path, monkeypatch,
+    ):
+        set_ended(tmp_path)
+        view, reasons = await self._view(
+            tmp_path, monkeypatch, interval=0.1, close_after_end_seconds=0.3,
+        )
+        try:
+            await view.open(normalize_url("https://example.com/"))
+
+            async def wake() -> None:
+                view.pause_now()
+
+            outcome = self._intercept_close(view, "media ended", wake)
+            assert await asyncio.wait_for(outcome, 5) is False
+            assert view.is_open and reasons == []
+        finally:
+            await view.close()
+
+    async def test_wake_word_between_idle_decision_and_close_keeps_the_view(
+        self, tmp_path, monkeypatch,
+    ):
+        view, reasons = await self._view(tmp_path, monkeypatch, interval=0.1)
+        try:
+            await view.open(normalize_url("https://example.com/"))
+            view._idle_seconds = 0.4
+
+            async def wake() -> None:
+                view.pause_now()
+
+            outcome = self._intercept_close(view, "nothing playing — idle timeout", wake)
+            assert await asyncio.wait_for(outcome, 5) is False
+            assert view.is_open and reasons == []
+        finally:
+            await view.close()
+
+    async def test_play_between_idle_decision_and_close_keeps_the_view(
+        self, tmp_path, monkeypatch,
+    ):
+        view, reasons = await self._view(tmp_path, monkeypatch, interval=0.1)
+        try:
+            await view.open(normalize_url("https://example.com/"))
+            view._idle_seconds = 0.4
+
+            async def play() -> None:
+                await view.media("play")
+
+            outcome = self._intercept_close(view, "nothing playing — idle timeout", play)
+            assert await asyncio.wait_for(outcome, 5) is False
+            assert view.is_open and reasons == []
+        finally:
+            await view.close()
+
+    async def test_limit_close_waiting_on_the_lock_survives_a_reload(self, tmp_path):
+        """The limit fires while a restart holds the lock: the reload's
+        new epoch must not make the limit stale."""
+        view, reasons = await self._view(tmp_path)
+        try:
+            await view.open(normalize_url("https://example.com/"))
+            await asyncio.sleep(0.01)      # the real timer is asleep by now
+            view._limit_at = 0.0           # the limit is due...
+            async with view._lock:
+                restart = asyncio.ensure_future(view.media("restart"))
+                await asyncio.sleep(0)
+                limit = asyncio.ensure_future(view._enforce_limit())
+                await asyncio.sleep(0.05)
+            await restart
+            await limit
+            assert not view.is_open and reasons == ["time limit reached"]
+        finally:
+            await view.close()
+
+    async def test_probe_sent_before_a_replay_is_discarded(self, tmp_path):
+        view, _ = await self._view(tmp_path)
+        try:
+            await view.open(normalize_url("https://example.com/"))
+            set_ended(tmp_path)
+            real_evaluate = view._evaluate
+
+            async def replayed_meanwhile(expression: str):
+                raw = await real_evaluate(expression)
+                view._playback_resumed(replay=True)    # media("play") landed
+                return raw
+
+            view._evaluate = replayed_meanwhile  # type: ignore[method-assign]
+            await view._check_activity(view._epoch)
+            assert view._ended is False and view._ended_since is None
+            view._evaluate = real_evaluate  # type: ignore[method-assign]
+            await view._check_activity(view._epoch)
+            assert view._ended is True
+        finally:
+            await view.close()
+
+    # -- crash events during a page load --------------------------------------
+
+    def _crash_during_next_load(self, view) -> None:
+        real_navigate = view._navigate
+
+        async def navigate(target):
+            # open() holds the lock and has taken the new epoch; the
+            # page being left reports its crash only now.
+            view._on_target_crashed({}, view._session_id)
+            await real_navigate(target)
+
+        view._navigate = navigate  # type: ignore[method-assign]
+
+    async def test_late_crash_of_the_old_page_spares_the_one_being_loaded(
+        self, tmp_path,
+    ):
+        view, reasons = await self._view(tmp_path)
+        try:
+            await view.open(normalize_url("https://example.com/a"))
+            self._crash_during_next_load(view)
+            await view.open(normalize_url("https://example.com/b"))
+            await asyncio.sleep(0.3)
+            assert view.is_open and reasons == []
+            assert view.state()["url"] == "https://example.com/b"
+            assert launches(tmp_path) == 1
+        finally:
+            await view.close()
+
+    async def test_page_that_crashed_while_loading_is_not_left_on_screen(
+        self, tmp_path,
+    ):
+        view, reasons = await self._view(tmp_path)
+        try:
+            await view.open(normalize_url("https://example.com/a"))
+            self._crash_during_next_load(view)
+            (tmp_path / "kiosk" / "evalfail").touch()  # the new page is dead
+            with pytest.raises(WebViewError, match="page crashed while loading"):
+                await view.open(normalize_url("https://example.com/b"))
+            assert not view.is_open and view._proc is None
         finally:
             await view.close()
 

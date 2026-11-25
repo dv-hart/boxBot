@@ -7,8 +7,10 @@ appropriate handler here. Handlers return a dict that is:
   (a) written back to the sandbox on stdin as a JSON line, *if* the action
       was tagged with ``_expects_response`` (paired with
       :func:`boxbot_sdk._transport.collect_response` on the other side);
-  (b) always collected into the ``sdk_actions`` array of the tool result
-      so the agent can see what happened.
+  (b) always logged in the ``sdk_actions`` array of the tool result so
+      the agent can see what happened — in full for a fire-and-forget
+      action, as ``{action, status}`` plus a short summary for one whose
+      reply the script already received (see :func:`_log_entry`).
 
 Handlers may also mutate :class:`ActionContext` — most importantly to add
 absolute file paths to ``ctx.image_attachments``. After the script
@@ -143,8 +145,10 @@ class ActionContext:
     """State accumulated across a single ``execute_script`` run."""
 
     image_attachments: list[Path] = field(default_factory=list)
-    # Every action processed, mirrored into the final tool result so the
+    # Every action processed, logged into the final tool result so the
     # agent can observe side effects (e.g. "photos.set_tags: ok").
+    # Response payloads the script already received are summarised, not
+    # repeated — see ``_log_entry``.
     action_log: list[dict[str, Any]] = field(default_factory=list)
     # Who is driving this action stream. "agent" = an execute_script turn,
     # a human in the loop deciding each call. "integration" = ANY integration
@@ -1105,68 +1109,90 @@ async def _handle_purchases_action(
     payload: dict[str, Any],
     ctx: ActionContext,  # unused; kept for uniform handler signature
 ) -> dict[str, Any]:
-    """Dispatch ``purchases.*`` — search, store_products, propose,
-    status, list, send_review_link, cancel.
+    """Dispatch ``purchases.*`` — find, show, stores, store_products,
+    cart, send, propose, status, list, send_review_link, cancel.
 
-    The sandbox can find products and *propose* a purchase. It cannot
-    pay, approve, choose an address or payment method, or read the
-    checkout's review link: ``propose`` hands the request to
+    The sandbox finds products, fills a cart and *sends* it. Everything
+    it passes back is a short result id (``a2``) resolved against the
+    main-process result cache of the conversation this tool call runs
+    in; it never supplies a title, price, store or image. It cannot pay,
+    approve, choose an address or payment method, or read a checkout's
+    review link: ``send`` / ``propose`` hand the request to
     :mod:`boxbot.purchases.service`, which builds the checkout itself,
     runs the deterministic rules and the isolated policy checker, and
     then either texts the admins a review link or schedules an
     automatic purchase. Every record returned here is the service's
     sanitised ``public_view``.
 
-    The requester is taken from the conversation the tool call runs in
-    (transport-attributed), never from the payload.
+    The requester and the conversation are taken from the tool call's
+    own context (transport-attributed), never from the payload.
     """
-    from boxbot.purchases import service
+    from boxbot.purchases import service, shopping
     from boxbot.purchases.store import VALID_STATUSES, get_purchase_store
     from boxbot.tools._tool_context import get_current_conversation
 
     sub = action_type.split(".", 1)[1] if "." in action_type else action_type
+    conv = get_current_conversation()
 
     try:
-        if sub == "search":
-            results = await service.search(
+        if sub == "find":
+            found = await shopping.find(
                 payload.get("query"),
                 max_price_cents=payload.get("max_price_cents"),
-                limit=payload.get("limit") or 8,
+                approved_only=payload.get("approved_only"),
+                show=payload.get("show"),
+                conv=conv,
             )
-            return {"status": "ok", "results": results}
+            return {"status": "ok", **found}
 
         if sub == "store_products":
-            results = await service.store_products(
+            found = await shopping.store_products(
                 payload.get("shop"),
                 query=payload.get("query"),
-                limit=payload.get("limit") or 20,
+                show=payload.get("show"),
+                conv=conv,
             )
-            return {"status": "ok", "results": results}
+            return {"status": "ok", **found}
+
+        if sub == "show":
+            return {"status": "ok", **await shopping.show(payload.get("ids"), conv=conv)}
+
+        if sub == "stores":
+            return {"status": "ok", "stores": await shopping.stores()}
+
+        if sub == "cart":
+            view = await shopping.cart(
+                add=payload.get("add"),
+                remove=payload.get("remove"),
+                replace=payload.get("replace"),
+                clear=payload.get("clear"),
+                quote=payload.get("quote"),
+                conv=conv,
+            )
+            return {"status": "ok", **view}
+
+        if sub == "send":
+            sent = await shopping.send(payload.get("reason"), conv=conv)
+            return {"status": "ok", **sent}
 
         if sub == "propose":
             outcome = await service.propose(
                 payload.get("shop"),
                 payload.get("items"),
                 payload.get("reason"),
-                conv=get_current_conversation(),
+                conv=conv,
             )
-            # The checker's verdict stays in the decision log. Handing
-            # it back — or the list of rules that passed, from which it
-            # can be read off — would give a compromised agent a
-            # per-try signal to tune proposals against. Where automatic
-            # purchasing is on, a proposal that goes to review says
-            # only that.
-            outcome.pop("checker", None)
-            from boxbot.core.config import get_config
+            shopping.note_sent(conv, outcome)
+            return {"status": "ok", **shopping.scrub_outcome(outcome)}
 
-            if (
-                get_config().purchases.mode == "auto"
-                and outcome.get("decision") == "review"
-            ):
-                outcome["blocked_by"] = ["needs_review"]
-            return {"status": "ok", **outcome}
+        if sub == "cancel":
+            done = await shopping.cancel(payload.get("id"), conv=conv)
+            reply: dict[str, Any] = {"status": "ok", **done}
+            if payload.get("id") is not None:
+                reply["purchase"] = done["cancelled"][0]
+            return reply
 
-        if sub in ("status", "get", "send_review_link", "cancel"):
+        if sub in ("status", "get", "send_review_link"):
             purchase_id = payload.get("id")
             if not isinstance(purchase_id, str) or not purchase_id.strip():
                 return {"status": "error", "message": "'id' is required"}
@@ -1174,9 +1200,6 @@ async def _handle_purchases_action(
             if sub == "send_review_link":
                 outcome = await service.resend_review_link(purchase_id)
                 return {"status": "ok", **outcome}
-            if sub == "cancel":
-                row = await service.cancel(purchase_id, by="boxBot")
-                return {"status": "ok", "purchase": service.public_view(row)}
             row = await get_purchase_store().get(purchase_id)
             if row is None:
                 return {
@@ -3047,5 +3070,54 @@ async def process_action(
             outcome = await outcome
         result = outcome
 
-    ctx.action_log.append({"action": action_type, **result})
+    ctx.action_log.append(_log_entry(
+        action_type, result, replied=bool(action.get("_expects_response")),
+    ))
     return result
+
+
+# ``path`` is load-bearing in the log — the trigger receipt reads the
+# workspace paths a run wrote from here (``core/agent.py``
+# ``_workspace_artifacts_from_thread``) — so it is kept even when long.
+_LOG_TEXT_MAX = 200
+_LOG_PATH_MAX = 1024
+
+
+def _log_entry(
+    action_type: str, result: dict[str, Any], *, replied: bool,
+) -> dict[str, Any]:
+    """One ``sdk_actions`` entry for the tool result.
+
+    A fire-and-forget action is logged whole: this array is the only
+    place its outcome appears. An action that expected a response has
+    already handed its full reply to the script, which prints what it
+    wants; repeating the payload here put every search result into the
+    model's context twice. Those keep their short scalars (``status``,
+    ``path``, ``id``, counts, flags — small, and some SDK calls return
+    nothing to the script, so this is where "3 photos retagged" shows)
+    and lose everything bulky: a list becomes ``n_<key>`` (its length),
+    a record becomes ``<key>_id`` when it has an id, and a long string
+    is dropped (an error ``message`` is clipped instead).
+    """
+    if not isinstance(result, dict):
+        return {"action": action_type}
+    if not replied:
+        return {"action": action_type, **result}
+    entry: dict[str, Any] = {"action": action_type}
+    for key, value in result.items():
+        if value is None or isinstance(value, (bool, int, float)):
+            entry[key] = value
+        elif isinstance(value, str):
+            if key == "path":
+                entry[key] = value[:_LOG_PATH_MAX]
+            elif len(value) <= _LOG_TEXT_MAX:
+                entry[key] = value
+            elif key == "message":
+                entry[key] = value[:_LOG_TEXT_MAX] + "…"
+        elif isinstance(value, (list, tuple)):
+            entry[f"n_{key}"] = len(value)
+        elif isinstance(value, dict):
+            inner = value.get("id")
+            if isinstance(inner, str) and len(inner) <= _LOG_TEXT_MAX:
+                entry[f"{key}_id"] = inner
+    return entry

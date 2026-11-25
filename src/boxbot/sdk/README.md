@@ -85,7 +85,7 @@ the renderer draws from a fixed, validated registry.
 | `skill` | Create skills at runtime (SKILL.md + resources + scripts). |
 | `integrations` | List / call / create / update / delete data pipes; read run logs. |
 | `packages` | Request a PyPI install. Human approves out-of-band. |
-| `purchases` | Search products, propose a purchase. Main process decides: admin review link, or buy within limits. |
+| `purchases` | find → cart → send by short result id; cancel. Main process holds rows, draws the screens, and decides: admin review link, or buy within limits. |
 | `secrets` | Write-only credential store. |
 | `integration` | In-script helpers for integration authors: `inputs()`, `return_output()`. |
 
@@ -117,7 +117,9 @@ returning `{"status": "error"}`) is data to inspect, not an exception.
    call, only as `BOXBOT_SECRET_<NAME>` env vars in a launched
    subprocess.
 7. **Auditable** — every action is logged with timestamp and context,
-   and surfaces in the tool result's `sdk_actions`.
+   and surfaces in the tool result's `sdk_actions` (whole for
+   fire-and-forget actions; `{action, status}` + a short summary for
+   ones whose reply the script already received).
 
 ## Files
 

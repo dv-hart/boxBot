@@ -561,8 +561,7 @@ purchases:
   max_per_month_cents: 10000
   max_items: 5
   # Stores the household trusts (bare domains). Only these qualify for
-  # automatic purchase and for bb.purchases.store_products. For any
-  # other store boxBot asks the admins first; an admin replies
+  # automatic purchase. For any other store an admin replies
   # "allow shop <domain>" to permit review-only checkouts there, until
   # an admin replies "block shop <domain>".
   allowed_shops: []               # e.g. ["www.cottagedoorpress.com"]
@@ -570,6 +569,11 @@ purchases:
   veto_window_seconds: 300        # admins can reply "cancel buy <id>"; auto needs >= 60
   duplicate_window_days: 14       # no automatic re-buy of the same item within this
   max_proposals_per_day: 20
+  max_quotes_per_hour: 12         # cart quotes (a store checkout, no purchase, no text)
+  # Product photos on the screen: the main process downloads catalogue
+  # images from these hosts only (https, size/type capped, re-encoded).
+  fetch_product_images: true
+  product_image_hosts: ["cdn.shopify.com"]
   checker_model: null             # null = BOXBOT_MODEL_LARGE
   checker_timeout_seconds: 20
   # policy: |                     # replaces the built-in purchase policy

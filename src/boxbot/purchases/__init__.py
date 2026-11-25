@@ -13,6 +13,8 @@ spending budget after a veto window.
 | :mod:`checker` | isolated policy-checker model call, fail closed |
 | :mod:`store` | purchases + full decision log (``data/purchases/``) |
 | :mod:`service` | orchestration, notifications, admin commands |
+| :mod:`shopping` | find → cart → send by short id: per-conversation result cache, cart, quotes |
+| :mod:`images` | the bounded product-image fetch (allow-listed hosts only) |
 
 Trust boundaries:
 
@@ -20,16 +22,17 @@ Trust boundaries:
   details, and payment credentials never reach the sandbox or any
   model context.
 - The agent cannot set an address, a payment method, or a price; it
-  names a store, variant ids, and quantities.
+  names result ids (resolved here against its own conversation's
+  cache) and quantities.
 - Review links and veto notices are composed and sent by the service,
   to registered admins only. Every string in them that the service did
   not establish itself (item titles, the agent's reason, user display
   names) passes through ``shop_client.plain_text``; the ``message``
   tool refuses agent text that imitates a notice or carries a Shop
   sign-in/checkout link.
-- A store outside ``purchases.allowed_shops`` gets a checkout — and
-  with it the household's saved contact and address — only after an
-  admin's own ``allow shop <domain>`` text. That approval is review
+- A store outside ``purchases.allowed_shops`` gets a checkout (for a
+  quote or a purchase) — and with it the household's saved contact and
+  address — only after an admin's own ``allow shop <domain>`` text. That approval is review
   only and lasts until an admin texts ``block shop <domain>``.
 - A veto window interrupted by a restart is never resumed: the
   purchase goes to review.

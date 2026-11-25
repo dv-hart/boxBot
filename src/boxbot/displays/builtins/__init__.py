@@ -14,6 +14,11 @@ Built-in displays:
   manager opens the browser window on top; this is what shows while it
   loads.
 - product: One product from a purchase search — image, title, price.
+  (Args typed by the caller; superseded by ``products``.)
+- products: 1–4 numbered product cards, drawn by the main process from
+  the purchase result cache (``bb.purchases.find`` / ``show``).
+- cart: the conversation's cart — lines, cost breakdown, total
+  (``bb.purchases.cart``).
 """
 
 from boxbot.displays.blocks import (
@@ -36,6 +41,8 @@ def get_builtin_specs() -> list[DisplaySpec]:
         _notice_display(),
         _web_display(),
         _product_display(),
+        _products_display(),
+        _cart_display(),
     ]
 
 
@@ -250,5 +257,40 @@ def _product_display() -> DisplaySpec:
         theme="boxbot",
         data_sources=[],
         root_block=root,
+        transition="crossfade",
+    )
+
+
+def _products_display() -> DisplaySpec:
+    """1–4 numbered product cards (one large card, or equal columns).
+
+    ``args.view`` is a token for content the main process published
+    (``boxbot.displays.shop_blocks.publish``) from the purchase result
+    cache. Nothing shown is taken from the args themselves, so the
+    caller cannot type a title, price or seller onto the card.
+    """
+    from boxbot.displays.shop_blocks import ProductCardsBlock
+
+    return DisplaySpec(
+        name="products",
+        theme="boxbot",
+        data_sources=[],
+        root_block=ProductCardsBlock(view="{args.view}"),
+        transition="crossfade",
+    )
+
+
+def _cart_display() -> DisplaySpec:
+    """The cart: lines left, subtotal / shipping / tax and total right.
+
+    Same token scheme as ``products``.
+    """
+    from boxbot.displays.shop_blocks import CartBlock
+
+    return DisplaySpec(
+        name="cart",
+        theme="boxbot",
+        data_sources=[],
+        root_block=CartBlock(view="{args.view}"),
         transition="crossfade",
     )

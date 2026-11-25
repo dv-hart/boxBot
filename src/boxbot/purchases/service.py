@@ -53,6 +53,7 @@ from boxbot.purchases.shop_client import (
     ShopError,
     ShopNotConnected,
     budget_instrument,
+    checkout_cost_shape,
     fetch_store_products,
     idempotency_key_for,
     normalize_shop,
@@ -143,6 +144,7 @@ _feed_rate = _RateWindow(30, 3600)
 _resend_rate = _RateWindow(6, 3600)          # review-link resends, all purchases
 _shop_ask_rate = _RateWindow(3, 86400)       # "may boxBot shop at …?" texts
 _shop_asked: dict[str, float] = {}           # host → when the admins were last asked
+_cancel_notice_rate = _RateWindow(6, 3600)   # "ignore the earlier link" texts
 # Every propose() attempt, including ones that fail before a row exists.
 _propose_attempts = _RateWindow(10**9, 86400)
 # Identical proposals from one conversation share one task for a while,
@@ -251,6 +253,12 @@ def public_view(row: dict[str, Any]) -> dict[str, Any]:
         "shop": row["shop"],
         "items": row["items"],
         "total_cents": row["total_cents"],
+        # The store's own breakdown of that total (None on old rows or
+        # when the store did not itemise).
+        "subtotal_cents": row.get("subtotal_cents"),
+        "shipping_cents": row.get("shipping_cents"),
+        "tax_cents": row.get("tax_cents"),
+        "delivery": row.get("delivery"),
         "currency": row["currency"],
         "reason": row["reason"],
         "status": row["status"],
@@ -290,12 +298,40 @@ def _describe(row: dict[str, Any], facts: dict[str, Any] | None = None) -> str:
             f"{plain_text(item.get('title'), 120)} "
             f"({_money(item.get('unit_cents'), row['currency'])} each)"
         )
-    total = f"Total: {_money(row['total_cents'], row['currency'])}"
-    shipping = (facts or {}).get("shipping_cents")
-    if isinstance(shipping, int) and shipping:
-        total += f" (includes {_money(shipping, row['currency'])} shipping)"
-    lines.append(total)
+    # The store's breakdown, from the stored row (the checkout facts
+    # only for a row written before the columns existed).
+    parts = []
+    for label, key in (
+        ("Subtotal", "subtotal_cents"), ("Shipping", "shipping_cents"),
+        ("Tax", "tax_cents"),
+    ):
+        cents = row.get(key)
+        if cents is None:
+            cents = (facts or {}).get(key)
+        if isinstance(cents, int) and not isinstance(cents, bool):
+            part = f"{label}: {_money(cents, row['currency'])}"
+            if key == "shipping_cents" and row.get("delivery"):
+                part += f" ({plain_text(row['delivery'], 40)})"
+            parts.append(part)
+    if parts:
+        lines.append(" · ".join(parts))
+    lines.append(f"Total: {_money(row['total_cents'], row['currency'])}")
     return "\n".join(lines)
+
+
+def _came_from(row: dict[str, Any]) -> str:
+    """Who asked, as the transport knows it, and when (local time).
+
+    The label is :func:`identify_requester`'s: a channel, plus the
+    registered sender for a text thread. Never a name the perception
+    stack attached to a voice.
+    """
+    label = row.get("requested_by") or "unknown"
+    at = _epoch(row.get("created_at"))
+    if at is None:
+        return label
+    clock = datetime.fromtimestamp(at).strftime("%I:%M %p").lstrip("0").lower()
+    return f"{label}, {clock}"
 
 
 def _epoch(iso: str | None) -> float | None:
@@ -408,7 +444,9 @@ async def identify_requester(
             ), user
         return rules.Requester(channel, False, f"unregistered {channel} sender"), None
     if channel == "voice":
-        return rules.Requester(channel, False, "voice in the room"), None
+        # Whoever the room's voice was matched to is not part of this:
+        # voice identity authorises nothing and is not shown as fact.
+        return rules.Requester(channel, False, "voice at the box"), None
     return rules.Requester(channel, False, f"{channel or 'unknown'} conversation"), None
 
 
@@ -504,18 +542,49 @@ async def search(
         raise _shop_failure(e) from e
 
 
+async def approved_shops() -> list[str]:
+    """Every store boxBot may build a checkout at, config list first.
+
+    The one definition of "approved": ``purchases.allowed_shops`` plus
+    the stores an admin approved by their own ``allow shop`` text.
+    (Automatic purchase is narrower — the config list only; see
+    :mod:`rules`.)
+    """
+    hosts = list(_config().allowed_shops)
+    store = get_purchase_store()
+    for host in await store.approved_shops():
+        if host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+async def shop_is_approved(host: str) -> bool:
+    """True when ``host`` is an approved store. Every path asks here."""
+    if host in _config().allowed_shops:
+        return True
+    return await get_purchase_store().shop_approved(host)
+
+
+def not_approved_message(host: str) -> str:
+    return (
+        f"{host} is not approved yet — an admin can approve it by text. "
+        "Nothing was sent to that store."
+    )
+
+
 async def store_products(
     shop: Any, *, query: Any = None, limit: Any = 20,
 ) -> list[dict[str, Any]]:
-    cfg = _require_enabled()
+    _require_enabled()
     try:
         host = normalize_shop(shop)
     except ValueError as e:
         raise PurchaseError(str(e)) from e
-    if host not in cfg.allowed_shops:
+    # This fetches a host the agent named; only an approved store's.
+    if not await shop_is_approved(host):
         raise PurchaseError(
-            f"{host} is not in purchases.allowed_shops; only an admin can "
-            "add a store. Use search() for stores Shop lists."
+            not_approved_message(host) + " stores() lists the approved ones; "
+            "find() searches every store Shop lists."
         )
     if query is not None and not isinstance(query, str):
         raise PurchaseError("query must be text")
@@ -573,8 +642,17 @@ async def propose(
     reason: Any,
     *,
     conv: "Conversation | None",
+    adopt: dict[str, Any] | None = None,
+    replaces: str | None = None,
 ) -> dict[str, Any]:
     """Build a checkout, decide, and either schedule it or send it for review.
+
+    ``adopt`` is a checkout this service already built for exactly
+    these lines (a cart quote); it is used instead of building another.
+    ``replaces`` is the id of a purchase this one supersedes — already
+    cancelled by the caller — and is named in the text to the admins.
+    Both come from :mod:`shopping` in the main process, never from the
+    sandbox.
 
     Returns ``{"purchase": <public view>, "decision": "auto" |
     "review", "blocked_by": [rule names], "checker": "allow" | "deny" |
@@ -631,7 +709,10 @@ async def propose(
         if _recent_proposals.get(key) is existing:
             _recent_proposals.pop(key, None)
 
-    task = _spawn(_propose(host, lines, reason, conv), "purchase-propose")
+    task = _spawn(
+        _propose(host, lines, reason, conv, adopt=adopt, replaces=replaces),
+        "purchase-propose",
+    )
     _recent_proposals[key] = (task, now)
 
     def _forget_failure(done: asyncio.Task) -> None:
@@ -651,6 +732,9 @@ async def _propose(
     lines: list[dict[str, Any]],
     reason: str,
     conv: "Conversation | None",
+    *,
+    adopt: dict[str, Any] | None = None,
+    replaces: str | None = None,
 ) -> dict[str, Any]:
     cfg = _config()
     store = get_purchase_store()
@@ -662,10 +746,10 @@ async def _propose(
         # contact and delivery details, so it happens only for a store
         # the household allow-listed or an admin approved by their own
         # text command. Nothing the agent says can stand in for that.
-        if host not in cfg.allowed_shops and not await store.shop_approved(host):
+        if not await shop_is_approved(host):
             asked = await _ask_shop_approval(host, requester)
             raise PurchaseError(
-                f"{host} is not a store this household has approved. "
+                f"{not_approved_message(host)} "
                 f"{_SHOP_ASK_REPLY[asked]} Tell the person — do not retry."
             )
 
@@ -682,13 +766,17 @@ async def _propose(
         turns, latest_person_at = conversation_turns(conv, user)
         channel_key = getattr(conv, "channel_key", None) if conv is not None else None
 
-        try:
-            checkout = await get_shop_client().create_checkout(host, lines)
-        except ShopNotConnected as e:
-            await _note_not_connected()
-            raise _shop_failure(e) from e
-        except (ShopError, httpx.HTTPError) as e:
-            raise _shop_failure(e) from e
+        if adopt is not None:
+            checkout = adopt
+        else:
+            try:
+                checkout = await get_shop_client().create_checkout(host, lines)
+            except ShopNotConnected as e:
+                await _note_not_connected()
+                raise _shop_failure(e) from e
+            except (ShopError, httpx.HTTPError) as e:
+                raise _shop_failure(e) from e
+            log_checkout_costs("proposal", host, checkout)
 
         facts = summarize_checkout(checkout)
         checkout_id = checkout.get("id")
@@ -734,6 +822,10 @@ async def _propose(
             channel_key=channel_key,
             checkout_id=checkout_id,
             continue_url=continue_url,
+            subtotal_cents=facts["subtotal_cents"],
+            shipping_cents=facts["shipping_cents"],
+            tax_cents=facts["tax_cents"],
+            delivery=(facts.get("delivery") or {}).get("name"),
         )
 
         try:
@@ -743,6 +835,7 @@ async def _propose(
                 duplicate_of=duplicate_of, latest_person_at=latest_person_at,
                 last_proposal=last_proposal, epoch_now=epoch_now,
                 day_start=day_start, month_start=month_start,
+                replaces=replaces,
             )
         except Exception:  # noqa: BLE001
             # A checkout exists; it must not be left with no decision
@@ -762,7 +855,9 @@ async def _propose(
                 logger.exception("purchase %s: could not record fallback", row["id"])
 
     if final == "review":
-        notified = await _send_review_link(row["id"], facts=facts)
+        notified = await _send_review_link(
+            row["id"], facts=facts, replaces=replaces,
+        )
 
     logger.info(
         "Purchase %s proposed: %s, %s item(s) from %s → %s (checker=%s)",
@@ -787,6 +882,7 @@ async def _decide_and_act(
     duplicate_of: str | None, latest_person_at: float | None,
     last_proposal: float | None, epoch_now: float,
     day_start: datetime, month_start: datetime,
+    replaces: str | None = None,
 ) -> tuple[str, list[rules.RuleResult], checker.CheckerResult, int]:
     """Rules + checker + decision log, then schedule if automatic.
 
@@ -859,7 +955,7 @@ async def _decide_and_act(
             if scheduled is None:
                 final = "review"        # cancelled meanwhile; stays cancelled
             else:
-                notified = await _announce_auto(row, facts, cfg)
+                notified = await _announce_auto(row, facts, cfg, replaces)
                 if notified == 0:
                     # Nobody could veto, so nobody was asked. Not automatic.
                     final = "review"
@@ -930,12 +1026,25 @@ def _large_model() -> str:
     return get_config().models.large
 
 
-async def _announce_auto(row: dict[str, Any], facts: dict[str, Any], cfg: Any) -> int:
+def _replaces_line(replaces: str | None, shop: str) -> str:
+    if not replaces:
+        return ""
+    return (
+        f"Replaces purchase {plain_text(replaces, 12)}, now cancelled — "
+        f"ignore the earlier link for {shop}.\n"
+    )
+
+
+async def _announce_auto(
+    row: dict[str, Any], facts: dict[str, Any], cfg: Any,
+    replaces: str | None = None,
+) -> int:
     minutes = max(1, round(cfg.veto_window_seconds / 60))
     return await _notify_admins(
         f"🛒 boxBot will buy this in about {minutes} "
         f"minute{'s' if minutes != 1 else ''} (purchase {row['id']}):\n"
-        f"Came from: {row['requested_by']}\n"
+        f"{_replaces_line(replaces, row['shop'])}"
+        f"Came from: {_came_from(row)}\n"
         f"{_describe(row, facts)}\n"
         f'Reply "cancel buy {row["id"]}" to stop it.'
     )
@@ -946,6 +1055,7 @@ async def _send_review_link(
     *,
     facts: dict[str, Any] | None = None,
     headline: str = "needs your review",
+    replaces: str | None = None,
 ) -> int:
     """Text the checkout's review link to the admins. Returns reach count.
 
@@ -962,7 +1072,8 @@ async def _send_review_link(
     verdict = decisions[-1]["checker_decision"] if decisions else "not run"
     body = (
         f"🛒 boxBot purchase {row['id']} — {headline}\n"
-        f"Came from: {row['requested_by']}\n"
+        f"{_replaces_line(replaces, row['shop'])}"
+        f"Came from: {_came_from(row)}\n"
         f"{_describe(row, facts)}\n"
         f"Policy check: {verdict}\n"
         f"boxBot's stated reason (unverified): \"{plain_text(row['reason'], _MAX_REASON_LEN)}\"\n"
@@ -1035,6 +1146,69 @@ async def cancel(purchase_id: str, *, by: str) -> dict[str, Any]:
         )
     logger.info("Purchase %s cancelled by %s", purchase_id, by)
     return updated
+
+
+async def cancel_by_agent(
+    purchase_id: str, *, notify: bool = True,
+) -> tuple[dict[str, Any], int]:
+    """Cancel on the agent's say-so; tell the admins if they hold a link.
+
+    Cancelling is local: the row stops here, but the store's checkout —
+    and the review link already texted — stays payable. So when a link
+    went out, the admins get one short fixed-format notice telling them
+    to ignore it (rate-limited; composed here, sent on the same path as
+    the review link). ``notify=False`` is for a purchase being replaced,
+    where the replacement's own text says so.
+
+    Returns ``(cancelled row, admins told)``.
+    """
+    before = await get_purchase_store().get(purchase_id)
+    row = await cancel(purchase_id, by="boxBot")
+    told = 0
+    link_out = before is not None and bool(before.get("link_sent_at"))
+    announced = before is not None and before["status"] in ("scheduled", "verifying")
+    if notify and (link_out or announced):
+        told = await send_cancel_notice(row)
+    return row, told
+
+
+async def send_cancel_notice(row: dict[str, Any]) -> int:
+    """Text the admins that a purchase they were sent is cancelled."""
+    if not _cancel_notice_rate.take():
+        logger.info("Purchase %s: cancel notice skipped (rate limit)", row["id"])
+        return 0
+    return await _notify_admins(
+        f"🛒 boxBot purchase {row['id']} cancelled — ignore the earlier "
+        f"link for {row['shop']} "
+        f"({_money(row['total_cents'], row['currency'])}). boxBot will not "
+        "buy it."
+    )
+
+
+async def request_shop_approval(host: str, conv: "Conversation | None") -> str:
+    """Ask the admins about an unapproved store; see :func:`_ask_shop_approval`."""
+    requester, _ = await identify_requester(conv)
+    return await _ask_shop_approval(host, requester)
+
+
+def shop_ask_reply(asked: str) -> str:
+    return _SHOP_ASK_REPLY[asked]
+
+
+def log_checkout_costs(what: str, host: str, checkout: dict[str, Any]) -> None:
+    """Log a checkout's totals and fulfilment structure (no personal data).
+
+    Every ``totals`` entry and the shape of the delivery block, so a
+    charge that looks wrong (shipping counted twice, say) can be traced
+    to what the store actually returned.
+    """
+    try:
+        logger.info(
+            "Checkout costs (%s, %s): %s", what, host,
+            json.dumps(checkout_cost_shape(checkout), sort_keys=True)[:4000],
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never break a purchase
+        logger.exception("could not log checkout costs")
 
 
 # ---------------------------------------------------------------------------
@@ -1329,6 +1503,9 @@ def start() -> None:
     up the agent coming online.
     """
     _spawn(_run_background(), "purchases-background")
+    from boxbot.purchases import shopping
+
+    shopping.start()
 
 
 async def _run_background() -> None:

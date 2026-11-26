@@ -1483,7 +1483,7 @@ class VoiceSession:
                 the transcript.
             identity_block: {display_name: {person_id, person_name,
                 voice_tier, voice_score, source, certainty, label,
-                enroll_ref}} — keyed by the same label the transcript
+                enroll_ref, utterance}} — keyed by the same label the transcript
                 uses; surfaced on TranscriptReady. See
                 ``TranscriptReady`` for field meanings.
         """
@@ -1636,6 +1636,9 @@ class VoiceSession:
                 "certainty": attribution.certainty,
                 "label": display,
                 "enroll_ref": attribution.ref,
+                # Short id of this utterance — what identify_person
+                # binds a claim to (``utterance=``).
+                "utterance": attribution.utterance_id,
             }
 
             identity_block[display] = entry

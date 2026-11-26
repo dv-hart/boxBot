@@ -191,6 +191,19 @@ GenerateFn = Callable[
 ]
 
 
+def _identity_entries(block: Any) -> list[dict[str, Any]]:
+    """A ``TranscriptReady.speaker_identities`` block as a list of
+    entries, each carrying its ``label`` (the block's key if absent)."""
+    if not isinstance(block, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for key, info in block.items():
+        entry = dict(info or {})
+        entry.setdefault("label", key)
+        out.append(entry)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Conversation
 # ---------------------------------------------------------------------------
@@ -224,8 +237,12 @@ class Conversation:
         self.channel = channel            # "voice" | "whatsapp" | "trigger"
         self.channel_key = channel_key    # "voice:room", "whatsapp:+1...", etc.
         self.participants: set[str] = set(participants or ())
-        # Who the transport attributed the LATEST human input to; None
-        # when it could not name them (unrecognised voice).
+        # Who the transport attributed the latest human input IN THE
+        # THREAD to; None when it could not name them (unrecognised
+        # voice). Recorded when a turn enters the thread the model is
+        # answering — not when it is queued behind a running generation
+        # (a text to "current_speaker" used to go to whoever spoke while
+        # the agent was still answering someone else).
         # ``speaker_resolved`` separates "unrecognised" from "no human
         # input yet" (trigger runs, relay-seeded rooms), where callers
         # may fall back to presence.
@@ -240,6 +257,23 @@ class Conversation:
         # enough to address the room by name, not to pick a text
         # recipient.
         self.speaker_guessed: bool = False
+        # Attribution of inputs not yet in the thread, keyed by the
+        # queued message object's id(). Moved onto the fields above by
+        # ``_note_turn_entered``.
+        self._queued_turn_info: dict[int, dict[str, Any]] = {}
+        # Voice: ids of the utterances whose lines have entered the
+        # thread — what the model has actually been shown. Read by
+        # ``identify_person`` so a claim never binds to a line that was
+        # still queued when the model made the call.
+        self.shown_utterance_ids: list[str] = []
+        # Voice: per-utterance identity entries of the turn(s) the
+        # current generation was started for (see TranscriptReady).
+        self.turn_identities: list[dict[str, Any]] = []
+        # What this conversation's turn-context blocks have already
+        # carried (day, channel, registered users, memory lines), so
+        # later blocks repeat only what changed. Owned by the agent's
+        # ``_prompt_dynamic_context``; cleared on compaction.
+        self.turn_context_emitted: dict[str, Any] = {}
         # Persistent conversations don't use a silence timer — the
         # agent's extraction sweep handles end-of-life. We still hold
         # the field so debug/logging code can read it; setting it to 0
@@ -494,11 +528,8 @@ class Conversation:
             if speaker_name:
                 self.participants.add(speaker_name)
 
+            guessed = bool(speaker_guessed and speaker_name)
             if human:
-                self.current_speaker = speaker_name or None
-                self.speaker_resolved = True
-                self.current_speaker_label = speaker_label or None
-                self.speaker_guessed = bool(speaker_guessed and speaker_name)
                 self.exchange_log.append({
                     "speaker": "person",
                     "name": speaker_name,
@@ -508,7 +539,20 @@ class Conversation:
 
             user_message = self._format_user_message(
                 cleaned, speaker_name=speaker_name, source=source,
+                speaker_guessed=guessed,
             )
+            if human:
+                # Attribution travels with the message and is applied
+                # when the message enters the thread (now, or at a
+                # drain) — see ``_note_turn_entered``.
+                self._queued_turn_info[id(user_message)] = {
+                    "name": speaker_name or None,
+                    "label": speaker_label or None,
+                    "guessed": guessed,
+                    "identities": _identity_entries(
+                        (context or {}).get("speaker_identities")
+                    ),
+                }
 
             # Prefetched context rides ON the user turn it was assembled
             # for — as turn METADATA, not inside the content string. It
@@ -578,6 +622,8 @@ class Conversation:
 
             # Append new user input to thread.
             self._thread.append(user_message)
+            self.turn_identities = []
+            self._note_turn_entered(user_message, starts_generation=True)
 
             # Durably persist the user turn for persistent-mode
             # conversations BEFORE generation kicks off. This way a
@@ -700,7 +746,35 @@ class Conversation:
             return []
         drained = self._pending_inputs
         self._pending_inputs = []
+        # These lines are about to be folded into the running turn: the
+        # model's NEXT response is the first that has seen them.
+        for item in drained:
+            self._note_turn_entered(item)
         return drained
+
+    def _note_turn_entered(
+        self, message: dict[str, Any], *, starts_generation: bool = False,
+    ) -> None:
+        """Apply a human input's attribution as it enters the thread.
+
+        The three entry points: ``handle_input`` starting a generation,
+        the post-turn drain in ``_run_generation``, and the mid-loop
+        fold (``drain_pending_inputs``). Machine-written inputs carry no
+        attribution and change nothing.
+        """
+        info = self._queued_turn_info.pop(id(message), None)
+        if info is None:
+            return
+        self.current_speaker = info["name"]
+        self.speaker_resolved = True
+        self.current_speaker_label = info["label"]
+        self.speaker_guessed = info["guessed"]
+        for entry in info["identities"]:
+            uid = entry.get("utterance")
+            if uid and uid not in self.shown_utterance_ids:
+                self.shown_utterance_ids.append(uid)
+        if starts_generation:
+            self.turn_identities.extend(info["identities"])
 
     @staticmethod
     def build_trigger_context_turns(
@@ -880,6 +954,8 @@ class Conversation:
                     len(self._pending_inputs),
                 )
                 self._pending_inputs = []
+                # Never shown to the model: their attribution goes too.
+                self._queued_turn_info.clear()
 
             self._state = ConversationState.LISTENING
             self._reset_silence_timer()
@@ -910,6 +986,7 @@ class Conversation:
                 await self._cancel_and_fold()
             # Drop any queued utterances — the conversation is over.
             self._pending_inputs = []
+            self._queued_turn_info.clear()
             # Deferred trigger-delivery turns were already persisted by
             # ingest_trigger_delivery; only the in-memory fold-in is
             # lost, which is fine — a rehydrate picks them up from the
@@ -1102,6 +1179,9 @@ class Conversation:
                 drained = self._pending_inputs
                 self._pending_inputs = []
                 self._thread.extend(drained)
+                self.turn_identities = []
+                for item in drained:
+                    self._note_turn_entered(item, starts_generation=True)
                 # The fresh generation must run under the DRAINED turns'
                 # prefetch state, not the finished turn's: clear the
                 # stale keys, then adopt the drained flags (last wins).
@@ -1225,8 +1305,14 @@ class Conversation:
         *,
         speaker_name: str | None,
         source: str,
+        speaker_guessed: bool = False,
     ) -> dict[str, Any]:
-        """Render an inbound message into the thread's message format."""
+        """Render an inbound message into the thread's message format.
+
+        ``speaker_guessed``: ``speaker_name`` is a presence guess, not an
+        attribution of this input. The line is labelled ``[Name?]`` — the
+        model reads a bare ``[Name]`` as confirmed.
+        """
         if source == "trigger":
             # Triggers inject as a system/user-style prompt so the model
             # understands this is an automated wake, not a spoken line.
@@ -1245,7 +1331,11 @@ class Conversation:
             return {"role": "user", "content": text}
         if speaker_name:
             # One sender label (text channels; unlabelled voice text).
-            return {"role": "user", "content": f"[{speaker_name}]: {text}"}
+            mark = "?" if speaker_guessed else ""
+            return {
+                "role": "user",
+                "content": f"[{speaker_name}{mark}]: {text}",
+            }
         return {"role": "user", "content": text}
 
     def _turn_count(self) -> int:

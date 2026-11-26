@@ -34,7 +34,7 @@ name for them.
 
 **Does not apply to:** `[Name]` lines (confirmed — use their name);
 `[Name?]` lines (maybe — soft-verify the suggested name instead, then
-`identify_person(name, ref="Name?")`); speakers talking to each other.
+`identify_person(name, utterance=<id>)`); speakers talking to each other.
 
 **Their request comes first.** Not knowing a name never blocks,
 delays, or replaces what they asked for.
@@ -61,10 +61,13 @@ delays, or replaces what they asked for.
    demand a name, never ask again.
 
 3. **Pin it** with `identify_person`: `name` = what they gave, trimmed
-   and naturally capitalized; `ref` = the bracketed label on the line
-   where they said it (e.g. `"Speaker A"`). Call it right away — it
-   binds to that label's most recent voice. Result `mixed_voices: true`
-   = more than one voice under the label: ask who is who, don't assume.
+   and naturally capitalized; `utterance` = the id beside the label of
+   the line where they said it ("People in this session": `[Speaker A]
+   u7` → `"u7"`). No id shown for that line: `ref` = its bracketed
+   label, exactly (`"Speaker A"`) — binds the latest line under it you
+   had seen. Result `mixed_voices: true` = more than one voice under
+   the label: ask who is who, don't assume; `label_only: true` =
+   nothing was stored — re-call with `utterance` once sure.
 
    | Outcome | Say |
    |---------|-----|

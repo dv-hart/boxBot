@@ -332,8 +332,8 @@ class TranscriptReady(Event):
           "voice_score": 0.48,      # the cosine that decided it
           "source": "voice_reid_match" | "agent_identify"
                     | "session_anchor" | "unknown",
-          "enroll_ref": "Jacob?",   # ref identify_person binds (the
-                                    #   label also resolves)
+          "enroll_ref": "Jacob?",   # enrollment buffer the line went to
+          "utterance": "u7",        # id identify_person(utterance=) binds
           "visual_tier": "high",    # optional; present if fusion available
           "visual_score": 0.88,
         }

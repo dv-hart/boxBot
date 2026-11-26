@@ -282,16 +282,41 @@ def _money(cents: Any, currency: str | None = "USD") -> str:
     return f"${amount}" if currency == "USD" else f"{amount} {currency or '?'}"
 
 
-def _describe(row: dict[str, Any], facts: dict[str, Any] | None = None) -> str:
+STANDING_LISTED = "in your config list"
+STANDING_BY_TEXT = (
+    "approved by an admin's text; not in your config list, so never "
+    "bought automatically"
+)
+STANDING_NONE = "not currently approved"
+
+
+async def _store_standing(host: str) -> str:
+    """How ``host`` came to be approved, in the words the admins read.
+
+    A store is approved one of two ways, and they differ in what they
+    allow: the config list (the only stores eligible for automatic
+    purchase) or an admin's own ``allow shop`` text (review links
+    only). A store approved by text *is* approved — the wording must
+    not suggest otherwise.
+    """
+    if host in _config().allowed_shops:
+        return STANDING_LISTED
+    try:
+        by_text = await get_purchase_store().shop_approved(host)
+    except Exception:  # noqa: BLE001 — wording must never break a notice
+        logger.exception("could not read store approval for %s", host)
+        by_text = False
+    return STANDING_BY_TEXT if by_text else STANDING_NONE
+
+
+async def _describe(
+    row: dict[str, Any], facts: dict[str, Any] | None = None,
+) -> str:
     """Store, items and total — every figure read from Shop, not the agent.
 
     Item titles are merchant text: single-line, link-stripped, clipped.
     """
-    listed = row["shop"] in _config().allowed_shops
-    lines = [
-        f"Store: {row['shop']} "
-        f"({'on' if listed else 'NOT on'} your allow-list)"
-    ]
+    lines = [f"Store: {row['shop']} ({await _store_standing(row['shop'])})"]
     for item in row["items"]:
         lines.append(
             f"- {item.get('quantity')} × "
@@ -643,22 +668,26 @@ async def propose(
     *,
     conv: "Conversation | None",
     adopt: dict[str, Any] | None = None,
-    replaces: str | None = None,
+    replaces: "list[tuple[str, str]] | None" = None,
 ) -> dict[str, Any]:
     """Build a checkout, decide, and either schedule it or send it for review.
 
     ``adopt`` is a checkout this service already built for exactly
     these lines (a cart quote); it is used instead of building another.
-    ``replaces`` is the id of a purchase this one supersedes — already
-    cancelled by the caller — and is named in the text to the admins.
-    Both come from :mod:`shopping` in the main process, never from the
-    sandbox.
+    ``replaces`` is ``[(purchase id, its store), …]`` — purchases this
+    one supersedes, already cancelled by the caller — each named in the
+    text to the admins. Both come from :mod:`shopping` in the main
+    process, never from the sandbox.
 
     Returns ``{"purchase": <public view>, "decision": "auto" |
     "review", "blocked_by": [rule names], "checker": "allow" | "deny" |
-    "error", "admins_notified": int, "already_proposed": bool}``. The
-    action handler removes ``checker`` (and, in auto mode, the rule
-    names) before anything reaches the sandbox.
+    "error", "admins_notified": int, "already_proposed": bool,
+    "replaces_announced": bool}``. ``replaces_announced`` is True only
+    when this call built a new purchase and its text — the one naming
+    every ``replaces`` id — was accepted for at least one admin; the
+    caller owes the admins a separate cancel notice otherwise. The
+    action handler removes ``checker`` and ``replaces_announced`` (and,
+    in auto mode, the rule names) before anything reaches the sandbox.
 
     The work runs in a main-process task that the caller's cancellation
     cannot interrupt: once a checkout exists, the decision is always
@@ -698,6 +727,8 @@ async def propose(
         if current is not None and current["status"] not in ("cancelled", "failed"):
             # Report the purchase as it stands now, not as it was decided.
             outcome["already_proposed"] = True
+            # No text went out for this call, whatever the first one did.
+            outcome["replaces_announced"] = False
             outcome["purchase"] = public_view(current)
             outcome["decision"] = current["decision"] or "review"
             return outcome
@@ -734,7 +765,7 @@ async def _propose(
     conv: "Conversation | None",
     *,
     adopt: dict[str, Any] | None = None,
-    replaces: str | None = None,
+    replaces: "list[tuple[str, str]] | None" = None,
 ) -> dict[str, Any]:
     cfg = _config()
     store = get_purchase_store()
@@ -872,6 +903,10 @@ async def _propose(
         "blocked_by": rules.failed_names(results) if results else ["internal_error"],
         "checker": verdict.decision if verdict is not None else "error",
         "admins_notified": notified,
+        # Both texts a new purchase can produce (veto notice, review
+        # link) carry the "Replaces" lines, so reaching an admin at all
+        # means the replaced ids were named.
+        "replaces_announced": bool(replaces) and notified > 0,
     }
 
 
@@ -882,7 +917,7 @@ async def _decide_and_act(
     duplicate_of: str | None, latest_person_at: float | None,
     last_proposal: float | None, epoch_now: float,
     day_start: datetime, month_start: datetime,
-    replaces: str | None = None,
+    replaces: "list[tuple[str, str]] | None" = None,
 ) -> tuple[str, list[rules.RuleResult], checker.CheckerResult, int]:
     """Rules + checker + decision log, then schedule if automatic.
 
@@ -1026,18 +1061,32 @@ def _large_model() -> str:
     return get_config().models.large
 
 
-def _replaces_line(replaces: str | None, shop: str) -> str:
-    if not replaces:
-        return ""
-    return (
-        f"Replaces purchase {plain_text(replaces, 12)}, now cancelled — "
-        f"ignore the earlier link for {shop}.\n"
-    )
+def _replaces_line(replaces: "list[tuple[str, str]] | None", shop: str) -> str:
+    """One line per purchase the new one supersedes ("" for none).
+
+    A purchase at the same store reads "ignore the earlier link for
+    <store>"; one at another store (the cart moved) names that store,
+    because nothing else in this text would.
+    """
+    out = []
+    for purchase_id, old_shop in replaces or []:
+        pid = plain_text(purchase_id, 12)
+        if old_shop == shop:
+            out.append(
+                f"Replaces purchase {pid}, now cancelled — "
+                f"ignore the earlier link for {shop}.\n"
+            )
+        else:
+            out.append(
+                f"Replaces purchase {pid} at {old_shop}, "
+                "now cancelled — ignore that link.\n"
+            )
+    return "".join(out)
 
 
 async def _announce_auto(
     row: dict[str, Any], facts: dict[str, Any], cfg: Any,
-    replaces: str | None = None,
+    replaces: "list[tuple[str, str]] | None" = None,
 ) -> int:
     minutes = max(1, round(cfg.veto_window_seconds / 60))
     return await _notify_admins(
@@ -1045,7 +1094,7 @@ async def _announce_auto(
         f"minute{'s' if minutes != 1 else ''} (purchase {row['id']}):\n"
         f"{_replaces_line(replaces, row['shop'])}"
         f"Came from: {_came_from(row)}\n"
-        f"{_describe(row, facts)}\n"
+        f"{await _describe(row, facts)}\n"
         f'Reply "cancel buy {row["id"]}" to stop it.'
     )
 
@@ -1055,7 +1104,7 @@ async def _send_review_link(
     *,
     facts: dict[str, Any] | None = None,
     headline: str = "needs your review",
-    replaces: str | None = None,
+    replaces: "list[tuple[str, str]] | None" = None,
 ) -> int:
     """Text the checkout's review link to the admins. Returns reach count.
 
@@ -1074,7 +1123,7 @@ async def _send_review_link(
         f"🛒 boxBot purchase {row['id']} — {headline}\n"
         f"{_replaces_line(replaces, row['shop'])}"
         f"Came from: {_came_from(row)}\n"
-        f"{_describe(row, facts)}\n"
+        f"{await _describe(row, facts)}\n"
         f"Policy check: {verdict}\n"
         f"boxBot's stated reason (unverified): \"{plain_text(row['reason'], _MAX_REASON_LEN)}\"\n"
     )
@@ -1148,32 +1197,53 @@ async def cancel(purchase_id: str, *, by: str) -> dict[str, Any]:
     return updated
 
 
+# What became of the "ignore the earlier link" text for one cancelled
+# purchase. Every agent-side cancel ends in exactly one of the first
+# three, and that is what the agent is handed.
+NOTICE_NOT_NEEDED = "none_needed"   # no link or veto notice ever reached an admin
+NOTICE_TOLD = "told"                # a text naming the purchase was accepted
+NOTICE_NOT_TOLD = "not_told"        # owed, but rate-limited or no admin reachable
+NOTICE_PENDING = "pending"          # owed; the caller must send it (internal)
+
+
 async def cancel_by_agent(
     purchase_id: str, *, notify: bool = True,
-) -> tuple[dict[str, Any], int]:
+) -> tuple[dict[str, Any], str]:
     """Cancel on the agent's say-so; tell the admins if they hold a link.
 
     Cancelling is local: the row stops here, but the store's checkout —
     and the review link already texted — stays payable. So when a link
-    went out, the admins get one short fixed-format notice telling them
-    to ignore it (rate-limited; composed here, sent on the same path as
-    the review link). ``notify=False`` is for a purchase being replaced,
-    where the replacement's own text says so.
+    (or a "will buy" notice) went out, the admins are owed one short
+    fixed-format text telling them to ignore it (rate-limited; composed
+    here, sent on the same path as the review link).
 
-    Returns ``(cancelled row, admins told)``.
+    ``notify=False`` is for a purchase being replaced: nothing is sent
+    here and the notice comes back ``NOTICE_PENDING`` — the caller must
+    then either get the id named in the replacement's own text or call
+    :func:`send_cancel_notice`. :mod:`shopping` does that in a
+    ``finally``.
+
+    Returns ``(cancelled row, notice)`` — one of the ``NOTICE_*``
+    values.
     """
     before = await get_purchase_store().get(purchase_id)
     row = await cancel(purchase_id, by="boxBot")
-    told = 0
     link_out = before is not None and bool(before.get("link_sent_at"))
     announced = before is not None and before["status"] in ("scheduled", "verifying")
-    if notify and (link_out or announced):
-        told = await send_cancel_notice(row)
-    return row, told
+    if not (link_out or announced):
+        return row, NOTICE_NOT_NEEDED
+    if not notify:
+        return row, NOTICE_PENDING
+    told = await send_cancel_notice(row)
+    return row, NOTICE_TOLD if told else NOTICE_NOT_TOLD
 
 
 async def send_cancel_notice(row: dict[str, Any]) -> int:
-    """Text the admins that a purchase they were sent is cancelled."""
+    """Text the admins that a purchase they were sent is cancelled.
+
+    Returns how many admins the text was accepted for; 0 when the
+    hourly ceiling is reached or nobody could be reached.
+    """
     if not _cancel_notice_rate.take():
         logger.info("Purchase %s: cancel notice skipped (rate limit)", row["id"])
         return 0
@@ -1286,7 +1356,7 @@ async def _mark_unknown(purchase_id: str, why: str) -> None:
     await _notify_admins(
         f"⚠️ boxBot purchase {purchase_id}: a payment request may have "
         f"been sent and the outcome could not be confirmed ({why}). It "
-        f"will NOT be retried. Check your Shop orders.\n{_describe(row)}"
+        f"will NOT be retried. Check your Shop orders.\n{await _describe(row)}"
     )
 
 
@@ -1306,7 +1376,7 @@ async def _mark_ordered(purchase_id: str, order: Any) -> None:
     logger.info("Purchase %s ordered", purchase_id)
     link = ref.get("permalink_url", "")
     await _notify_admins(
-        f"✅ boxBot bought (purchase {purchase_id}):\n{_describe(row)}"
+        f"✅ boxBot bought (purchase {purchase_id}):\n{await _describe(row)}"
         + (f"\nOrder: {link}" if link.startswith("https://") else "")
     )
 
@@ -1485,7 +1555,7 @@ async def _resolve_after_payment_attempt(
                 logger.warning("Purchase %s refused by Shop (%s)", purchase_id, detail)
                 await _notify_admins(
                     f"🛒 boxBot purchase {purchase_id} was NOT bought — Shop "
-                    f"refused the payment.\n{_describe(failed)}"
+                    f"refused the payment.\n{await _describe(failed)}"
                 )
             return
     await _mark_unknown(purchase_id, plain_text(detail, 80))

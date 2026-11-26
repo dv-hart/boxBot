@@ -106,7 +106,9 @@ def cart(
 
     ``add`` / ``remove``: lists of ids (``add={"a2": 3}`` sets a
     quantity). ``replace={old: new}``. No arguments = just read it.
-    Nothing is bought and nobody is texted.
+    Nothing is bought, nobody is texted, nothing is cancelled:
+    ``still_out`` lists sent purchases still payable once the cart is
+    empty (``cancel()`` pulls them back).
 
     Returns ``{"lines": [{"id", "title", "variant", "qty", "price"}],
     "stores": [{"store", "approved", "subtotal", "shipping", "tax",
@@ -135,11 +137,13 @@ def send(reason: str) -> dict[str, Any]:
     Returns ``{"purchases": [{"store", "decision", "purchase",
     "blocked_by", "admins_notified", "already_proposed"} | {"store",
     "error"}], "needs_approval": [{"store", "domain", "note"}],
-    "total", "admins": [names]}``.
+    "replaced": [{"id", "store", "admin_notice"}], "total",
+    "admins": [names]}``.
 
     Same cart again within 10 minutes → the same purchase
-    (``already_proposed``). Changed cart → replaces the earlier one
-    (one text, marked as a replacement). After a cancel → a new one.
+    (``already_proposed``). Earlier purchases the cart no longer
+    matches (changed lines, store dropped) are cancelled → ``replaced``
+    (``admin_notice`` as in :func:`cancel`). After a cancel → a new one.
     Survives a script timeout: check :func:`list` before sending again.
     """
     v.require_str(reason, "reason")
@@ -257,9 +261,12 @@ def send_review_link(purchase_id: str) -> dict[str, Any]:
 def cancel(purchase_id: str | None = None) -> Any:
     """Cancel before payment is sent. Anyone may ask.
 
-    No id: cancels what this conversation last sent and returns
-    ``{"cancelled": [records], "admins_told": int}``. With an id:
-    returns that record. Admins holding a link are told to ignore it.
+    No id: cancels every live purchase this conversation sent and
+    returns ``{"cancelled": [records]}``. With an id: returns that
+    record. A link already texted still works, so each record has
+    ``admin_notice``: ``"told"`` (admins texted to ignore it),
+    ``"none_needed"`` (no link went out) or ``"not_told"`` (link is
+    out, admins could not be told — say so).
     Raises ``ActionError`` once payment is being sent.
     """
     if purchase_id is None:

@@ -18,9 +18,15 @@ behind an id lives here, in the main process:
   the store the household's contact and delivery details. Cached per
   (store, lines) for :data:`QUOTE_TTL` seconds and adopted by ``send``.
 - **Send.** One purchase per store through :func:`service.propose`
-  (rules, checker, review link or veto window — all unchanged). A
-  changed cart sent again supersedes the earlier purchase: one text,
-  marked as replacing it.
+  (rules, checker, review link or veto window — all unchanged). After
+  a send, the only live purchases this conversation's cart has out are
+  the ones standing for the cart as it is now: an earlier one whose
+  lines changed, or whose store left the cart, is cancelled.
+- **Cancel is local, so it is always announced.** The store's checkout
+  link stays payable after a cancel here. Every purchase cancelled by
+  ``send`` or ``cancel`` whose link reached an admin gets exactly one
+  text — a "Replaces purchase …" line in the new purchase's text, or
+  the standalone cancel notice — on every exit path (:class:`_Retired`).
 
 Screens (``products`` / ``cart`` displays) are drawn from the same
 cached rows, so what is on the screen is what is in the cart.
@@ -68,6 +74,7 @@ _MAX_LINES = 10
 _MAX_QUANTITY = 10
 _CATALOGUE_FETCH = 20       # offers asked of the catalogue per find
 _RESEND_SECONDS = 600
+_MAX_TRACKED = 40           # purchase ids remembered per conversation
 _IMAGE_BUDGET = 12.0
 _ID_RE = re.compile(r"^[a-z]{1,2}[1-8]$")
 _LIVE = ("review", "scheduled", "verifying")
@@ -97,8 +104,10 @@ class _Session:
     rows: dict[str, dict[str, Any]] = field(default_factory=dict)
     cart: dict[str, int] = field(default_factory=dict)
     quotes: dict[str, _Quote] = field(default_factory=dict)      # store host →
-    sent: dict[str, _Sent] = field(default_factory=dict)         # store host →
-    batches: list[list[str]] = field(default_factory=list)       # purchase ids per send
+    # store host → the purchase standing for the cart's lines there
+    sent: dict[str, _Sent] = field(default_factory=dict)
+    # every purchase id this conversation put out (send or propose), oldest first
+    purchases: list[str] = field(default_factory=list)
 
 
 _sessions: "OrderedDict[str, _Session]" = OrderedDict()
@@ -671,9 +680,39 @@ async def cart(
             except PurchaseError as e:
                 errors[host] = str(e)
     view = _cart_view(session, approved, changed, errors)
+    if not session.cart:
+        # An empty cart is not a cancelled purchase. Say so, rather
+        # than let "cleared" pass for "nothing is out there".
+        out = await _still_out(session)
+        if out:
+            view["still_out"] = out
+            view["note"] = (
+                "The cart is empty, but "
+                + ", ".join(f"purchase {p['id']} ({p['store']}, {p['total']})" for p in out)
+                + (" is" if len(out) == 1 else " are")
+                + " still out for payment. Emptying the cart cancels "
+                "nothing; cancel() pulls back everything this conversation sent."
+            )
     if _on_screen(conv):
         await _draw_cart(session, view, approved)
     return view
+
+
+async def _still_out(session: _Session) -> list[dict[str, Any]]:
+    """Live purchases this conversation has sent: ``[{"id", "store",
+    "total", "status"}]``."""
+    store = get_purchase_store()
+    out = []
+    for purchase_id in session.purchases:
+        row = await store.get(purchase_id)
+        if row is not None and row["status"] in _LIVE:
+            out.append({
+                "id": purchase_id,
+                "store": _store_names.get(row["shop"], row["shop"]),
+                "total": service._money(row["total_cents"], row["currency"]),
+                "status": row["status"],
+            })
+    return out
 
 
 async def _quote(
@@ -854,21 +893,28 @@ def scrub_outcome(outcome: dict[str, Any]) -> dict[str, Any]:
     """
     outcome = dict(outcome)
     outcome.pop("checker", None)
+    outcome.pop("replaces_announced", None)     # bookkeeping for send()
     if service._config().mode == "auto" and outcome.get("decision") == "review":
         outcome["blocked_by"] = ["needs_review"]
     return outcome
 
 
+def _track(session: _Session, purchase_id: str) -> None:
+    if purchase_id in session.purchases:
+        session.purchases.remove(purchase_id)
+    session.purchases.append(purchase_id)
+    del session.purchases[:-_MAX_TRACKED]
+
+
 def note_sent(conv: "Conversation | None", outcome: dict[str, Any]) -> None:
-    """Remember a purchase proposed directly, so cancel() can default to it."""
+    """Remember a purchase proposed directly, so cancel() covers it."""
     try:
         session = _session(conv)
     except PurchaseError:
         return
     purchase_id = (outcome.get("purchase") or {}).get("id")
     if isinstance(purchase_id, str):
-        session.batches.append([purchase_id])
-        del session.batches[:-10]
+        _track(session, purchase_id)
 
 
 async def _admin_names() -> list[str]:
@@ -886,13 +932,115 @@ async def _admin_names() -> list[str]:
         return []
 
 
+class _Retired:
+    """Purchases one call cancelled, and the notices still owed for them.
+
+    Cancelling is local — the link already texted stays payable — so the
+    rule is: **a cancelled purchase whose link (or veto notice) reached
+    an admin gets exactly one text saying so.** Either the new
+    purchase's own text names it ("Replaces purchase …"), or the
+    standalone cancel notice does.
+
+    To make that hold on every exit path, a cancel here never sends
+    anything: it records the notice as owed (``NOTICE_PENDING``). It is
+    cleared only by :meth:`announced`, called when a text naming the id
+    was actually accepted for an admin. Whatever is still owed when the
+    caller's ``finally`` runs :meth:`flush` goes out as the standalone
+    notice — after a refused replacement, an ``already_proposed``
+    answer, an unexpected exception, or the caller being cancelled.
+    The hourly notice ceiling can still stop a text; then the entry
+    reads ``not_told`` and the agent is told to say so.
+    """
+
+    def __init__(self) -> None:
+        self._entries: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+    async def cancel(self, purchase_id: str, *, strict: bool = False) -> bool:
+        """Cancel ``purchase_id`` if it is still live. True when it was.
+
+        ``strict`` re-raises the service's refusal (unknown id, too
+        late) instead of treating it as "nothing to do".
+        """
+        if purchase_id in self._entries:
+            return True
+        try:
+            row, notice = await service.cancel_by_agent(purchase_id, notify=False)
+        except PurchaseError:
+            if strict:
+                raise
+            return False        # already settled, or too late: it stands
+        self._entries[purchase_id] = {"row": row, "notice": notice}
+        return True
+
+    def owed(self) -> list[tuple[str, str]]:
+        """``[(id, store host)]`` still waiting to be named to the admins."""
+        return [
+            (pid, e["row"]["shop"]) for pid, e in self._entries.items()
+            if e["notice"] == service.NOTICE_PENDING
+        ]
+
+    def announced(self, ids: list[str]) -> None:
+        """A text naming ``ids`` reached an admin: nothing more is owed."""
+        for pid in ids:
+            entry = self._entries.get(pid)
+            if entry is not None and entry["notice"] == service.NOTICE_PENDING:
+                entry["notice"] = service.NOTICE_TOLD
+
+    async def flush(self) -> None:
+        """Send the standalone notice for everything still owed.
+
+        Runs in a main-process task the caller's cancellation cannot
+        interrupt, like the proposal itself.
+        """
+        if self.owed():
+            await asyncio.shield(
+                service._spawn(self._flush(), "purchase-cancel-notices")
+            )
+
+    async def _flush(self) -> None:
+        for entry in self._entries.values():
+            if entry["notice"] != service.NOTICE_PENDING:
+                continue
+            # Settle the entry before the send can be interrupted twice.
+            entry["notice"] = service.NOTICE_NOT_TOLD
+            try:
+                if await service.send_cancel_notice(entry["row"]):
+                    entry["notice"] = service.NOTICE_TOLD
+            except Exception:  # noqa: BLE001 — one failure must not stop the rest
+                logger.exception(
+                    "purchase %s: cancel notice failed", entry["row"]["id"],
+                )
+
+    def views(self) -> list[dict[str, Any]]:
+        """Each cancelled purchase as the agent sees it, with
+        ``admin_notice``: ``told`` | ``none_needed`` | ``not_told``."""
+        return [
+            {**service.public_view(e["row"]), "admin_notice": e["notice"]}
+            for e in self._entries.values()
+        ]
+
+    def summary(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": pid,
+                "store": _store_names.get(e["row"]["shop"], e["row"]["shop"]),
+                "admin_notice": e["notice"],
+            }
+            for pid, e in self._entries.items()
+        ]
+
+
 async def send(reason: Any, *, conv: "Conversation | None") -> dict[str, Any]:
     """Propose the cart: one purchase per approved store.
 
     Each store goes through :func:`service.propose` — same rules, same
-    checker, same review link to the admins. Returns ``{"purchases":
-    [<propose outcome + "store">], "needs_approval": [...], "total",
-    "admins"}``.
+    checker, same review link to the admins. Earlier purchases from
+    this conversation's cart that the cart no longer stands for are
+    cancelled, and the admins told (:class:`_Retired`).
+
+    Returns ``{"purchases": [<propose outcome + "store">],
+    "needs_approval": [...], "replaced": [{"id", "store",
+    "admin_notice"}], "total", "admins"}``.
     """
     service._require_enabled()
     if not isinstance(reason, str) or not reason.strip():
@@ -904,13 +1052,72 @@ async def send(reason: Any, *, conv: "Conversation | None") -> dict[str, Any]:
         raise PurchaseError("the cart is empty; cart(add=[...]) first")
     if not _send_rate.take():
         raise PurchaseError("too many purchases sent this hour; stop and tell the person")
-    approved = set(await service.approved_shops())
-    store = get_purchase_store()
+    retired = _Retired()
     purchases: list[dict[str, Any]] = []
     waiting: list[dict[str, Any]] = []
-    batch: list[str] = []
-    failures: list[str] = []
-    for host, lines in _by_store(session).items():
+    try:
+        await _send_cart(session, reason, conv, retired, purchases, waiting)
+    finally:
+        # Every exit: whatever was cancelled and not yet named to the
+        # admins gets its own notice now.
+        await retired.flush()
+    replaced = retired.summary()
+    failures = [p["error"] for p in purchases if "error" in p]
+    if failures and len(failures) == len(purchases) and not waiting:
+        raise PurchaseError(failures[0] + _replaced_note(replaced))
+    cents = [
+        p["purchase"]["total_cents"] for p in purchases
+        if "purchase" in p and isinstance(p["purchase"].get("total_cents"), int)
+    ]
+    told = any(p.get("admins_notified") for p in purchases)
+    return {
+        "purchases": purchases,
+        "needs_approval": waiting,
+        "replaced": replaced,
+        "total": service._money(sum(cents)) if cents else None,
+        "admins": await _admin_names() if told else [],
+    }
+
+
+def _replaced_note(replaced: list[dict[str, Any]]) -> str:
+    """For an error message: what a failed send cancelled anyway."""
+    if not replaced:
+        return ""
+    parts = []
+    for entry in replaced:
+        if entry["admin_notice"] == service.NOTICE_NOT_TOLD:
+            parts.append(
+                f"{entry['id']} (admins could NOT be told; its earlier "
+                "link still works — tell them)"
+            )
+        else:
+            parts.append(entry["id"])
+    return ". Earlier purchase cancelled: " + ", ".join(parts)
+
+
+async def _send_cart(
+    session: _Session, reason: str, conv: "Conversation | None",
+    retired: _Retired, purchases: list[dict[str, Any]],
+    waiting: list[dict[str, Any]],
+) -> None:
+    approved = set(await service.approved_shops())
+    by_store = _by_store(session)
+
+    # 1. Earlier purchases the cart no longer stands for: the store has
+    #    left the cart, or (at a store that cannot be sent to right now)
+    #    the lines changed. Cancelled first, so the first new text of
+    #    this send can name them.
+    for host, earlier in list(session.sent.items()):
+        lines = by_store.get(host)
+        if lines and host in approved:
+            continue            # decided below, next to its replacement
+        if lines and earlier.key == _lines_key(host, lines):
+            continue            # same lines; it stands until the store is approved again
+        await retired.cancel(earlier.purchase_id)
+        session.sent.pop(host, None)
+
+    # 2. One purchase per approved store.
+    for host, lines in by_store.items():
         name = _store_names.get(host, host)
         if host not in approved:
             asked = await service.request_shop_approval(host, conv)
@@ -920,113 +1127,88 @@ async def send(reason: Any, *, conv: "Conversation | None") -> dict[str, Any]:
             })
             continue
         key = _lines_key(host, lines)
-        replaces, replaced_row = await _supersede(session, store, host, key)
+        earlier = session.sent.get(host)
+        recent_same = (
+            earlier is not None and earlier.key == key
+            and _now() - earlier.at < _RESEND_SECONDS
+        )
+        if earlier is not None and not recent_same:
+            # Changed, or past the re-send window: a new purchase
+            # replaces it. (Identical and recent: propose() returns it.)
+            await retired.cancel(earlier.purchase_id)
+            session.sent.pop(host, None)
         quote = _valid_quote(session, host, key)
+        owed = retired.owed()
         try:
             outcome = await service.propose(
                 host, lines, reason, conv=conv,
                 adopt=quote.checkout if quote is not None else None,
-                replaces=replaces,
+                replaces=owed or None,
             )
         except PurchaseError as e:
-            # The earlier purchase is already cancelled and its link is
-            # still out there: say so on its own.
-            if replaced_row is not None and replaces:
-                await service.send_cancel_notice(replaced_row)
-            failures.append(str(e))
+            # Anything cancelled above stays owed; a later store's text
+            # or the flush in send() carries it.
             purchases.append({"store": name, "error": str(e)})
             continue
+        if outcome.get("replaces_announced"):
+            retired.announced([pid for pid, _ in owed])
         if quote is not None and not outcome.get("already_proposed"):
             session.quotes.pop(host, None)      # one purchase per checkout
         purchase_id = outcome["purchase"]["id"]
-        if not outcome.get("already_proposed"):
-            session.sent[host] = _Sent(purchase_id, key, _now())
-        batch.append(purchase_id)
+        same = earlier is not None and earlier.purchase_id == purchase_id
+        if earlier is not None and not same:
+            # propose() answered with a different purchase than the one
+            # on our books for this store (an earlier identical proposal
+            # on the same channel, say). Ours must not stay payable.
+            await retired.cancel(earlier.purchase_id)
+        session.sent[host] = _Sent(purchase_id, key, earlier.at if same else _now())
+        _track(session, purchase_id)
         purchases.append({"store": name, **scrub_outcome(outcome)})
-    if batch:
-        session.batches.append(batch)
-        del session.batches[:-10]
-    if failures and not batch and not waiting:
-        raise PurchaseError(failures[0])
-    cents = [
-        p["purchase"]["total_cents"] for p in purchases
-        if "purchase" in p and isinstance(p["purchase"].get("total_cents"), int)
-    ]
-    told = any(p.get("admins_notified") for p in purchases)
-    return {
-        "purchases": purchases,
-        "needs_approval": waiting,
-        "total": service._money(sum(cents)) if cents else None,
-        "admins": await _admin_names() if told else [],
-    }
-
-
-async def _supersede(
-    session: _Session, store: Any, host: str, key: str,
-) -> tuple[str | None, dict[str, Any] | None]:
-    """Cancel this conversation's earlier live purchase at ``host``, if the
-    cart changed (or the earlier one is past the re-send window).
-
-    Returns ``(id to name as replaced, the cancelled row)``. The id is
-    None when there was nothing to replace or the admins were never
-    sent the earlier one.
-    """
-    earlier = session.sent.get(host)
-    if earlier is None:
-        return None, None
-    if earlier.key == key and _now() - earlier.at < _RESEND_SECONDS:
-        return None, None       # identical and recent: propose() returns it
-    before = await store.get(earlier.purchase_id)
-    if before is None or before["status"] not in _LIVE:
-        return None, None
-    try:
-        row, _ = await service.cancel_by_agent(earlier.purchase_id, notify=False)
-    except PurchaseError:
-        return None, None       # too late to stop; it stands on its own
-    known = bool(before.get("link_sent_at")) or before["status"] != "review"
-    return (earlier.purchase_id if known else None), row
 
 
 async def cancel(
     purchase_id: Any = None, *, conv: "Conversation | None",
 ) -> dict[str, Any]:
-    """Cancel one purchase, or (no id) this conversation's latest send.
+    """Cancel one purchase, or (no id) everything live this conversation sent.
 
-    Anyone may ask: stopping a purchase needs no authority. Returns
-    ``{"cancelled": [<purchase>…], "admins_told": int}``.
+    Anyone may ask: stopping a purchase needs no authority. No id means
+    *every* live purchase sent from this conversation — after "cancel",
+    nothing this conversation put out stays payable un-flagged.
+
+    Returns ``{"cancelled": [<purchase + "admin_notice">…]}`` where
+    ``admin_notice`` is ``"told"`` (an admin was texted to ignore the
+    link), ``"none_needed"`` (no link ever reached anyone) or
+    ``"not_told"`` (a link is out and the admins could not be told).
     """
+    retired = _Retired()
     if purchase_id is not None:
         if not isinstance(purchase_id, str) or not re.fullmatch(
             r"[0-9a-fA-F]{6,12}", purchase_id.strip()
         ):
             raise PurchaseError("'id' is a purchase id like 'ab12cd34'")
-        row, told = await service.cancel_by_agent(purchase_id.strip().lower())
-        return {"cancelled": [service.public_view(row)], "admins_told": told}
+        try:
+            await retired.cancel(purchase_id.strip().lower(), strict=True)
+        finally:
+            await retired.flush()
+        return {"cancelled": retired.views()}
     try:
         session = _session(conv, create=False)
     except PurchaseError:
         session = None
-    store = get_purchase_store()
-    for batch in reversed(session.batches if session is not None else []):
-        live = []
-        for candidate in batch:
-            row = await store.get(candidate)
-            if row is not None and row["status"] in _LIVE:
-                live.append(candidate)
-        if not live:
-            continue
-        cancelled, told = [], 0
-        for candidate in live:
-            try:
-                row, sent = await service.cancel_by_agent(candidate)
-            except PurchaseError:
-                continue
-            cancelled.append(service.public_view(row))
-            told += sent
-        if cancelled:
-            return {"cancelled": cancelled, "admins_told": told}
-    raise PurchaseError(
-        "nothing sent from this conversation is waiting to be cancelled. "
-        "To cancel another purchase pass its id (list() shows them); to "
-        "empty the cart, cart(clear=True)"
-    )
+    try:
+        for candidate in reversed(session.purchases if session is not None else []):
+            await retired.cancel(candidate)
+    finally:
+        await retired.flush()
+    cancelled = retired.views()
+    if not cancelled:
+        raise PurchaseError(
+            "nothing sent from this conversation is waiting to be cancelled. "
+            "To cancel another purchase pass its id (list() shows them); to "
+            "empty the cart, cart(clear=True)"
+        )
+    if session is not None:
+        gone = {c["id"] for c in cancelled}
+        for host in [h for h, sent in session.sent.items() if sent.purchase_id in gone]:
+            session.sent.pop(host, None)
+    return {"cancelled": cancelled}

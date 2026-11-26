@@ -52,7 +52,11 @@ c = bb.purchases.cart(quote=True)
 #    "subtotal": "$10.99", "total": "$17.98", "changed": ["added a2"]}
 ```
 
-- Every call redraws the cart screen. No purchase, no text to anyone.
+- Every call redraws the cart screen. No purchase, no text to anyone,
+  **nothing cancelled** — `clear=True` empties the cart only. If a sent
+  purchase is still payable when the cart ends up empty, the result has
+  `still_out: [{"id", "store", "total", "status"}]` and a `note`;
+  `cancel()` pulls it back.
 - `shipping` / `tax` / `total` are None until `quote=True`. A quote
   asks each approved store for the real figures; reused for 10 minutes
   while the lines are unchanged; hourly ceiling.
@@ -75,9 +79,11 @@ out = bb.purchases.send("Jacob asked for the Titanic book for Erik")
 #        "blocked_by": [...], "admins_notified": 1,
 #        "already_proposed": False}],
 #    "needs_approval": [{"store", "domain", "note"}],
+#    "replaced": [{"id", "store", "admin_notice"}],
 #    "total": "$17.98", "admins": ["Jacob"]}
-bb.purchases.cancel()             # what this conversation last sent
-bb.purchases.cancel("ab12cd34")   # one purchase by id
+bb.purchases.cancel()             # everything live this conversation sent
+# → {"cancelled": [{…purchase…, "admin_notice": "told"}]}
+bb.purchases.cancel("ab12cd34")   # one purchase by id → that record
 bb.purchases.status("ab12cd34")
 bb.purchases.list()               # newest first; list("review") filters
 bb.purchases.send_review_link("ab12cd34")   # 1 per 10 min per purchase, 6/hour
@@ -88,11 +94,23 @@ bb.purchases.send_review_link("ab12cd34")   # 1 per 10 min per purchase, 6/hour
   `auto` = main process buys after the veto window.
 - `admins_notified == 0` — nobody got it. Say so.
 - Same cart within 10 minutes → same purchase, `already_proposed:
-  True`. Changed cart → earlier purchase cancelled and replaced, one
-  text saying so. After a cancel → a new purchase. All fine to do.
-- `cancel()` works until payment is being sent; anyone may ask. Admins
-  holding a link are told to ignore it. No id → `{"cancelled":
-  [records], "admins_told": n}`; with id → the record.
+  True`. After a cancel → a new purchase. All fine to do.
+- `send` leaves live only the purchases matching the cart now. An
+  earlier one whose lines changed, or whose store left the cart, is
+  cancelled and listed in `replaced`.
+- `cancel()` works until payment is being sent; anyone may ask. No id
+  → every live purchase this conversation sent (all sends, and
+  `propose`), `{"cancelled": [records]}`; with id → the record.
+- **A cancel is local: a link already texted still works.** So each
+  cancelled record (`cancelled`, `replaced`) carries `admin_notice`:
+
+  | `admin_notice` | Means | Tell the person |
+  |---|---|---|
+  | `told` | Admins were texted to ignore that link (own notice, or named in the replacement's text). | Cancelled; the admin has been told to ignore the link. |
+  | `none_needed` | No link or buy notice ever reached an admin. | Cancelled. |
+  | `not_told` | A link is out and the admins could NOT be told (hourly notice ceiling, or unreachable). | Cancelled here, but the earlier link still works — they must tell the admin not to pay it. |
+
+  A `send` that fails outright says the same in its error text.
 - The main process finishes a send even if the script times out:
   `list()` before sending again.
 - `reason` is shown to admins as your unverified statement. It does

@@ -23,6 +23,7 @@ from boxbot.photos.search import (
     hybrid_search,
     query_terms,
     search_photos,
+    split_query_names,
 )
 from boxbot.sdk import _transport, photos as sdk_photos
 from boxbot.tools._sandbox_actions import ActionContext, process_action
@@ -76,8 +77,25 @@ class TestQuerySanitising:
         assert query_terms('zara\'s "birthday" (2026) AND NOT') == [
             "zara", "s", "birthday", "2026", "not"
         ]
-        assert query_terms("photos") == ["photos"]  # filler-only is kept
+        # Nothing but filler = no terms (the search then lists newest first).
+        assert query_terms("photos") == []
+        assert query_terms("show me photos") == []
         assert query_terms("  ") == [] and query_terms(None) == []
+
+    def test_names_are_pulled_out_whole(self):
+        known = {n.casefold(): n for n in
+                 ("Zara", "Ann", "Ann-Marie", "Mary", "Mary Jane", "Arcy")}
+        assert split_query_names("zara's birthday", known) == (
+            ["Zara"], "       birthday")
+        # Hyphenated and multi-word names are one unit, never fragments.
+        assert split_query_names("Ann-Marie", known)[0] == ["Ann-Marie"]
+        assert split_query_names("ann", known)[0] == ["Ann"]
+        assert split_query_names("mary  jane at the park", known)[0] == [
+            "Mary Jane"]
+        assert split_query_names("Joann and D'Arcy", known)[0] == []
+        assert split_query_names("Erik and Zara", {
+            "zara": "Zara", "erik": "Erik"})[0] == ["Erik", "Zara"]
+        assert split_query_names("the bazaar", known) == ([], "the bazaar")
 
     def test_match_expr_is_quoted_or(self):
         assert fts_match_expr(["zara", "beach"]) == '"zara" OR "beach"'
@@ -104,7 +122,7 @@ class TestPersonSearch:
             filename="5.jpg", source="signal", photo_id="photo_confirmed",
             description="two kids in a paddling pool")
         await photo_store.update_people(
-            "photo_confirmed", [{"label": "Zara"}], human_confirmed=True)
+            "photo_confirmed", [{"label": "Zara"}], agent_reported=True)
         await photo_store.create_photo(
             filename="6.jpg", source="signal", photo_id="photo_likely",
             description="a child eating ice cream")
@@ -125,19 +143,142 @@ class TestPersonSearch:
         assert "photo_unsure" not in ids and "photo_cat" not in ids
 
     async def test_name_plus_topic(self, photo_store):
+        """The name restricts; the topic only ranks within that person."""
         await _family_library(photo_store)
+        await photo_store.set_person_note("Zara", "girl, curly hair")
+        await photo_store.set_person_note("Erik", "boy")
+        await photo_store.create_photo(
+            filename="8.jpg", source="signal", photo_id="photo_erik_bday",
+            description="A boy with a birthday cake", tags=["birthday"],
+            people=[{"label": "Erik", "confidence": "captioned"}])
         results = await hybrid_search(photo_store, query="Zara birthday")
-        assert results[0].photo.id == "photo_desc"
+        assert [r.photo.id for r in results] == ["photo_desc", "photo_tag"]
+        assert results[0].score > results[1].score
+        # Same answer however the name is spelled or decorated.
+        for query in ("zara's birthday", "ZARA birthday!", "birthday, Zara"):
+            assert [r.photo.id for r in await hybrid_search(
+                photo_store, query=query)] == ["photo_desc", "photo_tag"]
 
     async def test_people_and_query_excludes_other_peoples_photos(self, photo_store):
         await _family_library(photo_store)
         await photo_store.create_photo(
             filename="8.jpg", source="signal", photo_id="photo_erik_bday",
             description="Erik's birthday cake", tags=["birthday"])
+        await photo_store.create_photo(
+            filename="9.jpg", source="signal", photo_id="photo_erik_label",
+            description="birthday candles and balloons", tags=["birthday"],
+            people=[{"label": "Erik", "confidence": "confirmed"}])
+        await photo_store.create_photo(
+            filename="10.jpg", source="signal", photo_id="photo_zara_unsure",
+            description="a birthday party, kids at a table",
+            tags=["birthday"])
+        await photo_store.apply_inferred_people(
+            "photo_zara_unsure", [{"label": "Zara", "confidence": "unsure"}])
         results = await hybrid_search(
             photo_store, query="birthday", people=["Zara"])
-        # Zara's birthday first, then other Zara photos; Erik's is excluded.
+        # Zara's birthday first, then other Zara photos. Erik's birthday
+        # photos — a better keyword match — and the unsure guess are out.
         assert [r.photo.id for r in results] == ["photo_desc", "photo_tag"]
+        # Putting a known name in the query is the same search.
+        await photo_store.set_person_note("Zara", "girl, curly hair")
+        in_query = await hybrid_search(photo_store, query="Zara birthday")
+        assert [r.photo.id for r in in_query] == ["photo_desc", "photo_tag"]
+
+    async def test_name_in_query_never_returns_another_persons_photo(
+        self, wired_store, monkeypatch
+    ):
+        """The reviewer's repro: 'Zara at the beach' must not show Erik."""
+        store = wired_store
+        for name in ("Zara", "Erik", "Ann"):
+            await store.set_person_note(name, "")
+        await store.create_photo(
+            filename="a.jpg", source="s", photo_id="photo_zara_beach",
+            description="A girl at the beach", tags=["beach"],
+            people=[{"label": "Zara", "confidence": "captioned"}])
+        await store.create_photo(
+            filename="b.jpg", source="s", photo_id="photo_erik_beach",
+            description="A boy at the beach", tags=["beach"],
+            people=[{"label": "Erik", "confidence": "captioned"}])
+        await store.create_photo(
+            filename="c.jpg", source="s", photo_id="photo_annmarie",
+            description="Ann-Marie with a cake", tags=["cake", "ann-marie"],
+            people=[{"label": "Ann-Marie", "confidence": "confirmed"}])
+        await store.create_photo(
+            filename="d.jpg", source="s", photo_id="photo_swing",
+            description="kid on swing", tags=["park"],
+            people=[{"label": "Zara", "confidence": "unsure"}])
+        await store.create_photo(
+            filename="e.jpg", source="s", photo_id="photo_ann",
+            description="a woman reading", tags=["sofa"],
+            people=[{"label": "Ann", "confidence": "likely"}])
+
+        async def ids(**kwargs):
+            return [r.photo.id for r in await hybrid_search(store, **kwargs)]
+
+        assert await ids(query="Zara at the beach") == ["photo_zara_beach"]
+        assert await ids(query="beach") == [
+            "photo_erik_beach", "photo_zara_beach"]  # no name: both, newest first
+        assert await ids(query="beach", people=["Zara"]) == ["photo_zara_beach"]
+        # Whole names, both ways round.
+        assert await ids(query="Ann") == ["photo_ann"]
+        assert await ids(people=["ann"]) == ["photo_ann"]
+        assert await ids(query="Ann-Marie") == ["photo_annmarie"]
+        assert await ids(query="ann-marie cake") == ["photo_annmarie"]
+        assert await ids(people=["Ann-Marie"]) == ["photo_annmarie"]
+        # A name with photos but no topic match still returns only theirs.
+        assert await ids(query="Erik cake") == ["photo_erik_beach"]
+
+        # ...and with show=True only the right child reaches the screen.
+        mgr = _FakeDisplayManager()
+        monkeypatch.setattr(display_manager_mod, "get_display_manager", lambda: mgr)
+        out = await search_photos(query="Zara at the beach", show=True)
+        assert mgr.calls == [("picture", {"image_ids": ["photo_zara_beach"]})]
+        assert out["shown"] == 1
+
+    async def test_several_names_need_all_of_them(self, wired_store):
+        store = wired_store
+        await store.set_person_note("Zara", "")
+        await store.set_person_note("Erik", "")
+        await store.create_photo(
+            filename="a.jpg", source="s", photo_id="photo_zara",
+            description="on a swing",
+            people=[{"label": "Zara", "confidence": "confirmed"}])
+        await store.create_photo(
+            filename="b.jpg", source="s", photo_id="photo_erik",
+            description="on a bike",
+            people=[{"label": "Erik", "confidence": "confirmed"}])
+        out = await search_photos(query="Zara and Erik")
+        assert out["results"] == []
+        assert "No photo has all of Zara, Erik together" in out["hint"]
+        assert "Zara alone: 1; Erik alone: 1" in out["hint"]
+        out = await search_photos(people=["Zara", "Erik"])
+        assert out["results"] == [] and "Zara alone: 1" in out["hint"]
+
+        await store.create_photo(
+            filename="c.jpg", source="s", photo_id="photo_both",
+            description="two kids",
+            people=[{"label": "Zara", "confidence": "likely"},
+                    {"label": "Erik", "confidence": "confirmed"}])
+        for kwargs in ({"query": "Zara and Erik"}, {"people": ["Zara", "Erik"]},
+                       {"query": "Erik", "people": ["zara"]}):
+            out = await search_photos(**kwargs)
+            assert [r["id"] for r in out["results"]] == ["photo_both"]
+            assert out["results"][0]["score"] == 0.9
+
+        out = await search_photos(query="Zara", date_from="2099-01-01")
+        assert "without date range: 2" in out["hint"]
+
+    async def test_unsure_guess_is_no_text_match_either(self, photo_store):
+        """An unsure suggestion must not match through tags/description."""
+        await photo_store.set_person_note("Zara", "")
+        await photo_store.create_photo(
+            filename="a.jpg", source="s", photo_id="photo_guess",
+            description="Zara, maybe, far away on a hill", tags=["zara"])
+        await photo_store.apply_inferred_people(
+            "photo_guess", [{"label": "Zara", "confidence": "unsure"}])
+        assert await hybrid_search(photo_store, query="Zara") == []
+        assert await hybrid_search(photo_store, people=["Zara"]) == []
+        assert await hybrid_search(photo_store, query="Zara on a hill") == []
 
 
 @pytest.mark.asyncio
@@ -187,6 +328,19 @@ class TestRelevanceFloor:
         ]
         results = await hybrid_search(photo_store, source="camera")
         assert [r.photo.id for r in results] == ["photo_bazaar"]
+
+    async def test_filler_only_query_lists_newest_first(self, wired_store):
+        await _family_library(wired_store)
+        newest_first = ["photo_bazaar", "photo_cat", "photo_desc", "photo_tag"]
+        for query in ("show me photos", "photos", "any pictures?", "-", '"'):
+            results = await hybrid_search(wired_store, query=query)
+            assert [r.photo.id for r in results] == newest_first, query
+        out = await search_photos(query="show me some photos", limit=2)
+        assert [r["id"] for r in out["results"]] == newest_first[:2]
+        assert "hint" not in out
+        # Filler around a real word is still a real query.
+        results = await hybrid_search(wired_store, query="show me cat photos")
+        assert [r.photo.id for r in results] == ["photo_cat"]
 
     async def test_deleted_photos_stay_hidden(self, photo_store):
         await _family_library(photo_store)
@@ -292,6 +446,32 @@ class TestSearchEntryPoint:
 
         out = await search_photos(query="Zara")
         assert "hint" not in out
+
+    async def test_query_count_does_not_grow_with_the_library(self, wired_store):
+        """One search (hint included) is a fixed handful of SQL statements."""
+        statements: list[str] = []
+
+        async def run(n_photos: int, **kwargs) -> int:
+            for i in range(n_photos):
+                await wired_store.create_photo(
+                    filename=f"{i}.jpg", source="signal",
+                    description=f"Zara photo {i}", tags=["park", f"t{i}"],
+                    people=[{"label": "Zara", "confidence": "likely"}])
+            statements.clear()
+            await search_photos(**kwargs)
+            return len([s for s in statements if s.lstrip().startswith("SELECT")])
+
+        await wired_store._ensure_db().set_trace_callback(statements.append)
+        hit = {"query": "Zara park"}
+        miss = {"query": "Zara park", "tags": ["nope"], "people": ["Zara"],
+                "date_from": "2000-01-01", "source": "signal",
+                "in_slideshow": True}  # empty: every hint relaxation runs
+        small_hit, small_miss = await run(3, **hit), await run(0, **miss)
+        big_hit, big_miss = await run(40, **hit), await run(0, **miss)
+        assert small_hit == big_hit == small_miss == big_miss
+        assert big_hit <= 6
+        out = await search_photos(**miss)
+        assert out["results"] == [] and "without tags: 43" in out["hint"]
 
     async def test_tool_and_sdk_share_backend_and_defaults(self, wired_store):
         for i in range(DEFAULT_LIMIT + 5):

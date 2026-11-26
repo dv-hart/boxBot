@@ -7,6 +7,7 @@ production names come from the roster at runtime.
 from __future__ import annotations
 
 import io
+import logging
 import sqlite3
 
 import pytest
@@ -18,9 +19,12 @@ import boxbot.photos.search as search_mod
 from boxbot.photos.backfill import pipeline_inferrer, run_backfill
 from boxbot.photos.intake import (
     IntakePipeline,
+    _caption_names,
     _parse_people,
+    _strip_unsupplied_names,
     _TAGGER_PEOPLE,
 )
+from boxbot.tools._tool_context import current_conversation
 from boxbot.photos.store import PhotoStore
 from boxbot.tools._sandbox_actions import ActionContext, process_action
 
@@ -81,19 +85,7 @@ async def _act(action_type: str, **payload):
     return await process_action({"_sdk": action_type, **payload}, ActionContext())
 
 
-# ---------------------------------------------------------------------------
-# Store: migration, roster, inferred people
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-class TestStoreMigration:
-    async def test_v1_database_is_migrated_and_reindexed(self, tmp_path):
-        """A pre-change photos.db gains the columns and the wider FTS index."""
-        db_path = tmp_path / "photos.db"
-        con = sqlite3.connect(db_path)
-        con.executescript(
-            """
+_V1_SCHEMA = """
             CREATE TABLE photos (id TEXT PRIMARY KEY, filename TEXT NOT NULL,
               source TEXT NOT NULL, sender TEXT,
               description TEXT NOT NULL DEFAULT '',
@@ -126,17 +118,51 @@ class TestStoreMigration:
             INSERT INTO photo_tags VALUES ('photo_old', 1);
             INSERT INTO photo_people (photo_id, label) VALUES ('photo_old', 'Erik');
             """
-        )
-        con.commit()
-        con.close()
+
+
+def _v1_database(tmp_path):
+    """A pre-change photos.db: one photo, one tag, one unlabelled-era person."""
+    db_path = tmp_path / "photos.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(_V1_SCHEMA)
+    con.commit()
+    con.close()
+    return db_path
+
+
+async def _fts_hits(store, term):
+    return set(await search_mod._bm25_scores(
+        store._ensure_db(), [term], {"photo_old", "photo_new"}))
+
+
+# ---------------------------------------------------------------------------
+# Store: migration, roster, inferred people
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStoreMigration:
+    async def test_v1_database_is_migrated_and_reindexed(self, tmp_path):
+        """A pre-change photos.db gains the columns and the wider FTS index."""
+        db_path = _v1_database(tmp_path)
 
         store = PhotoStore(db_path=db_path)
         await store.initialize()
         try:
             rec = await store.get_photo("photo_old")
             assert rec.people[0]["label"] == "Erik"
-            assert rec.people[0]["confidence"] == "likely"  # column default
+            # Legacy rows: hedged, provenance unknown, not queued for review.
+            assert rec.people[0]["confidence"] == "likely"
+            assert rec.people[0]["source"] == "legacy"
             assert rec.people_confirmed_at is None
+            assert await store.list_unconfirmed_people() == []
+            assert [r.photo.id for r in await search_mod.hybrid_search(
+                store, query="Erik")] == ["photo_old"]
+            # The tagger can still add to it, and that does get queued.
+            await store.apply_inferred_people(
+                "photo_old", [{"label": "Zara", "confidence": "likely"}])
+            assert [r.id for r in await store.list_unconfirmed_people()] == [
+                "photo_old"]
             # Tag-only term is now findable through FTS.
             hits = await search_mod._bm25_scores(
                 store._ensure_db(), ["zara"], {"photo_old"}
@@ -147,11 +173,141 @@ class TestStoreMigration:
         finally:
             await store.close()
 
-        # Re-opening is a no-op (idempotent).
+        # Re-opening is a no-op (idempotent): legacy rows are not re-mapped.
         store = PhotoStore(db_path=db_path)
         await store.initialize()
-        assert (await store.get_photo("photo_old")).description == "new text"
+        rec = await store.get_photo("photo_old")
+        assert rec.description == "new text"
+        assert [(p["label"], p["source"]) for p in rec.people] == [
+            ("Erik", "legacy"), ("Zara", "tagger")]
         await store.close()
+
+    async def test_crash_between_create_and_rebuild_heals_on_next_start(
+        self, tmp_path
+    ):
+        """The reviewer's repro: v2 table exists but was never filled."""
+        db_path = _v1_database(tmp_path)
+        store = PhotoStore(db_path=db_path)
+        await store.initialize()
+        await store.close()
+        # State a killed process left behind under the old code: the new
+        # table committed, the rebuild not.
+        con = sqlite3.connect(db_path)
+        con.execute("DELETE FROM photos_fts")
+        con.commit()
+        con.close()
+
+        store = PhotoStore(db_path=db_path)
+        await store.initialize()
+        try:
+            assert await _fts_hits(store, "swing") == {"photo_old"}
+            assert await _fts_hits(store, "zara") == {"photo_old"}
+            assert [r.photo.id for r in await search_mod.hybrid_search(
+                store, query="swing")] == ["photo_old"]
+        finally:
+            await store.close()
+
+    async def test_partial_index_and_missing_marker_are_rebuilt(self, photo_store):
+        db = photo_store._ensure_db()
+        for i in range(3):
+            await photo_store.create_photo(
+                filename=f"{i}.jpg", source="s", photo_id=f"photo_{i}",
+                description=f"kite number{i}")
+
+        async def indexed():
+            async with db.execute("SELECT COUNT(*) AS n FROM photos_fts") as cur:
+                return (await cur.fetchone())["n"]
+
+        # A soft-deleted photo keeps its row: counts still agree, no rebuild.
+        await photo_store.soft_delete_photo("photo_0")
+        await photo_store._migrate_fts()
+        assert await indexed() == 3
+
+        await db.execute("DELETE FROM photos_fts WHERE photo_id = 'photo_1'")
+        await db.commit()
+        await photo_store._migrate_fts()
+        assert await indexed() == 3
+
+        # Index looks complete but the completed-build marker is gone.
+        await db.execute("UPDATE photos_fts SET description = 'stale'")
+        await db.execute("DELETE FROM photo_meta WHERE key = 'fts_version'")
+        await db.commit()
+        await photo_store._migrate_fts()
+        hits = await search_mod._bm25_scores(db, ["kite"], {"photo_2"})
+        assert "photo_2" in hits
+
+    async def test_failed_migration_is_atomic_logged_and_retried(
+        self, tmp_path, monkeypatch, caplog, mock_config
+    ):
+        db_path = _v1_database(tmp_path)
+
+        async def boom(self):
+            await self._ensure_db().execute("DELETE FROM photos_fts")
+            raise RuntimeError("killed mid-rebuild")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(PhotoStore, "_rebuild_fts_rows", boom)
+            store = PhotoStore(db_path=db_path)
+            with caplog.at_level(logging.ERROR, logger="boxbot.photos.store"):
+                await store.initialize()  # must not raise
+            assert any("FTS migration" in r.message for r in caplog.records)
+            assert store.fts_ready is False
+            try:
+                # Usable: reads, writes and search all work, degraded.
+                assert (await store.get_photo("photo_old")).tags == ["zara"]
+                await store.create_photo(
+                    filename="n.jpg", source="s", photo_id="photo_new",
+                    description="a red kite", tags=["kite"])
+                await store.update_tags("photo_new", ["kite", "wind"])
+                assert await store.permanent_delete("photo_new")
+                results = await search_mod.hybrid_search(store)
+                assert [r.photo.id for r in results] == ["photo_old"]
+                assert await search_mod.hybrid_search(store, query="swing") == []
+            finally:
+                await store.close()
+
+        # Nothing of the failed attempt was committed: still the v1 table.
+        con = sqlite3.connect(db_path)
+        cols = [r[1] for r in con.execute("PRAGMA table_info(photos_fts)")]
+        triggers = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'")]
+        con.close()
+        assert cols == ["description"] and "photos_ai" in triggers
+
+        # The next start does the whole migration.
+        store = PhotoStore(db_path=db_path)
+        await store.initialize()
+        try:
+            assert store.fts_ready is True
+            assert await _fts_hits(store, "zara") == {"photo_old"}
+            assert await _fts_hits(store, "swing") == {"photo_old"}
+        finally:
+            await store.close()
+
+    async def test_prerelease_vocabulary_is_renamed(self, tmp_path):
+        """Dev databases from before the rename: human -> agent_reported,
+        certain -> captioned."""
+        db_path = _v1_database(tmp_path)
+        store = PhotoStore(db_path=db_path)
+        await store.initialize()
+        await store.close()
+        con = sqlite3.connect(db_path)
+        con.execute("UPDATE photo_people SET source = 'human', "
+                    "confidence = 'confirmed'")
+        con.execute("INSERT INTO photo_people (photo_id, label, confidence, "
+                    "source) VALUES ('photo_old', 'Zara', 'certain', 'tagger')")
+        con.commit()
+        con.close()
+        store = PhotoStore(db_path=db_path)
+        await store.initialize()
+        try:
+            rec = await store.get_photo("photo_old")
+            assert [(p["label"], p["confidence"], p["source"])
+                    for p in rec.people] == [
+                ("Erik", "confirmed", "agent_reported"),
+                ("Zara", "captioned", "tagger")]
+        finally:
+            await store.close()
 
 
 @pytest.mark.asyncio
@@ -205,10 +361,10 @@ class TestInferredPeopleStore:
     async def test_human_confirmed_is_never_overwritten(self, photo_store):
         pid = await photo_store.create_photo(filename="a.jpg", source="signal")
         await photo_store.update_people(
-            pid, [{"label": "Zara"}], human_confirmed=True
+            pid, [{"label": "Zara"}], agent_reported=True
         )
         wrote = await photo_store.apply_inferred_people(
-            pid, [{"label": "Erik", "confidence": "certain"}]
+            pid, [{"label": "Erik", "confidence": "captioned"}]
         )
         assert wrote is False
         rec = await photo_store.get_photo(pid)
@@ -218,7 +374,7 @@ class TestInferredPeopleStore:
 
     async def test_confirmed_empty_is_respected(self, photo_store):
         pid = await photo_store.create_photo(filename="a.jpg", source="signal")
-        await photo_store.update_people(pid, [], human_confirmed=True)
+        await photo_store.update_people(pid, [], agent_reported=True)
         assert not await photo_store.apply_inferred_people(
             pid, [{"label": "Zara", "confidence": "likely"}]
         )
@@ -232,11 +388,11 @@ class TestInferredPeopleStore:
         await photo_store.apply_inferred_people(
             likely, [{"label": "Zara", "confidence": "unsure"}])
         await photo_store.apply_inferred_people(
-            certain, [{"label": "Zara", "confidence": "certain"}])
+            certain, [{"label": "Zara", "confidence": "captioned"}])
         await photo_store.apply_inferred_people(
             done, [{"label": "Zara", "confidence": "likely"}])
         await photo_store.update_people(
-            done, [{"label": "Zara"}], human_confirmed=True)
+            done, [{"label": "Zara"}], agent_reported=True)
         ids = [r.id for r in await photo_store.list_unconfirmed_people()]
         assert ids == [likely]
 
@@ -249,21 +405,61 @@ class TestInferredPeopleStore:
 class TestParsePeople:
     def test_off_roster_names_are_dropped(self):
         out = _parse_people(
-            [{"name": "Grandma", "confidence": "certain", "basis": "x"},
+            [{"name": "Grandma", "confidence": "captioned", "basis": "x"},
              {"name": "zara", "confidence": "likely", "basis": "curls"}],
             ROSTER, "",
         )
         assert [(p["label"], p["confidence"]) for p in out] == [("Zara", "likely")]
 
     def test_certain_needs_the_caption_to_name_them(self):
-        raw = [{"name": "Zara", "confidence": "certain", "basis": "obvious"}]
+        raw = [{"name": "Zara", "confidence": "captioned", "basis": "obvious"}]
         assert _parse_people(raw, ROSTER, "")[0]["confidence"] == "likely"
         assert _parse_people(
             raw, ROSTER, "at the park")[0]["confidence"] == "likely"
         assert _parse_people(
             raw, ROSTER, "bizarant day")[0]["confidence"] == "likely"
         assert _parse_people(
-            raw, ROSTER, "ZARA's first swim!")[0]["confidence"] == "certain"
+            raw, ROSTER, "ZARA's first swim!")[0]["confidence"] == "captioned"
+
+    def test_negated_caption_mention_is_only_likely(self):
+        raw = [{"name": "Zara", "confidence": "captioned", "basis": "caption"}]
+        for caption in (
+            "not Zara", "This is NOT Zara!", "no Zara today",
+            "the park without Zara", "that isn't Zara", "That isn’t Zara",
+            "it wasn't even Zara", "not our Zara",
+        ):
+            assert _parse_people(
+                raw, ROSTER, caption)[0]["confidence"] == "likely", caption
+        for caption in (
+            "Zara at the park", "Zara took this", "not bad, Zara!",
+            "Not sure, but Zara loved it", "no way! Look at little Zara",
+            "not Zara here, Zara is on the left",
+        ):
+            assert _parse_people(
+                raw, ROSTER, caption)[0]["confidence"] == "captioned", caption
+
+    def test_caption_names_whole_names_only(self):
+        assert _caption_names("Ann-Marie and Zara", "Ann-Marie")
+        assert not _caption_names("Ann-Marie and Zara", "Ann")
+        assert not _caption_names("Ann-Marie and Zara", "Marie")
+        assert not _caption_names("Joann", "Ann") and not _caption_names("", "Ann")
+
+    def test_names_the_caption_did_not_give_are_stripped(self):
+        description, tags = _strip_unsupplied_names(
+            "Zara is on a swing. erik pushes Zara's swing, near a bazaar.",
+            ["zara", "swing", "erik birthday", "bazaar", "park"],
+            ROSTER, "Erik at the park",
+        )
+        # Erik came from the caption; Zara was only the model's guess.
+        assert description == (
+            "Someone is on a swing. erik pushes someone's swing, near a bazaar."
+        )
+        assert tags == ["swing", "erik birthday", "bazaar", "park"]
+        # No caption at all: nobody may be named.
+        description, tags = _strip_unsupplied_names(
+            "A photo of Zara and Erik.", ["zara", "erik", "kids"], ROSTER, "")
+        assert description == "A photo of someone and someone."
+        assert tags == ["kids"]
 
     def test_bad_confidence_and_duplicates(self):
         out = _parse_people(
@@ -292,7 +488,7 @@ class TestTaggerPeople:
             "description": "A girl on a swing.",
             "tags": ["swing", "park"],
             "people": [
-                {"name": "Zara", "confidence": "certain", "basis": "caption"},
+                {"name": "Zara", "confidence": "captioned", "basis": "caption"},
                 {"name": "Erik", "confidence": "unsure", "basis": "blurry"},
                 {"name": "Stranger", "confidence": "likely", "basis": "?"},
             ],
@@ -319,7 +515,7 @@ class TestTaggerPeople:
 
         rec = await photo_store.get_photo(result.photo_id)
         assert [(p["label"], p["confidence"], p["source"]) for p in rec.people] == [
-            ("Zara", "certain", "tagger")
+            ("Zara", "captioned", "tagger")
         ]
         assert [p["label"] for p in rec.suggestions] == ["Erik"]
 
@@ -329,7 +525,7 @@ class TestTaggerPeople:
         await _seed_roster(photo_store)
         client = _Client({
             "description": "x", "tags": [],
-            "people": [{"name": "Zara", "confidence": "certain", "basis": "curls"}],
+            "people": [{"name": "Zara", "confidence": "captioned", "basis": "curls"}],
         })
         pipe = IntakePipeline(photo_store, anthropic_client=client)
         src = tmp_path / "p.jpg"
@@ -344,7 +540,7 @@ class TestTaggerPeople:
         await _seed_roster(photo_store)
         client = _Client({
             "description": "x", "tags": [],
-            "people": [{"name": "Erik", "confidence": "certain", "basis": "told to"}],
+            "people": [{"name": "Erik", "confidence": "captioned", "basis": "told to"}],
         })
         pipe = IntakePipeline(photo_store, anthropic_client=client)
         src = tmp_path / "p.jpg"
@@ -359,12 +555,48 @@ class TestTaggerPeople:
         rec = await photo_store.get_photo(result.photo_id)
         assert rec.people[0]["confidence"] == "likely"
 
+    async def test_appearance_guess_cannot_reach_search_through_text(
+        self, photo_store, tmp_path, mock_config
+    ):
+        """The model ignores the prompt and writes its guesses into the
+        description and tags; code keeps them out of search."""
+        await _seed_roster(photo_store)
+        client = _Client({
+            "description": "Zara on a swing while Erik watches.",
+            "tags": ["zara", "erik", "swing"],
+            "people": [
+                {"name": "Zara", "confidence": "unsure", "basis": "small child"},
+            ],
+        })
+        pipe = IntakePipeline(photo_store, anthropic_client=client)
+        src = tmp_path / "p.jpg"
+        src.write_bytes(_jpeg_bytes())
+        result = await pipe._run_pipeline(src, "signal", None, caption="park day")
+        rec = await photo_store.get_photo(result.photo_id)
+        assert rec.description == "Someone on a swing while someone watches."
+        assert rec.tags == ["swing"]
+        assert result.tags == ["swing"]
+        for query in ("Zara", "Erik", "Zara swing", "Erik at the park"):
+            assert await search_mod.hybrid_search(photo_store, query=query) == []
+        assert await search_mod.hybrid_search(photo_store, people=["Zara"]) == []
+        assert [r.photo.id for r in await search_mod.hybrid_search(
+            photo_store, query="swing")] == [result.photo_id]
+
+        # A name the caption supplied stays, in text and in search.
+        result2 = await pipe._run_pipeline(
+            src, "signal", None, caption="Erik watching")
+        rec2 = await photo_store.get_photo(result2.photo_id)
+        assert rec2.description == "Someone on a swing while Erik watches."
+        assert sorted(rec2.tags) == ["erik", "swing"]
+        assert [r.photo.id for r in await search_mod.hybrid_search(
+            photo_store, query="Erik")] == [result2.photo_id]
+
     async def test_empty_roster_keeps_the_no_guessing_prompt(
         self, photo_store, tmp_path, mock_config
     ):
         client = _Client({
             "description": "x", "tags": [],
-            "people": [{"name": "Zara", "confidence": "certain", "basis": "?"}],
+            "people": [{"name": "Zara", "confidence": "captioned", "basis": "?"}],
         })
         pipe = IntakePipeline(photo_store, anthropic_client=client)
         src = tmp_path / "p.jpg"
@@ -462,9 +694,76 @@ class TestPeopleActions:
         assert res["people"] == ["Zara", "Grandma"]  # roster spelling wins
         rec = await wired_store.get_photo(pid)
         assert [(p["label"], p["confidence"], p["source"]) for p in rec.people] == [
-            ("Zara", "confirmed", "human"), ("Grandma", "confirmed", "human")
+            ("Zara", "confirmed", "agent_reported"),
+            ("Grandma", "confirmed", "agent_reported")
         ]
         assert rec.people_confirmed_at
+
+    async def test_confirmations_record_the_agent_and_where_it_was_told(
+        self, wired_store
+    ):
+        """Stored as agent-reported with conversation + channel — the
+        store never claims a human made the call."""
+
+        class _Conv:
+            conversation_id = "conv-42"
+            channel = "whatsapp"
+
+        async def act(action_type, **payload):
+            token = current_conversation.set(_Conv())
+            try:
+                return await process_action(
+                    {"_sdk": action_type, **payload},
+                    ActionContext(conversation_id="conv-42"),
+                )
+            finally:
+                current_conversation.reset(token)
+
+        def provenance(person):
+            return (person["label"], person["confidence"], person["source"],
+                    person["conversation_id"], person["channel"])
+
+        told = ("confirmed", "agent_reported", "conv-42", "whatsapp")
+        db = wired_store._ensure_db()
+
+        pid = await wired_store.create_photo(filename="a.jpg", source="signal")
+        assert (await act("photos.set_people", id=pid, names=["Zara"]))[
+            "status"] == "ok"
+        rec = await wired_store.get_photo(pid)
+        assert [provenance(p) for p in rec.people] == [("Zara", *told)]
+        assert rec.people_confirmed_at
+        assert rec.people_confirmed_conversation == "conv-42"
+        assert rec.people_confirmed_channel == "whatsapp"
+
+        pid2 = await wired_store.create_photo(filename="b.jpg", source="signal")
+        await wired_store.apply_inferred_people(
+            pid2, [{"label": "Erik", "confidence": "likely"}])
+        await act("photos.confirm_people", id=pid2)
+        rec = await wired_store.get_photo(pid2)
+        assert [provenance(p) for p in rec.people] == [("Erik", *told)]
+        assert rec.people_confirmed_channel == "whatsapp"
+
+        pid3 = await wired_store.create_photo(
+            filename="c.jpg", source="signal", people=[{"label": "unknown"}])
+        await act("photos.set_person", id=pid3, person_index=0, name="Zara")
+        rec = await wired_store.get_photo(pid3)
+        assert [provenance(p) for p in rec.people] == [("Zara", *told)]
+
+        async with db.execute(
+            "SELECT COUNT(*) AS n FROM photo_people WHERE source = 'human'"
+        ) as cur:
+            assert (await cur.fetchone())["n"] == 0
+
+        # Still locked against the tagger.
+        assert not await wired_store.apply_inferred_people(
+            pid, [{"label": "Erik", "confidence": "captioned"}])
+
+        # No conversation (ad-hoc call): honest source, unknown origin.
+        pid4 = await wired_store.create_photo(filename="d.jpg", source="signal")
+        await _act("photos.set_people", id=pid4, names=["Zara"])
+        rec = await wired_store.get_photo(pid4)
+        assert [provenance(p) for p in rec.people] == [
+            ("Zara", "confirmed", "agent_reported", None, None)]
 
     async def test_set_people_corrects_and_keeps_bbox(self, wired_store):
         pid = await wired_store.create_photo(
@@ -481,7 +780,7 @@ class TestPeopleActions:
         assert rec.people[0]["person_id"] == "p-erik"
         # ...and the tagger cannot bring Zara back.
         assert not await wired_store.apply_inferred_people(
-            pid, [{"label": "Zara", "confidence": "certain"}])
+            pid, [{"label": "Zara", "confidence": "captioned"}])
 
     async def test_set_people_empty_means_nobody(self, wired_store):
         pid = await wired_store.create_photo(filename="a.jpg", source="signal")
@@ -692,7 +991,7 @@ class TestBackfill:
         await _seed_roster(photo_store)
         await _library(photo_store, tmp_path)
         await photo_store.update_people(
-            "photo_2", [{"label": "Erik"}], human_confirmed=True)
+            "photo_2", [{"label": "Erik"}], agent_reported=True)
         infer = _FakeInferrer({
             "photo_0": [{"label": "Zara", "confidence": "likely", "basis": "curls"}],
             "photo_2": [{"label": "Zara", "confidence": "likely", "basis": "x"}],
@@ -704,7 +1003,7 @@ class TestBackfill:
             )
             assert summary.skipped_confirmed == 1
             assert summary.written == 2
-            assert "skipped: human-confirmed" in out.getvalue()
+            assert "skipped: people already confirmed" in out.getvalue()
         # One call per unconfirmed photo per run; none for the confirmed one.
         assert sorted(infer.calls) == ["photo_0", "photo_0", "photo_1", "photo_1"]
         rec0 = await photo_store.get_photo("photo_0")
@@ -769,7 +1068,7 @@ class TestBackfill:
         await _library(photo_store, tmp_path, n=1)
         await photo_store.update_photo("photo_0", description="Zara on the swing")
         client = _Client({"description": "ignored", "tags": ["ignored"], "people": [
-            {"name": "Zara", "confidence": "certain", "basis": "notes name her"}]})
+            {"name": "Zara", "confidence": "captioned", "basis": "notes name her"}]})
         pipe = IntakePipeline(photo_store, anthropic_client=client, infer_people=True)
         out = io.StringIO()
         await run_backfill(

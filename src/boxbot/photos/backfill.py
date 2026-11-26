@@ -9,7 +9,7 @@ nothing. ``--apply`` writes them.
 
   - Cost: one small-model call per photo considered.
   - Idempotent: a re-run replaces earlier tagger labels, never stacks.
-  - Human-confirmed photos (``bb.photos.set_people`` /
+  - Photos marked reviewed (``bb.photos.set_people`` /
     ``confirm_people``) are skipped — no call, no write.
   - There is no caption at backfill time, so labels are at best
     ``likely``; review them with ``bb.photos.unconfirmed()``.
@@ -140,7 +140,7 @@ async def run_backfill(
                  f"{(record.description or '')[:70]}"
         if record.people_confirmed_at:
             summary.skipped_confirmed += 1
-            emit(f"{header}\n    skipped: human-confirmed")
+            emit(f"{header}\n    skipped: people already confirmed")
             continue
 
         summary.considered += 1
@@ -178,7 +178,7 @@ async def run_backfill(
     emit(
         f"{summary.considered} considered, {summary.proposed} with "
         f"proposed people, {summary.skipped_confirmed} skipped "
-        f"(human-confirmed), {summary.failed} failed, "
+        f"(already confirmed), {summary.failed} failed, "
         + (
             f"{summary.written} written."
             if apply

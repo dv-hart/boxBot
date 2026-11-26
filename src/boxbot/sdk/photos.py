@@ -10,7 +10,7 @@ Usage:
         print(p)                      # id, description, people + confidence
     photos.search(query="Zara", show=True)   # find + put on screen
 
-    photos.set_people("photo_123", names=["Zara"])   # human-confirmed
+    photos.set_people("photo_123", names=["Zara"])   # a person told you
 
     photos.set_tags("photo_123", tags=["family", "beach"])
     photos.add_to_slideshow("photo_123")
@@ -60,7 +60,7 @@ class PhotoRecord:
 
     @property
     def people(self) -> list[dict[str, Any]]:
-        """``[{name, confidence}]`` — confirmed | certain | likely."""
+        """``[{name, confidence}]`` — confirmed | captioned | likely."""
         return self._data.get("people", [])
 
     @property
@@ -70,7 +70,7 @@ class PhotoRecord:
 
     @property
     def unsure(self) -> list[Any]:
-        """Weak tagger guesses — not people until a human confirms."""
+        """Weak tagger guesses — not people until a person confirms."""
         return self._data.get("unsure", [])
 
     @property
@@ -99,7 +99,7 @@ class PhotoRecord:
 
     def __repr__(self) -> str:
         who = [
-            p.get("name", "") if p.get("confidence") in ("confirmed", "certain")
+            p.get("name", "") if p.get("confidence") == "confirmed"
             else f"{p.get('name', '')} ({p.get('confidence')})"
             for p in self.people
         ]
@@ -269,7 +269,7 @@ def ingest(
         sender: Person who sent it, if known.
         caption: Optional human-supplied caption, verbatim. The tagger
             reads it to name household people (a caption naming someone
-            on the roster = "certain"); also the fallback description.
+            on the roster = "captioned"); also the fallback description.
 
     Returns the new photo's ID.
     """
@@ -339,7 +339,7 @@ def set_tags(photo_id: str, *, tags: list[str]) -> None:
 
 
 def set_person(photo_id: str, *, person_index: int, name: str) -> None:
-    """Rename one existing person slot (marks it human-confirmed).
+    """Rename one existing person slot (stored as confirmed, agent-reported).
 
     To add or remove people use ``set_people``.
 
@@ -358,14 +358,16 @@ def set_person(photo_id: str, *, person_index: int, name: str) -> None:
     }, timeout=30))
 
 
-# --- People: human confirmation ---
+# --- People: confirmation by a person, reported by the agent ---
 
 def set_people(photo_id: str, *, names: list[str]) -> list[str]:
-    """Set the human-confirmed people on a photo (replaces all labels).
+    """Set the people a person told you are in a photo (replaces all labels).
 
-    Add, remove or correct in one call. Only after a human said who is
-    in the photo: the result is stored as confirmed and the tagger never
-    changes it again. ``names=[]`` = nobody from the household.
+    Add, remove or correct in one call. Only after a person said who is
+    in the photo: the result is stored as confirmed — recorded as
+    reported by you, with this conversation and channel — and the
+    tagger never changes it again. ``names=[]`` = nobody from the
+    household.
 
     Returns the stored names (household spelling).
     """
@@ -381,9 +383,10 @@ def set_people(photo_id: str, *, names: list[str]) -> list[str]:
 
 
 def confirm_people(photo_id: str) -> list[str]:
-    """Mark a photo's current certain/likely labels human-confirmed.
+    """Mark a photo's current captioned/likely labels confirmed.
 
-    Use when a human agreed with the labels as they stand. ``unsure``
+    Use when a person agreed with the labels as they stand (recorded as
+    reported by you, with this conversation and channel). ``unsure``
     suggestions are dropped. Returns the confirmed names.
     """
     v.require_str(photo_id, "photo_id")
@@ -393,7 +396,7 @@ def confirm_people(photo_id: str) -> list[str]:
 
 
 def unconfirmed(limit: int = 20) -> list[PhotoRecord]:
-    """Photos with likely/unsure people no human has reviewed, newest first.
+    """Photos with likely/unsure people nobody has reviewed, newest first.
 
     Each record's ``people`` items carry ``basis`` (the tagger's reason);
     ``unsure`` is ``[{name, basis}]``.

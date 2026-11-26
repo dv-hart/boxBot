@@ -354,8 +354,8 @@ photos:
   # Small-model tagger names household people in new photos, using the
   # sender's caption and the household roster (bb.photos.set_roster).
   # The roster + caption are sent with the existing tagging call only.
-  # Labels are "certain" (caption names them), "likely" (appearance) or
-  # "unsure" (kept as a suggestion until a human confirms).
+  # Labels are "captioned" (caption names them), "likely" (appearance) or
+  # "unsure" (kept as a suggestion until a person confirms).
   infer_people: true
   # Photo search relevance floor (0-1). Results scoring below it are
   # dropped, so an unrelated query returns nothing. A keyword hit scores

@@ -2451,9 +2451,13 @@ class TestResolveSpeakerIdentities:
         emb = self._unit(seed=8)
 
         # First utterance: unknown speaker, buffered as "Speaker A".
-        await session._resolve_speaker_identities(self._diar_result(emb))
-        # Agent then identifies them mid-session.
-        await identity.enrollment.identify("Jacob", "Speaker A")
+        _, first = await session._resolve_speaker_identities(
+            self._diar_result(emb)
+        )
+        uid = first["Speaker A"]["utterance"]
+        # The line reaches the agent, which then identifies them.
+        identity.enrollment.mark_shown([uid])
+        await identity.enrollment.identify("Jacob", utterance=uid)
 
         label_map, block = await session._resolve_speaker_identities(
             self._diar_result(emb)

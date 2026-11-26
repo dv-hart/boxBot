@@ -80,10 +80,17 @@ def manager(store):
     return EnrollmentManager(store, voice_gate=VoiceGate())
 
 
-async def _hear(manager, store, emb, duration=LONG):
-    """What voice.py does per utterance: rank against clouds, attribute."""
+async def _hear(manager, store, emb, duration=LONG, shown=True):
+    """What voice.py does per utterance: rank against clouds, attribute.
+
+    ``shown`` — the line also reached the agent's thread (the normal,
+    nothing-queued case). False = heard while the agent was busy.
+    """
     ranked = VoiceReID().rank_clouds(emb, await store.get_voice_clouds())
-    return manager.attribute_voice(emb, ranked, duration=duration)
+    a = manager.attribute_voice(emb, ranked, duration=duration)
+    if shown:
+        manager.mark_shown([a.utterance_id])
+    return a
 
 
 async def _rows(store, person_id):
@@ -244,21 +251,29 @@ class TestIncidentReplay:
     async def test_old_style_mixed_bucket_binds_only_the_claiming_voice(
         self, manager, store,
     ):
-        """The exact pre-fix shape: both voices already under one ref."""
+        """The exact pre-fix shape: both voices already under one ref.
+        The claimant does NOT speak last — the adult does."""
         v = Voices()
         jacob = await _enroll_weak_adult(store, v)
 
         adult = [v.utt(v.adult, 0.8) for _ in range(5)]
         child = [v.utt(v.child, 0.9) for _ in range(4)]
         order = [adult[0], child[0], adult[1], adult[2], child[1],
-                 adult[3], child[2], adult[4], child[3]]  # child speaks last
-        for e in order:
+                 adult[3], child[2], child[3], adult[4]]
+        utts = [
             manager.buffer_voice_embedding("Speaker A", e, duration=LONG)
+            for e in order
+        ]
+        manager.mark_shown()
+        claim_line = utts[7]  # child[3]: "I'm Erik"
 
-        result = await manager.identify("Erik", "Speaker A")
+        result = await manager.identify("Erik", utterance=claim_line.uid)
+        assert result["utterance"] == claim_line.uid
+        assert result["binding"] == "utterance"
         assert result["voice_utterances_anchored"] == 4
         assert result["voice_utterances_other_voice"] == 5
         assert result["mixed_voices"] is True
+        assert result["label_only"] is False
 
         summary = await manager.commit_session(session_id="s1")
         erik = result["person_id"]
@@ -267,6 +282,341 @@ class TestIncidentReplay:
         assert summary["Speaker A"]["voice_added"] == 4
         assert summary["Speaker A"]["voice_dropped_low"] == 5
         assert len(await _rows(store, jacob)) == 3
+
+    @pytest.mark.asyncio
+    async def test_mixed_bucket_by_label_only_labels_and_stores_nothing(
+        self, manager, store,
+    ):
+        """Same bucket, but the agent only gave the label: the seed is
+        the latest line it had seen, and nothing is stored."""
+        v = Voices()
+        adult = [v.utt(v.adult, 0.8) for _ in range(3)]
+        child = [v.utt(v.child, 0.9) for _ in range(3)]
+        for e in (adult[0], child[0], adult[1], child[1], child[2], adult[2]):
+            manager.buffer_voice_embedding("Speaker A", e, duration=LONG)
+        manager.mark_shown()
+
+        result = await manager.identify("Erik", "Speaker A")
+        assert result["mixed_voices"] is True
+        assert result["label_only"] is True
+        assert result["voice_utterances_anchored"] == 1
+
+        summary = await manager.commit_session(session_id="s1")
+        assert summary["Speaker A"]["voice_added"] == 0
+        assert summary["Speaker A"]["voice_label_only"] is True
+        assert await _rows(store, result["person_id"]) == []
+
+
+# ---------------------------------------------------------------------------
+# Review 2026-11-25: the seed is the line the agent acted on
+# ---------------------------------------------------------------------------
+
+
+def _near_voices(seed=0, cos=0.495):
+    """Adult + a child whose voice sits in the 0.44–0.55 band to his."""
+    rng = np.random.default_rng(seed)
+    adult = _unit(rng.standard_normal(DIM))
+    other = rng.standard_normal(DIM)
+    other -= (other @ adult) * adult
+    child = _unit(cos * adult + np.sqrt(1 - cos**2) * _unit(other))
+
+    def utt(base):
+        return _unit(base + 0.03 * rng.standard_normal(DIM) / np.sqrt(DIM) * 12)
+
+    return adult, child, utt
+
+
+class TestSeedIsTheLineTheAgentActedOn:
+    """seed.py: adult says "I'm Jacob" (Speaker A); a child at cosine
+    ~0.495 to him speaks while the agent is still thinking — same
+    label, queued, not yet shown; then identify(Jacob, Speaker A)."""
+
+    async def _scenario(self, manager, store, *, by_utterance):
+        adult, child, utt = _near_voices()
+        a1 = await _hear(manager, store, utt(adult))               # shown
+        c1 = await _hear(manager, store, utt(child), shown=False)  # queued
+        assert (a1.label, c1.label) == ("Speaker A", "Speaker A")
+        if by_utterance:
+            r = await manager.identify("Jacob", utterance=a1.utterance_id)
+        else:
+            r = await manager.identify("Jacob", "Speaker A")
+        manager.mark_shown()  # the queued line is delivered afterwards
+        later_child = [await _hear(manager, store, utt(child)) for _ in range(3)]
+        later_adult = [await _hear(manager, store, utt(adult)) for _ in range(3)]
+        child_embs = {
+            manager.get_utterance(a.utterance_id).embedding.tobytes()
+            for a in [c1, *later_child]
+        }
+        adult_embs = {
+            manager.get_utterance(a.utterance_id).embedding.tobytes()
+            for a in [a1, *later_adult]
+        }
+        summary = await manager.commit_session(session_id="s")
+        stored = {
+            row["embedding"] for row in await _rows(store, r["person_id"])
+        }
+        return r, a1, later_child, later_adult, child_embs, adult_embs, stored, summary
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("by_utterance", [False, True])
+    async def test_child_is_never_jacob(self, manager, store, by_utterance):
+        (r, a1, later_child, later_adult, child_embs, adult_embs, stored,
+         _summary) = await self._scenario(
+            manager, store, by_utterance=by_utterance,
+        )
+        # Bound to the adult's line, not the child's later one.
+        assert r["utterance"] == a1.utterance_id
+        # The band (0.44–0.55) counts as another voice.
+        assert r["mixed_voices"] is True
+        assert r["voice_utterances_unanchored"] == 1
+
+        for a in later_child:
+            assert a.person_name != "Jacob"
+            assert "Jacob" not in a.label
+            assert a.certainty == "unknown"
+        for a in later_adult:
+            assert (a.label, a.certainty) == ("Jacob", "confirmed")
+        # Nothing of the child's ever reaches Jacob's voiceprint.
+        assert not (stored & child_embs)
+        assert stored <= adult_embs
+
+    @pytest.mark.asyncio
+    async def test_label_only_on_a_mixed_bucket_stores_nothing(
+        self, manager, store,
+    ):
+        r, *_rest, stored, summary = await self._scenario(
+            manager, store, by_utterance=False,
+        )
+        assert r["label_only"] is True and r["binding"] == "label"
+        assert stored == set()
+        assert summary["Speaker A"]["voice_label_only"] is True
+
+    @pytest.mark.asyncio
+    async def test_explicit_utterance_stores_only_the_adult(
+        self, manager, store,
+    ):
+        r, *_rest, adult_embs, stored, _summary = await self._scenario(
+            manager, store, by_utterance=True,
+        )
+        assert r["label_only"] is False
+        assert stored == adult_embs  # seed + 3 corroborating lines
+
+    @pytest.mark.asyncio
+    async def test_nothing_shown_binds_nothing(self, manager, store):
+        """The reviewer's script verbatim: no delivery information."""
+        adult, child, utt = _near_voices()
+        await _hear(manager, store, utt(adult), shown=False)
+        c = await _hear(manager, store, utt(child), shown=False)
+        r = await manager.identify("Jacob", c.ref)
+        assert r["voice_bound"] is False
+        assert r["voice_utterances_anchored"] == 0
+        assert manager.get_anchor("Speaker A") is None
+        later = await _hear(manager, store, utt(child))
+        assert later.certainty == "unknown"
+        await manager.commit_session(session_id="s")
+        assert await _rows(store, r["person_id"]) == []
+
+    @pytest.mark.asyncio
+    async def test_unshown_or_unknown_utterance_id_is_refused(
+        self, manager, store,
+    ):
+        adult, _child, utt = _near_voices()
+        a = await _hear(manager, store, utt(adult), shown=False)
+        with pytest.raises(ValueError, match="not been delivered"):
+            await manager.identify("Jacob", utterance=a.utterance_id)
+        with pytest.raises(ValueError, match="unknown this session"):
+            await manager.identify("Jacob", utterance="u999")
+        assert await store.get_person_by_name("Jacob") is None
+
+    @pytest.mark.asyncio
+    async def test_seed_alone_is_never_stored(self, manager, store):
+        v = Voices()
+        a = await _hear(manager, store, v.utt(v.child, 0.8))
+        r = await manager.identify("Erik", utterance=a.utterance_id)
+        summary = await manager.commit_session(session_id="s")
+        assert summary["Speaker A"]["voice_added"] == 0
+        assert await _rows(store, r["person_id"]) == []
+
+    @pytest.mark.asyncio
+    async def test_short_corroboration_is_not_enough(self, manager, store):
+        v = Voices()
+        a = await _hear(manager, store, v.utt(v.child, 0.9))
+        r = await manager.identify("Erik", utterance=a.utterance_id)
+        b = await _hear(manager, store, v.utt(v.child, 0.9), duration=SHORT)
+        assert b.label == "Erik"
+        await manager.commit_session(session_id="s")
+        assert await _rows(store, r["person_id"]) == []
+
+
+class TestMaybePool:
+    """``Name?`` pools different voices by design."""
+
+    @pytest.mark.asyncio
+    async def test_claim_on_a_maybe_label_binds_one_utterance(
+        self, manager, store,
+    ):
+        v = Voices()
+        jacob = await _enroll_weak_adult(store, v)
+        pool = [await _hear(manager, store, v.utt(v.adult, 0.72))
+                for _ in range(3)]
+        assert {a.label for a in pool} == {"Jacob?"}
+
+        r = await manager.identify("Jacob", "Jacob?")
+        # Latest shown line only, moved out of the pool.
+        assert r["utterance"] == pool[-1].utterance_id
+        assert r["voice_utterances_anchored"] == 1
+        assert r["ref"] != "Jacob?"
+        assert manager.get_anchor("Jacob?") is None
+        assert len(manager.get_session_person("Jacob?").voice_utterances) == 2
+        assert manager.get_claim("Jacob?").source == "voice_reid_match"
+
+        summary = await manager.commit_session(session_id="s")
+        assert summary["Jacob?"]["voice_added"] == 0
+        assert len(await _rows(store, jacob)) == 3
+
+    @pytest.mark.asyncio
+    async def test_pool_claim_by_id_takes_that_utterance(
+        self, manager, store,
+    ):
+        v = Voices()
+        await _enroll_weak_adult(store, v)
+        pool = [await _hear(manager, store, v.utt(v.adult, 0.72))
+                for _ in range(3)]
+        r = await manager.identify("Jacob", utterance=pool[0].utterance_id)
+        assert r["utterance"] == pool[0].utterance_id
+        assert r["voice_utterances_anchored"] == 1
+
+
+class TestAliasCannotMoveAVoice:
+    """alias.py: Carina anchored on Speaker A; Sarah (cosine ~0.5 to
+    her) is heard as "Carina?"; the agent drops the "?"."""
+
+    async def _setup(self, manager, store):
+        carina, sarah, utt = _near_voices(seed=1, cos=0.5)
+        c1 = await _hear(manager, store, utt(carina))
+        await manager.identify("Carina", utterance=c1.utterance_id)
+        c2 = await _hear(manager, store, utt(carina))
+        assert (c2.label, c2.ref) == ("Carina", "Speaker A")
+        s1 = await _hear(manager, store, utt(sarah))
+        return carina, sarah, utt, c1, c2, s1
+
+    @pytest.mark.asyncio
+    async def test_question_mark_label_never_resolves_to_the_anchor(
+        self, manager, store,
+    ):
+        v = Voices()
+        a = await _hear(manager, store, v.utt(v.child, 0.8))
+        await manager.identify("Erik", utterance=a.utterance_id)
+        await _hear(manager, store, v.utt(v.child, 0.8))
+        assert manager.resolve_ref("Erik") == "Speaker A"   # live label
+        assert manager.resolve_ref("Erik?") is None          # not live
+        with pytest.raises(ValueError, match="Live labels"):
+            await manager.identify("Sam", "Erik?")
+
+    @pytest.mark.asyncio
+    async def test_name_not_shown_as_a_label_is_not_an_alias(
+        self, manager, store,
+    ):
+        """Anchored, but no line has carried the name yet."""
+        v = Voices()
+        a = await _hear(manager, store, v.utt(v.child, 0.8))
+        await manager.identify("Erik", utterance=a.utterance_id)
+        assert manager.resolve_ref("Erik") is None
+        with pytest.raises(ValueError, match="Speaker A"):
+            await manager.identify("Sam", "Erik")
+
+    @pytest.mark.asyncio
+    async def test_reclaiming_an_anchored_label_needs_the_utterance(
+        self, manager, store,
+    ):
+        carina, sarah, utt, c1, c2, s1 = await self._setup(manager, store)
+        anchor_before = manager.get_anchor("Speaker A")
+
+        with pytest.raises(ValueError, match="already bound to Carina"):
+            await manager.identify("Sarah", "Carina")
+        assert manager.get_anchor("Speaker A") is anchor_before
+        assert await store.get_person_by_name("Sarah") is None
+
+        again = await _hear(manager, store, utt(carina))
+        assert (again.label, again.certainty) == ("Carina", "confirmed")
+
+    @pytest.mark.asyncio
+    async def test_explicit_claim_for_the_other_voice_leaves_the_anchor(
+        self, manager, store,
+    ):
+        carina, sarah, utt, c1, c2, s1 = await self._setup(manager, store)
+        r = await manager.identify("Sarah", utterance=s1.utterance_id)
+        assert r["ref"] != "Speaker A"
+        assert manager.get_anchor("Speaker A").name == "Carina"
+
+        c3 = await _hear(manager, store, utt(carina))
+        s2 = await _hear(manager, store, utt(sarah))
+        assert (c3.label, s2.label) == ("Carina", "Sarah")
+
+        await manager.commit_session(session_id="s")
+        carina_id = (await store.get_person_by_name("Carina"))["id"]
+        carina_rows = {x["embedding"] for x in await _rows(store, carina_id)}
+        sarah_rows = {x["embedding"] for x in await _rows(store, r["person_id"])}
+        assert carina_rows and sarah_rows
+        assert not (carina_rows & sarah_rows)
+
+    @pytest.mark.asyncio
+    async def test_explicit_correction_of_the_same_voice_replaces_anchor(
+        self, manager, store,
+    ):
+        """"I'm actually Sarah" said in the anchored voice itself."""
+        carina, sarah, utt, c1, c2, s1 = await self._setup(manager, store)
+        r = await manager.identify("Sarah", utterance=c2.utterance_id)
+        assert r["ref"] == "Speaker A"
+        assert manager.get_anchor("Speaker A").name == "Sarah"
+        again = await _hear(manager, store, utt(carina))
+        assert again.label == "Sarah"
+
+
+class TestSessionSwap:
+    @pytest.mark.asyncio
+    async def test_new_session_survives_an_in_flight_commit(self, store):
+        """commit_session awaits DB writes; a session starting in that
+        window must keep its buffers and not ride the old claim."""
+        import asyncio
+
+        manager = EnrollmentManager(store, voice_gate=VoiceGate())
+        v = Voices()
+        a = await _hear(manager, store, v.utt(v.child, 0.9))
+        await manager.identify("Erik", utterance=a.utterance_id)
+        await _hear(manager, store, v.utt(v.child, 0.9))
+
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+        real_add = store.add_voice_embedding
+
+        async def slow_add(*args, **kwargs):
+            entered.set()
+            await gate.wait()
+            return await real_add(*args, **kwargs)
+
+        store.add_voice_embedding = slow_add
+        commit = asyncio.create_task(manager.commit_session(session_id="old"))
+        await entered.wait()
+
+        # New session starts mid-commit.
+        new_emb = v.utt(v.adult, 0.9)
+        n = manager.attribute_voice(new_emb, [], duration=LONG)
+        assert n.label == "Speaker A" and n.certainty == "unknown"
+        assert manager.get_anchor("Speaker A") is None
+        assert manager.get_claim("Speaker A").source != "agent_identify"
+
+        gate.set()
+        summary = await commit
+        assert summary["Speaker A"]["voice_added"] == 2
+
+        # The new session's state is intact, and not written to Erik.
+        assert manager.get_session_refs() == ["Speaker A"]
+        assert manager.get_utterance(n.utterance_id) is not None
+        erik = (await store.get_person_by_name("Erik"))["id"]
+        stored = {r["embedding"] for r in await _rows(store, erik)}
+        assert new_emb.tobytes() not in stored
+        assert {r["session_id"] for r in await _rows(store, erik)} == {"old"}
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +691,8 @@ class TestAttribution:
         )
         summary = await manager.commit_session(session_id="s")
         assert summary["Erik?"]["voice_added"] == 0
-        assert len(await _rows(store, result["person_id"])) == 1
+        # The seed has nothing backing it: not stored either.
+        assert await _rows(store, result["person_id"]) == []
 
     @pytest.mark.asyncio
     async def test_correction_binds_voice_and_outranks_the_wrong_match(
@@ -424,14 +775,54 @@ class TestCommitGate:
         manager.buffer_voice_embedding(   # the claim's own utterance
             "Jacob", seed, best_person_id=jacob, best_score=0.62,
             runner_up_score=0.20, **kw)
-        await manager.identify("Jacob", "Jacob")
+        manager.mark_shown()
+        result = await manager.identify("Jacob", "Jacob")
+        # Random vectors: nothing agrees with the seed → mixed, and the
+        # label alone did not say which line → label-only.
+        assert result["label_only"] is True
+
+        summary = await manager.commit_session(session_id="s")
+        assert await _rows(store, jacob) == []
+        assert summary["Jacob"]["voice_label_only"] is True
+        assert summary["Jacob"]["voice_added"] == 0
+
+    @pytest.mark.asyncio
+    async def test_self_match_under_an_explicit_claim(self, manager, store):
+        """Same bucket, claim made by utterance id: own-match + margin
+        lines are stored; the uncorroborated seed is not."""
+        jacob = await store.create_person("Jacob")
+        carina = await store.create_person("Carina")
+        rng = np.random.default_rng(9)
+
+        def emb():
+            return _unit(rng.standard_normal(DIM))
+
+        clear, narrow, low, other, seed = emb(), emb(), emb(), emb(), emb()
+        kw = {"duration": LONG}
+        manager.buffer_voice_embedding(
+            "Jacob", clear, best_person_id=jacob, best_score=0.70,
+            runner_up_score=0.25, **kw)
+        manager.buffer_voice_embedding(   # margin 0.04 < 0.10
+            "Jacob", narrow, best_person_id=jacob, best_score=0.58,
+            runner_up_score=0.54, **kw)
+        manager.buffer_voice_embedding(   # below confirmed
+            "Jacob", low, best_person_id=jacob, best_score=0.50,
+            runner_up_score=0.20, **kw)
+        manager.buffer_voice_embedding(   # looks like Carina
+            "Jacob", other, best_person_id=carina, best_score=0.60,
+            runner_up_score=0.30, **kw)
+        claim = manager.buffer_voice_embedding(   # the claim's own line
+            "Jacob", seed, best_person_id=jacob, best_score=0.62,
+            runner_up_score=0.20, **kw)
+        manager.mark_shown()
+        await manager.identify("Jacob", utterance=claim.uid)
 
         summary = await manager.commit_session(session_id="s")
         rows = await _rows(store, jacob)
         by_emb = {r["embedding"]: r["provenance"] for r in rows}
         assert by_emb == {
-            seed.tobytes(): "agent_identify",   # (a) anchor
             clear.tobytes(): "voice_reid",      # (b) own match + margin
+            seed.tobytes(): "voice_reid",       # (b) too: 0.62, margin 0.42
         }
         info = summary["Jacob"]
         assert info["voice_added"] == 2
@@ -647,8 +1038,11 @@ class TestVoiceAdapterEndToEnd:
         for i, _ in enumerate(script):
             await session._on_utterance(self._utterance())
             if i == 1:
+                # The line reached the agent's thread before it acted.
+                uid = events[-1].speaker_identities["Speaker A"]["utterance"]
+                identity.enrollment.mark_shown([uid])
                 tool_result = json.loads(
-                    await tool.execute(name="Erik", ref="Speaker A")
+                    await tool.execute(name="Erik", utterance=uid)
                 )
 
         prefixes = [e.transcript.split("]:")[0] + "]" for e in events]
@@ -681,7 +1075,14 @@ class TestVoiceAdapterEndToEnd:
         # Tool told the agent what it bound.
         assert tool_result["voice_utterances_anchored"] == 1
         assert tool_result["mixed_voices"] is False
-        assert "most recent 'Speaker A' utterance" in tool_result["message"]
+        assert tool_result["binding"] == "utterance"
+        assert f"utterance {uid}" in tool_result["message"]
+        # Every event carries its utterance's id.
+        ids = [
+            next(iter(e.speaker_identities.values()))["utterance"]
+            for e in events
+        ]
+        assert len(set(ids)) == len(ids) and all(ids)
 
         # Session end → commit, stamped with the voice session id.
         await bus.publish(VoiceSessionEnded(conversation_id="voice_e2e"))
@@ -707,12 +1108,64 @@ class TestVoiceAdapterEndToEnd:
         enrollment = identity.enrollment
         for base in (v.adult, v.adult, v.child):
             enrollment.buffer_voice_embedding("Speaker A", v.utt(base, 0.8))
+        enrollment.mark_shown()
 
         result = json.loads(
             await IdentifyPersonTool().execute(name="Erik", ref="Speaker A")
         )
         assert result["mixed_voices"] is True
+        assert result["label_only"] is True
         assert result["voice_utterances_anchored"] == 1
         assert result["voice_utterances_other_voice"] == 2
         assert "DIFFERENT voice" in result["message"]
+        assert "NOTHING" in result["message"]
         assert "ask again" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_tool_binds_only_lines_the_conversation_has_shown(
+        self, identity, store, monkeypatch,
+    ):
+        """The tool reads which lines reached the thread from the
+        conversation that made the call."""
+        import boxbot.tools._tool_context as tool_context
+        from boxbot.tools.builtins.identify_person import IdentifyPersonTool
+
+        adult, child, utt = _near_voices()
+        enrollment = identity.enrollment
+        a = enrollment.attribute_voice(utt(adult), [], duration=LONG)
+        c = enrollment.attribute_voice(utt(child), [], duration=LONG)
+        assert a.ref == c.ref == "Speaker A"
+
+        conv = MagicMock()
+        conv.shown_utterance_ids = [a.utterance_id]   # child still queued
+        monkeypatch.setattr(
+            tool_context, "get_current_conversation", lambda: conv,
+        )
+        result = json.loads(
+            await IdentifyPersonTool().execute(name="Jacob", ref="Speaker A")
+        )
+        assert result["utterance"] == a.utterance_id
+        assert result["mixed_voices"] is True and result["label_only"] is True
+
+        # By id it is the same line, and eligible to store.
+        enrollment.clear_session()
+        a = enrollment.attribute_voice(utt(adult), [], duration=LONG)
+        enrollment.attribute_voice(utt(child), [], duration=LONG)
+        conv.shown_utterance_ids = [a.utterance_id]
+        result = json.loads(await IdentifyPersonTool().execute(
+            name="Jacob", utterance=a.utterance_id,
+        ))
+        assert result["binding"] == "utterance"
+        assert result["label_only"] is False
+
+        # No conversation, no delivery information: nothing is bound.
+        enrollment.clear_session()
+        enrollment.attribute_voice(utt(adult), [], duration=LONG)
+        monkeypatch.setattr(
+            tool_context, "get_current_conversation", lambda: None,
+        )
+        result = json.loads(
+            await IdentifyPersonTool().execute(name="Jacob", ref="Speaker A")
+        )
+        assert result["voice_bound"] is False
+        assert "NOT bound" in result["message"]

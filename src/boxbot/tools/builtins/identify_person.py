@@ -52,27 +52,50 @@ _OUTCOME_MESSAGES = {
 }
 
 
-def _binding_message(name: str, ref: str, anchored: int, other_voice: int) -> str:
+def _binding_message(name: str, result: dict[str, Any]) -> str:
     """Say what the claim was actually bound to (voice anchor)."""
-    if anchored == 0:
-        return (
-            f"No voice buffered under '{ref}' — nothing bound to a voice "
-            f"(visual embeddings, if any, still commit at session end)."
-        )
-    bound = (
-        f"Bound '{name}' to the voice of the most recent '{ref}' "
-        f"utterance ({anchored} matching utterance"
-        f"{'' if anchored == 1 else 's'}). Only lines in that voice will "
-        f"be labelled '{name}' or stored to their voiceprint."
+    ref = result.get("ref")
+    seed = result.get("utterance")
+    anchored = int(result.get("voice_utterances_anchored", 0) or 0)
+    others = int(result.get("voice_utterances_other_voice", 0) or 0) + int(
+        result.get("voice_utterances_unanchored", 0) or 0
     )
-    if other_voice:
-        bound += (
-            f" WARNING: '{ref}' also held {other_voice} utterance"
-            f"{'' if other_voice == 1 else 's'} in a DIFFERENT voice — "
-            f"more than one person was speaking under that label. Those "
-            f"stay unlabelled. If unsure who said the name, ask again."
+    if not seed:
+        return (
+            f"No line under '{ref}' had reached you when you called this — "
+            f"NOT bound to a voice; later lines will not carry '{name}'. "
+            f"Retry with utterance=<id beside the line where they said "
+            f"who they are>."
         )
-    return bound
+    how = (
+        f"utterance {seed}" if result.get("binding") == "utterance"
+        else f"the latest '{ref}' line you had seen ({seed})"
+    )
+    bound = (
+        f"Bound '{name}' to the voice of {how}; {anchored} matching "
+        f"utterance{'' if anchored == 1 else 's'}. Only lines in that "
+        f"voice will be labelled '{name}'."
+    )
+    if result.get("label_only"):
+        return bound + (
+            f" WARNING: '{ref}' also held {others} utterance"
+            f"{'' if others == 1 else 's'} in a DIFFERENT voice, and you "
+            f"did not say which line you meant. Labelling only — NOTHING "
+            f"from this label is stored to a voiceprint this session. If "
+            f"unsure who said the name, ask again, then pass "
+            f"utterance=<id>."
+        )
+    if others:
+        bound += (
+            f" '{ref}' also held {others} utterance"
+            f"{'' if others == 1 else 's'} in a DIFFERENT voice — more "
+            f"than one person spoke under that label. Those stay "
+            f"unlabelled."
+        )
+    return bound + (
+        " Stored to their voiceprint at session end only if another "
+        "line in the same voice backs it up."
+    )
 
 
 class IdentifyPersonTool(Tool):
@@ -84,11 +107,14 @@ class IdentifyPersonTool(Tool):
         "in the [Present: ...] header.\n"
         "- identify (default): bind a session speaker to a person. First "
         "meeting (\"I'm Erik\") or correction (\"I'm actually Sarah\"). "
-        "Needs `name` + `ref`. Binds to the VOICE of the ref's most "
-        "recent utterance, not every line under that label — call it "
-        "right after they say who they are. Later lines carry the name "
-        "only when the voice matches. Result `mixed_voices: true` = the "
-        "label held more than one voice: ask who is who, don't assume.\n"
+        "Needs `name` + `utterance` (the id beside that line's label "
+        "in \"People in this session\", e.g. u7). Binds to the VOICE of "
+        "that one line, never every line under its label. No id shown: "
+        "pass `ref` (the label) — binds the latest line under it you had "
+        "seen. Later lines carry the name only when the voice matches. "
+        "Result `mixed_voices: true` = the label held more than one "
+        "voice: ask who is who, don't assume. A label already bound to "
+        "someone else is only re-bound with `utterance`.\n"
         "- rename: change a person's name (\"call me Jake\"). Needs "
         "`name` (current) + `new_name`. Metadata only. Errors if "
         "`new_name` already belongs to someone else.\n"
@@ -117,12 +143,19 @@ class IdentifyPersonTool(Tool):
                     "name. merge: the record to KEEP."
                 ),
             },
+            "utterance": {
+                "type": "string",
+                "description": (
+                    "identify only, preferred. Id of the line where they "
+                    "said who they are (e.g. 'u7')."
+                ),
+            },
             "ref": {
                 "type": "string",
                 "description": (
-                    "identify only. The bracketed transcript label of "
-                    "the line where they identified themselves (e.g. "
-                    "'Speaker A', 'Jacob?')."
+                    "identify only, when no id is shown. The bracketed "
+                    "transcript label of that line, exactly as shown "
+                    "(e.g. 'Speaker A', 'Jacob?')."
                 ),
             },
             "new_name": {
@@ -154,17 +187,29 @@ class IdentifyPersonTool(Tool):
             return await self._merge(
                 kwargs.get("name"), kwargs.get("duplicate_name")
             )
-        return await self._identify(kwargs.get("name"), kwargs.get("ref"))
+        return await self._identify(
+            kwargs.get("name"), kwargs.get("ref"), kwargs.get("utterance"),
+        )
 
     # ------------------------------------------------------------------
     # action="identify" (default — original behavior)
     # ------------------------------------------------------------------
 
-    async def _identify(self, name: str | None, ref: str | None) -> Any:
-        if not name or not ref:
-            return _error("action=\"identify\" requires both name and ref.")
+    async def _identify(
+        self,
+        name: str | None,
+        ref: str | None,
+        utterance: str | None = None,
+    ) -> Any:
+        if not name or not (ref or utterance):
+            return _error(
+                "action=\"identify\" requires name and utterance (or ref)."
+            )
 
-        logger.info("identify_person: name=%s ref=%s", name, ref)
+        logger.info(
+            "identify_person: name=%s ref=%s utterance=%s",
+            name, ref, utterance,
+        )
 
         identity = _get_identity_service()
         enrollment = getattr(identity, "enrollment", None)
@@ -174,45 +219,68 @@ class IdentifyPersonTool(Tool):
                 "name": name,
                 "ref": ref,
                 "message": (
-                    f"Noted: '{ref}' is '{name}'. Identity service is "
-                    f"not active — identity will not be persisted."
+                    f"Noted: '{ref or utterance}' is '{name}'. Identity "
+                    f"service is not active — identity will not be "
+                    f"persisted."
                 ),
             })
 
+        # Tell enrollment which lines have actually reached this
+        # conversation's thread. A line still queued behind the turn
+        # that produced this call is not what the call is about, and
+        # must not become the voice the name is bound to.
+        from boxbot.tools._tool_context import get_current_conversation
+
+        conv = get_current_conversation()
+        shown = getattr(conv, "shown_utterance_ids", None)
+        if shown:
+            enrollment.mark_shown(list(shown))
+
         try:
-            result = await enrollment.identify(name, ref)
+            result = await enrollment.identify(
+                name, ref, utterance=utterance,
+            )
         except ValueError as exc:
             return json.dumps({
                 "status": "error",
                 "name": name,
                 "ref": ref,
+                "utterance": utterance,
                 "message": str(exc),
             })
 
         outcome = result.get("outcome", "unknown")
+        bound_ref = result.get("ref") or ref
+        shown_ref = ref or utterance
         message = _OUTCOME_MESSAGES.get(
             outcome,
             "Recorded '{ref}' as '{name}' (outcome: {outcome}).",
-        ).format(name=name, ref=ref, outcome=outcome)
-
-        anchored = int(result.get("voice_utterances_anchored", 0) or 0)
-        other_voice = int(result.get("voice_utterances_other_voice", 0) or 0)
-        message = f"{message} {_binding_message(name, ref, anchored, other_voice)}"
+        ).format(name=name, ref=shown_ref, outcome=outcome)
+        message = f"{message} {_binding_message(name, {**result, 'ref': shown_ref})}"
 
         body = {
             "status": result.get("status", "ok"),
             "outcome": outcome,
             "name": result.get("name", name),
-            "ref": ref,
+            "ref": shown_ref,
+            "utterance": result.get("utterance"),
+            "binding": result.get("binding"),
+            "voice_bound": bool(result.get("voice_bound", False)),
+            "label_only": bool(result.get("label_only", False)),
             "person_id": result.get("person_id"),
             "embeddings_buffered": result.get("embeddings_buffered", 0),
-            "voice_utterances_anchored": anchored,
-            "voice_utterances_other_voice": other_voice,
+            "voice_utterances_anchored": int(
+                result.get("voice_utterances_anchored", 0) or 0
+            ),
+            "voice_utterances_other_voice": int(
+                result.get("voice_utterances_other_voice", 0) or 0
+            ) + int(result.get("voice_utterances_unanchored", 0) or 0),
             "mixed_voices": bool(result.get("mixed_voices", False)),
             "prior_claim_name": result.get("prior_claim_name"),
             "prior_claim_source": result.get("prior_claim_source"),
             "message": message,
         }
+        ref = bound_ref if not ref else ref
 
         # On first-meeting / correction outcomes, attach the speaker's
         # most recent crop so the agent can look at their face and write

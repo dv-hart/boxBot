@@ -23,6 +23,7 @@ from boxbot.core.agent import (
     BoxBotAgent,
     _addressed_identity,
     _identity_certainty,
+    _prompt_identity_legend,
     _render_identity_section,
 )
 from boxbot.core.conversation import Conversation, GenerationResult
@@ -76,7 +77,7 @@ ERIK_ANCHOR_MAYBE = {
 
 
 def test_legend_uses_the_live_cloud_thresholds(mock_config):
-    out = _render_identity_section({"Jacob": JACOB_HIGH})
+    out = _prompt_identity_legend()
 
     confirmed = mock_config.perception.voice_confirmed_threshold
     maybe = mock_config.perception.voice_maybe_threshold
@@ -84,7 +85,8 @@ def test_legend_uses_the_live_cloud_thresholds(mock_config):
     assert f"[Name?] maybe ({maybe:.2f}–{confirmed:.2f})" in out
     assert f"[Speaker X] unknown (<{maybe:.2f})" in out
     # The score shown must sit inside the range the legend gives it.
-    assert "- [Jacob] → Jacob, confirmed (voice 0.69)" in out
+    lines = _render_identity_section({"Jacob": JACOB_HIGH})
+    assert "- [Jacob] → Jacob, confirmed (voice 0.69)" in lines
     assert 0.69 >= confirmed
 
 
@@ -92,7 +94,7 @@ def test_legend_follows_a_config_change(mock_config):
     mock_config.perception.voice_confirmed_threshold = 0.61
     mock_config.perception.voice_maybe_threshold = 0.5
 
-    out = _render_identity_section({"Jacob": JACOB_HIGH})
+    out = _prompt_identity_legend()
 
     assert "confirmed (voice ≥0.61, or" in out
     assert "maybe (0.50–0.61)" in out
@@ -100,7 +102,9 @@ def test_legend_follows_a_config_change(mock_config):
 
 
 def test_legend_has_no_retired_thresholds_or_dead_tier(mock_config):
-    out = _render_identity_section({"Speaker A": UNKNOWN})
+    out = _prompt_identity_legend() + _render_identity_section(
+        {"Speaker A": UNKNOWN}
+    )
 
     for stale in ("0.85", "0.70", "0.60", "- low", "Voice tiers"):
         assert stale not in out
@@ -108,12 +112,35 @@ def test_legend_has_no_retired_thresholds_or_dead_tier(mock_config):
 
 
 def test_legend_says_what_each_label_means(mock_config):
-    out = _render_identity_section({"Jacob?": JACOB_MAYBE})
+    out = _prompt_identity_legend()
 
     assert "[Name] confirmed" in out and "use the name" in out
     assert "do NOT act on identity" in out
-    assert 'identify_person(name, ref="Name?")' in out
+    assert "identify_person(name,\n  utterance=<id>)" in out
     assert "`onboarding` §1" in out
+
+
+def test_legend_is_static_not_per_turn(mock_config):
+    """The legend lives in the system prompt; the per-turn section is
+    just the lines (each turn's block stays in history)."""
+    out = _render_identity_section({"Jacob?": JACOB_MAYBE})
+    assert out == (
+        "## People in this session\n"
+        "- [Jacob?] → maybe Jacob, unverified (voice 0.48)"
+    )
+
+
+def test_utterance_id_renders_beside_the_label(mock_config):
+    out = _render_identity_section([
+        {**SPEAKER_A, "utterance": "u7"},
+        {**SPEAKER_A, "utterance": "u8"},      # same label, two lines
+        {**JACOB_CONFIRMED, "utterance": "u9"},
+    ])
+    assert out.splitlines()[1:] == [
+        "- [Speaker A] u7 → unknown voice",
+        "- [Speaker A] u8 → unknown voice",
+        "- [Jacob] u9 → Jacob, confirmed (voice 0.69)",
+    ]
 
 
 def test_entries_render_by_label_and_certainty(mock_config):
@@ -650,8 +677,16 @@ async def test_presence_guess_is_not_a_text_recipient(
     a._present_people = {"Jacob": datetime.now()}
 
     conv = await _hear(a, "voice_1", "hello?", {})
-    assert a._seen[-1]["person"] == "Jacob"
+    seen = a._seen[-1]
     assert conv.speaker_guessed is True
+    # A guess is shown as a guess: "[Jacob?]", no "Speaking with", and
+    # it is not who memories / prefetch are fetched for.
+    assert seen["utterance"] == "[Jacob?]: hello?"
+    assert seen["person"] is None
+    assert "Speaking with" not in seen["context"]
+    a._inject_memories.assert_awaited()
+    assert a._inject_memories.await_args.kwargs["person_name"] is None
+    assert a._prefetch_context_for_text.await_args.args[2] is None
 
     out, send = await _text_current_speaker(conv, monkeypatch)
     assert out["status"] == "error"

@@ -128,14 +128,21 @@ def _content_blocks(result: Any) -> list[dict[str, Any]]:
       * anything else — JSON-encode as a text block (defensive
         fallback; should not occur in practice).
     """
+    # Tool output is untrusted text (web pages, merchant strings, sandbox
+    # stdout): no live turn-context tag or ``[system]`` marker reaches
+    # the model from it — see core/untrusted_text.py.
+    from boxbot.core.untrusted_text import neutralize_content
+
     if isinstance(result, str):
-        return [{"type": "text", "text": result}]
-    if isinstance(result, list):
-        return [
+        blocks: list[Any] = [{"type": "text", "text": result}]
+    elif isinstance(result, list):
+        blocks = [
             _image_block_to_mcp(b) if isinstance(b, dict) else b
             for b in result
         ]
-    return [{"type": "text", "text": json.dumps(result)}]
+    else:
+        blocks = [{"type": "text", "text": json.dumps(result)}]
+    return neutralize_content(blocks)
 
 
 def wrap_tool(tool: "Tool", conv: Any = None) -> "SdkMcpTool[Any]":

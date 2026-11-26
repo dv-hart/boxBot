@@ -1081,7 +1081,12 @@ class EnrollmentManager:
                     and float(seed.unit @ anchor.vectors[0]) >= gate.anchor
                 )
             )
-            if same_person and (not explicit or seed_is_anchor_voice):
+            # A label-only anchor is upgraded by naming the utterance —
+            # that is what the tool told the agent to do.
+            upgrade = same_person and explicit and anchor.label_only
+            if same_person and not upgrade and (
+                not explicit or seed_is_anchor_voice
+            ):
                 # Already bound to this person: leave the anchor alone.
                 return self._identify_result(
                     IdentifyOutcome.NO_OP, anchor.name, resolved,
@@ -1103,7 +1108,7 @@ class EnrollmentManager:
                     f"really {name}, pass utterance=<id beside that line's "
                     f"label>. Same human, new name: action=\"rename\"."
                 )
-            extract = not seed_is_anchor_voice
+            extract = not seed_is_anchor_voice and not upgrade
         elif is_pool:
             if seed is None:
                 raise ValueError(

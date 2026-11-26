@@ -113,7 +113,13 @@ class TestCommitOnSessionEnd:
     async def test_end_to_end_commit(self, service, store):
         """The live-incident flow: buffer → identify → session end → rows."""
         enrollment = service.enrollment
-        enrollment.buffer_voice_embedding("Speaker A", _unit_vec(seed=1))
+        emb = _unit_vec(seed=1)
+        # Two lines in one voice, both delivered: one alone is not stored.
+        enrollment.buffer_voice_embedding("Speaker A", emb, duration=3.0)
+        enrollment.buffer_voice_embedding(
+            "Speaker A", emb + 0.01 * _unit_vec(seed=2), duration=3.0,
+        )
+        enrollment.mark_shown()
 
         result = await enrollment.identify("Jacob", "Speaker A")
         assert result["outcome"] == "create"
@@ -125,7 +131,7 @@ class TestCommitOnSessionEnd:
         person = await store.get_person_by_name("Jacob")
         assert person is not None
         embeddings = await store.get_voice_embeddings(person["id"])
-        assert len(embeddings) == 1
+        assert len(embeddings) == 2
         # Session buffers cleared after commit.
         assert enrollment.get_session_refs() == []
 

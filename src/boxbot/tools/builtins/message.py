@@ -118,10 +118,14 @@ def _resolve_attachments(raw: Any) -> tuple[list[str], str | None]:
 def _resolve_current_speaker(conv: Any) -> tuple[str | None, str | None, bool]:
     """(name, label, text_ok) for ``to="current_speaker"`` in ``conv``.
 
-    ``name`` — the person the latest human input was attributed to
-    (``Conversation.current_speaker``): the sender on a text channel,
-    the confirmed speaker of the last voice utterance; None for an
-    unknown / maybe ("Jacob?") voice. Before any human input (trigger
+    ``name`` — who the turn being answered is with
+    (``Conversation.current_speaker``): the speaker of the latest human
+    input that has ENTERED THE THREAD — the sender on a text channel,
+    the confirmed speaker of the last voice utterance the model has
+    seen; None for an unknown / maybe ("Jacob?") voice. A line queued
+    behind the running generation does not count until it is drained
+    into the thread: the call being resolved was written without it.
+    Before any human input (trigger
     run, relay-seeded room) it is the conversation's sole participant,
     or None when there is not exactly one — never an arbitrary pick.
 

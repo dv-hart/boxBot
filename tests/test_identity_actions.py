@@ -381,12 +381,24 @@ class TestIdentifyPersonToolActions:
 
         tool, store, enrollment = tool_env
         emb = _vec(dim=192, seed=7)
-        enrollment.buffer_voice_embedding("Speaker A", emb)
+        # Same voice twice: the line with the name, and one more that
+        # backs it up — a single line is never stored on its own.
+        again = emb + 0.02 * _vec(dim=192, seed=8)
+        again = again / np.linalg.norm(again)
+        seed = enrollment.buffer_voice_embedding(
+            "Speaker A", emb, duration=3.0, shown=True,
+        )
+        enrollment.buffer_voice_embedding(
+            "Speaker A", again, duration=3.0, shown=True,
+        )
 
-        result = json.loads(await tool.execute(name="Jacob", ref="Speaker A"))
+        result = json.loads(
+            await tool.execute(name="Jacob", utterance=seed.uid)
+        )
         assert result["status"] == "ok"
         assert result["outcome"] == "create"
-        assert result["embeddings_buffered"] == 1
+        assert result["embeddings_buffered"] == 2
+        assert result["voice_utterances_anchored"] == 2
         assert "not be persisted" not in result["message"]
 
         await get_event_bus().publish(
@@ -395,7 +407,7 @@ class TestIdentifyPersonToolActions:
 
         person = await store.get_person_by_name("Jacob")
         assert person is not None
-        assert len(await store.get_voice_embeddings(person["id"])) == 1
+        assert len(await store.get_voice_embeddings(person["id"])) == 2
 
     @pytest.mark.asyncio
     async def test_rename_happy_path(self, tool_env, monkeypatch):

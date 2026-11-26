@@ -402,6 +402,27 @@ class TestSeedIsTheLineTheAgentActedOn:
         assert stored == adult_embs  # seed + 3 corroborating lines
 
     @pytest.mark.asyncio
+    async def test_label_only_claim_is_upgraded_by_naming_the_line(
+        self, manager, store,
+    ):
+        adult, child, utt = _near_voices()
+        a1 = await _hear(manager, store, utt(adult))
+        await _hear(manager, store, utt(child))
+        first = await manager.identify("Jacob", "Speaker A")
+        # Latest shown line was the child's: label-only, on the wrong voice.
+        assert first["label_only"] is True
+        assert first["utterance"] != a1.utterance_id
+
+        second = await manager.identify("Jacob", utterance=a1.utterance_id)
+        assert second["utterance"] == a1.utterance_id
+        assert second["label_only"] is False
+        assert (await _hear(manager, store, utt(child))).certainty == "unknown"
+        later = [await _hear(manager, store, utt(adult)) for _ in range(2)]
+        assert {a.label for a in later} == {"Jacob"}
+        await manager.commit_session(session_id="s")
+        assert len(await _rows(store, second["person_id"])) == 3
+
+    @pytest.mark.asyncio
     async def test_nothing_shown_binds_nothing(self, manager, store):
         """The reviewer's script verbatim: no delivery information."""
         adult, child, utt = _near_voices()

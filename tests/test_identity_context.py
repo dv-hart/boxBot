@@ -692,3 +692,304 @@ async def test_presence_guess_is_not_a_text_recipient(
     assert out["status"] == "error"
     send.assert_not_awaited()
     await conv.end(reason="test")
+
+
+# ---------------------------------------------------------------------------
+# Review 2026-11-25: attribution is applied when a line enters the thread
+# ---------------------------------------------------------------------------
+
+
+def _ident(label: str, uid: str, base: dict) -> dict:
+    return {label: {**base, "label": label, "utterance": uid}}
+
+
+@pytest.mark.asyncio
+async def test_text_to_current_speaker_ignores_a_line_still_queued(
+    monkeypatch, mock_config,
+):
+    """Jacob asks; Carina speaks while the agent is still answering him.
+    The in-flight message(to="current_speaker", channel="text") must go
+    to Jacob — the model has not seen Carina's line."""
+    import asyncio
+
+    release = asyncio.Event()
+    started = asyncio.Event()
+    resolved: list[tuple[str | None, list[str]]] = []
+
+    async def _generate(conv):
+        started.set()
+        await release.wait()
+        _out, send = await _text_current_speaker(conv, monkeypatch)
+        who = send.await_args.kwargs["current_speaker"] if send.await_count else None
+        resolved.append((who, list(conv.shown_utterance_ids)))
+        return GenerationResult()
+
+    conv = _conv(generate_fn=_generate)
+    await conv.handle_input(
+        "[Jacob]: text me the link", speaker_name="Jacob", human=True,
+        speaker_label="Jacob",
+        context={"speaker_identities": _ident("Jacob", "u1", JACOB_CONFIRMED)},
+    )
+    await started.wait()
+
+    carina = {**JACOB_CONFIRMED, "person_id": "p3", "person_name": "Carina"}
+    await conv.handle_input(
+        "[Carina]: what's for dinner", speaker_name="Carina", human=True,
+        speaker_label="Carina",
+        context={"speaker_identities": _ident("Carina", "u2", carina)},
+    )
+    # Queued, not shown: nothing about the turn being answered moved.
+    assert conv.has_pending_inputs
+    assert conv.current_speaker == "Jacob"
+    assert conv.shown_utterance_ids == ["u1"]
+    assert [e["utterance"] for e in conv.turn_identities] == ["u1"]
+
+    started.clear()
+    release.set()
+    task = conv._generation_task
+    await task
+    # First generation answered Jacob; the drained one answers Carina.
+    assert resolved == [("Jacob", ["u1"]), ("Carina", ["u1", "u2"])]
+    assert conv.current_speaker == "Carina"
+    assert [e["utterance"] for e in conv.turn_identities] == ["u2"]
+    await conv.end(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_mid_loop_fold_moves_the_speaker_with_the_line():
+    """The fold between two API calls is the other way a line enters the
+    thread: from that point the next response has seen it."""
+    import asyncio
+
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def _generate(conv):
+        started.set()
+        await release.wait()
+        return GenerationResult()
+
+    conv = _conv(generate_fn=_generate)
+    await conv.handle_input("[Jacob]: hi", speaker_name="Jacob", human=True)
+    await started.wait()
+    await conv.handle_input(
+        "[Speaker A]: me too", human=True, speaker_label="Speaker A",
+        context={"speaker_identities": _ident("Speaker A", "u5", SPEAKER_A)},
+    )
+    assert (conv.current_speaker, conv.shown_utterance_ids) == ("Jacob", [])
+
+    (folded,) = conv.drain_pending_inputs()
+    assert folded["content"] == "[Speaker A]: me too"
+    assert (conv.current_speaker, conv.current_speaker_label) == (
+        None, "Speaker A",
+    )
+    assert conv.shown_utterance_ids == ["u5"]
+    release.set()
+    await conv._generation_task
+    await conv.end(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_interrupt_drops_queued_attribution():
+    import asyncio
+
+    started = asyncio.Event()
+
+    async def _generate(conv):
+        started.set()
+        await asyncio.Event().wait()
+
+    conv = _conv(generate_fn=_generate)
+    await conv.handle_input("[Jacob]: hi", speaker_name="Jacob", human=True)
+    await started.wait()
+    await conv.handle_input(
+        "[Carina]: hello", speaker_name="Carina", human=True,
+        context={"speaker_identities": _ident("Carina", "u2", JACOB_CONFIRMED)},
+    )
+    await conv.interrupt()
+    assert conv.current_speaker == "Jacob"
+    assert conv.shown_utterance_ids == []
+    assert conv._queued_turn_info == {}
+    await conv.end(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_identity_block_is_the_turns_own_with_utterance_ids(
+    routed_agent,
+):
+    a = routed_agent
+    conv = await _hear(
+        a, "voice_1", "[Speaker A]: I'm Erik",
+        _ident("Speaker A", "u7", SPEAKER_A),
+    )
+    assert "- [Speaker A] u7 → unknown voice" in a._seen[-1]["context"]
+    assert conv.shown_utterance_ids == ["u7"]
+    # A later utterance's block on the agent does not leak into a
+    # context built for the turn already in the thread.
+    a._latest_speaker_identities = _ident("Jacob", "u8", JACOB_CONFIRMED)
+    again = await a._prompt_dynamic_context(
+        person_name=None, channel="voice", context={},
+        initial_message="x", conv=conv,
+    )
+    assert "u7" in again and "u8" not in again
+    await conv.end(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_voice_identity_block_stays_out_of_text_and_trigger_turns(
+    routed_agent,
+):
+    """The room's identity block used to ride every channel's context
+    (and get persisted with Signal / WhatsApp turns)."""
+    a = routed_agent
+    voice = await _hear(
+        a, "voice_1", "[Jacob]: hi", _ident("Jacob", "u1", JACOB_CONFIRMED),
+    )
+    assert "People in this session" in a._seen[-1]["context"]
+    assert a._latest_speaker_identities  # the room block is on the books
+
+    for channel, key in (("signal", "signal:+1"), ("whatsapp", "whatsapp:+1"),
+                         ("trigger", "trigger:t:1")):
+        conv = _conv(channel=channel, channel_key=key, conversation_id=key)
+        out = await a._prompt_dynamic_context(
+            person_name="Carina", channel=channel, context={},
+            initial_message="hello", conv=conv,
+        )
+        assert "People in this session" not in out, channel
+        assert "Jacob, confirmed" not in out, channel
+        assert "Onboarding skill" not in out, channel
+    await voice.end(reason="test")
+
+
+# ---------------------------------------------------------------------------
+# Review 2026-11-25: later turn-context blocks repeat only what changed
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def household(monkeypatch, routed_agent):
+    from types import SimpleNamespace
+
+    import boxbot.communication.auth as auth_module
+
+    users = [
+        SimpleNamespace(name=n, role=r) for n, r in (
+            ("Jacob", "admin"), ("Carina", "admin"),
+            ("Erik", "user"), ("Sarah", "user"),
+        )
+    ]
+    auth = MagicMock()
+    auth.list_users = AsyncMock(return_value=users)
+    monkeypatch.setattr(auth_module, "get_auth_manager", lambda: auth)
+    monkeypatch.setattr(
+        agent_module, "get_status_line",
+        AsyncMock(return_value="[To-do: 4 items | Triggers: 6 active]"),
+    )
+    memories = [
+        f"#m{i:07d} (person/Jacob): Jacob prefers the kitchen lights "
+        f"dimmed after 9pm and asked not to be reminded about item {i}."
+        for i in range(8)
+    ]
+    convs = [
+        f"#c{i:07d} (2026-11-2{i}, Jacob, voice): Talked about the "
+        f"Seattle move and the movers' quote number {i}."
+        for i in range(3)
+    ]
+
+    def block(mem, conv):
+        return (
+            "[Active Memories]\n" + "\n".join(mem) + "\n\n"
+            "[Recent Conversations]\n" + "\n".join(conv) + "\n"
+        )
+
+    routed_agent._inject_memories = AsyncMock(
+        return_value=(block(memories, convs), ["m0"])
+    )
+    return SimpleNamespace(
+        agent=routed_agent, users=users, auth=auth,
+        memories=memories, convs=convs, block=block,
+    )
+
+
+@pytest.mark.asyncio
+async def test_later_blocks_carry_only_what_changed(household, capsys):
+    h = household
+    a = h.agent
+    conv = await _hear(
+        a, "voice_1", "[Jacob]: dim the lights",
+        _ident("Jacob", "u1", JACOB_CONFIRMED),
+    )
+    first = a._seen[-1]["context"]
+    for needle in ("- Day: ", "- Channel: ", "## Registered users",
+                   "- Carina (admin)", "[To-do: 4 items", h.memories[0],
+                   h.convs[0], "- Current time: ", "- Speaking with: Jacob",
+                   "- [Jacob] u1 → Jacob, confirmed"):
+        assert needle in first, needle
+    # The legend is static: system prompt, not the per-turn block.
+    assert "[Name?] maybe" not in first
+
+    # Turn 2: one new memory, same everything else.
+    new_memory = "#m9999999 (household): The spare key is with the Lees."
+    a._inject_memories.return_value = (
+        h.block([*h.memories[:5], new_memory], h.convs), ["m0"],
+    )
+    await _hear(
+        a, "voice_1", "[Jacob]: and where is the spare key",
+        _ident("Jacob", "u2", JACOB_CONFIRMED),
+    )
+    second = a._seen[-1]["context"]
+    # Inherently per-turn lines are there…
+    for needle in ("- Current time: ", "- Speaking with: Jacob",
+                   "- [Jacob] u2 → Jacob, confirmed", new_memory,
+                   "[Active Memories]"):
+        assert needle in second, needle
+    # …what the first block already carries is not.
+    for stale in ("- Day: ", "- Channel: ", "## Registered users",
+                  "[To-do: 4 items", h.memories[0], h.convs[0],
+                  "[Recent Conversations]"):
+        assert stale not in second, stale
+    # Extraction still gets the full latest block.
+    assert h.memories[0] in conv.injected_memories_block
+
+    # A change is re-emitted, once.
+    h.users.append(type(h.users[0])(name="Lena", role="user"))
+    await _hear(
+        a, "voice_1", "[Jacob]: thanks",
+        _ident("Jacob", "u3", JACOB_CONFIRMED),
+    )
+    third = a._seen[-1]["context"]
+    assert "## Registered users" in third and "- Lena" in third
+    assert new_memory not in third and "[Active Memories]" not in third
+
+    # Compaction may evict the blocks that carried them: start over.
+    a._compact_thread = BoxBotAgent._compact_thread.__get__(a)
+    conv.turn_context_emitted.clear()
+    await _hear(
+        a, "voice_1", "[Jacob]: one more",
+        _ident("Jacob", "u4", JACOB_CONFIRMED),
+    )
+    assert "- Day: " in a._seen[-1]["context"]
+    assert h.memories[0] in a._seen[-1]["context"]
+
+    legend = agent_module._prompt_identity_legend()
+    with capsys.disabled():
+        print(
+            f"\n[turn-context size] first block {len(first)} chars; "
+            f"follow-up block {len(second)} chars; legend moved to the "
+            f"system prompt {len(legend)} chars; pre-fix every block "
+            f"≈ {len(first) + len(legend)} chars"
+        )
+    assert len(second) < len(first) / 3
+    await conv.end(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_carries_the_legend_and_stays_static(
+    routed_agent,
+):
+    a = routed_agent
+    a._read_system_memory = AsyncMock(return_value="")
+    (block,) = await a._build_system_prompt_blocks()
+    assert "## Voice labels" in block["text"]
+    assert "[Speaker X] unknown" in block["text"]
+    assert await a._build_system_prompt_blocks() == [block]

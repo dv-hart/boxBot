@@ -27,6 +27,11 @@ from boxbot.displays.blocks import (
 from boxbot.displays.spec import DataSourceSpec, DisplaySpec
 
 
+# HTML renderer only: these displays centre one thing in the upper half,
+# so the skyline sits low, clear of it. The PIL renderer ignores it.
+_LOW_SKYLINE = {"horizon": "low"}
+
+
 def get_builtin_specs() -> list[DisplaySpec]:
     """Return all built-in display specs."""
     return [
@@ -52,6 +57,7 @@ def _clock_display() -> DisplaySpec:
         data_sources=[],
         root_block=root,
         transition="crossfade",
+        scene=_LOW_SKYLINE,
     )
 
 
@@ -95,6 +101,7 @@ def _weather_simple_display() -> DisplaySpec:
         ],
         root_block=root,
         transition="crossfade",
+        scene=_LOW_SKYLINE,
     )
 
 
@@ -144,6 +151,7 @@ def _notice_display() -> DisplaySpec:
         data_sources=[],
         root_block=root,
         transition="crossfade",
+        scene=_LOW_SKYLINE,
     )
 
 
@@ -211,6 +219,7 @@ def _web_display() -> DisplaySpec:
         data_sources=[],
         root_block=root,
         transition="none",
+        scene=_LOW_SKYLINE,
     )
 
 

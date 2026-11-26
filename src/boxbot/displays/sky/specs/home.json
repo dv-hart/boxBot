@@ -1,0 +1,34 @@
+{
+  "name": "home",
+  "theme": "living_sky",
+  "transition": "crossfade",
+  "scene": { "horizon": "high" },
+  "data_sources": [
+    { "name": "weather", "type": "integration", "refresh": 1800 },
+    { "name": "calendar", "type": "integration", "inputs": { "action": "list_upcoming_events", "max_results": 10 }, "refresh": 600 },
+    { "name": "tasks", "type": "builtin", "refresh": 300 },
+    { "name": "people", "type": "builtin" },
+    { "name": "inbox", "type": "static", "value": { "needs_reply": 0 } }
+  ],
+  "layout": {
+    "type": "zones",
+    "children": [
+      {
+        "type": "zone",
+        "place": "sky",
+        "children": [
+          { "type": "sky_clock", "size": "hero" },
+          { "type": "now", "weather": "{weather}" }
+        ]
+      },
+      {
+        "type": "zone",
+        "place": "ground",
+        "children": [
+          { "type": "next_event", "events": "{calendar.events}" },
+          { "type": "house", "present": "{people.present}", "replies": "{inbox.needs_reply}", "todos": "{tasks.items}" }
+        ]
+      }
+    ]
+  }
+}

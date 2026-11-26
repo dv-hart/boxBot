@@ -99,6 +99,19 @@ home_assistant:
 
 # ── Display ───────────────────────────────────────────────────────────
 display:
+  # What draws the screen.
+  #   pil   the original block renderer (frames through the pygame backend)
+  #   html  the Living Sky page in a local, offline Chromium window: a
+  #         Seattle scene that follows the real time of day and weather,
+  #         with every display drawn on top. Adds the home, brief, week,
+  #         day, inbox and capture displays. If the browser cannot start,
+  #         boxBot logs an error and draws with pil.
+  renderer: "pil"
+  html:
+    browser: "chromium"
+    # Household members in a fixed order; position picks the colour each
+    # person keeps on every display (first four).
+    people: []
   # Display rotation interval during idle (seconds)
   rotation_interval: 30
   # Displays to rotate through when idle

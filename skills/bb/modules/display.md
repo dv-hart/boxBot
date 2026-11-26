@@ -340,6 +340,55 @@ stringifies.
 **Never `color="muted"` text inside `card(color="muted")`** — same
 surface tone, text vanishes.
 
+## Living Sky — `get_active()["renderer"] == "html"`: scene behind every display, extra displays + blocks
+
+Only when `renderer` is `"html"`. Under `"pil"` skip this section: these
+displays are absent and the blocks draw nothing.
+
+Scene = Seattle skyline, drawn from `get_active()["atmosphere"]`, behind
+every display. No pixels needed to know the sky:
+
+| Field | Values |
+| --- | --- |
+| `phase` | `dawn` `noon` `afternoon` `golden` `dusk` `night` (from the sun) |
+| `weather` | `clear` `partly` `fog` `overcast` `rain` `snow`; Rainier shows only on `clear`/`partly` |
+| `weather_known` | `false` = no forecast, sky is a neutral guess |
+| `sun` | `{next: "sunset"\|"sunrise", at: "4:25 PM"}` or null |
+| `dim` | night mode: scene veiled, ink lowered |
+
+Displays (all `theme: "living_sky"`; `load(name)` for the spec):
+
+| Display | Shows | You supply |
+| --- | --- | --- |
+| `home` | clock, weather line, next event, who is home | `update_data("home","inbox",value={"needs_reply": n})` |
+| `brief` | your sentence + today's agenda + to-dos | `update_data("brief","brief",value={"greeting","summary"})`; `args.mode`: `morning`\|`evening` |
+| `week` | 7 day columns | `update_data("week","week",value={"summary"})`; `args.start`: `rolling`\|`monday`\|`sunday` |
+| `day` | today on an hour scale, column per person | `update_data("day","day",value={"background":[{label,start,end,people}]})` |
+| `inbox` | mail needing a person | whole block: `update_data("inbox","inbox",value={...})`, fields in `schema()["blocks"]["inbox"]` |
+| `picture` | photo + caption; portrait sits beside the scene | `args.image_ids`, optional `args.reason`, `args.pair` |
+| `capture` | camera still just taken | `args`: `image` (path), `say`, `people`, `saved`, `at` |
+
+- **`inbox.privacy: "discreet"`** — set it whenever anyone but the
+  inbox owners is in the room. Shows counts, senders, whose inbox.
+  Hides subjects, summaries, drafts, deadlines.
+- Calendar events colour by `person` (household name, `"family"`,
+  `"A+B"`); `short_title` (≤14 chars) fits week columns. Neither is in
+  the calendar feed — unset = neutral colour, truncated title.
+- Voice states (listening / thinking / speaking) draw as a dock over
+  the bottom ~170px of any display, automatically. Keep nothing
+  essential there on a display meant to be read mid-conversation.
+- Own displays: any original block works, `card` = dark slab. Sky
+  blocks (`zones`, `zone`, `surface`, `sky_clock`, `now`, `next_event`,
+  `house`, `say`, `agenda_timeline`, `todo_list`, `forecast_strip`,
+  `week_grid`, `day_grid`, `cal_header`, `legend`, `picture`,
+  `photo_caption`, `sky_chip`, `capture`, `inbox`): fields in
+  `schema()`, marked `renderer: "html"`.
+- Spec-level `"scene": {"horizon": "high"|"mid"|"low"|<px 120-480>,
+  "scale": 0.4-1.2, "vista": "kerry"|"sound"}` moves the skyline clear
+  of your content. Text zones at `high`: quiet sky x 40–460 / y 30–290;
+  ground y 470–600.
+- Image params take `"photo:<id or path>"`; anything else is dropped.
+
 ## Editing a display — load → mutate dict → preview → save
 
 `load(name)` → plain dict. `children` is a list — replace/pop/insert/
@@ -348,7 +397,8 @@ append all work. Then `preview` → `save`.
 ## Seeing the screen — get_active (structural) vs screenshot (pixels)
 
 - `bb.display.get_active()` — structural, cheap, no render. Confirms a
-  switch; tells you what you'd replace.
+  switch; tells you what you'd replace. Includes `renderer` and, under
+  `"html"`, `atmosphere` (the sky on screen).
 - `bb.display.screenshot()` — pixels, attached. The ONLY verify against
   **real** data (`preview` sees placeholders). Surface size is
   config-driven — 1024x600 on the 7" LCD by default; the screenshot

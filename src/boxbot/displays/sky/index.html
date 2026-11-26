@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- Offline by construction: nothing loads from the network, no inline script runs. Data reaches the page
+     only through BB.apply() over the DevTools pipe. Images: local files (photos) and data: (pushed frames). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src file:; style-src file: 'unsafe-inline'; font-src file:; img-src file: data:">
+<title>boxBot</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="core.css">
+<link rel="stylesheet" href="blocks/base.css">
+<link rel="stylesheet" href="blocks/home.css">
+<link rel="stylesheet" href="blocks/calendar.css">
+<link rel="stylesheet" href="blocks/inbox.css">
+<link rel="stylesheet" href="blocks/picture.css">
+<link rel="stylesheet" href="blocks/presence.css">
+</head>
+<body>
+<div id="stage">
+  <div id="scene" class="layer"></div>
+  <div id="veil" class="layer"></div>
+  <img id="frame" class="layer" alt="">
+  <div id="view" class="layer"></div>
+  <div id="presence" class="layer"></div>
+  <div id="status" class="layer"></div>
+</div>
+<script src="scene.js"></script>
+<script src="icons.js"></script>
+<script src="core.js"></script>
+<script src="blocks/base.js"></script>
+<script src="blocks/home.js"></script>
+<script src="blocks/calendar.js"></script>
+<script src="blocks/inbox.js"></script>
+<script src="blocks/picture.js"></script>
+<script src="blocks/presence.js"></script>
+</body>
+</html>

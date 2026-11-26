@@ -1,0 +1,141 @@
+/* inbox — rules for blocks/inbox.js only (everything is under .inbox, inner classes prefixed ib-).
+   Sky zone: count + clock in atmosphere ink. Everything else sits on one solid .slab docked to the bottom, so
+   text contrast never depends on the sky behind it. Dock height = amount of work; the scene horizon follows it
+   (see specs/inbox.json). */
+.inbox{position:absolute;inset:0;overflow:hidden}
+
+/* ── sky zone ── */
+.inbox .ib-hd{position:absolute;left:44px;top:26px;right:210px;display:flex;align-items:center;gap:20px}
+.inbox .ib-hd>div{min-width:0}
+.inbox .ib-n{font-size:148px;line-height:.86;font-weight:380;letter-spacing:-.04em;color:var(--accent);font-variant-numeric:lining-nums;flex:none}
+.inbox .ib-t{font-size:50px;line-height:1.05;display:flex;align-items:center;gap:18px;white-space:nowrap}
+.inbox .ib-s{font-size:19px;font-weight:600;margin-top:8px;display:flex;align-items:center;gap:8px;white-space:nowrap}
+.inbox .ib-s .ico{width:21px;height:21px;stroke-width:2}
+.inbox .ib-s .who{font-size:19px;font-weight:700;margin-right:10px}
+.inbox .ib-s .dot{width:13px;height:13px}
+.inbox .ib-s .ib-sep{margin:0 8px 0 0}
+.inbox .ib-s .ib-more{margin-right:10px;opacity:.8}
+#stage.ink-dark .inbox .ib-n{color:color-mix(in srgb,var(--accent) 80%,#1a0d05)}
+.inbox .ib-hd.zero{top:40px}
+.inbox .ib-hd.zero .ib-n{font-size:0;width:96px;height:96px;border-radius:50%;border:3px solid var(--accent);display:flex;align-items:center;justify-content:center}
+.inbox .ib-hd.zero .ib-n .ico{width:54px;height:54px;stroke-width:1.9}
+.inbox .ib-hd.zero .ib-t{font-size:58px}
+.inbox .ib-hd.quiet{top:42px}
+.inbox .ib-hd.quiet .ib-t{font-size:44px}
+.inbox .ib-pips{display:inline-flex;gap:8px}
+.inbox .ib-pips i{width:13px;height:13px;border-radius:50%;border:2px solid currentColor;opacity:.55}
+.inbox .ib-pips i.on{background:var(--accent);border-color:var(--accent);opacity:1;width:34px;border-radius:7px}
+#stage.ink-dark .inbox .ib-pips i.on{background:color-mix(in srgb,var(--accent) 80%,#1a0d05);border-color:transparent}
+.inbox .ib-now{position:absolute;right:44px;top:34px;display:flex;flex-direction:column;align-items:flex-end;font-size:18px;font-weight:600;white-space:nowrap}
+.inbox .ib-now .d{font-size:46px;line-height:1}
+.inbox .ib-wx{display:flex;align-items:center;gap:7px;margin-top:4px}
+/* the moon sits just left of the clock: on a night it is out, keep the weather line short enough to clear it */
+#stage.ph-night.wx-clear .inbox .ib-cond,#stage.ph-night.wx-partly .inbox .ib-cond{display:none}
+
+/* ── the dock ── */
+.inbox .ib-dock{padding:20px 44px 0;display:flex;flex-direction:column;--on:var(--on-accent);box-shadow:0 -1px 0 var(--sh2)}
+.inbox .ib-dock:before{content:"";position:absolute;left:0;right:0;bottom:100%;height:44px;margin-bottom:1px;
+  background:linear-gradient(to top,var(--slab-solid),var(--slab-fade));opacity:.5;pointer-events:none}
+.inbox .ib-dock.ib-triage{height:262px}
+.inbox .ib-dock.ib-thread{height:288px}
+.inbox .ib-dock.ib-sent{height:206px}
+.inbox .ib-dock.ib-discreet{height:162px}
+.inbox .ib-dock.ib-slim{height:58px;padding-top:0}
+.inbox .ib-dock .who{font-size:16px;font-weight:600}
+.inbox .ib-sep{display:inline-block;width:4px;height:4px;border-radius:50%;background:currentColor;opacity:.5;margin:0 10px;vertical-align:middle;flex:none}
+.inbox .ib-cols{flex:1;display:grid;grid-template-columns:minmax(0,1fr) 400px;gap:0 34px;min-height:0}
+.inbox .ib-cols.one{grid-template-columns:minmax(0,1fr)}
+.inbox .ib-cols>*{min-width:0}
+.inbox .ib-cols>*+*{border-left:1px solid var(--hair);padding-left:34px}
+
+/* handle = the ordinal you can say, filled with the colour of whose inbox it is (split = shared) */
+.inbox .ib-bdg{width:30px;height:30px;border-radius:50%;background:var(--family);color:var(--on);flex:none;display:inline-flex;
+  align-items:center;justify-content:center;font-size:21px;font-weight:600;letter-spacing:0;line-height:1;padding-bottom:2px}
+.inbox .ib-bdg.big{width:44px;height:44px;font-size:30px}
+.inbox .ib-bdg.wide{font-size:17px;padding-bottom:1px}
+.inbox .ib-bdg.big.wide{font-size:24px}
+
+.inbox .ib-r1{display:flex;align-items:center;gap:12px;min-width:0}
+.inbox .ib-r1 b{font-size:21px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.inbox .ib-nm{font-size:36px;line-height:1.1;font-weight:380;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;padding-bottom:3px}
+.inbox .ib-due{margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-size:16px;font-weight:600;color:var(--muted);white-space:nowrap;flex:none}
+.inbox .ib-due .ico{width:18px;height:18px;stroke-width:2}
+.inbox .ib-due.urgent{background:var(--accent);color:var(--on);font-weight:700;border-radius:999px;padding:4px 13px 4px 9px}
+.inbox .ib-ctx{font-size:16px;font-weight:500;color:var(--muted);margin:5px 0 0 56px;display:flex;align-items:center;gap:0;white-space:nowrap;min-width:0}
+.inbox .ib-ctx>span:first-child{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.inbox .ib-ctx .ib-for{flex:none;display:inline-flex;align-items:center}
+.inbox .ib-ctx .who{margin-left:7px;color:var(--text)}
+.inbox .ib-ctx .who+.who{margin-left:12px}
+.inbox .ib-sum{font-size:20px;line-height:1.3;font-weight:500;margin:9px 0 0 56px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+/* one line: the proposal pill always shows; the phrases to say drop off the end, whole, when it runs long */
+.inbox .ib-r4{display:flex;align-items:center;flex-wrap:wrap;height:35px;overflow:hidden;margin:12px -28px 0 56px;min-width:0}
+.inbox .ib-r4>*{height:35px}
+.inbox .ib-go{display:inline-flex;align-items:center;gap:8px;background:var(--accent);color:var(--on);font-size:17px;font-weight:700;
+  border-radius:999px;padding:0 16px 0 12px;white-space:nowrap;min-width:0;max-width:100%;margin-right:16px}
+.inbox .ib-go span{overflow:hidden;text-overflow:ellipsis}
+.inbox .ib-go .ico{width:19px;height:19px;stroke-width:2.2}
+.inbox .ib-say{display:inline-flex;align-items:center;font-size:17px;font-weight:600;color:var(--text);white-space:nowrap;flex:none;transition:opacity .5s}
+.inbox .ib-say>.ico{width:19px;height:19px;margin-right:7px;color:var(--accent);stroke-width:2}
+.inbox .ib-say em{font-style:normal;color:var(--muted);font-weight:500;margin-left:7px;font-variant-numeric:tabular-nums}
+.inbox .ib-say.gone{opacity:0}
+
+.inbox .ib-rest{display:flex;flex-direction:column;justify-content:space-between;padding-bottom:6px}
+.inbox .ib-rest.single{justify-content:flex-start}
+.inbox .ib-it p{font-size:17px;font-weight:500;line-height:1.25;margin:4px 0 0 42px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.inbox .ib-sg{display:flex;align-items:center;gap:6px;margin:3px 0 0 42px;font-size:16px;font-weight:700;color:var(--accent);white-space:nowrap}
+.inbox .ib-sg span{overflow:hidden;text-overflow:ellipsis}
+.inbox .ib-sg .ico{width:17px;height:17px;stroke-width:2.2}
+.inbox .ib-rest .ib-it+.ib-it{border-top:1px solid var(--hair);padding-top:11px}
+
+.inbox .ib-foot{height:46px;flex:none;margin-top:12px;border-top:1px solid var(--hair);display:flex;align-items:center;gap:12px;
+  font-size:16px;font-weight:500;color:var(--muted);white-space:nowrap;min-width:0}
+.inbox .ib-slim .ib-foot{margin-top:11px;border-top:0}
+.inbox .ib-foot>span{flex:none}
+.inbox .ib-foot>.ib-clip{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.inbox .ib-ok{display:inline-flex;align-items:center;gap:7px;color:var(--text)}
+.inbox .ib-ok .ico{width:19px;height:19px;stroke-width:2.2;color:var(--accent)}
+.inbox .ib-foot b{font-weight:700;color:var(--text)}
+.inbox .ib-fyi b{font-size:16px;letter-spacing:.14em;margin-right:10px;color:var(--accent)}
+.inbox .ib-foot>.ib-sep{margin:0 4px}
+.inbox .ib-foot .r{margin-left:auto}
+.inbox .ib-foot .ib-say .ib-sep+.ico{margin-left:0}
+
+/* ── thread ── */
+.inbox .ib-thread .ib-cols{grid-template-columns:minmax(0,1fr) 402px;gap:0 30px}
+.inbox .ib-q{font-size:19px;line-height:1.32;font-style:italic;font-weight:360;margin:11px 0 0 56px;padding-left:14px;border-left:3px solid var(--accent);color:var(--text);
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.inbox .ib-thread .ib-sum{font-size:19px}
+.inbox .ib-cols.one .ib-q{-webkit-line-clamp:3}
+.inbox .ib-note{background:var(--paper);color:var(--on);border-radius:14px;padding:14px 20px 13px;margin:0 0 2px 30px;border:0!important;
+  display:flex;flex-direction:column;box-shadow:0 10px 26px rgba(0,0,0,.28);min-height:0}
+.inbox .ib-note .label{color:var(--on);opacity:.72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:none}
+.inbox .ib-note p{font-size:22px;line-height:1.25;font-weight:400;margin-top:8px;letter-spacing:-.01em;
+  display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.inbox .ib-note p span{white-space:nowrap}
+.inbox .ib-note .ib-fx{white-space:nowrap;margin-top:auto;padding-top:9px;border-top:1px solid rgba(0,0,0,.16);font-size:16px;font-weight:600;display:flex;align-items:center;gap:7px;flex:none;min-width:0}
+.inbox .ib-fx span{overflow:hidden;text-overflow:ellipsis}
+.inbox .ib-fx .ico{width:18px;height:18px;stroke-width:2}
+
+/* ── sent ── */
+.inbox .ib-fuse{position:absolute;left:0;right:0;top:-1px;height:3px;background:var(--accent);transform-origin:0 50%;
+  animation:ib-fuse 8s linear forwards}
+@keyframes ib-fuse{to{transform:scaleX(0)}}
+.inbox .ib-sent .ib-cols{grid-template-columns:minmax(0,1fr) 364px}
+.inbox .ib-done{display:flex;gap:16px;align-items:flex-start}
+.inbox .ib-done>div{min-width:0}
+.inbox .ib-tick{width:44px;height:44px;border-radius:50%;background:var(--accent);color:var(--on);display:flex;align-items:center;justify-content:center;flex:none}
+.inbox .ib-tick .ico{width:26px;height:26px;stroke-width:2.6}
+.inbox .ib-done .ib-q{margin:8px 0 0;border:0;padding:0;font-size:19px;color:var(--muted)}
+.inbox .ib-done .ib-fx{display:flex;align-items:center;gap:7px;font-size:16px;font-weight:600;margin-top:8px;white-space:nowrap}
+.inbox .ib-done .ib-fx .ico{color:var(--accent)}
+.inbox .ib-next .label{margin-bottom:8px}
+.inbox .ib-next p{font-size:17px;font-weight:500;margin:5px 0 0 42px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ── discreet: counts, senders and whose inbox. Nothing else. ── */
+.inbox .ib-trio{flex:1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-content:center;padding-bottom:4px}
+.inbox .ib-trio .ib-it{padding:4px 26px;border-left:1px solid var(--hair);min-width:0}
+.inbox .ib-trio .ib-it:first-child{padding-left:0;border-left:0}
+.inbox .ib-trio .ib-r1 b{font-size:23px}
+.inbox .ib-trio .ib-r2{display:flex;align-items:center;gap:12px;margin:9px 0 0 42px;min-height:20px}
+.inbox .ib-trio .ib-it.on .ib-r1 b{box-shadow:0 3px 0 var(--accent)}

@@ -305,8 +305,36 @@ class WebViewConfig(BaseModel):
     extra_args: list[str] = Field(default_factory=list)
 
 
+class SkySurfaceConfig(BaseModel):
+    """The browser window behind ``display.renderer: html``.
+
+    See :mod:`boxbot.displays.sky_surface`. It shows only the page
+    bundled with boxBot and has no network access.
+    """
+
+    # Browser binary: a name on PATH or an absolute path.
+    browser: str = "chromium"
+    # No window (dev machines, tests). Previews are always headless.
+    headless: bool = False
+    # Browser profiles, recreated on every launch.
+    state_dir: str = "data/display"
+    # Seconds to wait for the browser and page to come up.
+    launch_timeout: int = 30
+    # Household members in a stable order: position picks the colour a
+    # person keeps on every display (first four; others share one).
+    people: list[str] = Field(default_factory=list)
+    # Extra browser flags (e.g. ``--no-sandbox`` in a container).
+    extra_args: list[str] = Field(default_factory=list)
+
+
 class DisplayConfig(BaseModel):
     """Display manager settings."""
+
+    # "pil": the original block renderer, blitted through the screen
+    # backend below. "html": the Living Sky page in a local browser
+    # window (see ``html``); the screen backend is not used.
+    renderer: Literal["pil", "html"] = "pil"
+    html: SkySurfaceConfig = Field(default_factory=SkySurfaceConfig)
 
     rotation_interval: int = 30
     idle_displays: list[str] = Field(

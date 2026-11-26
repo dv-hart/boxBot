@@ -1,0 +1,227 @@
+/* Original block vocabulary in the Living Sky look. Markup: base.js. Every class is `bb-*` (or `t-*` on a
+   .bb-text). Colour comes from the stage tokens; a card remaps them to the slab set, so the same block markup
+   works on the scene and on a card. */
+
+/* ── tokens these blocks add (`--bb-*`): status colours, hairline, ink on a filled pill, halo tone.
+   Set on the stage so a block also works inside another block file's container; a card or slab resets them. ── */
+#stage{--bb-dim:var(--muted);--bb-line:var(--hair2);--bb-on:#1a1326;--bb-halo:rgba(16,8,40,.55);
+  --bb-ok:#8fdc9f;--bb-warn:#ffb866;--bb-err:#ff9484;--bb-sec:#8ccbff}
+#stage.ink-dark{--bb-halo:rgba(255,255,255,.8);--bb-on:#fffaf0;--bb-ok:#12603a;--bb-warn:#8a4a00;--bb-err:#a3261c;--bb-sec:#1d5590}
+#stage.dim,#stage.no-scene{--bb-halo:rgba(16,8,40,.55);--bb-on:#1a1326;--bb-ok:#8fdc9f;--bb-warn:#ffb866;--bb-err:#ff9484;--bb-sec:#8ccbff}
+
+/* ── root ── */
+.bb-root{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center}
+#stage.no-scene .bb-root{--text:#fff6e6;--muted:rgba(255,246,230,.72);--accent:#ffcf7d;--hair:rgba(255,246,230,.16);--hair2:rgba(255,246,230,.3);
+  --chip:rgba(255,246,230,.12);text-shadow:none}
+.bb-root > .bb-row,.bb-root > .bb-column,.bb-root > .bb-columns,.bb-root > .bb-image,.bb-root > .bb-rotate{flex:1 1 auto;min-height:0;min-width:0}
+.bb-root > .bb-card{flex:1 1 auto;margin:30px 36px;min-height:0}
+.bb-root > .bb-text{padding:34px 44px}
+
+/* Centred heroes: the middle of the screen is the skyline, so a centred root (and a root that centres with
+   flex spacers: the first one is .bb-lift) hangs its content at ~1/4 of the free height, in the open sky. */
+.bb-rise{justify-content:flex-start !important}
+.bb-rise::before,.bb-rise::after{content:'';flex:.34 1 0}
+.bb-rise::before{margin-bottom:calc(-1 * var(--g,0px))}
+.bb-rise::after{flex-grow:1;margin-top:calc(-1 * var(--g,0px))}
+.bb-spacer.bb-flex.bb-lift{flex-grow:.34}
+#stage.no-scene .bb-rise::before,#stage.no-scene .bb-spacer.bb-flex.bb-lift{flex-grow:1}
+
+/* Ink per element, set after mount by zoneInk (base.js): .bb-lite / .bb-dark swap the token set where the
+   scene's own ink would not hold against what is behind the element; .bb-halo adds a soft halo of the
+   opposite tone (mist behind dark ink, shade behind light ink). Static: painted once. */
+.bb-lite{--text:var(--ground);--muted:rgba(255,246,230,.86);--accent:#ffd27a;--bb-dim:rgba(255,246,230,.86);
+  --hair:rgba(255,246,230,.18);--hair2:rgba(255,246,230,.34);--chip:rgba(255,246,230,.14);--bb-line:rgba(255,246,230,.34);
+  --bb-on:#1a1326;--bb-ok:#8fdc9f;--bb-warn:#ffb866;--bb-err:#ff9484;--bb-sec:#8ccbff;--bb-halo:rgba(7,7,20,.62);
+  --p1:var(--l1);--p2:var(--l2);--p3:var(--l3);--p4:var(--l4);--family:var(--lf);color:var(--text)}
+.bb-dark{--text:#1d1430;--muted:rgba(29,20,48,.78);--accent:#9c3d0a;--bb-dim:rgba(29,20,48,.78);
+  --hair:rgba(29,20,48,.16);--hair2:rgba(29,20,48,.3);--chip:rgba(29,20,48,.1);--bb-line:rgba(29,20,48,.3);
+  --bb-on:#fffaf0;--bb-ok:#12603a;--bb-warn:#8a4a00;--bb-err:#a3261c;--bb-sec:#1d5590;--bb-halo:rgba(255,255,255,.8);color:var(--text)}
+.bb-halo{--muted:color-mix(in srgb,var(--text) 88%,transparent);--bb-dim:var(--muted);
+  text-shadow:0 0 2px var(--bb-halo),0 0 8px var(--bb-halo),0 0 18px var(--bb-halo),0 0 36px var(--bb-halo)}
+.bb-halo.bb-clock,.bb-halo.d{text-shadow:0 0 22px var(--bb-halo),0 0 46px var(--bb-halo)}   /* heroes: mist only, no outline */
+/* clipped text clips its halo too: give it room and a tighter glow */
+.bb-halo.bb-clip1,.bb-halo.bb-clip{padding:9px 12px;margin:-9px -12px;text-shadow:0 0 2px var(--bb-halo),0 0 7px var(--bb-halo)}
+.bb-halo.bb-clip{padding:0 12px;margin:0 -12px}
+svg.bb-halo{filter:drop-shadow(0 0 7px var(--bb-halo))}
+.bb-badge.bb-halo{text-shadow:none}
+
+/* ── containers ── */
+.bb{min-width:0}
+.bb-row{display:flex;align-items:center}
+.bb-row > .bb,.bb-flow > .bb{flex:0 1 auto}
+.bb-row > .bb-icon,.bb-row > .bb-badge,.bb-row > .bb-clock,.bb-row > .bb-countdown,.bb-row > .bb-emoji,
+.bb-flow > .bb-icon,.bb-flow > .bb-badge{flex:none}
+.bb-row > .bb-keep,.bb-flow > .bb-keep{flex:none;white-space:nowrap}
+.bb-spread > .bb:not(.bb-spacer),.bb-spread > .bb-flow > .bb:not(.bb-spacer){flex:1 1 0}
+.bb-flow{display:contents}
+.bb-column,.bb-card{display:flex;flex-direction:column}
+.bb-column > .bb,.bb-card > .bb{flex:none}
+.bb-columns{display:flex;align-items:stretch}
+.bb-col{display:flex;flex-direction:column;min-width:0;min-height:0}
+.bb-col > .bb{flex:1 1 auto;min-height:0}
+.bb-column > .bb-grow,.bb-card > .bb-grow,.bb-row > .bb-grow{flex:1 1 0;min-height:0}
+.bb-row > .bb-column.bb-grow,.bb-row > .bb-card.bb-grow{align-self:stretch}
+
+/* A spacer is an item, so flex `gap` lands on both sides of it; the old engine counted one. Take one back. */
+.bb-spacer{display:block;flex:none;align-self:stretch}
+.bb-spacer.bb-flex{flex:1 1 0}
+.bb-row > .bb-spacer,.bb-flow > .bb-spacer{margin-left:calc(-1 * var(--g,0px))}
+.bb-column > .bb-spacer,.bb-card > .bb-spacer{margin-top:calc(-1 * var(--g,0px))}
+
+.bb-divider{display:block;flex:none;align-self:stretch;background:var(--bb-line);border-radius:1px}
+.bb-divider.bb-v{min-height:1.2em}
+
+/* Card: the slab recipe as a rounded surface. Dark ink tinted from the atmosphere's ground, cream text. */
+.bb-card{gap:8px;padding:20px;border-radius:22px}
+/* Plate: the same surface, laid under a table, chart or key_value that a legacy layout put straight on the
+   scene (class set after mount). Side padding is cancelled by margin; it costs 24 px of height. */
+.bb-plate{padding:12px 18px;margin:0 -18px;border-radius:18px}
+.bb-card,.bb-plate{background:linear-gradient(180deg,color-mix(in srgb,var(--slab-solid) 86%,transparent),color-mix(in srgb,var(--slab-solid) 93%,transparent));
+  box-shadow:inset 0 0 0 1px var(--sh);color:var(--st);text-shadow:none;
+  --text:var(--st);--muted:var(--sm);--accent:var(--sa);--hair:var(--sh);--hair2:var(--sh2);--chip:var(--sh);
+  --p1:var(--l1);--p2:var(--l2);--p3:var(--l3);--p4:var(--l4);--family:var(--lf)}
+.bb-card,.bb-plate,.slab{--bb-dim:color-mix(in srgb,var(--st) 56%,transparent);--bb-line:var(--sh);--bb-on:var(--on-accent);
+  --bb-ok:#8fdc9f;--bb-warn:#ffb866;--bb-err:#ff9484;--bb-sec:#8ccbff}
+.bb-card .bb-card,.bb-card.bb-card-alt{background:var(--raise);box-shadow:none}
+.bb-card.bb-card-lit{box-shadow:none}
+.bb-card.bb-card-paper{box-shadow:none;color:#1c1626;--text:#1c1626;--muted:rgba(28,22,38,.7);--accent:#a4420c;--hair:rgba(28,22,38,.16);
+  --hair2:rgba(28,22,38,.3);--chip:rgba(28,22,38,.1);--bb-dim:rgba(28,22,38,.56);--bb-line:rgba(28,22,38,.18);--bb-on:#fffaf0;
+  --bb-ok:#12603a;--bb-warn:#8a4a00;--bb-err:#a3261c;--bb-sec:#1d5590}
+#stage.dim .bb-card,#stage.dim .bb-plate,#stage.dim .slab{--bb-ok:#84c892;--bb-warn:#e6a960;--bb-err:#e68a7c;--bb-sec:#82b9e6}
+
+/* ── text ── */
+.bb-text{font-size:20px;font-weight:500;line-height:1.3;overflow-wrap:break-word}
+.bb-text.t-title{font-size:52px;line-height:1.04;font-weight:340;letter-spacing:-.022em}
+.bb-text.t-heading{font-size:34px;line-height:1.12;font-weight:350}
+.bb-text.t-subtitle{font-size:24px;line-height:1.25}
+.bb-text.t-caption{font-size:17px;line-height:1.35}
+.bb-text.t-small{font-size:16px;line-height:1.35}
+.bb-text.t-label{font-size:16px;font-weight:700;letter-spacing:.14em}
+.bb-text.t-px.d{letter-spacing:-.022em}
+.bb-clip1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-bottom:.08em}
+.bb-clip{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden}
+
+/* ── icon, emoji ── */
+.bb-icon.bb-i-sm{width:22px;height:22px;stroke-width:1.9}
+.bb-icon.bb-i-md{width:28px;height:28px}
+.bb-icon.bb-i-lg{width:38px;height:38px;stroke-width:1.55}
+.bb-icon.bb-i-xl{width:60px;height:60px;stroke-width:1.3}
+.bb-emoji{line-height:1;flex:none}
+.bb-emoji.bb-i-md{font-size:28px}.bb-emoji.bb-i-lg{font-size:38px}.bb-emoji.bb-i-xl{font-size:60px}
+
+/* ── metric ── */
+.bb-m-label{display:flex;align-items:center;gap:8px}
+.bb-m-label .bb-icon{color:var(--accent)}
+.bb-m-row{display:flex;align-items:baseline;gap:8px;margin-top:2px;white-space:nowrap}
+.bb-m-val{font-size:46px;line-height:1.08;font-weight:350;letter-spacing:-.025em}
+.bb-m-unit{font-size:20px;font-weight:600;color:var(--muted)}
+.bb-m-chg{font-size:18px;font-weight:700;margin-left:6px}
+
+/* ── badge ── */
+.bb-badge{display:inline-block;align-self:center;padding:3px 13px 4px;border-radius:999px;font-size:16px;font-weight:700;line-height:1.35;
+  color:var(--bb-on);text-shadow:none;white-space:nowrap;letter-spacing:.01em}
+.bb-column > .bb-badge,.bb-card > .bb-badge{align-self:flex-start}
+
+/* ── list ── */
+.bb-list{display:flex;flex-direction:column;gap:9px;font-size:20px;font-weight:500;line-height:1.3}
+.bb-l-item{display:flex;align-items:flex-start;gap:12px}
+.bb-l-item > span:last-child{min-width:0;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+.bb-l-item .bb-icon{margin-top:2px}
+.bb-l-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--muted);margin:10px 3px 0 4px}
+.bb-l-check{flex:none;width:19px;height:19px;border-radius:6px;border:1.8px solid var(--muted);margin-top:3px}
+.bb-l-n{flex:none;min-width:20px;font-weight:700;color:var(--accent)}
+.bb-l-more{font-size:17px;font-weight:600;color:var(--muted);padding-left:26px}
+
+/* ── table, key_value ── */
+.bb-table{display:grid;column-gap:18px;font-size:19px;font-weight:500;line-height:1.3}
+.bb-th,.bb-td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:8px 0}
+.bb-th{font-size:16px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);padding:0 0 8px;border-bottom:1px solid var(--bb-line)}
+.bb-td{border-bottom:1px solid var(--hair);font-variant-numeric:tabular-nums}
+.bb-striped .bb-td{border-bottom:0}
+.bb-striped .bb-odd{background:var(--chip);box-shadow:-9px 0 0 var(--chip),9px 0 0 var(--chip)}
+.bb-kv{display:grid;grid-template-columns:minmax(0,max-content) minmax(0,1fr);gap:8px 22px;font-size:20px;line-height:1.3}
+.bb-k{color:var(--muted);font-weight:500}
+.bb-v{font-weight:600}
+.bb-k,.bb-v{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ── progress ── */
+.bb-p-label{font-size:17px;font-weight:600;margin-bottom:7px}
+.bb-p-track{height:10px;border-radius:5px;background:var(--bb-line);overflow:hidden}
+.bb-p-track > i{display:block;height:100%;border-radius:5px;min-width:10px}
+
+/* ── image ── */
+.bb-image{position:relative;--r:16px;aspect-ratio:16/9;width:100%;max-width:356px;display:flex;align-items:center;justify-content:center}
+.bb-row > .bb-image{flex:0 1 356px}
+.bb-image.bb-fill,.bb-image.bb-grow{aspect-ratio:auto;max-width:none;min-height:0}
+.bb-image > img{display:block;border-radius:var(--r)}
+.bb-fit-cover > img,.bb-fit-fill > img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.bb-fit-fill > img{object-fit:fill}
+.bb-fit-contain > img{position:absolute;inset:0;margin:auto;max-width:100%;max-height:100%;width:auto;height:auto}
+.bb-noimg-ico{display:none}
+.bb-image.bb-noimg{background:var(--chip);border-radius:var(--r);box-shadow:inset 0 0 0 1px var(--hair)}
+.bb-image.bb-noimg .bb-noimg-ico{display:block;width:44px;height:44px;stroke-width:1.3;color:var(--muted)}
+.bb-root > .bb-image.bb-noimg{flex:none;align-self:center;width:320px;height:200px;--r:22px}
+
+/* ── chart ── */
+.bb-chart{display:flex;flex-direction:column;min-height:90px}
+.bb-column > .bb-chart,.bb-card > .bb-chart{flex:0 1 auto}
+.bb-c-plot{position:relative;flex:1 1 0;min-height:0}
+.bb-c-plot > svg{position:absolute;inset:0;width:100%;height:100%;display:block;overflow:visible}
+.bb-c-plot path,.bb-c-plot line{vector-effect:non-scaling-stroke}
+.bb-c-grid{stroke:var(--bb-line);stroke-width:1}
+.bb-c-line{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}
+.bb-c-plot > i{position:absolute;width:11px;height:11px;margin:-5.5px 0 0 -5.5px;border-radius:50%;box-shadow:0 0 0 3px var(--slab-solid)}
+.bb-c-x{position:relative;flex:none;height:22px;margin-top:9px;font-size:16px;font-weight:600;color:var(--muted)}
+.bb-c-x > span{position:absolute;top:0;transform:translateX(-50%);white-space:nowrap;line-height:22px}
+.bb-c-x > .bb-c-first{transform:none}
+.bb-c-x > .bb-c-last{transform:translateX(-100%)}
+.bb-c-legend{flex:none;display:flex;gap:20px;margin-top:10px;font-size:16px;font-weight:600;color:var(--muted)}
+.bb-c-legend span{display:inline-flex;align-items:center;gap:8px}
+.bb-c-legend i{width:12px;height:12px;border-radius:4px}
+.bb-chart-empty{align-items:center;justify-content:center;border-radius:14px;background:var(--chip);font-size:17px;font-weight:500;color:var(--muted)}
+
+/* ── clock, countdown ── */
+.bb-clock{text-align:center;white-space:nowrap}
+.bb-ck-time{display:inline-flex;align-items:baseline}
+.bb-ck-t,.bb-ck-s{font-weight:360;letter-spacing:-.035em;line-height:.9}
+.bb-ck-s{opacity:.62}
+.bb-ck-m{font-weight:600;letter-spacing:.04em;opacity:.84}
+.bb-clock-md .bb-ck-t,.bb-clock-md .bb-ck-s{font-size:44px;font-weight:380;line-height:1}
+.bb-clock-md .bb-ck-m{font-size:17px;margin-left:6px}
+.bb-clock-md .bb-ck-date{margin-bottom:2px}
+.bb-clock-lg .bb-ck-t,.bb-clock-lg .bb-ck-s{font-size:82px}
+.bb-clock-lg .bb-ck-m{font-size:22px;margin-left:9px}
+.bb-clock-lg .bb-ck-date{margin-bottom:10px}
+.bb-clock-xl .bb-ck-t,.bb-clock-xl .bb-ck-s{font-size:168px;font-variation-settings:"opsz" 30}
+.bb-clock-xl .bb-ck-m{font-size:30px;margin-left:14px}
+.bb-clock-xl .bb-ck-date{font-size:18px;margin-bottom:22px}
+.bb-cd-t{font-size:46px;line-height:1.05;font-weight:360;letter-spacing:-.025em;color:var(--accent)}
+.bb-countdown .label{margin-bottom:2px}
+
+/* ── composites ── */
+.bb-widget{gap:14px}
+.bb-none{font-size:24px;font-style:italic;font-weight:320;color:var(--muted)}
+.bb-wx-now{display:flex;align-items:center;gap:16px}
+.bb-wx-t{font-size:64px;line-height:1;font-weight:350;letter-spacing:-.03em}
+.bb-wx-c{display:flex;flex-direction:column;gap:2px;margin-left:6px;min-width:0}
+.bb-wx-c b{font-size:22px;font-weight:600}
+.bb-wx-c span{font-size:17px;font-weight:500;color:var(--muted);display:inline-flex;align-items:center;white-space:nowrap}
+.bb-sep{width:4px;height:4px;border-radius:50%;background:currentColor;margin:0 10px;opacity:.7}
+.bb-wx-days{display:flex;border-top:1px solid var(--hair);padding-top:14px;margin-top:2px}
+.bb-wx-days > div{flex:1 1 0;display:flex;flex-direction:column;align-items:center;gap:5px;font-size:18px}
+.bb-wx-days b{font-weight:700}
+.bb-wx-days div > span:last-child{color:var(--muted);font-weight:500;font-size:16px;margin-top:-4px}
+.bb-cal-row{display:flex;gap:16px;align-items:baseline;font-size:20px;line-height:1.3}
+.bb-cal-t{flex:none;min-width:86px;font-size:17px;font-weight:700;color:var(--accent);text-align:right}
+.bb-cal-row > div{min-width:0;display:flex;flex-direction:column}
+.bb-cal-row b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bb-cal-row div > span{font-size:16px;font-weight:500;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ── rotate, page_dots ── */
+.bb-rotate{display:grid}
+.bb-page{grid-area:1/1;display:flex;flex-direction:column;min-width:0;min-height:0;opacity:0;transition:opacity .6s ease}
+.bb-page.on{opacity:1}
+.bb-page > .bb{flex:1 1 auto}
+.bb-dots{display:flex;justify-content:center;gap:10px;--dot:var(--accent)}
+.bb-dots > i{width:9px;height:9px;border-radius:50%;background:var(--bb-line);transition:background-color .4s ease}
+.bb-dots > i.on{background:var(--dot)}

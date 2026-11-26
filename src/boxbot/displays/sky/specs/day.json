@@ -1,0 +1,37 @@
+{
+  "name": "day",
+  "theme": "living_sky",
+  "transition": "crossfade",
+  "scene": { "horizon": "high", "seed": 21 },
+  "data_sources": [
+    { "name": "weather", "type": "integration", "refresh": 1800 },
+    { "name": "calendar", "type": "integration", "inputs": { "action": "list_upcoming_events", "since": "today", "max_results": 20 }, "refresh": 600 },
+    { "name": "day", "type": "static", "value": { "background": [] } }
+  ],
+  "layout": {
+    "type": "zones",
+    "children": [
+      {
+        "type": "zone",
+        "place": "sky",
+        "children": [
+          { "type": "cal_header", "range": "day", "events": "{calendar.events}" }
+        ]
+      },
+      {
+        "type": "zone",
+        "place": "sky-right",
+        "children": [
+          { "type": "now", "style": "compact", "weather": "{weather}" }
+        ]
+      },
+      {
+        "type": "surface",
+        "dock": "bottom",
+        "children": [
+          { "type": "day_grid", "events": "{calendar.events}", "from": "07:30", "to": "20:30", "background": "{day.background}" }
+        ]
+      }
+    ]
+  }
+}

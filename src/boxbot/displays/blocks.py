@@ -550,6 +550,13 @@ class PageDotsBlock(Block):
 # Block registry and parser
 # ---------------------------------------------------------------------------
 
+def is_sky_block(block_type: str) -> bool:
+    """True for a block only the HTML renderer draws (see ``sky_blocks``)."""
+    from boxbot.displays.sky_blocks import SKY_BLOCKS
+
+    return block_type in SKY_BLOCKS
+
+
 # Maps block type strings to their dataclass types
 BLOCK_REGISTRY: dict[str, type[Block]] = {
     "row": RowBlock,
@@ -594,6 +601,14 @@ def parse_block(data: dict[str, Any]) -> Block:
     """
     block_type = data.get("type", "")
     cls = BLOCK_REGISTRY.get(block_type)
+    if cls is None and is_sky_block(block_type):
+        # Living Sky blocks are drawn by the page, which reads their
+        # params as they are: nothing to type-check into a dataclass.
+        return Block(
+            block_type=block_type,
+            children=[parse_block(c) for c in data.get("children", [])],
+            params={k: v for k, v in data.items() if k not in ("type", "children")},
+        )
     if cls is None:
         raise ValueError(
             f"Unknown block type '{block_type}'. "

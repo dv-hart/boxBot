@@ -70,6 +70,10 @@ class DisplaySpec:
     data_sources: list[DataSourceSpec] = field(default_factory=list)
     root_block: Block | None = None
     transition: str = "crossfade"
+    # HTML renderer only: options for the scene behind the display
+    # (``horizon``, ``scale``, ``vista``, ``hidden``). Values may be
+    # bindings. Ignored by the PIL renderer.
+    scene: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +105,14 @@ def parse_spec(data: dict[str, Any]) -> DisplaySpec:
     if layout_data:
         root_block = parse_block(layout_data)
 
+    scene = data.get("scene")
     return DisplaySpec(
         name=name,
         theme=theme,
         data_sources=sources,
         root_block=root_block,
         transition=transition,
+        scene=dict(scene) if isinstance(scene, dict) else {},
     )
 
 
@@ -152,6 +158,12 @@ def resolve_bindings(block: Block, data: dict[str, Any],
     resolved = copy.deepcopy(block)
     _resolve_block(resolved, data, repeat_item, current_item)
     return resolved
+
+
+def resolve_value(value: Any, data: dict[str, Any]) -> Any:
+    """Resolve the bindings in one value (string, list or dict) that
+    lives outside the block tree, such as a spec's ``scene`` options."""
+    return _resolve_value(value, data, None, None)
 
 
 def _resolve_block(block: Block, data: dict[str, Any],
@@ -313,7 +325,10 @@ def _navigate(obj: Any, path: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
-_VALID_THEMES = ("boxbot", "midnight", "daylight", "classic")
+# "living_sky" is the HTML renderer's look; the PIL renderer draws it
+# with the default theme.
+_VALID_THEMES = ("boxbot", "midnight", "daylight", "classic", "living_sky")
+_SCENE_KEYS = ("horizon", "scale", "vista", "hidden", "seed", "mountain")
 _VALID_TRANSITIONS = ("crossfade", "slide_left", "slide_right", "none")
 
 # Per-block enum constraints — field name → tuple of valid values. Keep
@@ -380,6 +395,13 @@ def validate_spec(spec: DisplaySpec) -> list[str]:
             f"Must be one of: {', '.join(_VALID_TRANSITIONS)}"
         )
 
+    for key in spec.scene:
+        if key not in _SCENE_KEYS:
+            errors.append(
+                f"Unknown scene option '{key}'. "
+                f"Must be one of: {', '.join(_SCENE_KEYS)}"
+            )
+
     # Validate data sources
     source_names: set[str] = set()
     for src in spec.data_sources:
@@ -415,6 +437,13 @@ def _validate_block(block: Block, errors: list[str],
                     source_names: set[str]) -> None:
     """Recursively validate a block and its children."""
     from boxbot.displays.blocks import BLOCK_REGISTRY
+    from boxbot.displays.sky_blocks import SKY_BLOCKS, validate_sky_block
+
+    if block.block_type in SKY_BLOCKS:
+        errors.extend(validate_sky_block(block.block_type, block.params))
+        for child in block.children:
+            _validate_block(child, errors, source_names)
+        return
 
     if block.block_type not in BLOCK_REGISTRY:
         errors.append(f"Unknown block type: '{block.block_type}'")

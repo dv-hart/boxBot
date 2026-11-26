@@ -25,6 +25,21 @@ Display Manager (manager.py)
   └── Renderer — pygame surface, animations, dirty rectangling
 ```
 
+## Two renderers
+
+`display.renderer: pil` (default) draws PIL frames for the screen HAL,
+as described below. `display.renderer: html` hands the screen to a
+local Chromium window showing the Living Sky page: the manager builds
+one JSON state per change and the page draws it.
+
+| File | Role (html renderer) |
+|---|---|
+| `sky/` | The page: scene, blocks, fonts, specs, fixtures. Contract in `sky/README.md` |
+| `sky_surface.py` | Launches and supervises the browser; pushes state over the DevTools pipe |
+| `sky_state.py` | Builds the state document; voice-presence tracker; photo records |
+| `sky_blocks.py` | Params of the blocks only the page draws (validation, `schema()`) |
+| `atmosphere.py` | Phase and weather for the scene, from sun position and forecast |
+
 ## Files
 
 ### `base.py`

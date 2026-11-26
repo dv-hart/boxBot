@@ -340,10 +340,17 @@ _community_themes: dict[str, Theme] = {}
 # ---------------------------------------------------------------------------
 
 
+# The HTML renderer's look. Its colours come from the sky, not from a
+# token table, so it is not a Theme; a spec that names it draws with the
+# default theme under the PIL renderer.
+LIVING_SKY = "living_sky"
+
+
 def get_theme(name: str) -> Theme:
     """Get a theme by name.
 
     Checks built-in themes first, then community themes.
+    ``living_sky`` resolves to the default theme (see above).
 
     Args:
         name: Theme name (e.g. 'boxbot', 'midnight').
@@ -354,6 +361,8 @@ def get_theme(name: str) -> Theme:
     Raises:
         KeyError: If the theme name is not found.
     """
+    if name == LIVING_SKY:
+        return THEME_BOXBOT
     if name in _BUILTIN_THEMES:
         return _BUILTIN_THEMES[name]
     if name in _community_themes:

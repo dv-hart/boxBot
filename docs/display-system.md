@@ -829,6 +829,53 @@ Rendering adapts to what's happening:
 | Static display | 0 fps | Sleep until next data source refresh |
 | Screen off | No rendering | Night mode or manual off |
 
+## HTML Renderer (Living Sky)
+
+`display.renderer` picks what draws the screen. `pil` is everything
+described above. `html` replaces the frame pipeline with one local
+Chromium window showing the page in `src/boxbot/displays/sky/`:
+
+```
+Display Manager ── state JSON (DevTools pipe) ──▶ sky/index.html
+  spec + data + args                               scene  = f(phase, weather)
+  + atmosphere (displays/atmosphere.py)            blocks = the block tree
+  + voice presence, status pill                    dock, pill, clocks
+```
+
+- **Same specs, same data sources, same bindings.** The manager
+  resolves bindings exactly as before and sends the resolved tree; the
+  page draws it. Every original block is implemented in
+  `sky/blocks/base.js`, so existing and agent-made displays keep
+  working.
+- **The scene.** A generative Seattle vista sits behind every display.
+  It is a pure function of the *atmosphere*: `phase` (dawn, noon,
+  afternoon, golden, dusk, night — from computed sunrise and sunset at
+  `BOXBOT_WEATHER_LAT/LON`) and `weather` (clear, partly, fog,
+  overcast, rain, snow — from the forecast text). Ink colours derive
+  from it, so contrast holds in every sky.
+- **Still declarative.** The agent knows what is on screen from the
+  spec, the data and `bb.display.get_active()["atmosphere"]`. No block
+  shows anything that is not in its params or the atmosphere.
+- **More displays and blocks.** `home`, `brief`, `week`, `day`,
+  `inbox`, `capture` and a new `picture` ship as specs in
+  `sky/specs/`. Their blocks (`agenda_timeline`, `week_grid`, `inbox`,
+  …) are drawn only by the page; `displays/sky_blocks.py` describes
+  their params for validation and `bb.display.schema()`. A spec may
+  also set `"scene": {horizon, scale, vista}` to move the skyline clear
+  of its content.
+- **Voice presence.** Listening, thinking and speaking draw as a dock
+  over the bottom of whatever is showing, driven by the voice events on
+  the bus (`sky_state.PresenceTracker`). The status pill is part of the
+  same state.
+- **Previews and screenshots** come from the browser: previews from a
+  second, headless instance, so authoring never touches the screen.
+- **Fallback.** If the browser cannot start, the manager logs an error
+  and draws with the PIL renderer.
+
+The page contract (state shape, how to write a block, tokens, render
+budget) is in `src/boxbot/displays/sky/README.md`; the browser's
+isolation is in [security.md](security.md#display-page-html-renderer).
+
 ## Preview Workflow
 
 The agent cannot see what it creates. The preview system lets it

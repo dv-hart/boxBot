@@ -132,6 +132,14 @@ from boxbot.displays.spec import (
 )
 from boxbot.core.paths import DISPLAYS_DIR, PROJECT_ROOT
 from boxbot.displays.themes import Theme, get_theme
+from boxbot.displays.atmosphere import build_atmosphere
+from boxbot.displays.sky_state import (
+    PresenceTracker,
+    build_state,
+    photo_items,
+    state_signature,
+)
+from boxbot.displays.sky_surface import PAGE_DIR, SkySurface, SkySurfaceError
 from boxbot.displays.web_view import (
     WebTarget,
     WebView,
@@ -155,8 +163,15 @@ _SLOW_LIVE_SECONDS = 60.0
 # 90s outlives any sane single tool call (sandbox scripts included).
 _STATUS_TTL_SECONDS = 90.0
 
+# HTML renderer: how often the scene's weather is refreshed when the
+# display on screen does not fetch weather itself, and how long an idle
+# preview browser is kept before it is closed.
+_ATMOSPHERE_WEATHER_SECONDS = 1800.0
+_PREVIEW_IDLE_SECONDS = 120.0
+
 # Default paths
 _BUILTINS_DIR = Path(__file__).parent / "builtins"
+_SKY_SPECS_DIR = PAGE_DIR / "specs"
 _USER_DISPLAYS_DIR = PROJECT_ROOT / "displays"
 _AGENT_DISPLAYS_DIR = DISPLAYS_DIR
 
@@ -257,13 +272,37 @@ class DisplayManager:
         self,
         width: int = 1024,
         height: int = 600,
+        renderer: str = "pil",
+        sky_config: Any | None = None,
     ) -> None:
         """Initialize the display manager.
 
         Args:
             width: Display width in pixels. Defaults to 1024.
             height: Display height in pixels. Defaults to 600.
+            renderer: ``"pil"`` (frames for the screen HAL) or ``"html"``
+                (state pushed to the Living Sky page in a browser).
+            sky_config: ``SkySurfaceConfig`` for the HTML renderer.
         """
+        # HTML renderer. ``_renderer_mode`` is what was asked for;
+        # ``_sky`` exists only once the browser is actually up, and
+        # every html branch below keys on it.
+        self._renderer_mode = renderer
+        self._sky_config = sky_config
+        self._sky: SkySurface | None = None
+        self._sky_preview: SkySurface | None = None
+        self._sky_preview_lock = asyncio.Lock()
+        self._sky_preview_closer: asyncio.TimerHandle | None = None
+        self._sky_signature = ""
+        self._sky_frame: str | None = None  # data: URL of a pushed frame
+        self._sky_minute = -1
+        self._presence = PresenceTracker()
+        self._presence_subscribed = False
+        self._atmo_weather: dict[str, Any] = {}
+        self._atmo_task: asyncio.Task[None] | None = None
+        self._slideshow_index = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+
         # Display specs registry
         self._specs: dict[str, DisplaySpec] = {}
 
@@ -355,12 +394,16 @@ class DisplayManager:
             agent_dir: Path to agent-created displays.
         """
         self._running = True
+        self._loop = asyncio.get_running_loop()
 
         # Load display specs from all directories
         await self.load_displays(builtins_dir, user_dir, agent_dir)
 
         # Subscribe to DisplaySwitch events on the event bus
         self._subscribe_events()
+
+        if self._renderer_mode == "html":
+            await self._start_sky()
 
         # Start background live-tick task for clock/countdown blocks
         self._live_tick_task = asyncio.create_task(
@@ -388,6 +431,7 @@ class DisplayManager:
 
         # Never leave a browser window behind on the screen
         await self._close_web_view()
+        await self._stop_sky()
 
         # Stop live tick task
         if self._live_tick_task and not self._live_tick_task.done():
@@ -632,6 +676,11 @@ class DisplayManager:
 
         # Load from all directories (file-based specs override builtins)
         self._load_specs_from_dir(builtins_path)
+        if self._renderer_mode == "html":
+            # The Living Sky displays (home, brief, week, …) and its
+            # versions of built-ins such as ``picture``. They use blocks
+            # only the page can draw, so the PIL renderer never sees them.
+            self._load_specs_from_dir(_SKY_SPECS_DIR)
         self._load_specs_from_dir(user_path)
         self._load_specs_from_dir(agent_path)
 
@@ -877,6 +926,8 @@ class DisplayManager:
         self._active_display = name
         self._active_spec = spec
         self._active_args = args
+        self._sky_frame = None
+        self._slideshow_index = 0
 
         # Render the initial frame
         self._render_and_update_frame()
@@ -1008,6 +1059,7 @@ class DisplayManager:
                     return
                 # Rotate left: [a, b, c] -> [b, c, a]
                 self._active_args["image_ids"] = ids[1:] + ids[:1]
+                self._slideshow_index = (self._slideshow_index + 1) % len(ids)
                 self._render_and_update_frame()
         except asyncio.CancelledError:
             pass
@@ -1480,6 +1532,19 @@ class DisplayManager:
 
         Thread-safe; same contract as the internal render path.
         """
+        if self._sky is not None:
+            import base64
+            import io
+
+            buffer = io.BytesIO()
+            frame.convert("RGB").save(buffer, format="JPEG", quality=80)
+            url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+            loop = self._loop
+            if loop is not None:
+                # Pushers run on their own threads; the page state is
+                # owned by the event loop.
+                loop.call_soon_threadsafe(self._set_sky_frame, url)
+            return
         self._update_frame(frame)
 
     def _update_frame(self, frame: Image.Image) -> None:
@@ -1514,6 +1579,8 @@ class DisplayManager:
             if self._base_frame is not None:
                 self._current_frame = self._composite_status(self._base_frame)
                 self._frame_generation += 1
+        if self._sky is not None:
+            self._push_sky_state()
 
     def clear_status_text(self) -> None:
         """Remove the status pill and restore the un-overlaid frame."""
@@ -1524,6 +1591,8 @@ class DisplayManager:
             if self._base_frame is not None:
                 self._current_frame = self._base_frame
                 self._frame_generation += 1
+        if self._sky is not None:
+            self._push_sky_state()
 
     def _composite_status(self, base: Image.Image) -> Image.Image:
         """Apply the status pill to ``base`` if one is active.
@@ -1554,6 +1623,10 @@ class DisplayManager:
         5. Updates the thread-safe frame buffer
         """
         if not self._active_display:
+            return
+
+        if self._sky is not None:
+            self._push_sky_state()
             return
 
         spec = self._specs.get(self._active_display)
@@ -1693,6 +1766,335 @@ class DisplayManager:
         return renderer.render_preview(spec, preview_data)
 
     # ------------------------------------------------------------------
+    # HTML renderer (Living Sky)
+    # ------------------------------------------------------------------
+
+    @property
+    def renderer(self) -> str:
+        """The renderer actually drawing the screen: ``html`` or ``pil``.
+
+        ``html`` only while the browser surface is up — if it could not
+        start, the manager is drawing PIL frames and says so.
+        """
+        return "html" if self._sky is not None else "pil"
+
+    async def _start_sky(self) -> None:
+        """Bring up the browser surface, or stay on PIL if it will not start."""
+        from boxbot.core.config import SkySurfaceConfig
+
+        config = self._sky_config or SkySurfaceConfig()
+        surface = SkySurface(config, size=(self._width, self._height))
+        try:
+            await surface.start()
+        except SkySurfaceError as e:
+            logger.error(
+                "HTML renderer unavailable (%s) — drawing with the PIL "
+                "renderer instead", e,
+            )
+            return
+        self._sky = surface
+        self._sky_config = config
+        self._subscribe_presence()
+        self._atmo_task = asyncio.create_task(
+            self._atmosphere_weather_loop(), name="display-atmosphere-weather",
+        )
+        logger.info("HTML renderer started")
+
+    async def _stop_sky(self) -> None:
+        self._unsubscribe_presence()
+        if self._atmo_task is not None:
+            self._atmo_task.cancel()
+            self._atmo_task = None
+        if self._sky_preview_closer is not None:
+            self._sky_preview_closer.cancel()
+            self._sky_preview_closer = None
+        for surface in (self._sky, self._sky_preview):
+            if surface is not None:
+                await surface.stop()
+        self._sky = self._sky_preview = None
+
+    async def _atmosphere_weather_loop(self) -> None:
+        """Keep the scene's weather current.
+
+        The sky is behind every display, including ones that never
+        asked for a forecast (``picture``, ``clock``), so the manager
+        fetches it on its own account. A display's own weather source
+        wins when it has one — see :meth:`get_atmosphere`.
+        """
+        source = create_source(
+            "weather", "integration",
+            {"refresh": int(_ATMOSPHERE_WEATHER_SECONDS)},
+        )
+        try:
+            while self._running:
+                try:
+                    data = await source.do_fetch()
+                except Exception:
+                    logger.debug("Atmosphere weather fetch failed", exc_info=True)
+                    data = {}
+                if isinstance(data, dict) and data.get("condition"):
+                    if data.get("condition") != self._atmo_weather.get("condition"):
+                        self._source_dirty = True
+                    self._atmo_weather = data
+                await asyncio.sleep(_ATMOSPHERE_WEATHER_SECONDS)
+        except asyncio.CancelledError:
+            pass
+
+    def get_atmosphere(self) -> dict[str, Any]:
+        """Phase, weather and sun for the scene behind the display.
+
+        This is what the agent reads to know what the sky looks like.
+        """
+        weather = self._data_manager.get_data("weather")
+        if not (isinstance(weather, dict) and weather.get("condition")):
+            weather = self._atmo_weather
+        dim = False
+        try:
+            from boxbot.core.config import get_config
+
+            night = get_config().display.night_mode
+            dim = night.enabled and self._is_night_mode(night.start, night.end)
+        except (RuntimeError, ImportError):
+            pass
+        return build_atmosphere(weather=weather, dim=dim)
+
+    def _household(self) -> list[str]:
+        people = getattr(self._sky_config, "people", None)
+        return list(people) if people else []
+
+    def _sky_data(self, spec: DisplaySpec, data: dict[str, Any],
+                  args: dict[str, Any]) -> dict[str, Any]:
+        """``data`` plus what only the manager knows: args and photos."""
+        data = {**data, "args": dict(args)}
+        ids = args.get("image_ids")
+        if isinstance(ids, list) and ids:
+            refs = [str(i) for i in ids]
+            items = photo_items(refs, _resolve_photo_refs(refs))
+            index = self._slideshow_index if spec.name == self._active_display else 0
+            data["photos"] = {
+                "items": items,
+                "count": len(refs),
+                # 1-based, for "3 of 12" and the position pips.
+                "position": {"index": index + 1, "count": len(refs)},
+            }
+        return data
+
+    def _sky_state_for(
+        self,
+        spec: DisplaySpec,
+        data: dict[str, Any],
+        args: dict[str, Any],
+        *,
+        live: bool,
+    ) -> dict[str, Any] | None:
+        """Page state for ``spec``. ``live`` adds what belongs to the
+        screen in the room (status pill, voice dock, pushed frame) and
+        is off for previews."""
+        if spec.root_block is None:
+            return None
+        data = self._sky_data(spec, data, args)
+        resolved = resolve_bindings(spec.root_block, data)
+        _resolve_photo_sources(resolved)
+        _resolve_photo_params(resolved)
+        slideshow = live and self._slideshow_task is not None
+        return build_state(
+            spec, resolved, data, args,
+            atmosphere=self.get_atmosphere(),
+            people=self._household(),
+            status=self._status_text if live else None,
+            presence=self._presence.current() if live else None,
+            frame=self._sky_frame if live else None,
+            # A slideshow step is the same display with a new photo: it
+            # should fade like a switch, not snap like a data refresh.
+            transition="always" if slideshow else None,
+        )
+
+    def _push_sky_state(self) -> None:
+        """Send the page what should be on screen, if that changed."""
+        if self._sky is None or not self._active_display:
+            return
+        spec = self._specs.get(self._active_display)
+        if spec is None:
+            return
+        try:
+            state = self._sky_state_for(
+                spec, self._data_manager.get_all_data(), self._active_args, live=True,
+            )
+        except Exception:
+            logger.exception("Could not build state for '%s'", self._active_display)
+            return
+        if state is None:
+            return
+        signature = state_signature(state)
+        if signature == self._sky_signature:
+            return
+        self._sky_signature = signature
+        self._sky.submit(state)
+
+    def _set_sky_frame(self, url: str) -> None:
+        self._sky_frame = url
+        self._push_sky_state()
+
+    # -- voice presence -------------------------------------------------
+
+    def _presence_events(self) -> list[tuple[Any, Any]]:
+        from boxbot.core import events as ev
+
+        return [
+            (ev.WakeWordHeard, self._on_presence_wake),
+            (ev.SpeakerIdentified, self._on_presence_speaker),
+            (ev.TranscriptDraft, self._on_presence_draft),
+            (ev.TranscriptReady, self._on_presence_transcript),
+            (ev.AgentToolCalled, self._on_presence_tool),
+            (ev.AgentSpeaking, self._on_presence_speaking),
+            (ev.AgentSpeakingDone, self._on_presence_speaking_done),
+            (ev.VoiceSessionEnded, self._on_presence_ended),
+            (ev.ConversationEnded, self._on_presence_ended),
+        ]
+
+    def _subscribe_presence(self) -> None:
+        if self._presence_subscribed:
+            return
+        try:
+            from boxbot.core.events import get_event_bus
+
+            bus = get_event_bus()
+            for event_type, handler in self._presence_events():
+                bus.subscribe(event_type, handler)
+            self._presence_subscribed = True
+        except Exception:
+            logger.exception("Could not subscribe to voice events")
+
+    def _unsubscribe_presence(self) -> None:
+        if not self._presence_subscribed:
+            return
+        self._presence_subscribed = False
+        try:
+            from boxbot.core.events import get_event_bus
+
+            bus = get_event_bus()
+            for event_type, handler in self._presence_events():
+                bus.unsubscribe(event_type, handler)
+        except Exception:
+            logger.debug("Could not unsubscribe from voice events")
+
+    # These sit on the voice pipeline's publish path: each only flips
+    # the tracker and queues a push, nothing waits on the browser.
+
+    async def _on_presence_wake(self, event: Any) -> None:
+        self._presence.wake_word()
+        self._push_sky_state()
+
+    async def _on_presence_speaker(self, event: Any) -> None:
+        self._presence.speaker(getattr(event, "person_name", "") or None)
+        self._push_sky_state()
+
+    async def _on_presence_draft(self, event: Any) -> None:
+        self._presence.draft(getattr(event, "text", ""))
+        self._push_sky_state()
+
+    async def _on_presence_transcript(self, event: Any) -> None:
+        if getattr(event, "source", "voice") != "voice":
+            return
+        self._presence.transcript(getattr(event, "raw_text", ""))
+        self._push_sky_state()
+
+    async def _on_presence_tool(self, event: Any) -> None:
+        if getattr(event, "channel", "") != "voice":
+            return
+        self._presence.tool(getattr(event, "status_text", ""))
+        self._push_sky_state()
+
+    async def _on_presence_speaking(self, event: Any) -> None:
+        self._presence.speaking(getattr(event, "text", ""))
+        self._push_sky_state()
+
+    async def _on_presence_speaking_done(self, event: Any) -> None:
+        self._presence.speaking_done()
+        self._push_sky_state()
+
+    async def _on_presence_ended(self, event: Any) -> None:
+        if getattr(event, "channel", "voice") != "voice":
+            return
+        self._presence.ended()
+        self._push_sky_state()
+
+    # -- pixels for the agent --------------------------------------------
+
+    async def capture_frame(self) -> Image.Image | None:
+        """An image of what is on the screen now, whichever renderer drew it."""
+        if self._sky is None:
+            return self.get_current_frame()
+        try:
+            png = await self._sky.screenshot()
+        except SkySurfaceError as e:
+            logger.warning("Screen capture failed: %s", e)
+            return None
+        return _png_to_image(png)
+
+    async def render_preview_image(
+        self,
+        name: str,
+        data: dict[str, Any] | None = None,
+        args: dict[str, Any] | None = None,
+    ) -> Image.Image | None:
+        """Render a registered display for the agent to look at.
+
+        Under the HTML renderer the preview is drawn by a second,
+        headless browser so authoring never disturbs the screen. The
+        sky in a preview is the sky right now.
+        """
+        if self._sky is None:
+            return self.render_preview(name, data=data, args=args)
+        spec = self._specs.get(name)
+        if spec is None:
+            logger.warning("Display '%s' not found for preview", name)
+            return None
+        preview_data = self.build_preview_data(spec, data=data, args=args)
+        preview_args = preview_data.pop("args", {}) or {}
+        state = self._sky_state_for(spec, preview_data, preview_args, live=False)
+        if state is None:
+            return None
+        async with self._sky_preview_lock:
+            try:
+                surface = await self._preview_surface()
+                png = await surface.render(state)
+            except SkySurfaceError as e:
+                logger.warning("Preview render failed: %s", e)
+                return None
+            finally:
+                self._schedule_preview_close()
+        return _png_to_image(png)
+
+    async def _preview_surface(self) -> SkySurface:
+        if self._sky_preview is None:
+            surface = SkySurface(
+                self._sky_config, size=(self._width, self._height),
+                headless=True, name="preview",
+            )
+            await surface.start()
+            self._sky_preview = surface
+        return self._sky_preview
+
+    def _schedule_preview_close(self) -> None:
+        """Close the preview browser once authoring has gone quiet: an
+        idle Chromium is ~150 MB the Pi can use elsewhere."""
+        if self._sky_preview_closer is not None:
+            self._sky_preview_closer.cancel()
+        loop = asyncio.get_running_loop()
+        self._sky_preview_closer = loop.call_later(
+            _PREVIEW_IDLE_SECONDS,
+            lambda: asyncio.ensure_future(self._close_preview_surface()),
+        )
+
+    async def _close_preview_surface(self) -> None:
+        async with self._sky_preview_lock:
+            surface, self._sky_preview = self._sky_preview, None
+            self._sky_preview_closer = None
+            if surface is not None:
+                await surface.stop()
+
+    # ------------------------------------------------------------------
     # Background tasks
     # ------------------------------------------------------------------
 
@@ -1729,6 +2131,16 @@ class DisplayManager:
                     self.clear_status_text()
 
                 if not self._active_display:
+                    continue
+
+                if self._sky is not None:
+                    # The page ticks its own clocks. What changes here
+                    # is data, and — once a minute — the sky itself.
+                    minute = int(time.time() // 60)
+                    if self._source_dirty or minute != self._sky_minute:
+                        self._sky_minute = minute
+                        self._source_dirty = False
+                        self._push_sky_state()
                     continue
 
                 spec = self._specs.get(self._active_display)
@@ -1849,6 +2261,14 @@ class DisplayManager:
         return "midnight"
 
 
+def _png_to_image(png: bytes) -> Image.Image:
+    import io
+
+    image = Image.open(io.BytesIO(png))
+    image.load()
+    return image.convert("RGB")
+
+
 # ---------------------------------------------------------------------------
 # Photo source pre-resolution
 # ---------------------------------------------------------------------------
@@ -1896,6 +2316,45 @@ def _resolve_photo_sources(block: "Block") -> None:
             _rewrite(child)
 
     _rewrite(block)
+
+
+def _resolve_photo_params(block: "Block") -> None:
+    """Resolve every remaining ``photo:<ref>`` string in a block tree.
+
+    The page's blocks take images in params other than an image block's
+    ``source`` (``capture.image``, say). The rule is the same: a ref
+    becomes a vetted absolute path, and one that does not resolve
+    becomes ``None`` — the page is never handed a path nobody checked.
+    """
+    refs: list[str] = []
+
+    def visit(value: Any, collect: bool) -> Any:
+        if isinstance(value, str) and value.startswith("photo:"):
+            ref = value.split(":", 1)[1]
+            if collect:
+                refs.append(ref)
+                return value
+            return paths.get(ref)
+        if isinstance(value, list):
+            return [visit(v, collect) for v in value]
+        if isinstance(value, dict):
+            return {k: visit(v, collect) for k, v in value.items()}
+        return value
+
+    def walk(b: "Block", collect: bool) -> None:
+        if collect:
+            visit(b.params, True)
+        else:
+            b.params = visit(b.params, False)
+        for child in b.children:
+            walk(child, collect)
+
+    paths: dict[str, str] = {}
+    walk(block, True)
+    if not refs:
+        return
+    paths = _resolve_photo_refs([r for r in refs if r])
+    walk(block, False)
 
 
 def _resolve_photo_refs(refs: list[str]) -> dict[str, str]:

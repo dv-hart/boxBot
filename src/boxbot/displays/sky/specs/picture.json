@@ -1,0 +1,23 @@
+{
+  "name": "picture",
+  "theme": "living_sky",
+  "transition": "crossfade",
+  "scene": { "horizon": "high" },
+  "data_sources": [
+    { "name": "weather", "type": "integration", "refresh": 1800 }
+  ],
+  "layout": {
+    "type": "picture",
+    "photos": "{photos.items}",
+    "layout": "{args.layout}",
+    "pair": "{args.pair}",
+    "reason": "{args.reason}",
+    "position": "{photos.position}",
+    "ui": "full",
+    "minimal_after_s": 6,
+    "dwell_s": "{args.interval}",
+    "temp": "{weather.temp}",
+    "condition": "{weather.condition}",
+    "icon": "{weather.icon}"
+  }
+}

@@ -287,11 +287,18 @@ def _list_upcoming_events(
 ) -> dict[str, Any]:
     cal_id = args.get("calendar_id") or "primary"
     max_results = max(1, min(int(args.get("max_results", 5)), 50))
-    now = datetime.now(timezone.utc).isoformat()
+    if args.get("since") == "today":
+        # From local midnight: a day view needs the events already behind
+        # us (done counts, struck rows), not only what is still to come.
+        since = datetime.now().astimezone().replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+    else:
+        since = datetime.now(timezone.utc)
     _, payload = _request(
         token, "GET", f"/calendars/{cal_id}/events",
         params={
-            "timeMin": now,
+            "timeMin": since.isoformat(),
             "maxResults": max_results,
             "singleEvents": "true",
             "orderBy": "startTime",

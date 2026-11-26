@@ -323,14 +323,18 @@ class TestMainInitHelpers:
         built = {}
 
         class _FakeManager:
-            def __init__(self, width, height):
+            def __init__(self, width, height, renderer, sky_config):
                 built["size"] = (width, height)
+                built["renderer"] = renderer
+                built["sky_config"] = sky_config
                 self.start = AsyncMock()
 
         monkeypatch.setattr(manager_mod, "DisplayManager", _FakeManager)
         monkeypatch.setattr(manager_mod, "set_display_manager", MagicMock())
         mgr = await main_mod._init_display_manager()
         assert built["size"] == (mock_config.display.width, mock_config.display.height)
+        assert built["renderer"] == mock_config.display.renderer == "pil"
+        assert built["sky_config"] is mock_config.display.html
         mgr.start.assert_awaited_once()
 
 

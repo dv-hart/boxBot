@@ -9,21 +9,30 @@ Scoring (query given), per photo:
   - keyword: ``BM25_WEIGHT`` x FTS5 BM25 over description + tags +
     people; any literal term hit earns at least half the weight
   - person: ``PERSON_WEIGHT`` x how well the photo matches each person
-    name — from ``people=[...]`` or a household name found in the query.
-    A name is a soft match across people labels, tags and description
-    (``PERSON_MATCH``), not a hard filter on ``photo_people``.
+    name (``PERSON_MATCH``).
+
+Person names are a HARD filter. A name comes from ``people=[...]`` or
+from a known name (roster entry or existing label) found in the query —
+the two are treated identically. A photo is returned only if it matches
+every name: by people label, or by the name appearing as a whole name
+in its tags or description. The other query words only rank within that
+set. Names match whole: "Ann" is not "Ann-Marie" (``people.name_pattern``).
+An ``unsure`` suggestion never matches, by label or by text.
 
 Results under the relevance floor (``photos.search_min_score``) are
 dropped, so an unrelated query returns nothing instead of everything.
-No query and no people = newest first, no floor.
+No query (or nothing but filler: "show me photos") and no people =
+newest first, no floor.
 
-Hard filters: tags (AND), date range, source, slideshow. With
-``people=[...]`` a photo must also mention at least one of the names
-somewhere (label, tag or description).
+Other hard filters: tags (AND), date range, source, slideshow.
 
 An empty result is returned empty, with a ``hint`` saying which filter
 to drop — never silently broadened, so a caller that shows results
 straight on screen cannot show the wrong photos.
+
+Cost: one search = three row queries (photos, tags, people), one names
+query and one FTS query, whatever the library size; the hint is
+computed from the same loaded set.
 
 Usage:
     from boxbot.photos.search import search_photos
@@ -36,7 +45,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -44,6 +53,7 @@ from typing import Any
 import numpy as np
 
 from boxbot.memory.embeddings import EMBEDDING_DIM, cosine_similarity, embed
+from boxbot.photos.people import name_pattern, text_names
 from boxbot.photos.store import PhotoRecord, PhotoStore
 
 logger = logging.getLogger(__name__)
@@ -55,8 +65,8 @@ PERSON_WEIGHT = 1.0
 
 # How strongly each kind of evidence says "this person is in the photo".
 PERSON_MATCH = {
-    "confirmed": 1.0,   # a human said so
-    "certain": 1.0,     # the caption named them
+    "confirmed": 1.0,   # a person confirmed it, as reported by the agent
+    "captioned": 1.0,   # the caption passed at ingest names them
     "likely": 0.8,      # tagger: appearance/context vs the roster
     "text": 0.6,        # name appears in tags or description only
 }
@@ -105,16 +115,15 @@ def _min_score() -> float:
 def query_terms(query: str | None) -> list[str]:
     """Lowercased word tokens of a query, minus search-request filler.
 
-    Punctuation is discarded. If nothing but filler remains, the filler
-    is kept so the query still means something.
+    Punctuation is discarded. A query of nothing but filler ("show me
+    photos") has no terms — the caller treats it as no query.
     """
     if not query:
         return []
-    tokens = [t.lower() for t in _TOKEN_RE.findall(query)]
-    kept = [t for t in tokens if t not in _STOPWORDS]
     out: list[str] = []
-    for token in kept or tokens:
-        if token not in out:
+    for token in _TOKEN_RE.findall(query):
+        token = token.lower()
+        if token not in _STOPWORDS and token not in out:
             out.append(token)
     return out
 
@@ -128,10 +137,30 @@ def fts_match_expr(terms: list[str]) -> str:
     return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
 
-def _contains_word(text: str, word: str) -> bool:
-    return re.search(
-        rf"(?<!\w){re.escape(word)}(?!\w)", text, re.IGNORECASE
-    ) is not None
+def split_query_names(
+    query: str | None, known: dict[str, str]
+) -> tuple[list[str], str]:
+    """Pull known person names out of a query.
+
+    *known* is ``{casefolded: stored spelling}``. Returns the names
+    found (stored spelling, in query order) and the query with those
+    names removed. Longest names are taken first, so "Mary Jane" is one
+    name even when "Mary" is also known.
+    """
+    rest = query or ""
+    found: list[tuple[int, str]] = []
+    for key in sorted(known, key=len, reverse=True):
+        pattern = re.compile(
+            name_pattern(known[key]).pattern + r"(?:['’]s(?!\w))?",
+            re.IGNORECASE,
+        )
+        match = pattern.search(rest)
+        if match is None:
+            continue
+        found.append((match.start(), known[key]))
+        # Same-length blank keeps the positions of later matches stable.
+        rest = pattern.sub(lambda m: " " * len(m.group(0)), rest)
+    return [name for _, name in sorted(found)], rest
 
 
 def _person_match(record: PhotoRecord, name: str) -> float:
@@ -146,26 +175,187 @@ def _person_match(record: PhotoRecord, name: str) -> float:
             )
     if best:
         return best
-    if any(_contains_word(tag, name) for tag in record.tags):
+    # A weak guess must not become a match through the text fields.
+    if any(
+        str(s.get("label") or "").casefold() == wanted
+        for s in record.suggestions
+    ):
+        return 0.0
+    if any(text_names(tag, name) for tag in record.tags):
         return PERSON_MATCH["text"]
-    if _contains_word(record.description or "", name):
+    if text_names(record.description, name):
         return PERSON_MATCH["text"]
     return 0.0
 
 
-async def _known_names(store: PhotoStore) -> set[str]:
-    """Casefolded names the library knows: roster + existing labels."""
-    db = store._ensure_db()
-    names: set[str] = set()
-    async with db.execute("SELECT name FROM people_notes") as cursor:
-        async for row in cursor:
-            names.add(row["name"].casefold())
-    async with db.execute(
-        "SELECT DISTINCT label FROM photo_people WHERE confidence != 'unsure'"
-    ) as cursor:
-        async for row in cursor:
-            names.add(row["label"].casefold())
-    return names
+def _merge_names(*groups: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for name in group:
+            key = name.casefold()
+            if key not in seen:
+                seen.add(key)
+                out.append(name)
+    return out
+
+
+@dataclass
+class _Prepared:
+    """Everything one search needs, loaded once.
+
+    Holds the library (minus soft-deleted unless asked for) and the
+    query-dependent signals for every photo. Filters are then applied in
+    Python by ``_rank``, so the empty-result hint can try relaxed
+    filters without touching the database again.
+    """
+
+    records: dict[str, PhotoRecord]
+    # Query with person names and filler accounted for; None = no query.
+    query: str | None = None
+    query_names: list[str] = field(default_factory=list)
+    has_query_embedding: bool = False
+    similarity: dict[str, float] = field(default_factory=dict)
+    # Raw BM25 per photo (higher = better) for the non-name query terms.
+    bm25: dict[str, float] = field(default_factory=dict)
+
+
+async def _prepare(
+    store: PhotoStore, query: str | None, *, include_deleted: bool = False
+) -> _Prepared:
+    records, embeddings = await store.load_records(
+        include_deleted=include_deleted
+    )
+    query = (query or "").strip() or None
+    prep = _Prepared(records=records)
+    if not query or not records:
+        return prep
+
+    known = await store.known_person_names()
+    prep.query_names, rest = split_query_names(query, known)
+    terms = query_terms(rest)
+    if not terms and not prep.query_names:
+        # Nothing but filler ("show me photos"): same as no query.
+        return prep
+    prep.query = query
+
+    # None query embedding = no embedding model installed; BM25 then
+    # carries the full text weight.
+    query_embedding = embed(query)
+    if query_embedding is not None:
+        prep.has_query_embedding = True
+        for pid, blob in embeddings.items():
+            if not blob:
+                continue
+            photo_embedding = np.frombuffer(blob, dtype=np.float32)
+            if len(photo_embedding) == EMBEDDING_DIM:
+                prep.similarity[pid] = float(
+                    cosine_similarity(query_embedding, photo_embedding)
+                )
+
+    if getattr(store, "fts_ready", True):
+        prep.bm25 = await _bm25_scores(
+            store._ensure_db(), terms, set(records)
+        )
+    return prep
+
+
+def _passes_filters(
+    record: PhotoRecord,
+    *,
+    tags: list[str] | None,
+    date_from: str | None,
+    date_to: str | None,
+    source: str | None,
+    in_slideshow: bool | None,
+) -> bool:
+    if source and record.source != source:
+        return False
+    if in_slideshow is not None and record.in_slideshow != bool(in_slideshow):
+        return False
+    if date_from and not (record.created_at or "") >= str(date_from):
+        return False
+    if date_to and not (record.created_at or "") <= str(date_to):
+        return False
+    if tags:
+        have = {t.casefold() for t in record.tags}
+        if any(str(t).strip().casefold() not in have for t in tags):
+            return False
+    return True
+
+
+def _rank(
+    prep: _Prepared,
+    *,
+    names: list[str],
+    tags: list[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    source: str | None = None,
+    in_slideshow: bool | None = None,
+    limit: int = DEFAULT_LIMIT,
+    min_score: float | None = None,
+) -> list[SearchResult]:
+    """Filter, score and order the prepared library. No I/O."""
+    records = {
+        pid: r for pid, r in prep.records.items()
+        if _passes_filters(
+            r, tags=tags, date_from=date_from, date_to=date_to,
+            source=source, in_slideshow=in_slideshow,
+        )
+    }
+
+    # Person names: a photo must match every one of them.
+    scored: dict[str, float] = {}
+    if names:
+        for pid, record in records.items():
+            matches = [_person_match(record, n) for n in names]
+            if all(m > 0 for m in matches):
+                scored[pid] = PERSON_WEIGHT * sum(matches) / len(matches)
+        records = {pid: records[pid] for pid in scored}
+    else:
+        scored = {pid: 0.0 for pid in records}
+
+    if not records:
+        return []
+
+    if prep.query:
+        for pid in records:
+            sim = prep.similarity.get(pid)
+            if sim is not None:
+                scored[pid] += VECTOR_WEIGHT * max(0.0, sim)
+
+        bm25_weight = BM25_WEIGHT if prep.has_query_embedding else 1.0
+        hits = {pid: sc for pid, sc in prep.bm25.items() if pid in records}
+        max_bm25 = max(hits.values(), default=0.0)
+        for pid, bm25_score in hits.items():
+            norm = bm25_score / max_bm25 if max_bm25 > 0 else 1.0
+            # Any literal hit is worth half the weight; rank adds the rest.
+            scored[pid] += bm25_weight * (0.5 + 0.5 * norm)
+
+    if prep.query or names:
+        floor = _min_score() if min_score is None else min_score
+        scored = {pid: sc for pid, sc in scored.items() if sc >= floor}
+
+    # Order — score, then newest first.
+    def _ts(pid: str) -> float:
+        try:
+            return datetime.fromisoformat(records[pid].created_at).timestamp()
+        except (ValueError, TypeError):
+            return 0.0
+
+    sorted_ids = sorted(
+        scored.keys(), key=lambda pid: (scored[pid], _ts(pid)), reverse=True
+    )[: max(1, limit)]
+
+    return [
+        SearchResult(photo=records[pid], score=scored[pid])
+        for pid in sorted_ids
+    ]
+
+
+def _clean_people(people: list[str] | None) -> list[str]:
+    return [p.strip() for p in people or [] if p and p.strip()]
 
 
 async def hybrid_search(
@@ -186,10 +376,11 @@ async def hybrid_search(
 
     Args:
         store: The PhotoStore instance to search against.
-        query: Natural language query. None = newest first.
+        query: Natural language query. None / filler only = newest first.
+            A known person name in it filters exactly like ``people``.
         tags: Hard filter — photo must carry all listed tags.
-        people: Person names. Soft match across people labels, tags and
-            description; a photo mentioning none of them is excluded.
+        people: Person names. Hard filter — the photo must match every
+            name (people label, or whole name in tags/description).
         date_from: ISO 8601 date string — only photos on or after this date.
         date_to: ISO 8601 date string — only photos on or before this date.
         source: Filter by source ("whatsapp", "camera", "upload").
@@ -201,133 +392,13 @@ async def hybrid_search(
     Returns:
         List of SearchResult ordered by relevance score (highest first).
     """
-    db = store._ensure_db()
-    query = (query or "").strip() or None
-    explicit_people = [p.strip() for p in people or [] if p and p.strip()]
-
-    # --- Step 1: Candidates passing the hard filters ---
-
-    where_clauses: list[str] = []
-    params: list[Any] = []
-
-    if not include_deleted:
-        where_clauses.append("p.deleted_at IS NULL")
-
-    if source:
-        where_clauses.append("p.source = ?")
-        params.append(source)
-
-    if in_slideshow is not None:
-        where_clauses.append("p.in_slideshow = ?")
-        params.append(1 if in_slideshow else 0)
-
-    if date_from:
-        where_clauses.append("p.created_at >= ?")
-        params.append(date_from)
-
-    if date_to:
-        where_clauses.append("p.created_at <= ?")
-        params.append(date_to)
-
-    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
-
-    rows: dict[str, Any] = {}
-    async with db.execute(
-        f"SELECT * FROM photos p WHERE {where_sql}", params
-    ) as cursor:
-        async for row in cursor:
-            rows[row["id"]] = row
-
-    if tags and rows:
-        tag_matched_ids = await _filter_by_tags(db, set(rows.keys()), tags)
-        rows = {pid: r for pid, r in rows.items() if pid in tag_matched_ids}
-
-    if not rows:
-        return []
-
-    records: dict[str, PhotoRecord] = {}
-    for pid, row in rows.items():
-        records[pid] = await store._row_to_record(row)
-
-    # --- Step 2: Person names (explicit + household names in the query) ---
-
-    terms = query_terms(query)
-    names = list(explicit_people)
-    if terms:
-        known = await _known_names(store)
-        have = {n.casefold() for n in names}
-        for term in terms:
-            if term in known and term not in have:
-                names.append(term)
-                have.add(term)
-
-    person_scores: dict[str, float] = {}
-    if names:
-        for pid, record in records.items():
-            matches = [_person_match(record, n) for n in names]
-            person_scores[pid] = sum(matches) / len(matches)
-
-    if explicit_people:
-        # Soft across fields, but the photo must mention someone asked for.
-        records = {
-            pid: r for pid, r in records.items()
-            if any(_person_match(r, n) > 0 for n in explicit_people)
-        }
-        if not records:
-            return []
-
-    # --- Step 3: Scoring ---
-
-    scored: dict[str, float] = {
-        pid: PERSON_WEIGHT * person_scores.get(pid, 0.0) for pid in records
-    }
-
-    if query:
-        # None query embedding = no embedding model installed; BM25 then
-        # carries the full text weight.
-        query_embedding = embed(query)
-        bm25_weight = BM25_WEIGHT if query_embedding is not None else 1.0
-
-        if query_embedding is not None:
-            for pid in records:
-                blob = rows[pid]["embedding"]
-                if not blob:
-                    continue
-                photo_embedding = np.frombuffer(blob, dtype=np.float32)
-                if len(photo_embedding) == EMBEDDING_DIM:
-                    sim = float(
-                        cosine_similarity(query_embedding, photo_embedding)
-                    )
-                    scored[pid] += VECTOR_WEIGHT * max(0.0, sim)
-
-        bm25_scores = await _bm25_scores(db, terms, set(records.keys()))
-        max_bm25 = max(bm25_scores.values(), default=0.0)
-        for pid, bm25_score in bm25_scores.items():
-            norm = bm25_score / max_bm25 if max_bm25 > 0 else 1.0
-            # Any literal hit is worth half the weight; rank adds the rest.
-            scored[pid] += bm25_weight * (0.5 + 0.5 * norm)
-
-    relevance_ranked = bool(query or names)
-    if relevance_ranked:
-        floor = _min_score() if min_score is None else min_score
-        scored = {pid: sc for pid, sc in scored.items() if sc >= floor}
-
-    # --- Step 4: Order — score, then newest first ---
-
-    def _ts(pid: str) -> float:
-        try:
-            return datetime.fromisoformat(records[pid].created_at).timestamp()
-        except (ValueError, TypeError):
-            return 0.0
-
-    sorted_ids = sorted(
-        scored.keys(), key=lambda pid: (scored[pid], _ts(pid)), reverse=True
-    )[: max(1, limit)]
-
-    return [
-        SearchResult(photo=records[pid], score=scored[pid])
-        for pid in sorted_ids
-    ]
+    prep = await _prepare(store, query, include_deleted=include_deleted)
+    return _rank(
+        prep,
+        names=_merge_names(_clean_people(people), prep.query_names),
+        tags=tags, date_from=date_from, date_to=date_to, source=source,
+        in_slideshow=in_slideshow, limit=limit, min_score=min_score,
+    )
 
 
 async def get_photo_detail(store: PhotoStore, photo_id: str) -> PhotoRecord | None:
@@ -438,35 +509,65 @@ async def show_photos(photo_ids: list[str]) -> dict[str, Any]:
     return {"dispatched": bool(ok)}
 
 
-async def _empty_hint(
-    store: PhotoStore, filters: dict[str, Any]
-) -> str:
+def _empty_hint(prep: _Prepared, filters: dict[str, Any]) -> str:
     """Explain an empty search: which single filter, dropped, finds photos.
 
     Nothing is broadened on the caller's behalf — a relaxed result set
     presented as the answer is how the wrong photo ends up on screen.
+    Computed from the already-loaded library; no further queries.
     """
+    explicit = _clean_people(filters.get("people"))
+    names = _merge_names(explicit, prep.query_names)
+
+    def count(relaxed: dict[str, Any], relaxed_names: list[str]) -> int:
+        return len(_rank(
+            prep, names=relaxed_names, tags=relaxed.get("tags"),
+            date_from=relaxed.get("date_from"),
+            date_to=relaxed.get("date_to"), source=relaxed.get("source"),
+            in_slideshow=relaxed.get("in_slideshow"), limit=MAX_LIMIT,
+        ))
+
+    # Several names and no shared photo: say so before anything else.
+    if len(names) > 1:
+        each = [(name, count(filters, [name])) for name in names]
+        if any(found for _, found in each):
+            return (
+                "No photo has all of " + ", ".join(names) + " together ("
+                + "; ".join(f"{name} alone: {found}" for name, found in each)
+                + "). Search one name at a time and say so — do not show "
+                "one person's photos as the group."
+            )
     suggestions: list[str] = []
     for key in ("tags", "people", "date", "source", "in_slideshow"):
         relaxed = dict(filters)
+        relaxed_names = names
         if key == "date":
             if not (filters.get("date_from") or filters.get("date_to")):
                 continue
             relaxed["date_from"] = relaxed["date_to"] = None
+        elif key == "people":
+            if not explicit:
+                continue
+            relaxed_names = list(prep.query_names)
         else:
             if filters.get(key) in (None, [], ""):
                 continue
             relaxed[key] = None
-        count = len(await hybrid_search(store, **relaxed, limit=MAX_LIMIT))
-        if count:
+        found = count(relaxed, relaxed_names)
+        if found:
             label = "date range" if key == "date" else key
-            suggestions.append(f"without {label}: {count}")
+            suggestions.append(f"without {label}: {found}")
     if suggestions:
         return (
             "No match with these filters. " + "; ".join(suggestions)
             + ". Retry with that filter dropped and say what you dropped."
         )
-    if filters.get("query") or filters.get("people"):
+    if names:
+        return (
+            "No photos of " + ", ".join(names) + " match. Do not show "
+            "other people's or unrelated photos instead."
+        )
+    if prep.query:
         return (
             "Nothing in the library matches. Try other words (what is in "
             "the photo, where, when) — do not show unrelated photos."
@@ -514,16 +615,20 @@ async def search_photos(
             return {"error": "limit must be an integer"}
         limit = max(1, min(limit, MAX_LIMIT))
         filters: dict[str, Any] = {
-            "query": query,
             "tags": tags,
-            "people": people,
             "date_from": date_from,
             "date_to": date_to,
             "source": source,
             "in_slideshow": in_slideshow,
-            "include_deleted": include_deleted,
         }
-        results = await hybrid_search(store, **filters, limit=limit)
+        prep = await _prepare(
+            store, query, include_deleted=include_deleted
+        )
+        results = _rank(
+            prep,
+            names=_merge_names(_clean_people(people), prep.query_names),
+            **filters, limit=limit,
+        )
         out: dict[str, Any] = {
             "results": [
                 {**_record_to_row(r.photo), "score": round(r.score, 2)}
@@ -531,7 +636,7 @@ async def search_photos(
             ]
         }
         if not results:
-            out["hint"] = await _empty_hint(store, filters)
+            out["hint"] = _empty_hint(prep, {**filters, "people": people})
         if show:
             if results:
                 shown = await show_photos([r.photo.id for r in results])
@@ -563,32 +668,6 @@ async def resolve_photo_path(photo_id: str) -> Path | None:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-async def _filter_by_tags(
-    db: Any, photo_ids: set[str], tags: list[str]
-) -> set[str]:
-    """Filter photo IDs to only those having ALL specified tags (AND logic)."""
-    if not tags or not photo_ids:
-        return photo_ids
-
-    matched = set(photo_ids)
-    for tag_name in tags:
-        tag_name = str(tag_name).strip().lower()
-        ids_with_tag: set[str] = set()
-        async with db.execute(
-            """SELECT pt.photo_id FROM photo_tags pt
-               JOIN tags t ON pt.tag_id = t.id
-               WHERE t.name = ?""",
-            (tag_name,),
-        ) as cursor:
-            async for row in cursor:
-                ids_with_tag.add(row["photo_id"])
-        matched &= ids_with_tag
-        if not matched:
-            break
-
-    return matched
 
 
 async def _bm25_scores(

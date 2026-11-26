@@ -455,7 +455,27 @@ async def _handle_photos_action(
         search_photos,
     )
 
+    from boxbot.photos.store import SOURCE_AGENT_REPORTED
+
     _BBOX_KEYS = ("bbox_x", "bbox_y", "bbox_w", "bbox_h")
+
+    def _reported_from() -> dict[str, str | None]:
+        """Where a people confirmation came from: conversation + channel.
+
+        The agent makes these calls, so the label is stored as
+        agent-reported with this provenance, not as a human's own act.
+        """
+        from boxbot.tools._tool_context import get_current_conversation
+
+        conv = get_current_conversation()
+        conversation_id = getattr(ctx, "conversation_id", None) or (
+            getattr(conv, "conversation_id", None)
+        )
+        channel = getattr(conv, "channel", None)
+        return {
+            "conversation_id": str(conversation_id) if conversation_id else None,
+            "channel": str(channel) if channel else None,
+        }
 
     try:
         if action_type == "photos.search":
@@ -722,15 +742,17 @@ async def _handle_photos_action(
                 label=who["label"],
                 person_id=who["person_id"] or people[idx].get("person_id"),
                 confidence="confirmed",
-                source="human",
+                source=SOURCE_AGENT_REPORTED,
+                **_reported_from(),
             )
             await store.update_people(pid, people + record.suggestions)
             return {"status": "ok", "id": pid, "person": people[idx]}
 
         if action_type == "photos.set_people":
-            # The human-confirmed people on a photo: replaces every label
-            # (add / remove / correct in one call) and locks the photo
-            # against the tagger. An empty list = "nobody we know".
+            # The people a person confirmed, as reported by the agent:
+            # replaces every label (add / remove / correct in one call)
+            # and locks the photo against the tagger. An empty list =
+            # "nobody we know".
             try:
                 pid = validate_photo_id(payload.get("id"))
                 raw_names = payload.get("names")
@@ -767,7 +789,9 @@ async def _handle_photos_action(
                     "person_id": who["person_id"] or old_row.get("person_id"),
                     "basis": old_row.get("basis") or "",
                 })
-            await store.update_people(pid, rows, human_confirmed=True)
+            await store.update_people(
+                pid, rows, agent_reported=True, **_reported_from()
+            )
             return {
                 "status": "ok",
                 "id": pid,
@@ -776,7 +800,7 @@ async def _handle_photos_action(
             }
 
         if action_type == "photos.confirm_people":
-            # Accept the current certain/likely labels as they stand;
+            # Accept the current captioned/likely labels as they stand;
             # "unsure" suggestions are discarded.
             try:
                 pid = validate_photo_id(payload.get("id"))
@@ -787,7 +811,8 @@ async def _handle_photos_action(
             if record is None:
                 return {"status": "error", "error": f"photo {pid} not found"}
             await store.update_people(
-                pid, [dict(p) for p in record.people], human_confirmed=True
+                pid, [dict(p) for p in record.people],
+                agent_reported=True, **_reported_from(),
             )
             return {
                 "status": "ok",

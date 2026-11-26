@@ -34,6 +34,28 @@ _PHOTO_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
+def name_pattern(name: str) -> re.Pattern[str]:
+    """Regex matching *name* in free text as one whole name.
+
+    Case-insensitive. A hyphenated or multi-word name is one unit, and a
+    name never matches as a fragment of a longer one: "Ann" does not
+    match inside "Ann-Marie" or "Joann", "Marie" does not match inside
+    "Ann-Marie", "Arcy" does not match inside "D'Arcy". A trailing
+    possessive ("Zara's") still matches.
+    """
+    body = r"\s+".join(re.escape(part) for part in name.split())
+    return re.compile(
+        rf"(?<!\w)(?<!\w[-'’]){body}(?!\w)(?!-\w)", re.IGNORECASE
+    )
+
+
+def text_names(text: str | None, name: str) -> bool:
+    """True if *text* mentions *name* as a whole name (see ``name_pattern``)."""
+    if not text or not name or not name.strip():
+        return False
+    return name_pattern(name).search(text) is not None
+
+
 def validate_person_name(value: Any, field: str = "name") -> str:
     """Return a cleaned person name or raise ``ValueError``."""
     if not isinstance(value, str):

@@ -103,7 +103,7 @@ person without one is still allowed).
 ### `backfill.py`
 `python3 -m boxbot.photos.backfill [--apply] [--limit N] [--photo ID]` —
 re-runs people inference over existing photos. Dry-run by default; one
-small-model call per photo; idempotent; skips human-confirmed photos;
+small-model call per photo; idempotent; skips photos marked confirmed;
 never touches descriptions or tags. No caption exists at backfill time,
 so labels come out `likely` at best and are meant to be reviewed
 (`bb.photos.unconfirmed()`).
@@ -119,25 +119,37 @@ of defaults (`DEFAULT_LIMIT`).
 |---|---|---|
 | vector | 0.6 x cosine(query, description) | negatives clipped to 0 |
 | keyword | 0.4 x (0.5 + 0.5 x normalised BM25) | FTS5 over description, tags, people; any literal hit earns >= 0.2 |
-| person | 1.0 x match | per name: confirmed/certain label 1.0, likely label 0.8, name in tags/description 0.6 |
+| person | 1.0 x match | per name: confirmed/captioned label 1.0, likely label 0.8, name in tags/description 0.6 |
 
-- A **person name is a soft match** across people labels, tags and
-  description — never a hard filter on `photo_people`. Names come from
-  `people=[...]` or from a roster/label name appearing in the query.
-  With `people=[...]` a photo must mention at least one of the names
-  somewhere. `unsure` suggestions never match.
+- A **person name is a hard filter.** Names come from `people=[...]` or
+  from a known name (roster entry or existing label) found in the query
+  (`split_query_names`); both are treated the same. A photo is returned
+  only if it matches **every** name — by people label, or by the name
+  appearing as a whole name in tags or description. The remaining query
+  words only rank within that set, so "Zara at the beach" never returns
+  another child's beach photo. Names match whole (`people.name_pattern`):
+  hyphenated and multi-word names are one unit, "Ann" is not
+  "Ann-Marie". `unsure` suggestions never match — not by label, and a
+  name that is an `unsure` suggestion on a photo does not match that
+  photo through its text either. A name that is neither on the roster
+  nor a label is an ordinary keyword (OR-ed with the rest).
 - **Relevance floor** — `photos.search_min_score` (default 0.2). Results
   below it are dropped, so an unrelated query returns nothing. A keyword
   hit (>= 0.2) and a name match (>= 0.6) always clear it; a meaning-only
-  match needs cosine >= ~0.33. No query and no people = newest first, no
-  floor.
+  match needs cosine >= ~0.33. No query (or filler only — "show me
+  photos") and no people = newest first, no floor.
 - **Query sanitising** — word tokens only, request filler ("photos",
   "of", "show", ...) removed, each term quoted and OR-ed, so user
   punctuation cannot produce an FTS syntax error. A real FTS fault is
   logged with a traceback.
 - **Hard filters** — tags (AND), date range, source, slideshow.
 - **Empty result → `hint`, not a broadened result set.** The hint names
-  the single filter whose removal finds photos ("without tags: 3").
+  the single filter whose removal finds photos ("without tags: 3"), or,
+  for several names with no shared photo, the per-name counts. It is
+  computed in Python from the set the search already loaded.
+- **Cost** — one search is three row queries (photos, tags, people —
+  `PhotoStore.load_records`), one names query and one FTS query,
+  independent of library size; filters are applied in Python.
   Broadening silently is the unsafe choice: with `show=True` the relaxed
   set would go straight onto the screen as "photos of X".
 - **Rows are slim** — id, short description, tags, people (+confidence),
@@ -149,7 +161,13 @@ of defaults (`DEFAULT_LIMIT`).
 description, tags, people)`, maintained from `PhotoStore._reindex_photo`
 on every write that touches those fields. `PhotoStore.initialize()`
 migrates the old description-only external-content table (drops its
-triggers, recreates, rebuilds once).
+triggers, recreates, rebuilds) in **one transaction**, and writes an
+`fts_version` marker (`photo_meta`) in that same transaction. Every
+start also self-heals: a missing/old marker, or an index row count that
+differs from the photo row count, triggers a rebuild — so a crash
+mid-migration cannot leave search empty. If the migration itself fails
+it is logged and rolled back; the store still opens (`fts_ready` False:
+no keyword signal, index writes skipped) and the next start retries.
 
 **DRY architecture:**
 ```
@@ -236,8 +254,17 @@ An empty roster means nobody is named.
 `_parse_people`):
 - Only roster names — the tool schema's `name` is an enum of the roster
   and anything else is dropped. Strangers are never named.
-- `certain` only when the **caption itself** names the person;
+- `captioned` only when the **caption itself** names the person;
   otherwise it is lowered to `likely`. Appearance is `likely` at best.
+  `captioned` means exactly that and no more: the caption text passed to
+  ingest contains the name ("Zara took this" counts; the caption is
+  whatever the caller passed). A mention directly preceded by a simple
+  negation ("not Zara", "without Zara", "isn't Zara") is lowered to
+  `likely` (`_caption_names`).
+- A roster name the caption did not supply is removed from the tagger's
+  output (`_strip_unsupplied_names`): tags containing it are dropped and
+  it becomes "someone" in the description, so an appearance guess cannot
+  turn into a text match in search.
 - `unsure` is kept as a suggestion (`PhotoRecord.suggestions`), not as a
   person: not searchable, not in the FTS index.
 - Caption, sender, roster notes and stored notes are untrusted data:
@@ -245,16 +272,23 @@ An empty roster means nobody is named.
   delimiters, and the prompt says to treat them as evidence only.
 
 **Storage** — `photo_people` gains `confidence`
-(`confirmed | certain | likely | unsure`), `source`
-(`human | tagger | detector`) and `basis`; `photos.people_confirmed_at`
-marks a human-reviewed photo.
+(`confirmed | captioned | likely | unsure`), `source`
+(`agent_reported | tagger | detector | legacy`), `basis`, and
+`conversation_id` / `channel`; `photos.people_confirmed_at` (+
+`people_confirmed_conversation` / `_channel`) marks a reviewed photo.
+`confirmed` means "confirmed by a person, as reported by the agent": the
+agent makes the `set_people` / `confirm_people` / `set_person` calls, so
+the row records `agent_reported` plus the conversation and channel the
+call came from — the store cannot attest that a person was involved.
+Rows that predate these columns become `likely` / `legacy` and stay out
+of the `unconfirmed()` queue.
 
 **Confirmation** — `bb.photos.unconfirmed()` lists unreviewed photos
 with `likely`/`unsure` labels; `confirm_people(id)` accepts the labels
 as they stand; `set_people(id, names=[...])` replaces them (add, remove,
 correct — no detected slot needed). Both mark the photo confirmed.
 `PhotoStore.apply_inferred_people` — the only path the tagger writes
-through — refuses a confirmed photo, so human labels are never
+through — refuses a confirmed photo, so confirmed labels are never
 overwritten.
 
 **Privacy** — labels and roster are household data and stay in

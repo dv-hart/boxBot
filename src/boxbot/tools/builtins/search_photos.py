@@ -25,11 +25,14 @@ class SearchPhotosTool(Tool):
     description = (
         "Photo library. 'search': ranked; a person's name goes in query "
         "(query='Zara', query='Zara at the beach'); no query = newest "
-        "first. show=true also puts the results on the screen — one call "
-        "for 'show us photos of X'. 'get': full detail by photo_id.\n"
-        "people[].confidence: confirmed/certain = say it plainly; likely "
-        "= inferred from appearance, say 'looks like'; `unsure` = a "
-        "guess, not a person — ask.\n"
+        "first. A known person name = only that person's photos; several "
+        "names = photos with all of them. show=true also puts the "
+        "results on the screen — one call for 'show us photos of X'. "
+        "'get': full detail by photo_id.\n"
+        "people[].confidence: confirmed (a person confirmed, as reported "
+        "by the agent) / captioned (caption names them) = say it plainly; "
+        "likely = inferred from appearance, say 'looks like'; `unsure` = "
+        "a guess, not a person — ask.\n"
         "Empty results come with a hint; never show unrelated photos "
         "instead."
     )
@@ -61,8 +64,9 @@ class SearchPhotosTool(Tool):
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Person names; must be mentioned in labels, tags or "
-                    "description. Prefer putting the name in query."
+                    "Person names; photo must match every name (label, "
+                    "or whole name in tags/description). Prefer putting "
+                    "the name in query."
                 ),
             },
             "date_from": {

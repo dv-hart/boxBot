@@ -16,9 +16,15 @@ photos = bb.photos.search(limit=5)               # no query = newest first
 p = bb.photos.get("photo_abc123def456")          # full record; PhotosError if missing
 ```
 
-Person's name goes in `query`. Names match people labels, tags and
-description. `tags` = hard filter (AND). `people=[...]` = must mention
-one of them. Same backend + defaults as the `search_photos` tool
+Person's name goes in `query`. A known name (roster or existing label)
+in `query` or `people=[...]` = hard filter: only that person's photos
+(label, or whole name in tags/description); other words rank within
+them. Whole names only: "Ann" ≠ "Ann-Marie".
+Several names = photos with ALL of them; none → `[]` + hint with per-name counts.
+Name not on the roster and never labelled = plain keyword, no filter
+→ pass `people=[...]` or `set_roster` first.
+`tags` = hard filter (AND). Filler-only query ("show me photos") =
+newest first. Same backend + defaults as the `search_photos` tool
 (limit 10).
 
 Rows: `id, description (short), tags, people, created, source, sender,
@@ -26,8 +32,8 @@ score`. `print(p)` shows people with confidence.
 
 | `people[].confidence` | Means | Say |
 |---|---|---|
-| `confirmed` | a human said so | plainly |
-| `certain` | sender's caption named them | plainly |
+| `confirmed` | confirmed by a person, as reported by the agent (you, earlier) | plainly |
+| `captioned` | caption passed at ingest names them — not checked against pixels | plainly; `view()` first if it matters |
 | `likely` | inferred from appearance vs roster | "looks like Zara" |
 | `p.unsure` (names) | weak guess, not a person, never matched | ask |
 
@@ -50,14 +56,16 @@ bb.photos.remove_from_roster("Zara")
 
 for p in bb.photos.unconfirmed():                    # likely/unsure, unreviewed
     print(p.id, p.people, p.unsure)                  # items carry `basis`
-bb.photos.confirm_people(photo_id)                   # human agreed with labels as-is
-bb.photos.set_people(photo_id, names=["Zara", "Erik"])   # human gave the names
+bb.photos.confirm_people(photo_id)                   # a person agreed with labels as-is
+bb.photos.set_people(photo_id, names=["Zara", "Erik"])   # a person gave the names
 ```
 
 - `set_people` REPLACES all names (add / remove / correct); `names=[]`
   = nobody from the household. Works with no detected slot.
-- `confirm_people` / `set_people` only after a human told you. They
-  mark the photo `confirmed`; the tagger never changes it again.
+- `confirm_people` / `set_people` only after a person told you. They
+  mark the photo `confirmed` — stored as reported by you
+  (`source: agent_reported` + this conversation and channel), not as
+  the person's own act; the tagger never changes it again.
 - When it matters who is in a photo (sending it on, a keepsake, a
   `likely` you are about to assert), `view()` it and ask a human.
 - Empty roster = nobody gets named. New household member, or a child
@@ -86,7 +94,9 @@ photo_id = bb.photos.ingest(path,
 
 Copies bytes into `data/photos/`, tags (description, tags, roster
 people), indexes, deletes the original. Pass the sender's caption
-as-is: a caption naming a roster person → `certain`. Ingest = worth keeping (family moments, "remember
+as-is: a caption naming a roster person → `captioned` ("not Zara" →
+`likely`). Names the caption did not give are kept out of
+description/tags. Ingest = worth keeping (family moments, "remember
 this"). Memes/throwaway = view, respond, don't ingest — the inbound
 janitor reaps them (7-day TTL).
 

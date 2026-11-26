@@ -44,6 +44,7 @@ from boxbot.photos.people import (
     MAX_NAMES_PER_PHOTO,
     MAX_ROSTER_SIZE,
     clean_untrusted_text,
+    name_pattern,
 )
 from boxbot.photos.store import PhotoStore
 
@@ -84,8 +85,8 @@ _TAGGER_PEOPLE = """
 People: also fill `people` with the household members visible in the photo.
 - Name only people listed in <household_roster>, spelled exactly as listed. Never invent a name. Strangers, guests and anyone not on the roster are not named.
 - Evidence, in order: the caption first, then appearance and context against the roster notes.
-- "certain": the caption names the person and they are plausibly in the photo.
-- "likely": appearance or context matches a roster note well, or existing notes name the person. Appearance alone is never "certain".
+- "captioned": the caption names the person as being in the photo.
+- "likely": appearance or context matches a roster note well, or existing notes name the person. Appearance alone is never "captioned".
 - "unsure": a weak or ambiguous match (for example two roster people fit equally).
 - No evidence for a person: leave them out. An empty list is a fine answer.
 - `basis`: a few words on the evidence ("caption names her", "matches note: glasses, beard").
@@ -116,7 +117,19 @@ _TAGGER_TOOL = {
     },
 }
 
-_TAGGER_CONFIDENCES = ("certain", "likely", "unsure")
+_TAGGER_CONFIDENCES = ("captioned", "likely", "unsure")
+
+# A caption that mentions a name right after one of these does not say
+# the person is in the photo ("not Zara", "without Erik").
+_NEGATIONS = frozenset({
+    "not", "no", "without", "isn't", "isnt", "wasn't", "wasnt",
+})
+_NEGATION_WINDOW = 2  # tokens before the name
+_CAPTION_TOKEN_RE = re.compile(r"[\w']+", re.UNICODE)
+_CLAUSE_BREAK_RE = re.compile(r"[,.;:!?()\-–—]")
+
+# Stand-in for a roster name the caption did not supply.
+_UNNAMED = "someone"
 
 
 def _tagger_tool(roster_names: list[str]) -> dict[str, Any]:
@@ -167,13 +180,26 @@ def _fence(text: str) -> str:
     return text.replace("<", "(").replace(">", ")")
 
 
-def _names_person(text: str, name: str) -> bool:
-    """True if *name* appears in *text* as a whole word (case-insensitive)."""
-    if not text or not name:
+def _caption_names(caption: str, name: str) -> bool:
+    """True if *caption* mentions *name* and not only in a negated way.
+
+    This is all ``captioned`` means: the caption text handed to ingest
+    contains the name as a whole name (see ``people.name_pattern``). It
+    is not proof the person is pictured ("Zara took this" counts), and
+    the caption is whatever the caller passed. The one refinement: a
+    mention directly preceded by a simple negation in the same clause
+    ("not Zara", "this isn't Zara", "without Zara") does not count.
+    """
+    if not caption or not name:
         return False
-    return re.search(
-        rf"(?<!\w){re.escape(name)}(?!\w)", text, re.IGNORECASE
-    ) is not None
+    for match in name_pattern(name).finditer(caption):
+        before = caption[: match.start()].replace("’", "'").lower()
+        # Same clause only: "not bad, Zara!" does not negate Zara.
+        clause = _CLAUSE_BREAK_RE.split(before)[-1]
+        window = _CAPTION_TOKEN_RE.findall(clause)[-_NEGATION_WINDOW:]
+        if not any(token in _NEGATIONS for token in window):
+            return True
+    return False
 
 
 def _parse_people(
@@ -184,8 +210,8 @@ def _parse_people(
     Enforced in code, whatever the model returned:
       - a name not on the roster is dropped (never invented, no strangers)
       - an unknown confidence becomes ``unsure``
-      - ``certain`` stands only if the caption itself names the person;
-        otherwise it is lowered to ``likely``
+      - ``captioned`` stands only if the caption itself names the person
+        (``_caption_names``); otherwise it is lowered to ``likely``
       - one row per person, at most ``MAX_NAMES_PER_PHOTO``
     """
     if not isinstance(raw, list):
@@ -204,7 +230,7 @@ def _parse_people(
         confidence = str(item.get("confidence") or "").strip().lower()
         if confidence not in _TAGGER_CONFIDENCES:
             confidence = "unsure"
-        if confidence == "certain" and not _names_person(
+        if confidence == "captioned" and not _caption_names(
             caption, entry["name"]
         ):
             confidence = "likely"
@@ -220,6 +246,38 @@ def _parse_people(
         if len(out) >= MAX_NAMES_PER_PHOTO:
             break
     return out
+
+
+def _strip_unsupplied_names(
+    description: str,
+    tags: list[str],
+    roster: list[dict[str, Any]],
+    caption: str,
+) -> tuple[str, list[str]]:
+    """Remove roster names the caption did not supply from tagger text.
+
+    The prompt tells the model not to write a name it inferred from
+    appearance into the description or tags; this enforces it. For every
+    roster name that the caption does not mention:
+      - a tag containing the name is dropped
+      - in the description the name is replaced by "someone"
+    so an appearance guess can never become a text match in search.
+    A name the caption mentions is left alone.
+    """
+    for entry in roster:
+        name = entry["name"]
+        pattern = name_pattern(name)
+        if pattern.search(caption or ""):
+            continue
+        tags = [t for t in tags if not pattern.search(t)]
+        if description and pattern.search(description):
+            def _sub(match: re.Match[str]) -> str:
+                head = description[: match.start()].rstrip()
+                starts_sentence = not head or head[-1] in ".!?"
+                return _UNNAMED.capitalize() if starts_sentence else _UNNAMED
+
+            description = pattern.sub(_sub, description)
+    return description, tags
 
 
 @dataclass
@@ -900,6 +958,11 @@ class IntakePipeline:
             tag = str(raw).strip().lower()
             if tag and tag not in tags:
                 tags.append(tag)
+
+        if roster:
+            description, tags = _strip_unsupplied_names(
+                description, tags, roster, caption_text
+            )
 
         existing_lower = {e.lower() for e in existing}
         new_tags = [t for t in tags if t not in existing_lower]

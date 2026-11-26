@@ -608,7 +608,7 @@ class DisplayManager:
         Without this the ``web`` display's "Opening…" card would sit on
         screen forever once the browser window above it disappears.
         """
-        if self._active_display != WEB_DISPLAY:
+        if self._active_display != WEB_DISPLAY or self._web_view_open():
             return
         self._pinned = False
         if self._rotation_displays:
@@ -619,9 +619,12 @@ class DisplayManager:
         preferred = [n for n in ("clock", "picture") if n in self._specs]
         others = sorted(n for n in self._specs if n != WEB_DISPLAY)
         for fallback in preferred + others:
-            if await self.switch(fallback, pin=False):
+            if await self.switch(fallback, pin=False, _after_web_exit=True):
                 return
         logger.warning("No display to fall back to after the web view closed")
+
+    def _web_view_open(self) -> bool:
+        return self._web_view is not None and self._web_view.is_open
 
     def get_web_state(self) -> dict[str, Any] | None:
         """What the web view is showing, or ``None`` when it is closed."""
@@ -783,6 +786,8 @@ class DisplayManager:
         name: str,
         args: dict[str, Any] | None = None,
         pin: bool = True,
+        *,
+        _after_web_exit: bool = False,
     ) -> bool:
         """Switch to a named display.
 
@@ -839,6 +844,14 @@ class DisplayManager:
             # underneath it would tear the view down mid-video.
             pin = True
         else:
+            if _after_web_exit and self._web_view_open():
+                # This switch only exists to put a display back after
+                # the browser closed itself. A page opened since then
+                # is somebody's deliberate act: leave it alone.
+                logger.info(
+                    "Web view reopened before the fallback display; keeping it"
+                )
+                return True
             await self._close_web_view()
 
         # Picture display without explicit image_ids => slideshow mode.

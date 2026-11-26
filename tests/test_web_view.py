@@ -2019,6 +2019,23 @@ class TestManagerWebDisplay:
         assert manager.get_active() != "web"
         assert not manager.is_pinned()
 
+    async def test_exit_notice_for_an_old_page_spares_a_reopened_one(self, manager):
+        """The browser closed itself and, before the fallback display
+        went up, a new page was opened. The late fallback must not
+        close it."""
+        await manager.switch("web", args={"url": "https://example.com/"})
+        # Self-close notice arrives, but the view is open again.
+        await manager._on_web_view_exit("media ended")
+        assert manager._web_view.closed == 0
+        assert manager.get_active() == "web"
+        assert manager.is_pinned()
+
+    async def test_fallback_switch_aborts_if_a_page_opened_meanwhile(self, manager):
+        await manager.switch("web", args={"url": "https://example.com/"})
+        assert await manager.switch("clock", pin=False, _after_web_exit=True)
+        assert manager._web_view.closed == 0
+        assert manager.get_active() == "web"
+
     async def test_idle_minutes_arg_reaches_the_view(self, manager):
         await manager.switch(
             "web", args={"url": "https://example.com/", "idle_minutes": 30},

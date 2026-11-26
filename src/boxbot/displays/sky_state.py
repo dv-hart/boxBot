@@ -69,6 +69,9 @@ class Presence:
         return d
 
 
+_KEEP: Any = object()
+
+
 class PresenceTracker:
     """Follows the room's voice conversation from bus events.
 
@@ -99,6 +102,9 @@ class PresenceTracker:
         self._presence = None
         self._who = None
 
+    def is_listening(self) -> bool:
+        return self._presence is not None and self._presence.state == "listening"
+
     def _set(self, state: str, text: str = "", detail: str = "") -> None:
         self._presence = Presence(state=state, who=self._who, text=text, detail=detail)
         self._deadline = time.monotonic() + self._ttl
@@ -106,10 +112,12 @@ class PresenceTracker:
     # -- events --------------------------------------------------------
 
     def wake_word(self) -> None:
+        self._who = None
         self._set("listening")
 
     def speaker(self, name: str | None) -> None:
-        """The speaker was identified (voice or fused)."""
+        """The speaker of the utterance in hand was confirmed by voice
+        (``SpeakerIdentified`` is published for nothing less)."""
         if not name:
             return
         self._who = name
@@ -122,8 +130,16 @@ class PresenceTracker:
             return  # barge-in is decided by the conversation, not here
         self._set("listening", text=text.strip())
 
-    def transcript(self, text: str) -> None:
-        """The utterance is final; the agent has it now."""
+    def transcript(self, text: str, who: Any = _KEEP) -> None:
+        """The utterance is final; the agent has it now.
+
+        ``who`` is the confirmed speaker of *this* utterance, or None
+        when it has none (a candidate, an unknown voice): the name on
+        the dock is replaced either way. A name is never carried over
+        from an earlier utterance — that would be a guess.
+        """
+        if who is not _KEEP:
+            self._who = who or None
         self._set("thinking", text=text.strip())
 
     def tool(self, status_text: str) -> None:
@@ -135,8 +151,12 @@ class PresenceTracker:
         self._set("speaking", text=text.strip())
 
     def speaking_done(self) -> None:
-        """Speech finished; the mic is open again until the session ends."""
+        """Speech finished; the mic is open again until the session ends.
+
+        Whoever speaks next is not known yet, so the dock names nobody.
+        """
         if self._presence is not None:
+            self._who = None
             self._set("listening")
 
     def ended(self) -> None:

@@ -1138,12 +1138,13 @@ async def _async_main() -> None:
         # Screen HAL — backend selected by config. "pygame" blits frames to
         # HDMI (default); "none" skips screen output entirely.
         screen_backend = config.display.backend
-        if display_manager.renderer == "html":
-            # The browser window is the screen; there are no frames to blit.
-            logger.info("HTML renderer owns the screen — screen backend not started")
-        elif screen_backend == "none":
-            logger.info("Screen backend 'none' — no screen output")
-        else:
+
+        async def _start_screen() -> None:
+            if screen_backend == "none":
+                logger.info("Screen backend 'none' — no screen output")
+                return
+            if "screen" in subsystems:
+                return
             try:
                 from boxbot.hardware.screen import Screen
 
@@ -1160,6 +1161,15 @@ async def _async_main() -> None:
                     "Screen not available (backend=%s) — display will not render",
                     screen_backend, exc_info=True,
                 )
+
+        if display_manager.renderer == "html":
+            # The browser window is the screen; there are no frames to
+            # blit. If the browser is later lost for good the manager
+            # drops to PIL and asks for the screen backend then.
+            logger.info("HTML renderer owns the screen — screen backend not started")
+            display_manager.set_renderer_fallback(_start_screen)
+        else:
+            await _start_screen()
 
         # Identity core — person store + enrollment; every device class
         identity = await _init_identity()
@@ -1178,6 +1188,14 @@ async def _async_main() -> None:
         voice_session = await _init_voice(hal_modules, config)
         if voice_session is not None:
             subsystems["voice"] = voice_session
+            # HTML renderer: the voice dock says "listening" only while
+            # the mic really is open (not dormant, not muted).
+            display_manager.set_mic_probe(
+                lambda: (
+                    getattr(voice_session.state, "value", "") == "active"
+                    and not voice_session.is_mic_muted
+                )
+            )
 
         # Communication — auth + per-channel clients + message routing
         comm_router = await _init_communication(

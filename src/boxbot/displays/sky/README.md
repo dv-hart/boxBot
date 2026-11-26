@@ -48,7 +48,9 @@ the same JSON this page draws from. Anything a block shows must come from its pa
   args: {},                        // switch_display args
   status: "Searching the web…",    // or null — agent status pill
   presence: { state: "listening", who: "Carina", text: "…" },   // or null — voice-state dock (below)
-  frame: null                      // data: URL of an externally pushed frame (camera live view), or null
+  frame: null,                     // data: URL of a frame drawn elsewhere, shown full-bleed over the view, or null:
+                                   //   camera live view, and displays only PIL can draw (products, cart)
+  images: ["/abs/vetted/a.jpg"]    // every absolute image path the page may load for this state
 }
 ```
 
@@ -125,7 +127,13 @@ Query overrides for fixtures: `phase weather time vista dim now status presence 
 A new block type also needs an entry in `../sky_blocks.py` (its params, for spec validation and the
 agent's `bb.display.schema()`); `tests/test_sky_page.py` fails if the page and Python disagree on the
 vocabulary. Image params reach a block as vetted absolute paths: specs write `"photo:<id or path>"` and
-Python resolves it, or drops it.
+Python resolves it, or drops it. **Turn a path into an `<img>` source only with `BB.img(path)`**: it
+returns `''` for an absolute path that is not in `state.images`. Name an image param `source`, `src`,
+`thumb`, `path`, `image` or `photo` (lists: `photos`, `images`, `thumbs`) so Python vets it
+(`manager._IMAGE_KEYS`).
+
+A display whose tree contains a block that is neither in `BLOCK_REGISTRY` nor in `sky_blocks.py` is not
+drawn by this page at all: the manager renders it with PIL and sends it as `frame`.
 
 Tests: `tests/test_sky_renderer.py` (Python side, fake browser) and `tests/test_sky_page.py` (this page in
 a real Chromium: every fixture and spec draws cleanly, hostile text stays text, no network).

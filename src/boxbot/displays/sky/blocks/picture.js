@@ -33,14 +33,13 @@
 
   /* ── data in ── */
   /* Path or URL → something an <img> may load under the page CSP (file: and data: only). '' = refuse. */
-  function url(s) {
-    s = s == null ? '' : String(s).trim();
-    if (!s) return '';
-    if (/^data:/i.test(s)) return /^data:image\/(png|jpe?g|webp|gif|avif);base64,[a-z0-9+/=\s]+$/i.test(s) ? s : '';
-    const enc = p => p.split('/').map(seg => { try { return encodeURIComponent(decodeURIComponent(seg)); } catch (e) { return encodeURIComponent(seg); } }).join('/');
-    if (/^file:\/\//i.test(s)) return 'file://' + enc(s.slice(7).replace(/[?#].*$/, ''));
-    if (/^[a-z][a-z0-9+.-]*:/i.test(s)) return '';
-    return s[0] === '/' ? 'file://' + s.split('/').map(encodeURIComponent).join('/') : s.split('/').map(encodeURIComponent).join('/');
+  const url = s => BB.img(s);      // absolute paths only if Python listed them in state.images
+  const DIMS_MAX = 200;
+  function measured(key, value) {   // bounded: a long slideshow must not grow this for ever
+    delete DIMS[key];
+    DIMS[key] = value;
+    const keys = Object.keys(DIMS);
+    for (let i = 0; i < keys.length - DIMS_MAX; i++) delete DIMS[keys[i]];
   }
   function box(b, w, h) {
     if (!Array.isArray(b) || b.length !== 4) return null;
@@ -278,11 +277,11 @@
       el.querySelectorAll('img[data-a], img.pc-probe').forEach(img => {
         if (img.closest('.pc-prev')) return;
         const key = img.getAttribute('src');
-        const fail = () => { DIMS[key] = { bad: true }; redraw(el); };
+        const fail = () => { measured(key, { bad: true }); redraw(el); };
         const ok = () => {
           if (!img.naturalWidth || !img.naturalHeight) return fail();
           const a = +img.dataset.a, n = img.naturalWidth / img.naturalHeight;
-          if (!a || Math.abs(a / n - 1) > .03) { DIMS[key] = { w: img.naturalWidth, h: img.naturalHeight }; redraw(el); }
+          if (!a || Math.abs(a / n - 1) > .03) { measured(key, { w: img.naturalWidth, h: img.naturalHeight }); redraw(el); }
         };
         if (img.complete) ok();
         else { img.addEventListener('load', ok, { once: true }); img.addEventListener('error', fail, { once: true }); }

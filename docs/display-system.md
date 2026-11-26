@@ -866,11 +866,43 @@ Display Manager ── state JSON (DevTools pipe) ──▶ sky/index.html
 - **Voice presence.** Listening, thinking and speaking draw as a dock
   over the bottom of whatever is showing, driven by the voice events on
   the bus (`sky_state.PresenceTracker`). The status pill is part of the
-  same state.
+  same state. The dock names a speaker only for an utterance whose
+  attribution is `confirmed` (the rule behind the agent's "Speaking
+  with"); a candidate (`[Jacob?]`) or unknown voice shows no name, and
+  a name is not carried to the next utterance. "Listening" comes down
+  when the mic closes without an event (dormant, `mute_mic`).
+- **PIL-only displays.** `products` and `cart` are drawn by
+  renderer-only PIL blocks (`shop_blocks`) the page has no code for.
+  The manager renders them with the PIL renderer and hands the page
+  the picture as `frame` (a bounded JPEG `data:` URL), shown
+  full-bleed. The page receives the view token and an empty layout —
+  no title, price or seller reaches it as text. The status pill still
+  draws over the frame; the voice dock does not. Any display whose tree
+  holds a block that is in neither `BLOCK_REGISTRY` nor `sky_blocks`
+  takes this path (`manager._needs_pil_frame`).
+- **The `web` display.** The kiosk browser is a second Chromium, its
+  own OS user and profile, opened above the page's window; the page
+  underneath shows the "Opening…" card. When it closes, the normal
+  fallback switch pushes a state and the page is simply visible again.
+  If the page's own browser is relaunched while the web view is open,
+  the web view is closed (`get_web_exit()` → `screen restarted`): a new
+  window would otherwise cover a page that plays on.
 - **Previews and screenshots** come from the browser: previews from a
-  second, headless instance, so authoring never touches the screen.
+  second, headless instance, so authoring never touches the screen. A
+  draft is previewed from the spec object and never registered.
+- **Images.** The page loads only files Python vetted for the state in
+  hand (`state.images`): `photo:` refs resolved by the manager and
+  paths under the roots that gate image attachments. The PIL renderer
+  applies the same rule.
 - **Fallback.** If the browser cannot start, the manager logs an error
-  and draws with the PIL renderer.
+  and draws with the PIL renderer; the Living Sky displays are then not
+  registered. The same happens at runtime when the browser is lost for
+  good — three relaunches fail in a row, or it exits four times in five
+  minutes (a crashed or hung page is killed and counts as an exit):
+  the manager drops the Living Sky displays, puts the current display
+  (or the rotation, or `clock`) back through PIL, and `core/main.py`
+  starts the screen backend it had skipped. `get_active()["renderer"]`
+  reports `pil` from then until boxBot restarts.
 
 The page contract (state shape, how to write a block, tokens, render
 budget) is in `src/boxbot/displays/sky/README.md`; the browser's

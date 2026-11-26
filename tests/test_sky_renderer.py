@@ -133,7 +133,8 @@ class TestPresence:
         p.speaking("Five thirty.")
         assert p.current() == {"state": "speaking", "who": "Carina", "text": "Five thirty."}
         p.speaking_done()
-        assert p.current() == {"state": "listening", "who": "Carina"}
+        # Whoever speaks next is not known yet: no name carried over.
+        assert p.current() == {"state": "listening"}
         p.ended()
         assert p.current() is None
 

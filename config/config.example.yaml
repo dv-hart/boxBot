@@ -105,7 +105,10 @@ display:
   #         Seattle scene that follows the real time of day and weather,
   #         with every display drawn on top. Adds the home, brief, week,
   #         day, inbox and capture displays. If the browser cannot start,
-  #         boxBot logs an error and draws with pil.
+  #         or is lost for good while running, boxBot logs an error and
+  #         draws with pil (those extra displays are then unavailable).
+  #         Needs: a Chromium binary (html.browser) and the same Wayland
+  #         session the pygame backend uses.
   renderer: "pil"
   html:
     browser: "chromium"

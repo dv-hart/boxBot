@@ -1383,6 +1383,36 @@ def _render_image(ctx: RenderContext, block: Block, rect: Rect) -> None:
         )
 
 
+_TRUSTED_IMAGE_PATHS: "dict[str, None]" = {}
+_MAX_TRUSTED_IMAGE_PATHS = 512
+
+
+def trust_image_paths(paths: Any) -> None:
+    """Mark files a resolver vetted as drawable (bounded, oldest out)."""
+    for path in paths:
+        if not path:
+            continue
+        _TRUSTED_IMAGE_PATHS.pop(str(path), None)
+        _TRUSTED_IMAGE_PATHS[str(path)] = None
+    while len(_TRUSTED_IMAGE_PATHS) > _MAX_TRUSTED_IMAGE_PATHS:
+        _TRUSTED_IMAGE_PATHS.pop(next(iter(_TRUSTED_IMAGE_PATHS)))
+
+
+def _vetted_image_path(source: str) -> str | None:
+    from pathlib import Path
+
+    try:
+        if source in _TRUSTED_IMAGE_PATHS:
+            return source if Path(source).is_file() else None
+        if not Path(source).is_absolute():
+            return None
+        from boxbot.displays.manager import _resolve_direct_image_path
+
+        return _resolve_direct_image_path(source)
+    except Exception:
+        return None
+
+
 def _try_load_image(source: str) -> Image.Image | None:
     """Try to load an image from the given source string.
 
@@ -1395,11 +1425,15 @@ def _try_load_image(source: str) -> Image.Image | None:
     if not source:
         return None
 
-    # Direct file path (for preview/testing)
-    from pathlib import Path
-    if Path(source).is_file():
+    # A file path — but only one that was vetted: a path the display
+    # manager resolved from a ``photo:`` ref (``trust_image_paths``), or
+    # one under the roots that gate image attachments. A display spec is
+    # agent-written, and a preview hands its pixels back to the agent;
+    # "any file the service can read" must not be drawable.
+    path = _vetted_image_path(source)
+    if path is not None:
         try:
-            return Image.open(source)
+            return Image.open(path)
         except Exception:
             return None
 

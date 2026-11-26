@@ -95,7 +95,7 @@
           <div class="ib-done"><span class="ib-tick">${ico('check')}</span><div><div class="ib-nm d">Sent to ${esc(cur.sender)}</div>
             ${!discreet && str(d.text) ? `<p class="ib-q d">${q(d.text)}</p>` : ''}${!discreet && fx ? `<div class="ib-fx">${ico('cal')}<span>${esc(fx)}</span></div>` : ''}</div></div>
           ${nx ? `<div class="ib-next"><div class="label">Next</div><div class="ib-r1">${badge(nx)}<b>${esc(nx.sender)}</b></div>${!discreet && nx.short ? `<p>${esc(nx.short)}</p>` : ''}</div>` : ''}</div>
-          <div class="ib-foot">${secs ? `<span class="ib-say ib-undo" data-s="${secs}">${ico('undo')}“Undo” <em>for ${secs} more second${secs === 1 ? '' : 's'}</em></span>` : ''}
+          <div class="ib-foot">${secs ? `<span class="ib-say ib-undo" data-s="${secs}" data-k="${esc(undoKey(b, cur))}">${ico('undo')}“Undo” <em>for ${secs} more second${secs === 1 ? '' : 's'}</em></span>` : ''}
             ${nx ? `<span class="ib-say r">${ico('mic')}“Next one”${sep}${ico('knob')}turn</span>` : ''}</div>`);
     } else if (view === 'thread') {
       const d = draftOf(b.draft) || cur.draft, quote = str(b.quote) || cur.quote;
@@ -139,8 +139,26 @@
     return `<div class="ib-ctx"><span>${esc(t.role)}</span>${t.who.length ? `<span class="ib-for">${t.role ? sep : ''}for ${whos(t)}</span>` : ''}</div>`;
   }
 
-  /* undo countdown: the bar is a CSS transform; the seconds are counted from when the pane landed */
-  BB.onMount(root => root.querySelectorAll('.ib-undo[data-s]').forEach(e => { e.dataset.until = Date.now() + (+e.dataset.s) * 1000; }));
+  /* undo countdown: anchored to the moment this send first appeared, not to when the pane last landed — a
+     pane rebuilt by a data refresh carries on from the same deadline (text and fuse bar both). */
+  const UNDO = {};
+  function undoKey(b, cur) {
+    const s = JSON.stringify([b.undo_seconds, b.draft || null, cur && cur.sender, cur && cur.draft || null]);
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return 'u' + (h >>> 0).toString(36);
+  }
+  BB.onMount(root => {
+    const t = Date.now();
+    Object.keys(UNDO).forEach(k => { if (UNDO[k] < t - 60000) delete UNDO[k]; });
+    root.querySelectorAll('.ib-undo[data-s]').forEach(e => {
+      const k = e.dataset.k || '', total = (+e.dataset.s) * 1000;
+      const until = UNDO[k] || (UNDO[k] = t + total);
+      e.dataset.until = until;
+      const dock = e.closest('.ib-dock'), fuse = dock && dock.querySelector('.ib-fuse');
+      if (fuse && until - total < t) fuse.style.animationDelay = `${((until - total - t) / 1000).toFixed(2)}s`;
+    });
+  });
   BB.onTick((d, root) => {
     const t = BB.fmtTime(d, { meridiem: false });
     root.querySelectorAll('.ib-clock').forEach(e => { if (e.textContent !== t) e.textContent = t; });

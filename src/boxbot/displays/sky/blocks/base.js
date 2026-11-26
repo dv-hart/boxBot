@@ -251,12 +251,8 @@
 
   /* ── image ──────────────────────────────────────────────────── */
   const NOIMG = '<svg class="ico bb-noimg-ico"><use href="#i-image"/></svg>';
-  function imageUrl(src) {
-    src = str(src).trim();
-    if (/^data:image\//i.test(src) || /^file:\/\//i.test(src)) return src;
-    if (src.startsWith('/')) return 'file://' + src.split('/').map(encodeURIComponent).join('/');
-    return '';                                   // photo:…, url:…, asset:… never resolved → placeholder
-  }
+  /* Only what Python vetted (BB.img); photo:…, url:…, asset:… never resolved → placeholder. */
+  const imageUrl = src => BB.img(str(src));
   def('image', (b, ctx) => {
     const url = imageUrl(b.source), fit = { contain: 'contain', fill: 'fill' }[b.fit] || 'cover';
     const fill = isRoot(b, ctx) || ctx.bbIn === 'col';

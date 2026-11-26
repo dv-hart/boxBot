@@ -2516,42 +2516,36 @@ async def _handle_display_action(
                     "errors": ["display manager not running"],
                 }
 
-            # Register the spec temporarily so render_preview can find
-            # it by name. If a spec by this name was already registered,
-            # restore it after rendering so we don't clobber a saved
-            # display when the agent is iterating.
-            existing = mgr.get_spec(parsed.name)
-            mgr.register_spec(parsed)
-            try:
-                # Compute warnings against the same data the renderer
-                # uses, so static-source values and live-fetched data
-                # don't get falsely flagged. ``data`` from the payload
-                # is an agent-supplied override (useful for testing
-                # http_json fields/maps without a real fetch); it
-                # layers on top of live + static + placeholder data.
-                #
-                # For each declared source the override touches, run
-                # the source's ``fields`` config over the fixture
-                # before handing it to the renderer. That's what the
-                # author actually wants: validate "given an API
-                # response shaped like this, do my fields+map produce
-                # the right binding values?" Without this, the
-                # override would have to be in post-fields shape,
-                # defeating the purpose.
-                override = payload.get("data") or {}
-                render_data = mgr.build_preview_data(parsed)
-                if isinstance(override, dict):
-                    render_data.update(_apply_fields_to_override(
-                        override, parsed,
-                    ))
-                image = await mgr.render_preview_image(
-                    parsed.name, data=render_data,
-                )
-            finally:
-                if existing is not None:
-                    mgr.register_spec(existing)
-                else:
-                    mgr.unregister_spec(parsed.name)
+            # The draft is rendered from the spec object and is never
+            # registered: the render can wait on a browser for seconds,
+            # and a display registered under its real name in that gap
+            # could be put on the screen by a tick or a switch — an
+            # unsaved draft on the wall, or a saved display clobbered.
+            #
+            # Compute warnings against the same data the renderer
+            # uses, so static-source values and live-fetched data
+            # don't get falsely flagged. ``data`` from the payload
+            # is an agent-supplied override (useful for testing
+            # http_json fields/maps without a real fetch); it
+            # layers on top of live + static + placeholder data.
+            #
+            # For each declared source the override touches, run
+            # the source's ``fields`` config over the fixture
+            # before handing it to the renderer. That's what the
+            # author actually wants: validate "given an API
+            # response shaped like this, do my fields+map produce
+            # the right binding values?" Without this, the
+            # override would have to be in post-fields shape,
+            # defeating the purpose.
+            override = payload.get("data") or {}
+            render_data = mgr.build_preview_data(parsed)
+            if isinstance(override, dict):
+                render_data.update(_apply_fields_to_override(
+                    override, parsed,
+                ))
+            image = await mgr.render_preview_image(
+                parsed.name, data=render_data, spec=parsed,
+            )
 
             if image is None:
                 return {

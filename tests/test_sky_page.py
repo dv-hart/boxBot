@@ -198,3 +198,92 @@ async def test_page_and_python_agree_on_the_block_vocabulary(tmp_path) -> None:
     # type when the tree is serialised, so the page answers to those too.
     chart_kinds = {"line", "bar", "area"}
     assert drawn - overlays - chart_kinds == set(BLOCK_REGISTRY) | set(SKY_BLOCKS)
+
+
+async def test_page_loads_only_images_python_listed(tmp_path) -> None:
+    """A path is an ``<img>`` source only if ``state.images`` lists it."""
+    from PIL import Image
+
+    listed, unlisted = tmp_path / "listed.png", tmp_path / "unlisted.png"
+    for path in (listed, unlisted):
+        Image.new("RGB", (4, 4), (255, 0, 0)).save(path)
+    surface = SkySurface(config(tmp_path))
+    await surface.start()
+    try:
+        await surface.apply({
+            "v": 1, "display": "t", "transition": "none", "people": [],
+            "atmosphere": {"phase": "noon", "weather": "clear", "time": "12:00"},
+            "images": [str(listed)],
+            "layout": {"type": "column", "children": [
+                {"type": "image", "source": str(listed)},
+                {"type": "image", "source": str(unlisted)},
+                {"type": "image", "source": "file://" + str(unlisted)},
+                {"type": "image", "source": "file:///etc/hostname"},
+                {"type": "picture", "photos": [str(unlisted), {"src": "../../../../../etc/x.png"}]},
+                {"type": "capture", "image": str(unlisted)},
+                {"type": "picture", "photos": [{"id": "ok", "src": str(listed)}]},
+            ]},
+        })
+        sources = await surface.evaluate(
+            "[...document.querySelectorAll('#view img')].map(i => i.getAttribute('src'))"
+        )
+        assert sources and all(s.endswith("/listed.png") for s in sources), sources
+        assert await surface.evaluate(
+            "[BB.img('/etc/passwd'), BB.img('file:///etc/passwd'), BB.img('../x.png'),"
+            " BB.img('a/../../x.png'), BB.img('https://example.com/x.png'),"
+            " BB.img('data:text/html;base64,AAAA')]"
+        ) == ["", "", "", "", "", ""]
+    finally:
+        await surface.stop()
+
+
+async def test_a_new_minute_repaints_the_scene_not_the_view(tmp_path) -> None:
+    """The time moves the scene (ferry, windows). The view pane must
+    survive it, or captions, zooms and countdowns restart every minute."""
+    source = (PAGE_DIR / "fixtures" / "inbox-sent.js").read_text()
+    surface = SkySurface(config(tmp_path))
+    await surface.start()
+    try:
+        state = await surface.evaluate(f"BB.fixture=null;{source}\n;BB.fixture")
+        state["atmosphere"] = {**state.get("atmosphere", {}), "time": "16:02"}
+        await surface.apply(state)
+        probe = (
+            "(() => { const p = document.querySelector('#view > *'), u = document.querySelector('.ib-undo');"
+            " return {mark: (p && p.dataset.mark) || null, until: u ? u.dataset.until : null,"
+            " scene: document.getElementById('scene').innerHTML.length}; })()"
+        )
+        await surface.evaluate("document.querySelector('#view > *').dataset.mark = 'first'")
+        before = await surface.evaluate(probe)
+        assert before["mark"] == "first" and before["until"]
+        state["atmosphere"] = {**state["atmosphere"], "time": "16:03"}
+        await surface.apply(state)
+        after = await surface.evaluate(probe)
+        assert after["mark"] == "first", "the view pane was rebuilt by a time change"
+        assert after["until"] == before["until"]
+        # A real change rebuilds the pane, and the countdown keeps its deadline.
+        state["status"] = None
+        state["people"] = list(state.get("people") or []) + ["Zed"]
+        await surface.apply(state)
+        rebuilt = await surface.evaluate(probe)
+        assert rebuilt["mark"] is None and rebuilt["until"] == before["until"]
+        assert await surface.evaluate("document.getElementById('frame').getAttribute('src')") is None
+    finally:
+        await surface.stop()
+
+
+async def test_frame_is_released_when_no_longer_shown(tmp_path) -> None:
+    from tests.fake_sky_browser import PNG
+
+    surface = SkySurface(config(tmp_path))
+    await surface.start()
+    try:
+        base = {"v": 1, "display": "t", "transition": "none", "people": [],
+                "atmosphere": {"phase": "noon", "weather": "clear", "time": "12:00"},
+                "layout": {"type": "column"}}
+        await surface.apply({**base, "frame": "data:image/png;base64," + PNG})
+        assert await surface.evaluate("document.getElementById('stage').classList.contains('raw')")
+        await surface.apply({**base, "frame": "javascript:alert(1)"})
+        assert not await surface.evaluate("document.getElementById('stage').classList.contains('raw')")
+        assert await surface.evaluate("document.getElementById('frame').getAttribute('src')") is None
+    finally:
+        await surface.stop()

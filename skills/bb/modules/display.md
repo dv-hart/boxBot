@@ -390,6 +390,8 @@ Displays (all `theme: "living_sky"`; `load(name)` for the spec):
 - Voice states (listening / thinking / speaking) draw as a dock over
   the bottom ~170px of any display, automatically. Keep nothing
   essential there on a display meant to be read mid-conversation.
+  Not over `products` / `cart` (full-screen pictures of the PIL
+  render) and not visible under `web`.
 - Own displays: any original block works, `card` = dark slab. Sky
   blocks (`zones`, `zone`, `surface`, `sky_clock`, `now`, `next_event`,
   `house`, `say`, `agenda_timeline`, `todo_list`, `forecast_strip`,
@@ -400,7 +402,10 @@ Displays (all `theme: "living_sky"`; `load(name)` for the spec):
   "scale": 0.4-1.2, "vista": "kerry"|"sound"}` moves the skyline clear
   of your content. Text zones at `high`: quiet sky x 40–460 / y 30–290;
   ground y 470–600.
-- Image params take `"photo:<id or path>"`; anything else is dropped.
+- Image params take `"photo:<id or path>"` or a path under the
+  workspace / photo library; any other file is dropped.
+- `renderer` can change to `"pil"` mid-run (browser lost): the displays
+  in the table above then no longer exist — `list()` before switching.
 
 ## Editing a display — load → mutate dict → preview → save
 

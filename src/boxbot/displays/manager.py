@@ -169,6 +169,22 @@ _STATUS_TTL_SECONDS = 90.0
 _ATMOSPHERE_WEATHER_SECONDS = 1800.0
 _PREVIEW_IDLE_SECONDS = 120.0
 
+# HTML renderer: ceiling on one frame handed to the page as a data: URL
+# (camera live view, and displays only the PIL renderer can draw). Bytes
+# of JPEG before base64; base64 adds a third, and the whole state must
+# stay under ``sky_surface.MAX_STATE_BYTES``.
+_MAX_FRAME_BYTES = 400 * 1024
+_FRAME_QUALITIES = (90, 80, 65, 50)
+
+# The dock says "listening" only while the mic is open. This many
+# consecutive ticks with it closed (dormant, muted) take the dock down;
+# more than one so the tick cannot race the wake word that opens it.
+_MIC_CLOSED_TICKS = 2
+
+# Fixed string for ``get_web_exit``: the screen's own browser was
+# replaced and the web view was closed rather than left under it.
+WEB_EXIT_SCREEN_RESTARTED = "screen restarted"
+
 # Default paths
 _BUILTINS_DIR = Path(__file__).parent / "builtins"
 _SKY_SPECS_DIR = PAGE_DIR / "specs"
@@ -302,6 +318,15 @@ class DisplayManager:
         self._atmo_task: asyncio.Task[None] | None = None
         self._slideshow_index = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Displays the page cannot draw (see ``_needs_pil_frame``) are
+        # rendered by PIL and shown as a frame; (key, data URL) of the
+        # last one so voice events do not re-render it.
+        self._pil_frame_cache: tuple[str, str | None] | None = None
+        self._display_dirs: tuple[Any, Any, Any] = (None, None, None)
+        self._on_renderer_fallback: Any | None = None
+        self._fallback_task: asyncio.Task[None] | None = None
+        self._mic_open: Any | None = None
+        self._mic_closed_ticks = 0
 
         # Display specs registry
         self._specs: dict[str, DisplaySpec] = {}
@@ -398,15 +423,18 @@ class DisplayManager:
         """
         self._running = True
         self._loop = asyncio.get_running_loop()
+        self._display_dirs = (builtins_dir, user_dir, agent_dir)
+
+        # Before the specs: which displays exist depends on whether the
+        # page is really there to draw them.
+        if self._renderer_mode == "html":
+            await self._start_sky()
 
         # Load display specs from all directories
         await self.load_displays(builtins_dir, user_dir, agent_dir)
 
         # Subscribe to DisplaySwitch events on the event bus
         self._subscribe_events()
-
-        if self._renderer_mode == "html":
-            await self._start_sky()
 
         # Start background live-tick task for clock/countdown blocks
         self._live_tick_task = asyncio.create_task(
@@ -433,6 +461,11 @@ class DisplayManager:
         self._stop_slideshow()
 
         # Never leave a browser window behind on the screen
+        if self._fallback_task is not None:
+            self._fallback_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._fallback_task
+            self._fallback_task = None
         await self._close_web_view()
         await self._stop_sky()
 
@@ -708,10 +741,12 @@ class DisplayManager:
 
         # Load from all directories (file-based specs override builtins)
         self._load_specs_from_dir(builtins_path)
-        if self._renderer_mode == "html":
+        if self._sky is not None:
             # The Living Sky displays (home, brief, week, …) and its
             # versions of built-ins such as ``picture``. They use blocks
-            # only the page can draw, so the PIL renderer never sees them.
+            # only the page can draw, so they are loaded only while the
+            # page is up: the PIL renderer never sees them, including
+            # after a fallback to it.
             self._load_specs_from_dir(_SKY_SPECS_DIR)
         self._load_specs_from_dir(user_path)
         self._load_specs_from_dir(agent_path)
@@ -969,6 +1004,7 @@ class DisplayManager:
         self._active_spec = spec
         self._active_args = args
         self._sky_frame = None
+        self._pil_frame_cache = None
         self._slideshow_index = 0
 
         # Render the initial frame
@@ -1576,14 +1612,9 @@ class DisplayManager:
         Thread-safe; same contract as the internal render path.
         """
         if self._sky is not None:
-            import base64
-            import io
-
-            buffer = io.BytesIO()
-            frame.convert("RGB").save(buffer, format="JPEG", quality=80)
-            url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+            url = _frame_data_url(frame, (self._width, self._height))
             loop = self._loop
-            if loop is not None:
+            if url is not None and loop is not None:
                 # Pushers run on their own threads; the page state is
                 # owned by the event loop.
                 loop.call_soon_threadsafe(self._set_sky_frame, url)
@@ -1768,6 +1799,7 @@ class DisplayManager:
         width: int | None = None,
         height: int | None = None,
         args: dict[str, Any] | None = None,
+        spec: DisplaySpec | None = None,
     ) -> Image.Image | None:
         """Render a display to a PIL Image for preview.
 
@@ -1788,15 +1820,16 @@ class DisplayManager:
             A PIL Image of the rendered display, or None if the display
             is not found.
         """
-        display_name = name or self._active_display
-        if not display_name:
-            logger.warning("No display to render preview for")
-            return None
-
-        spec = self._specs.get(display_name)
         if spec is None:
-            logger.warning("Display '%s' not found for preview", display_name)
-            return None
+            display_name = name or self._active_display
+            if not display_name:
+                logger.warning("No display to render preview for")
+                return None
+
+            spec = self._specs.get(display_name)
+            if spec is None:
+                logger.warning("Display '%s' not found for preview", display_name)
+                return None
 
         pw = width or self._width
         ph = height or self._height
@@ -1806,6 +1839,9 @@ class DisplayManager:
             renderer = self._renderer
 
         preview_data = self.build_preview_data(spec, data=data, args=args)
+        from boxbot.displays.renderer import trust_image_paths
+
+        trust_image_paths(_photo_paths_in(spec, preview_data))
         return renderer.render_preview(spec, preview_data)
 
     # ------------------------------------------------------------------
@@ -1826,7 +1862,10 @@ class DisplayManager:
         from boxbot.core.config import SkySurfaceConfig
 
         config = self._sky_config or SkySurfaceConfig()
-        surface = SkySurface(config, size=(self._width, self._height))
+        surface = SkySurface(
+            config, size=(self._width, self._height),
+            on_restart=self._on_sky_restarted, on_failed=self._on_sky_failed,
+        )
         try:
             await surface.start()
         except SkySurfaceError as e:
@@ -1906,13 +1945,15 @@ class DisplayManager:
         return list(people) if people else []
 
     def _sky_data(self, spec: DisplaySpec, data: dict[str, Any],
-                  args: dict[str, Any]) -> dict[str, Any]:
+                  args: dict[str, Any], vetted: set[str]) -> dict[str, Any]:
         """``data`` plus what only the manager knows: args and photos."""
         data = {**data, "args": dict(args)}
         ids = args.get("image_ids")
         if isinstance(ids, list) and ids:
             refs = [str(i) for i in ids]
-            items = photo_items(refs, _resolve_photo_refs(refs))
+            paths = _resolve_photo_refs(refs)
+            vetted.update(paths.values())
+            items = photo_items(refs, paths)
             index = self._slideshow_index if spec.name == self._active_display else 0
             data["photos"] = {
                 "items": items,
@@ -1935,12 +1976,32 @@ class DisplayManager:
         is off for previews."""
         if spec.root_block is None:
             return None
-        data = self._sky_data(spec, data, args)
+        if _needs_pil_frame(spec):
+            # The page has no block for this display (product cards, the
+            # cart). PIL draws it as it always has and the page shows
+            # the picture, full-bleed. The page is sent an empty layout:
+            # nothing the display shows — titles, prices, sellers —
+            # reaches it as text. No voice dock either; these screens
+            # use the whole panel and were not laid out around one.
+            return build_state(
+                spec, Block(block_type="column"), {"args": dict(args)}, args,
+                atmosphere=self.get_atmosphere(),
+                people=self._household(),
+                status=self._status_text if live else None,
+                presence=None,
+                frame=self._pil_frame(spec, data, args),
+                transition="none",
+            ) | {"images": []}
+        # Every file the page may load is one a resolver vetted during
+        # this build. The page is handed the list (``images``) and
+        # refuses any other path, whichever param it arrived in.
+        vetted: set[str] = set()
+        data = self._sky_data(spec, data, args, vetted)
         resolved = resolve_bindings(spec.root_block, data)
-        _resolve_photo_sources(resolved)
-        _resolve_photo_params(resolved)
+        _resolve_photo_sources(resolved, vetted)
+        _resolve_photo_params(resolved, vetted)
         slideshow = live and self._slideshow_task is not None
-        return build_state(
+        state = build_state(
             spec, resolved, data, args,
             atmosphere=self.get_atmosphere(),
             people=self._household(),
@@ -1951,6 +2012,10 @@ class DisplayManager:
             # should fade like a switch, not snap like a data refresh.
             transition="always" if slideshow else None,
         )
+        state["layout"] = _vet_image_params(state["layout"], vetted)
+        state["data"] = _vet_image_params(state["data"], vetted)
+        state["images"] = sorted(vetted)
+        return state
 
     def _push_sky_state(self) -> None:
         """Send the page what should be on screen, if that changed."""
@@ -1977,6 +2042,158 @@ class DisplayManager:
     def _set_sky_frame(self, url: str) -> None:
         self._sky_frame = url
         self._push_sky_state()
+
+    def _pil_frame(self, spec: DisplaySpec, data: dict[str, Any],
+                   args: dict[str, Any]) -> str | None:
+        """``spec`` drawn by the PIL renderer, as a bounded data: URL.
+
+        Cached on what was drawn from, so the status pill and voice
+        events (which rebuild the state) do not redraw an unchanged
+        screen. ``None`` if the render failed or will not fit.
+        """
+        full = {**data, "args": dict(args)}
+        try:
+            key = json.dumps([spec.name, id(spec), full], sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            key = ""
+        if key and self._pil_frame_cache is not None and self._pil_frame_cache[0] == key:
+            return self._pil_frame_cache[1]
+        url: str | None = None
+        try:
+            try:
+                theme = get_theme(spec.theme)
+            except KeyError:
+                theme = get_theme("boxbot")
+            resolved = resolve_bindings(spec.root_block, full)
+            _resolve_photo_sources(resolved)
+            image = self._renderer.render_block_tree(resolved, theme, full)
+            url = _frame_data_url(image, (self._width, self._height))
+            if url is None:
+                logger.warning("Frame for display '%s' is too large to show", spec.name)
+        except Exception:
+            logger.exception("PIL render failed for display '%s'", spec.name)
+        self._pil_frame_cache = (key, url)
+        return url
+
+    # -- when the browser goes away ---------------------------------------
+
+    def set_renderer_fallback(self, handler: Any | None) -> None:
+        """``async handler()`` run after the manager dropped from the
+        HTML renderer to PIL at runtime: the caller starts whatever
+        shows PIL frames (the screen HAL), which was never started
+        while the browser owned the screen."""
+        self._on_renderer_fallback = handler
+
+    def _on_sky_restarted(self) -> None:
+        """The screen's browser came back as a new window.
+
+        A new window opens above whatever is there — including the
+        kiosk browser, which would then play on, unseen. Close it and
+        put a normal display back, as when it closes by itself.
+        """
+        if self._web_view_open():
+            logger.warning("Display browser restarted over the web view — closing it")
+            asyncio.ensure_future(self._close_web_for_screen())
+
+    async def _close_web_for_screen(self) -> None:
+        try:
+            await self._close_web_view()
+            self._web_exit = (WEB_EXIT_SCREEN_RESTARTED, time.monotonic())
+            await self._leave_web()
+        except Exception:
+            logger.exception("Could not close the web view after a screen restart")
+
+    def _on_sky_failed(self, reason: str) -> None:
+        if self._sky is None or not self._running:
+            return
+        if self._fallback_task is None or self._fallback_task.done():
+            self._fallback_task = asyncio.ensure_future(self._fall_back_to_pil(reason))
+
+    async def _fall_back_to_pil(self, reason: str) -> None:
+        """The browser is gone for good: draw with PIL from here on.
+
+        Until the process restarts. The Living Sky displays leave the
+        registry (PIL cannot draw them), whatever was on screen is put
+        back if PIL has it, and the screen HAL is started through the
+        fallback handler.
+        """
+        logger.error(
+            "HTML renderer lost (%s) — drawing with the PIL renderer "
+            "until restart", reason,
+        )
+        try:
+            name, args, pinned = self._active_display, dict(self._active_args), self._pinned
+            was_web = name == WEB_DISPLAY
+            if self._web_view_open():
+                # The PIL screen's window will open above it.
+                await self._close_web_view()
+                self._web_exit = (WEB_EXIT_SCREEN_RESTARTED, time.monotonic())
+            await self._stop_sky()
+            self._sky_signature = ""
+            self._sky_frame = None
+            self._pil_frame_cache = None
+
+            self._specs.clear()
+            await self.load_displays(*self._display_dirs)
+
+            self._stop_slideshow()
+            self._active_display = None
+            self._active_spec = None
+            self._active_args = {}
+            keep = name if name in self._specs and not was_web else None
+            if keep and pinned:
+                await self.switch(keep, args, pin=True)
+            else:
+                self._pinned = False
+                self.stop_rotation()
+                rotation = [d for d in self._rotation_displays if d in self._specs]
+                if rotation:
+                    self.start_rotation(rotation, self._rotation_interval)
+                    # The loop draws on its first pass; do not wait for it.
+                    await self.switch(rotation[0], pin=False)
+                elif keep:
+                    await self.switch(keep, args, pin=False)
+            if self._active_display is None:
+                for fallback in ("clock", "notice", *sorted(self._specs)):
+                    if fallback != WEB_DISPLAY and fallback in self._specs:
+                        if await self.switch(fallback, pin=False):
+                            break
+            handler = self._on_renderer_fallback
+            if handler is not None:
+                await handler()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Fallback to the PIL renderer failed")
+
+    def set_mic_probe(self, probe: Any | None) -> None:
+        """``probe() -> bool``: is the room mic open right now? Without
+        one the dock trusts the voice events alone."""
+        self._mic_open = probe
+
+    def _watch_mic(self) -> None:
+        """Take the "listening" dock down once the mic has closed.
+
+        Going dormant and ``mute_mic`` publish no event, and the dock
+        must not say "listening" to a room nobody is listening to.
+        """
+        probe = self._mic_open
+        if probe is None or not self._presence.is_listening():
+            self._mic_closed_ticks = 0
+            return
+        try:
+            is_open = bool(probe())
+        except Exception:
+            logger.debug("mic probe failed", exc_info=True)
+            is_open = True
+        if is_open:
+            self._mic_closed_ticks = 0
+            return
+        self._mic_closed_ticks += 1
+        if self._mic_closed_ticks >= _MIC_CLOSED_TICKS:
+            self._mic_closed_ticks = 0
+            self._presence.clear()
+            self._push_sky_state()
 
     # -- voice presence -------------------------------------------------
 
@@ -2039,7 +2256,9 @@ class DisplayManager:
     async def _on_presence_transcript(self, event: Any) -> None:
         if getattr(event, "source", "voice") != "voice":
             return
-        self._presence.transcript(getattr(event, "raw_text", ""))
+        self._presence.transcript(
+            getattr(event, "raw_text", ""), who=_confirmed_speaker(event),
+        )
         self._push_sky_state()
 
     async def _on_presence_tool(self, event: Any) -> None:
@@ -2077,22 +2296,31 @@ class DisplayManager:
 
     async def render_preview_image(
         self,
-        name: str,
+        name: str | None,
         data: dict[str, Any] | None = None,
         args: dict[str, Any] | None = None,
+        spec: DisplaySpec | None = None,
     ) -> Image.Image | None:
-        """Render a registered display for the agent to look at.
+        """Render a display for the agent to look at.
+
+        ``spec`` previews a draft that is not registered: nothing is
+        put in the registry, so no tick or switch can put an unsaved
+        draft on the screen while the preview browser starts.
 
         Under the HTML renderer the preview is drawn by a second,
         headless browser so authoring never disturbs the screen. The
         sky in a preview is the sky right now.
         """
         if self._sky is None:
-            return self.render_preview(name, data=data, args=args)
-        spec = self._specs.get(name)
+            return self.render_preview(name, data=data, args=args, spec=spec)
+        if spec is None:
+            spec = self._specs.get(name or "")
         if spec is None:
             logger.warning("Display '%s' not found for preview", name)
             return None
+        if _needs_pil_frame(spec):
+            # Drawn by PIL on the screen too; the preview is that image.
+            return self.render_preview(name, data=data, args=args, spec=spec)
         preview_data = self.build_preview_data(spec, data=data, args=args)
         preview_args = preview_data.pop("args", {}) or {}
         state = self._sky_state_for(spec, preview_data, preview_args, live=False)
@@ -2104,9 +2332,15 @@ class DisplayManager:
                 png = await surface.render(state)
             except SkySurfaceError as e:
                 logger.warning("Preview render failed: %s", e)
+                # Do not keep a browser that failed (it may have given
+                # up restarting): the next preview starts a fresh one.
+                surface, self._sky_preview = self._sky_preview, None
+                if surface is not None:
+                    await surface.stop()
                 return None
             finally:
-                self._schedule_preview_close()
+                if self._sky_preview is not None:
+                    self._schedule_preview_close()
         return _png_to_image(png)
 
     async def _preview_surface(self) -> SkySurface:
@@ -2177,6 +2411,7 @@ class DisplayManager:
                     continue
 
                 if self._sky is not None:
+                    self._watch_mic()
                     # The page ticks its own clocks. What changes here
                     # is data, and — once a minute — the sky itself.
                     minute = int(time.time() // 60)
@@ -2304,6 +2539,69 @@ class DisplayManager:
         return "midnight"
 
 
+def _needs_pil_frame(spec: DisplaySpec) -> bool:
+    """True if ``spec`` uses a block the Living Sky page cannot draw.
+
+    The page draws the declarative vocabulary (``BLOCK_REGISTRY``) and
+    its own blocks (``sky_blocks``). Anything else is a renderer-only
+    PIL block — today the shopping screens (``shop_blocks``), which are
+    kept out of the registry on purpose.
+    """
+    from boxbot.displays.blocks import BLOCK_REGISTRY, is_sky_block
+
+    def foreign(block: Block) -> bool:
+        kind = block.block_type
+        if kind not in BLOCK_REGISTRY and not is_sky_block(kind):
+            return True
+        return any(foreign(child) for child in block.children)
+
+    return spec.root_block is not None and foreign(spec.root_block)
+
+
+def _frame_data_url(frame: Image.Image, size: tuple[int, int]) -> str | None:
+    """``frame`` as a ``data:image/jpeg`` URL of bounded size, or None.
+
+    Larger than the panel is scaled down to it; quality steps down
+    until the JPEG is under ``_MAX_FRAME_BYTES``. Full chroma, so
+    coloured text keeps its edges.
+    """
+    import base64
+    import io
+
+    image = frame.convert("RGB")
+    if image.width > size[0] or image.height > size[1]:
+        image.thumbnail(size)
+    for quality in _FRAME_QUALITIES:
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=quality, subsampling=0)
+        if buffer.tell() <= _MAX_FRAME_BYTES:
+            return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+    return None
+
+
+def _confirmed_speaker(event: Any) -> str | None:
+    """The name to put on the dock for a voice utterance, or None.
+
+    The same rule the agent uses for "Speaking with": the last line's
+    speaker, and only when that attribution is ``confirmed``. A
+    candidate (``[Jacob?]``) or an unknown voice (``[Speaker A]``) is
+    not a name — and neither is a presence guess, so an utterance with
+    no identity block names nobody.
+    """
+    identities = getattr(event, "speaker_identities", None)
+    if not identities:
+        return None
+    try:
+        from boxbot.core.agent import _addressed_identity, _identity_certainty
+
+        _, info = _addressed_identity(identities, getattr(event, "transcript", None))
+        if info and _identity_certainty(info) == "confirmed":
+            return str(info["person_name"])
+    except Exception:
+        logger.debug("speaker attribution unavailable", exc_info=True)
+    return None
+
+
 def _png_to_image(png: bytes) -> Image.Image:
     import io
 
@@ -2317,7 +2615,61 @@ def _png_to_image(png: bytes) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_photo_sources(block: "Block") -> None:
+# Params that name an image file. A path-like string under one of these
+# is kept only if a resolver vetted it; see ``_vet_image_params``.
+_IMAGE_KEYS = frozenset({"source", "src", "thumb", "path", "image", "photo"})
+_IMAGE_LIST_KEYS = frozenset({"photos", "images", "thumbs"})
+
+
+def _path_like(value: Any) -> str | None:
+    """The filesystem path ``value`` names, if it names one outright
+    (``/abs/path`` or ``file://…``); None for anything else."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text[:7].lower() == "file://":
+        from urllib.parse import unquote
+
+        return unquote(urlsplit(text).path) or "/"
+    return text if text.startswith("/") else None
+
+
+def _vet_image_params(value: Any, vetted: set[str], key: str = "") -> Any:
+    """``value`` with every image path nobody vetted taken out.
+
+    For the page: a block there turns a path into ``<img src="file://…">``
+    and the browser can read whatever the service user can. So a
+    path-like string in an image param survives only if it is in
+    ``vetted`` (a resolver produced it during this build) or resolves
+    now through the attachment allowlist — it is then rewritten to the
+    resolved path and added to ``vetted``. Anything else becomes
+    ``None`` (dropped from a list). Strings elsewhere are left as they
+    are — text may start with a slash — and the page refuses to load
+    any path that is not in the list it is handed.
+    """
+    if isinstance(value, dict):
+        return {k: _vet_image_params(v, vetted, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        if key in _IMAGE_LIST_KEYS:
+            out = [_vet_image_params(v, vetted, "src" if isinstance(v, str) else key)
+                   for v in value]
+            return [v for v in out if v is not None]
+        return [_vet_image_params(v, vetted, key) for v in value]
+    if key in _IMAGE_KEYS:
+        path = _path_like(value)
+        if path is None:
+            return value
+        if path in vetted:
+            return path
+        direct = _resolve_direct_image_path(path)
+        if direct is None:
+            return None
+        vetted.add(direct)
+        return direct
+    return value
+
+
+def _resolve_photo_sources(block: "Block", vetted: set[str] | None = None) -> None:
     """Walk a resolved block tree and rewrite ``photo:<ref>`` image sources.
 
     After :func:`boxbot.displays.spec.resolve_bindings` runs, ImageBlock
@@ -2347,6 +2699,12 @@ def _resolve_photo_sources(block: "Block") -> None:
         return
 
     paths = _resolve_photo_refs(refs)
+    if vetted is not None:
+        vetted.update(paths.values())
+    # The PIL renderer opens only paths it was told a resolver vetted.
+    from boxbot.displays.renderer import trust_image_paths
+
+    trust_image_paths(paths.values())
 
     def _rewrite(b: _Block) -> None:
         if b.block_type == "image":
@@ -2361,7 +2719,7 @@ def _resolve_photo_sources(block: "Block") -> None:
     _rewrite(block)
 
 
-def _resolve_photo_params(block: "Block") -> None:
+def _resolve_photo_params(block: "Block", vetted: set[str] | None = None) -> None:
     """Resolve every remaining ``photo:<ref>`` string in a block tree.
 
     The page's blocks take images in params other than an image block's
@@ -2397,7 +2755,30 @@ def _resolve_photo_params(block: "Block") -> None:
     if not refs:
         return
     paths = _resolve_photo_refs([r for r in refs if r])
+    if vetted is not None:
+        vetted.update(paths.values())
     walk(block, False)
+
+
+def _photo_paths_in(spec: DisplaySpec, data: dict[str, Any]) -> list[str]:
+    """Vetted files behind the ``photo:`` refs ``spec`` shows on ``data``
+    (for a PIL preview, which resolves bindings inside the renderer)."""
+    if spec.root_block is None:
+        return []
+    refs: list[str] = []
+
+    def collect(b: Block) -> None:
+        src = str(b.params.get("source", "")) if b.block_type == "image" else ""
+        if src.startswith("photo:"):
+            refs.append(src.split(":", 1)[1])
+        for child in b.children:
+            collect(child)
+
+    try:
+        collect(resolve_bindings(spec.root_block, data))
+    except Exception:
+        return []
+    return list(_resolve_photo_refs(refs).values()) if refs else []
 
 
 def _resolve_photo_refs(refs: list[str]) -> dict[str, str]:

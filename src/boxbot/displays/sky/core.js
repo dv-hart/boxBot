@@ -18,7 +18,8 @@
   const blocks = {};      // type -> (block, ctx) => html
   const tickers = [];     // (Date, root) => void, once a second
   const mounts = [];      // (root, ctx) => void, after a view pane lands in the DOM
-  let state = null, ctx = null, lastView = '', lastScene = '', lastDisplay = null, clockOffset = 0;
+  let state = null, ctx = null, lastView = '', lastScene = '', lastLook = '', lastDisplay = null, clockOffset = 0;
+  let allowed = new Set();   // absolute image paths Python vetted for the state on screen
 
   /* ── atmosphere ─────────────────────────────────────────────── */
   function slabVars(P, phase) {
@@ -43,6 +44,9 @@
     if (opts.scale != null) o.scale = opts.scale;
     if (opts.mountain != null) o.mountain = opts.mountain;
     const key = JSON.stringify(o);
+    /* What the blocks' own look depends on: everything but the minute. The scene repaints when the time moves
+       (ferry, lit windows); the view must not — a rebuilt pane restarts captions, zooms and countdowns. */
+    lastLook = JSON.stringify({ ...o, time: null });
     stage.classList.toggle('no-scene', opts.hidden === true);
     const P = palette(o.phase, o.weather);
     if (key !== lastScene) {
@@ -74,6 +78,25 @@
     const k = Math.min(innerWidth / 1024, innerHeight / 600) || 1;
     return k === 1 ? '' : `transform:scale(${k})`;
   };
+
+  /* ── images ─────────────────────────────────────────────────── */
+  /* Path or URL → something an <img> may load, or '' to refuse. The browser can read any file the service
+     can, so the page loads only: an absolute path Python vetted and listed in state.images; a data: image
+     (pushed frames); a path relative to the page with no '..' (bundled fixtures). Nothing else — a path that
+     arrives in some param Python did not expect is not in the list and is not loaded. */
+  const DATA_IMG = /^data:image\/(png|jpe?g|webp|gif|avif);base64,[a-z0-9+/=\s]+$/i;
+  const encPath = p => p.split('/').map(encodeURIComponent).join('/');
+  function img(s) {
+    s = s == null ? '' : String(s).trim();
+    if (!s) return '';
+    if (/^data:/i.test(s)) return DATA_IMG.test(s) ? s : '';
+    let path = null;
+    if (/^file:\/\//i.test(s)) { try { path = decodeURIComponent(s.slice(7).replace(/[?#].*$/, '')); } catch (e) { return ''; } }
+    else if (s[0] === '/') path = s;
+    if (path != null) return allowed.has(path) ? 'file://' + encPath(path) : '';
+    if (/^[a-z][a-z0-9+.-]*:/i.test(s) || s.split(/[\\/]/).includes('..')) return '';
+    return encPath(s);
+  }
 
   /* ── blocks ─────────────────────────────────────────────────── */
   function render(block, c) {
@@ -116,15 +139,18 @@
   function apply(next) {
     if (typeof next === 'string') next = JSON.parse(next);
     state = next;
+    allowed = new Set(Array.isArray(next.images) ? next.images.map(String) : []);
     const atmo = next.atmosphere || { phase: 'noon', weather: 'clear' };
     clockOffset = next.now ? new Date(next.now) - Date.now() : 0;
     const P = paintScene(atmo, next.scene || {});
     ctx = { state: next, data: next.data || {}, args: next.args || {}, atmosphere: atmo, P, now: now(), display: next.display };
 
-    $('stage').classList.toggle('raw', !!next.frame);
-    if (next.frame) $('frame').src = next.frame;
+    const frame = next.frame && DATA_IMG.test(next.frame) ? next.frame : '';
+    $('stage').classList.toggle('raw', !!frame);
+    if (frame) { if ($('frame').getAttribute('src') !== frame) $('frame').src = frame; }
+    else $('frame').removeAttribute('src');          // do not keep the last frame decoded behind the view
 
-    const key = JSON.stringify([next.display, next.layout, next.args, next.people, lastScene]);
+    const key = JSON.stringify([next.display, next.layout, next.args, next.people, next.images, lastLook]);
     if (key !== lastView) {
       lastView = key;
       const sameDisplay = next.display === lastDisplay && next.transition !== 'always';
@@ -157,7 +183,7 @@
 
   function boot() {
     mountIcons();
-    addEventListener('resize', () => { lastScene = ''; if (state) apply(state); });
+    addEventListener('resize', () => { lastScene = ''; lastView = ''; if (state) apply(state); });
     setInterval(tick, 1000);
     const q = new URLSearchParams(location.search);
     BB.still = q.has('still') || q.has('fixture');        // no cross-fades: screenshots land on the final frame
@@ -185,7 +211,7 @@
     alias: (type, of) => { blocks[type] = (b, c) => blocks[of](b, c); },
     onTick: fn => tickers.push(fn),
     onMount: fn => mounts.push(fn),
-    render, children, esc, slug, person, now, fmtTime, until, styleOf, apply, blocks,
+    render, children, esc, slug, person, now, fmtTime, until, styleOf, apply, blocks, img,
     get state() { return state; }, get ctx() { return ctx; },
     ready: false, still: false, presence: null, fixture: null,
   };

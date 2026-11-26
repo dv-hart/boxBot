@@ -40,7 +40,7 @@ import shutil
 import signal
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from boxbot.displays.cdp_pipe import CDPError, CDPPipe
 
@@ -70,6 +70,25 @@ _EXEC_SCRIPT = (
 
 _RESTART_DELAYS = (1.0, 2.0, 5.0, 15.0, 30.0)
 
+# When to stop trying. A browser that will not come back, or that keeps
+# dying, leaves the screen showing nothing; the owner (the display
+# manager) is told so it can draw another way. Either: this many
+# relaunches failed in a row, or this many exits inside the window.
+_MAX_RESTART_FAILURES = 3
+_MAX_EXITS = 4
+_EXIT_WINDOW_SECONDS = 300.0
+
+# A renderer that hangs keeps its process alive. One state push is
+# given this long; this many unanswered in a row and the browser is
+# killed, which the supervisor then treats like any other exit.
+_PUSH_TIMEOUT = 10.0
+_MAX_PUSH_FAILURES = 3
+
+# The browser's whole environment. The service's own holds every secret
+# from ``.env``; none of it is the browser's business. ``TZ`` because
+# the page's clocks are local time.
+_ENV_PASSTHROUGH = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+
 # Resolves once fonts are in and every image has decoded (or failed):
 # a screenshot before that catches fallback type and empty photos.
 _SETTLED_JS = (
@@ -82,6 +101,15 @@ _SETTLED_JS = (
 
 class SkySurfaceError(Exception):
     """The surface could not start or did not answer."""
+
+
+class SkyPageError(SkySurfaceError):
+    """The page answered, with an exception: it is alive, and sending
+    the same state again would fail the same way."""
+
+
+class SkyStateTooLarge(SkySurfaceError):
+    """The state does not fit in one message."""
 
 
 class SkySurface:
@@ -100,8 +128,16 @@ class SkySurface:
         size: tuple[int, int] = (1024, 600),
         headless: bool | None = None,
         name: str = "screen",
+        on_restart: Callable[[], None] | None = None,
+        on_failed: Callable[[str], None] | None = None,
     ) -> None:
+        """``on_restart`` is called after the browser was relaunched (a
+        new window now exists); ``on_failed(reason)`` once, when the
+        surface has given up and stopped itself. Both are called on the
+        event loop and must not block."""
         self._config = config
+        self._on_restart = on_restart
+        self._on_failed = on_failed
         self._size = size
         self._headless = config.headless if headless is None else headless
         self._name = name
@@ -158,12 +194,13 @@ class SkySurface:
     async def stop(self) -> None:
         self._wanted = False
         for task in (self._supervisor, self._pump):
-            if task is not None:
+            # Cancel until it has really ended: ``asyncio.wait_for``
+            # (Python < 3.12) swallows a cancellation that lands in the
+            # same loop pass as the reply it was waiting for, and the
+            # pump would then go back to waiting for ever.
+            while task is not None and not task.done():
                 task.cancel()
-        for task in (self._supervisor, self._pump):
-            if task is not None:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+                await asyncio.wait({task}, timeout=0.5)
         self._supervisor = self._pump = None
         await self._teardown()
 
@@ -244,7 +281,7 @@ class SkySurface:
         if "exceptionDetails" in result:
             detail = result["exceptionDetails"]
             text = (detail.get("exception") or {}).get("description") or detail.get("text")
-            raise SkySurfaceError(f"page error: {text}")
+            raise SkyPageError(f"page error: {text}")
         return (result.get("result") or {}).get("value")
 
     async def _push(self, state: dict[str, Any]) -> None:
@@ -257,15 +294,40 @@ class SkySurface:
             slim = {**state, "data": {}}
             payload = json.dumps(slim, ensure_ascii=True, separators=(",", ":"), default=str)
             if len(payload) > MAX_STATE_BYTES:
-                raise SkySurfaceError(
+                raise SkyStateTooLarge(
                     f"display state is {len(payload)} bytes (limit {MAX_STATE_BYTES})"
                 )
         async with self._lock:
             cdp, session = self._require()
-            await self._eval(cdp, session, f"BB.apply({payload})")
+            await self._eval(cdp, session, f"BB.apply({payload})", timeout=_PUSH_TIMEOUT)
         self._pushed += 1
 
+    def _kill(self, why: str) -> None:
+        """Kill the browser; the supervisor relaunches it (or gives up)."""
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return
+        logger.warning("Display browser (%s): %s — killing it", self._name, why)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+
+    def _on_target_crashed(self, params: dict[str, Any], session_id: str | None) -> None:
+        # The renderer process died ("Aw, snap"); the browser process
+        # lives on showing a dead page, so its exit would never come.
+        self._kill("page crashed")
+
+    def _browser_env(self, profile: Path) -> dict[str, str]:
+        """A minimal, explicit environment — never the service's own."""
+        env = {k: os.environ[k] for k in _ENV_PASSTHROUGH if os.environ.get(k)}
+        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+        # Its own home: nothing of the service user's is read or written.
+        env["HOME"] = str(profile)
+        if not self._headless:
+            env.update(self._session_env())
+        return env
+
     async def _pump_loop(self) -> None:
+        failures = 0
         while True:
             await self._dirty.wait()
             await self._ready.wait()
@@ -275,15 +337,42 @@ class SkySurface:
                 continue
             try:
                 await self._push(state)
+                failures = 0
+            except (SkyPageError, SkyStateTooLarge) as e:
+                # The page is alive and refused this state; the same
+                # state again would only fail again. The next one may not.
+                logger.error("display state not shown: %s", e)
             except SkySurfaceError as e:
-                if self._ready.is_set():
-                    logger.warning("display state push failed: %s", e)
+                if not self._ready.is_set():
+                    # The supervisor re-pushes after the restart.
+                    failures = 0
+                    continue
+                failures += 1
+                logger.warning(
+                    "display state push failed (%d/%d): %s",
+                    failures, _MAX_PUSH_FAILURES, e,
+                )
+                if failures >= _MAX_PUSH_FAILURES:
+                    failures = 0
+                    self._kill("page stopped answering")
+                    # Wait for the supervisor to notice before looking
+                    # at ``_ready`` again.
+                    await asyncio.sleep(0.2)
+                else:
                     await asyncio.sleep(1.0)
-                # Not ready: the supervisor re-pushes after the restart.
+                # Not delivered: it is still what should be on screen.
+                self._dirty.set()
 
     async def _supervise(self) -> None:
-        """Restart the browser whenever it exits while still wanted."""
+        """Restart the browser whenever it exits while still wanted.
+
+        Gives up (see ``_MAX_RESTART_FAILURES`` / ``_MAX_EXITS``) rather
+        than retry forever over a blank screen: the surface stops itself
+        and reports through ``on_failed``.
+        """
         failures = 0
+        exits: list[float] = []
+        loop = asyncio.get_running_loop()
         while self._wanted:
             proc = self._proc
             if proc is not None:
@@ -294,7 +383,19 @@ class SkySurface:
                     "Display browser (%s) exited (code %s): %s",
                     self._name, code, self._stderr_tail(),
                 )
+                now = loop.time()
+                exits = [t for t in exits if now - t < _EXIT_WINDOW_SECONDS] + [now]
             await self._teardown()
+            if failures >= _MAX_RESTART_FAILURES or len(exits) >= _MAX_EXITS:
+                reason = (
+                    f"{failures} restarts failed in a row" if failures >= _MAX_RESTART_FAILURES
+                    else f"browser exited {len(exits)} times in "
+                         f"{int(_EXIT_WINDOW_SECONDS)}s"
+                )
+                logger.error("Display browser (%s) given up: %s", self._name, reason)
+                self._wanted = False
+                self._notify(self._on_failed, reason)
+                return
             delay = _RESTART_DELAYS[min(failures, len(_RESTART_DELAYS) - 1)]
             await asyncio.sleep(delay)
             if not self._wanted:
@@ -309,6 +410,15 @@ class SkySurface:
             failures = 0
             if self._state is not None:
                 self._dirty.set()
+            self._notify(self._on_restart)
+
+    def _notify(self, callback: Callable[..., None] | None, *args: Any) -> None:
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception:
+            logger.exception("Display browser (%s) callback failed", self._name)
 
     def _argv(self, read_fd: int, write_fd: int, profile: Path) -> list[str]:
         cfg = self._config
@@ -341,6 +451,10 @@ class SkySurface:
             "--mute-audio",
             "--overscroll-history-navigation=0",
             "--block-new-web-contents",
+            # Nothing the page could ask for is granted, and WebRTC may
+            # not open sockets around the dead proxy.
+            "--deny-permission-prompts",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             # Offline twice over: no name resolves, and anything that
             # tries an address anyway is sent to a port nobody listens on.
             "--host-resolver-rules=MAP * ~NOTFOUND",
@@ -421,7 +535,7 @@ class SkySurface:
                     stderr=stderr,
                     pass_fds=(child_r, child_w),
                     start_new_session=True,
-                    env={**os.environ, **({} if self._headless else self._session_env())},
+                    env=self._browser_env(profile),
                 )
         except OSError as e:
             raise SkySurfaceError(f"could not start browser: {e}") from e
@@ -451,6 +565,8 @@ class SkySurface:
             if not session:
                 raise CDPError("browser did not return a page session")
             await self._cdp.call("Page.enable", session_id=session)
+            for crashed in ("Inspector.targetCrashed", "Target.targetCrashed"):
+                self._cdp.on_event(crashed, self._on_target_crashed)
             await self._cdp.call("Browser.setDownloadBehavior", {"behavior": "deny"})
             if self._headless:
                 # Headless windows lose part of their height to phantom

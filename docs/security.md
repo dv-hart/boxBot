@@ -311,6 +311,10 @@ photos and must not reach the internet.
 - **Runs as the service user.** It loads only files shipped in the
   package, and it has to read the photo library. There is no untrusted
   page to contain.
+- **Its own environment.** The browser is started with an explicit,
+  minimal environment (`PATH`, locale, `TZ`, the Wayland session, a
+  `HOME` inside its profile) — none of the service's variables, which
+  hold every secret from `.env`.
 - **No network.** Launched with every hostname mapped to `NOTFOUND` and
   all traffic routed to a dead local proxy; the page's CSP allows
   `file:` (and `data:` images) and nothing else.
@@ -322,9 +326,22 @@ photos and must not reach the internet.
   the CSP refuses inline script and event handlers if one ever fails
   to. `tests/test_sky_page.py` drives hostile strings through every
   block in a real browser.
-- **Vetted image paths only.** Photo sources reach the page as file
-  paths resolved through the same allowlist that gates image
-  attachments; a ref that does not resolve is dropped, not passed on.
+- **Vetted image paths only.** The browser can read any file the
+  service user can, so which files it is asked for is decided in
+  Python. While a state is built, every image param is resolved: a
+  `photo:` ref through the photo library / attachment allowlist, a
+  bare path or `file:` URL through the attachment allowlist
+  (`manager._vet_image_params`). What does not resolve is removed. The
+  state carries the resulting list (`images`), and the page loads an
+  absolute path only if it is on that list (`BB.img`) — a path arriving
+  in a param nobody anticipated is not loaded. Besides those: `data:`
+  images (pushed frames) and files bundled beside the page. The PIL
+  renderer holds image blocks to the same rule, so neither renderer's
+  preview can hand the sandbox pixels of a file it could not attach.
+- **Frames are pictures.** `products` and `cart` (and the camera live
+  view) reach the page as one JPEG `data:` URL, size-capped, set as an
+  `<img>` source. Merchant text is in the pixels only; the page gets
+  the opaque view token and an empty layout.
 - **Fresh profile** under `display.html.state_dir`, recreated on every
   launch.
 

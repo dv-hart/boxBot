@@ -17,8 +17,13 @@ directly under fixed limits (docs/security.md, "Product images"):
   them; the raw download is never written to disk;
 - no cookies, no credentials, no request body, a fixed User-Agent.
 
-Results are cached under ``<workspace>/tmp/product-images/`` by URL
-hash. The URL is never supplied by the sandbox: callers pass the
+Results are cached under ``data/purchases/product-images/`` by URL
+hash — next to the purchase database, mode ``0700``, a directory no
+sandbox action can name: it is outside the workspace, the photo
+library and every image-attach root, and :func:`is_cached_image`
+refuses a cache that is ever configured inside one of them. So a file
+in the cache was written by :func:`_reencode` and by nothing else.
+The URL is never supplied by the sandbox: callers pass the
 ``image_url`` held in the main-process result cache.
 """
 
@@ -55,9 +60,60 @@ _slots: asyncio.Semaphore | None = None
 
 
 def cache_dir() -> Path:
-    from boxbot.core.paths import WORKSPACE_DIR
+    """The image cache: main-process-only, beside the purchase database."""
+    from boxbot.core import paths
 
-    return WORKSPACE_DIR / "tmp" / "product-images"
+    return paths.PURCHASES_DIR / "product-images"
+
+
+def _agent_roots() -> list[Path]:
+    """Every directory a sandbox action can read or write by path."""
+    from boxbot.core import paths
+
+    roots = [paths.WORKSPACE_DIR, paths.PHOTOS_DIR, paths.DISPLAYS_DIR,
+             paths.SANDBOX_DIR]
+    try:
+        from boxbot.tools._sandbox_actions import _attach_roots
+
+        roots.extend(_attach_roots())
+    except Exception:  # noqa: BLE001 — the static list still applies
+        logger.exception("product image: could not read the attach roots")
+    try:
+        from boxbot.core.config import get_config
+
+        config = get_config()
+        roots.append(Path(config.photos.storage_path))
+        roots.append(Path(config.sandbox.runtime_dir))
+    except Exception:  # noqa: BLE001 — config not loaded (tests, tools)
+        pass
+    out = []
+    for root in roots:
+        try:
+            out.append(Path(root).resolve())
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _agent_reachable(path: Path) -> bool:
+    """True when ``path`` (resolved) lies in a directory the sandbox can
+    address — the workspace, the photo library, an attach root."""
+    return any(path == root or root in path.parents for root in _agent_roots())
+
+
+def _ensure_cache_dir() -> Path | None:
+    """Create the cache owner-only; None if it may not be used."""
+    try:
+        root = cache_dir()
+        if _agent_reachable(root.resolve()):
+            logger.error("product image cache %s is agent-reachable; not used", root)
+            return None
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(root, 0o700)
+        return root
+    except OSError:
+        logger.exception("product image: could not prepare the cache")
+        return None
 
 
 def _config() -> Any:
@@ -95,8 +151,7 @@ def cached_path(url: Any) -> Path | None:
     """The cached, re-encoded file for ``url`` if it exists."""
     if allowed_url(url) is None:
         return None
-    path = cache_dir() / f"{_key(url)}.jpg"
-    return path if path.is_file() else None
+    return is_cached_image(cache_dir() / f"{_key(url)}.jpg")
 
 
 def is_cached_image(path: Any) -> Path | None:
@@ -104,7 +159,10 @@ def is_cached_image(path: Any) -> Path | None:
 
     The product blocks open nothing else: an ``image`` value arriving
     from anywhere but this module (an agent-authored display spec, say)
-    cannot make the renderer read an arbitrary file.
+    cannot make the renderer read an arbitrary file. And never a file
+    the sandbox could have written: a path under the workspace or any
+    other agent-addressable directory is refused even if the cache were
+    pointed there.
     """
     if not isinstance(path, (str, Path)) or not str(path):
         return None
@@ -115,7 +173,35 @@ def is_cached_image(path: Any) -> Path | None:
         return None
     if resolved.parent != root or resolved.suffix != ".jpg" or not resolved.is_file():
         return None
+    if _agent_reachable(resolved):
+        return None
     return resolved
+
+
+def open_cached(path: Any) -> Any:
+    """The cached image at ``path`` as an RGB ``PIL.Image``, or None.
+
+    The only way the renderer opens a product photo. Belt and braces
+    behind :func:`is_cached_image`: the header is read first, and a file
+    that is not a JPEG or is over :data:`MAX_PIXELS` is refused before
+    any pixel is decoded — whatever is on disk, a render cannot be made
+    to allocate an arbitrarily large bitmap.
+    """
+    from PIL import Image
+
+    safe = is_cached_image(path)
+    if safe is None:
+        return None
+    try:
+        with Image.open(safe) as opened:
+            if opened.format != "JPEG":
+                return None
+            width, height = opened.size
+            if width <= 0 or height <= 0 or width * height > MAX_PIXELS:
+                return None
+            return opened.convert("RGB")
+    except Exception:  # noqa: BLE001 — a broken file is just "no image"
+        return None
 
 
 async def _download(url: str) -> bytes | None:
@@ -170,7 +256,8 @@ def _reencode(raw: bytes, dest: Path) -> bool:
         flat = Image.new("RGB", image.size, (255, 255, 255))
         flat.paste(image, mask=image.split()[3])
         flat.thumbnail((OUT_LONG_EDGE, OUT_LONG_EDGE), Image.Resampling.LANCZOS)
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        if _ensure_cache_dir() is None or dest.parent != cache_dir():
+            return False
         partial = dest.with_name(f".{dest.name}.{os.getpid()}.part")
         # A fresh Image carries no EXIF/ICC/XMP from the download.
         flat.save(partial, format="JPEG", quality=85)

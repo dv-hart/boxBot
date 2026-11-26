@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,8 +181,16 @@ class PurchaseStore:
         cursor = await db.execute("PRAGMA table_info(purchases)")
         have = {row[1] for row in await cursor.fetchall()}
         for name, kind in _ADDED_COLUMNS:
-            if name not in have:
+            if name in have:
+                continue
+            try:
                 await db.execute(f"ALTER TABLE purchases ADD COLUMN {name} {kind}")
+            except sqlite3.OperationalError as e:
+                # Another connection opening the same old database added
+                # it between our PRAGMA and our ALTER. That is the state
+                # we wanted.
+                if "duplicate column name" not in str(e).lower():
+                    raise
         await db.commit()
         return db
 

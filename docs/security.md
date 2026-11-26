@@ -237,11 +237,29 @@ text only.
   shown to admins is the transport ("voice at the box, 4:12 pm"), never
   a name the perception stack attached to a voice.
 - **Cancel is open to anyone, and local.** Cancelling stops boxBot's
-  own purchase row; the store's checkout link stays payable. So when a
-  purchase whose link was sent is cancelled by the agent, the main
-  process texts the admins a fixed-format "ignore the earlier link"
-  notice (rate-limited). A changed cart sent again cancels the earlier
-  purchase and its one text is marked as a replacement.
+  own purchase row; the store's checkout link stays payable. So the
+  invariant is: **a purchase whose link (or veto notice) reached an
+  admin and is then cancelled by the agent gets exactly one text saying
+  so** — a "Replaces purchase <id> …, now cancelled" line in the
+  replacement's own text, or the fixed-format "ignore the earlier link"
+  notice. `shopping._Retired` records each cancel as owing a notice,
+  clears it only when a text naming the id was accepted for an admin,
+  and sends whatever is still owed in a `finally` (a refused or
+  already-existing replacement, an unexpected error, a cancelled tool
+  call). The standalone notice is rate-limited (6/hour); when it cannot
+  go out the agent is told so per purchase (`admin_notice:
+  "not_told"`) and instructed to say the link still works.
+- **After a send, nothing stale stays payable.** `send` leaves live
+  only the purchases that stand for the cart as it is: an earlier one
+  from this conversation's cart whose lines changed, or whose store is
+  no longer in the cart, is cancelled under the rule above. `cancel()`
+  with no id cancels every live purchase the conversation sent.
+  Emptying the cart cancels nothing and texts nobody (cart calls never
+  do); the result names any purchase still out for payment.
+- **Admin texts say how a store is approved.** "in your config list"
+  (the only stores eligible for automatic purchase) or "approved by an
+  admin's text; not in your config list, so never bought
+  automatically".
 
 **Product images — a deliberate, bounded exception.** The main process
 otherwise never fetches a URL that came from a store. To put a photo
@@ -257,15 +275,28 @@ limits:
 | Content type | `image/jpeg`, `image/png`, `image/webp` |
 | Size | 3 MB, enforced while streaming (and on `Content-Length`) |
 | Time | 8 s per request, 12 s per screen |
-| Decode | pixel-count cap, then re-encoded to a plain JPEG (≤800 px) — metadata dropped; the raw download is never written to disk |
+| Decode | pixel-count cap (24 MP), then re-encoded to a plain JPEG (≤800 px) — metadata dropped; the raw download is never written to disk |
 | Request | GET, no cookies, no credentials, fixed User-Agent |
 | Source of the URL | the main-process result cache only — the sandbox cannot name a URL to fetch |
-| Cache | `data/workspace/tmp/product-images/<sha256>.jpg`, pruned to 300 files |
+| Cache | `data/purchases/product-images/<sha256>.jpg` (directory mode `0700`, beside the purchase database), pruned to 300 files |
+| Render | cache files only; JPEG only; the same pixel-count cap checked from the header before any decode |
 
-The product blocks open image files from that cache directory only.
-Cards render at once with a placeholder and redraw when the image
-lands. Residual risk: an image decoder bug reachable from an
-allow-listed CDN; widening the host list widens that surface.
+**The cache is main-process-only.** It lives under `data/purchases/`,
+which no sandbox action can name: it is outside the workspace
+(`bb.workspace` paths cannot leave `data/workspace/`), the photo
+library, and every image-attach root, so neither `bb.workspace.write`
+nor a display `image` source resolves to it. It must stay that way — a
+cache the agent could write would let it put its own picture beside a
+real title and price. `images.is_cached_image` therefore refuses any
+path that resolves inside an agent-addressable directory, even if the
+cache were configured there, and `_reencode` will not write to one.
+The product blocks open images only through `images.open_cached`:
+that directory, `.jpg`, JPEG format, and the pixel-count cap checked
+before pixels are decoded, so no file can make a render allocate an
+arbitrarily large bitmap. Cards render at once with a placeholder and
+redraw when the image lands. Residual risk: an image decoder bug
+reachable from an allow-listed CDN; widening the host list widens that
+surface.
 
 ### Package Installation (Out-of-Band Approval)
 

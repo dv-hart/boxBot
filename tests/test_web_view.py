@@ -1635,7 +1635,9 @@ async def manager():
 class TestManagerWebDisplay:
     async def test_web_is_a_registered_display(self, manager):
         assert "web" in manager.list_available()
-        assert "product" in manager.list_available()
+        # The hand-typed ``product`` card is gone; shopping draws its own.
+        assert "product" not in manager.list_available()
+        assert "products" in manager.list_available()
 
     async def test_switch_opens_the_view_pinned(self, manager):
         ok = await manager.switch(

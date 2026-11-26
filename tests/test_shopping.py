@@ -63,6 +63,8 @@ from test_purchases import (  # noqa: F401 — fixtures used by name
     texts,
 )
 
+_REAL_CACHE_DIR = images.cache_dir   # fixtures below replace the attribute
+
 OTHER = "toys.example.org"          # approved by an admin's text in some tests
 STRANGER = "far.example.net"        # never approved
 REPO = Path(__file__).parent.parent
@@ -611,6 +613,107 @@ class TestScreens:
                 frame.getpixel((x, 330)) != accent for x in range(30, 110)
             )
 
+    VARIANTS = ["Paperback · 2010", "Hardcover · 2019", "ISBN ending 6945",
+                "Library binding · 2012 · ISBN ending 0042"]     # 40: the longest a label gets
+
+    def draw(self, items, monkeypatch):
+        """Render product cards; return (frame, [(text, font px)] drawn)."""
+        from PIL import ImageDraw
+
+        from boxbot.displays.renderer import render_to_image
+        from boxbot.displays.shop_blocks import ProductCardsBlock, publish
+        from boxbot.displays.themes import get_theme
+
+        drawn = []
+        real = ImageDraw.ImageDraw.text
+
+        def recording(self, xy, text, *args, **kwargs):
+            drawn.append((text, getattr(kwargs.get("font"), "size", None), xy))
+            return real(self, xy, text, *args, **kwargs)
+
+        monkeypatch.setattr(ImageDraw.ImageDraw, "text", recording)
+        frame = render_to_image(
+            ProductCardsBlock(view=publish({"items": items, "hint": "Say a number"})),
+            get_theme("boxbot"),
+        )
+        return frame, drawn
+
+    @pytest.mark.parametrize("count", [2, 3, 4])
+    def test_same_titled_cards_show_the_whole_variant(self, count, monkeypatch):
+        title = "I Survived the Sinking of the Titanic, 1912 (I Survived #1)"
+        items = [
+            {"number": n + 1, "title": title, "variant": self.VARIANTS[n],
+             "price": "$10.99", "store": "Barnes & Noble", "approved": True,
+             "image": None}
+            for n in range(count)
+        ]
+        frame, drawn = self.draw(items, monkeypatch)
+        assert frame.size == (1024, 600)
+        strings = [text for text, _, _ in drawn]
+        words = " ".join(strings).split()
+        for variant in self.VARIANTS[:count]:
+            # Every word of the label is on the screen, none cut short.
+            for word in variant.replace(" · ", " ").split():
+                assert word in words, (variant, strings)
+        assert not any(s.rstrip().endswith("·") for s in strings)
+        # The label lines carry no ellipsis; only the shared title does.
+        assert [s for s in strings if s.endswith("...")] == [
+            s for s in strings if s.startswith("I Survived")]
+        # One title line per card — the second only repeated the neighbour's.
+        assert sum(s.startswith("I Survived") for s in strings) == count
+        assert not any(s.startswith("Sinking") for s in strings)
+        # Still readable from across the room, price and number still big.
+        from boxbot.displays import shop_blocks
+
+        assert min(size for _, size, _ in drawn) >= 28
+        price_sizes = [size for text, size, _ in drawn if text == "$10.99"]
+        assert len(price_sizes) == count
+        assert min(price_sizes) >= shop_blocks.PRICE_PX
+        number_sizes = [size for text, size, _ in drawn if text in "1234"]
+        assert len(number_sizes) == count and min(number_sizes) >= 48
+        # Prices share one baseline whatever the label lengths.
+        assert len({xy[1] for text, _, xy in drawn if text == "$10.99"}) == 1
+        # Everything is inside the frame, above the footer hint.
+        hint_y = next(xy[1] for text, _, xy in drawn if text.startswith("Say a number"))
+        assert all(xy[1] + size <= hint_y + 4
+                   for text, size, xy in drawn if not text.startswith("Say a number"))
+
+    def test_unique_titles_keep_two_title_lines_and_wrap_the_variant(self, monkeypatch):
+        variants = self.VARIANTS[:3] + ["Library binding · 2012"]
+        items = [
+            {"number": n + 1, "title": f"Book number {n + 1} with quite a long title",
+             "variant": variants[n], "price": "$6.99", "store": "Store",
+             "approved": True, "image": None}
+            for n in range(4)
+        ]
+        _, drawn = self.draw(items, monkeypatch)
+        strings = [text for text, _, _ in drawn]
+        assert sum(s.startswith("Book number") for s in strings) == 4
+        assert sum("with quite" in s for s in strings) == 4      # second line kept
+        words = " ".join(strings).split()
+        for variant in variants:
+            for word in variant.replace(" · ", " ").split():
+                assert word in words, (variant, strings)
+        # A label breaks at its separator, never leaving one dangling.
+        assert not any(s.rstrip().endswith("·") for s in strings)
+
+    async def test_the_hand_typed_product_display_is_gone(self):
+        from boxbot.displays.builtins import get_builtin_specs
+        from boxbot.displays.manager import DisplayManager
+
+        names = [spec.name for spec in get_builtin_specs()]
+        assert "product" not in names
+        assert "products" in names and "cart" in names
+        manager = DisplayManager()
+        await manager.load_displays()
+        try:
+            assert "product" not in manager.list_available()
+            # No built-in draws a title, price or seller from display args.
+            assert not await manager.switch("product", args={
+                "title": "Typed", "price": "$0.01", "seller": "Typed"})
+        finally:
+            await manager.stop()
+
     def test_text_sizes_are_readable_from_across_the_room(self):
         from boxbot.displays import shop_blocks
 
@@ -839,6 +942,98 @@ class TestImages:
         for bad in (str(outside), "/etc/passwd", str(self.dir / ".." / "secret.jpg"),
                     str(self.dir / "missing.jpg"), "", None, 7):
             assert images.is_cached_image(bad) is None
+
+    def test_the_cache_is_main_process_only(self, tmp_path):
+        from boxbot.core import paths
+        from boxbot.displays.manager import _resolve_direct_image_path
+        from boxbot.tools._sandbox_actions import _is_attach_allowed
+        from boxbot.workspace.store import Workspace, WorkspaceError
+
+        data = tmp_path / "data"
+        self.monkeypatch.setattr(paths, "PURCHASES_DIR", data / "purchases")
+        self.monkeypatch.setattr(paths, "WORKSPACE_DIR", data / "workspace")
+        self.monkeypatch.setattr(images, "cache_dir", _REAL_CACHE_DIR)
+        cache = images.cache_dir()
+        assert cache == data / "purchases" / "product-images"
+        # Written through the real path: owner-only directory.
+        assert images._reencode(jpeg_bytes(), cache / "abc.jpg")
+        assert (cache.stat().st_mode & 0o777) == 0o700
+        inside = cache / "abc.jpg"
+        assert images.is_cached_image(inside) == inside.resolve()
+        # No path the sandbox can hand over resolves to it.
+        assert not _is_attach_allowed(inside)
+        assert _resolve_direct_image_path(str(inside)) is None
+        assert _resolve_direct_image_path("../purchases/product-images/abc.jpg") is None
+        workspace = Workspace(root=data / "workspace")
+        for attempt in ("../purchases/product-images/abc.jpg", str(inside),
+                        "tmp/../../purchases/product-images/abc.jpg"):
+            with pytest.raises(WorkspaceError):
+                workspace._safe_path(attempt)
+
+    def test_a_file_planted_in_the_old_workspace_location_is_not_used(self, tmp_path):
+        """bb.workspace.write("tmp/product-images/<key>.jpg") used to
+        land in the cache itself."""
+        from boxbot.core import paths
+
+        data = tmp_path / "data"
+        self.monkeypatch.setattr(paths, "PURCHASES_DIR", data / "purchases")
+        self.monkeypatch.setattr(paths, "WORKSPACE_DIR", data / "workspace")
+        self.monkeypatch.setattr(images, "cache_dir", _REAL_CACHE_DIR)
+        url = "https://cdn.shopify.com/s/files/x.jpg"
+        old = data / "workspace" / "tmp" / "product-images"
+        old.mkdir(parents=True)
+        planted = old / f"{images._key(url)}.jpg"
+        planted.write_bytes(jpeg_bytes())
+        assert images.cached_path(url) is None
+        assert images.is_cached_image(planted) is None
+        assert images.open_cached(planted) is None
+
+    def test_a_path_under_the_workspace_never_counts_as_cached(self, tmp_path):
+        """Even with the cache (mis)pointed inside an agent-writable
+        tree, nothing in it is trusted, and nothing is written to it."""
+        from boxbot.core import paths
+
+        data = tmp_path / "data"
+        self.monkeypatch.setattr(paths, "WORKSPACE_DIR", data / "workspace")
+        self.monkeypatch.setattr(paths, "PHOTOS_DIR", data / "photos")
+        for root in (data / "workspace" / "tmp" / "product-images",
+                     data / "workspace", data / "photos" / "cache"):
+            root.mkdir(parents=True, exist_ok=True)
+            self.monkeypatch.setattr(images, "cache_dir", lambda root=root: root)
+            planted = root / "abc.jpg"
+            planted.write_bytes(jpeg_bytes())
+            assert images.is_cached_image(planted) is None
+            assert images.open_cached(planted) is None
+            assert not images._reencode(jpeg_bytes(), root / "new.jpg")
+            assert not (root / "new.jpg").exists()
+
+    def test_the_card_checks_format_and_pixel_count_before_decoding(self):
+        from boxbot.displays import shop_blocks
+
+        self.dir.mkdir()
+        good = self.dir / "good.jpg"
+        good.write_bytes(jpeg_bytes())
+        assert images.open_cached(good).size == (60, 80)
+        # A PNG under a .jpg name never came from _reencode.
+        png = io.BytesIO()
+        Image.new("RGB", (10, 10), (255, 0, 0)).save(png, "PNG")
+        fake = self.dir / "fake.jpg"
+        fake.write_bytes(png.getvalue())
+        assert images.open_cached(fake) is None
+        # Over the fetch-side pixel cap: refused from the header alone.
+        self.monkeypatch.setattr(images, "MAX_PIXELS", 60 * 80 - 1)
+        decoded = []
+        self.monkeypatch.setattr(
+            Image.Image, "convert",
+            lambda self, *a, **k: decoded.append(1) or self,
+        )
+        self.monkeypatch.setattr(
+            Image.Image, "load", lambda self, *a, **k: decoded.append(1),
+        )
+        assert images.open_cached(good) is None and decoded == []
+        # The block has no image-open path of its own.
+        source = Path(shop_blocks.__file__).read_text()
+        assert "Image.open" not in source and "open_cached(path)" in source
 
     async def test_cards_show_at_once_then_redraw_when_the_image_arrives(self, world):
         import asyncio
@@ -1215,6 +1410,51 @@ class TestBreakdown:
         assert (await old.get("old00001"))["id"] == "old00001"   # reopened, intact
 
 
+    async def test_concurrent_first_opens_of_an_old_database_all_succeed(self, tmp_path):
+        """Each open reads the columns, then adds the missing ones; two
+        opens can both decide a column is missing."""
+        import asyncio
+
+        import aiosqlite
+
+        path = tmp_path / "old" / "purchases.db"
+        path.parent.mkdir()
+        db = sqlite3.connect(path)
+        db.execute(
+            "CREATE TABLE purchases (id TEXT PRIMARY KEY, shop TEXT NOT NULL, "
+            "items TEXT NOT NULL, total_cents INTEGER, currency TEXT, "
+            "reason TEXT NOT NULL, requested_by TEXT, channel_key TEXT, "
+            "status TEXT NOT NULL, decision TEXT, checkout_id TEXT NOT NULL, "
+            "continue_url TEXT, complete_after TEXT, link_sent_at TEXT, "
+            "order_ref TEXT, note TEXT, created_at TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL)"
+        )
+        db.commit()
+        db.close()
+        old = PurchaseStore(db_path=path)
+        results = await asyncio.gather(
+            *(old.list() for _ in range(8)), return_exceptions=True,
+        )
+        assert results == [[]] * 8, results
+        # The losing side of the race, deterministically: the column is
+        # already there when the ALTER runs.
+        real = aiosqlite.Connection.execute
+        raced = []
+
+        async def stale_pragma(self, sql, *args):
+            if sql.startswith("PRAGMA table_info(purchases)"):
+                raced.append(1)
+                return await real(self, "SELECT 0, 'id' ")
+            return await real(self, sql, *args)
+
+        with patch.object(aiosqlite.Connection, "execute", stale_pragma):
+            assert await old.list() == []
+        assert raced
+        columns = {r[1] for r in sqlite3.connect(path).execute(
+            "PRAGMA table_info(purchases)")}
+        assert {"subtotal_cents", "shipping_cents", "tax_cents", "delivery"} <= columns
+
+
 # ---------------------------------------------------------------------------
 # G. Send and cancel
 # ---------------------------------------------------------------------------
@@ -1248,6 +1488,7 @@ class TestSend:
             assert set(entry) == {"store", "purchase", "decision", "blocked_by",
                                   "admins_notified", "already_proposed"}
             assert entry["decision"] == "review" and entry["admins_notified"] == 1
+        assert out["replaced"] == []
         assert out["total"] == "$19.98" and out["admins"] == ["Admin"]
         assert out["needs_approval"] == []
         rows = await self.w.store.list()
@@ -1341,6 +1582,187 @@ class TestSend:
         last = texts(self.w.out)[-1]
         assert f"boxBot purchase {first} cancelled — ignore the earlier link" in last
 
+    # -- a cart that moves store, and the notice every cancel is owed ------
+
+    def cancel_notices(self, purchase_id):
+        return [t for t in texts(self.w.out)
+                if f"boxBot purchase {purchase_id} cancelled — ignore" in t]
+
+    def mentions(self, purchase_id):
+        """Texts telling the admins this purchase is dead, either way."""
+        return [t for t in texts(self.w.out)
+                if f"purchase {purchase_id} cancelled" in t
+                or f"Replaces purchase {purchase_id}" in t]
+
+    async def test_cart_moved_to_another_store_cancels_the_old_purchase(self):
+        await self.cart(add=["a1"])
+        first = (await self.send())["purchases"][0]["purchase"]["id"]
+        await self.cart(replace={"a1": "a3"})               # a3 is at OTHER
+        out = await self.send()
+        second = out["purchases"][0]["purchase"]["id"]
+        assert (await self.w.store.get(first))["status"] == "cancelled"
+        assert (await self.w.store.get(second))["shop"] == OTHER
+        sent = texts(self.w.out)
+        assert len(sent) == 2                               # no third text
+        assert (f"Replaces purchase {first} at {SHOP}, now cancelled — "
+                "ignore that link.") in sent[1].splitlines()
+        assert sent[1].splitlines()[-1].startswith(f"Review and pay: https://{OTHER}/")
+        assert out["replaced"] == [
+            {"id": first, "store": "Example Books", "admin_notice": "told"}]
+        # Nothing this conversation sent is live except the new one.
+        with pytest.raises(service.PurchaseError):
+            await shopping.cancel(first, conv=self.w.conv)
+        done = await shopping.cancel(conv=self.w.conv)
+        assert [c["id"] for c in done["cancelled"]] == [second]
+
+    async def test_store_dropped_with_no_new_text_gets_the_cancel_notice(self):
+        await self.cart(add=["a1", "a3"])
+        first = {p["store"]: p["purchase"]["id"] for p in (await self.send())["purchases"]}
+        await self.cart(remove=["a3"])
+        out = await self.send()
+        # The remaining store's purchase is the same one: no new text…
+        assert out["purchases"][0]["already_proposed"] is True
+        assert (await self.w.store.get(first["Example Books"]))["status"] == "review"
+        # …so the dropped store's link is called off on its own.
+        assert (await self.w.store.get(first["Toy Shop"]))["status"] == "cancelled"
+        assert len(self.cancel_notices(first["Toy Shop"])) == 1
+        assert len(self.mentions(first["Toy Shop"])) == 1
+        assert out["replaced"] == [
+            {"id": first["Toy Shop"], "store": "Toy Shop", "admin_notice": "told"}]
+
+    async def test_cart_moved_to_an_unapproved_store_still_cancels_with_notice(self):
+        self.w.shop.offers = [
+            offer(4, title="Far book", shop=STRANGER, seller="Far Away", price=400)]
+        await shopping.find("far", show=False, conv=self.w.conv)
+        await self.cart(add=["a1"])
+        first = (await self.send())["purchases"][0]["purchase"]["id"]
+        await self.cart(replace={"a1": "b1"})
+        out = await self.send()
+        assert out["purchases"] == [] and len(out["needs_approval"]) == 1
+        assert (await self.w.store.get(first))["status"] == "cancelled"
+        assert len(self.cancel_notices(first)) == 1
+        assert out["replaced"][0]["admin_notice"] == "told"
+
+    async def test_already_proposed_answer_still_announces_the_cancel(self):
+        """The replacement turns out to be a purchase that already
+        exists, so no new text is written — the earlier link must still
+        be called off."""
+        await self.cart(add=["a1"])
+        first = (await self.send())["purchases"][0]["purchase"]["id"]
+        with patch.object(checker, "check", side_effect=deny):
+            direct = await service.propose(
+                SHOP, [{"variant_id": gid(2), "quantity": 1}], "directly",
+                conv=self.w.conv,
+            )
+        await self.cart(replace={"a1": "a2"})
+        out = await self.send()
+        entry = out["purchases"][0]
+        assert entry["already_proposed"] is True
+        assert entry["purchase"]["id"] == direct["purchase"]["id"]
+        assert (await self.w.store.get(first))["status"] == "cancelled"
+        assert len(self.mentions(first)) == 1 == len(self.cancel_notices(first))
+        assert out["replaced"] == [
+            {"id": first, "store": "Example Books", "admin_notice": "told"}]
+
+    async def test_unexpected_error_in_the_replacement_still_announces_the_cancel(self):
+        await self.cart(add=["a1"])
+        first = (await self.send())["purchases"][0]["purchase"]["id"]
+        await self.cart(replace={"a1": "a2"})
+
+        async def boom(*_a, **_kw):
+            raise RuntimeError("not a PurchaseError")
+
+        with patch.object(service, "propose", side_effect=boom):
+            with pytest.raises(RuntimeError):
+                await shopping.send("why", conv=self.w.conv)
+        assert (await self.w.store.get(first))["status"] == "cancelled"
+        assert len(self.cancel_notices(first)) == 1
+
+    async def test_a_cancelled_send_call_still_announces_the_cancel(self):
+        """The sandbox script timing out cancels the handler mid-send."""
+        import asyncio
+
+        await self.cart(add=["a1"])
+        first = (await self.send())["purchases"][0]["purchase"]["id"]
+        await self.cart(replace={"a1": "a2"})
+        reached = asyncio.Event()
+
+        async def hang(*_a, **_kw):
+            reached.set()
+            await asyncio.sleep(3600)
+
+        with patch.object(service, "propose", side_effect=hang):
+            task = asyncio.ensure_future(shopping.send("why", conv=self.w.conv))
+            await reached.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert (await self.w.store.get(first))["status"] == "cancelled"
+        assert len(self.cancel_notices(first)) == 1
+
+    async def test_exactly_one_text_per_cancelled_purchase_when_replaced(self):
+        await self.cart(add=["a1", "a3"])
+        first = {p["store"]: p["purchase"]["id"] for p in (await self.send())["purchases"]}
+        # Both stores change at once: each old id is named once, by a
+        # new text, and no standalone notice follows.
+        await self.cart(replace={"a1": "a2"}, add={"a3": 2})
+        out = await self.send()
+        assert [r["admin_notice"] for r in out["replaced"]] == ["told", "told"]
+        for pid in first.values():
+            assert (await self.w.store.get(pid))["status"] == "cancelled"
+            assert len(self.mentions(pid)) == 1 and self.cancel_notices(pid) == []
+
+    async def test_a_notice_that_could_not_go_out_is_reported_not_hidden(self):
+        from boxbot.purchases.shop_client import ShopError
+
+        await self.cart(add=["a1"])
+        first = (await self.send())["purchases"][0]["purchase"]["id"]
+        for _ in range(service._cancel_notice_rate.limit):
+            service._cancel_notice_rate.add()
+        # Replacement refused and the notice ceiling reached: the error
+        # itself says the old link is still out there.
+        await self.cart(replace={"a1": "a2"})
+        self.w.shop.create_error = ShopError("sold out")
+        with pytest.raises(service.PurchaseError) as failed:
+            await self.send()
+        assert first in str(failed.value) and "could NOT be told" in str(failed.value)
+        assert self.cancel_notices(first) == []
+
+    async def test_store_left_cart_and_notice_ceiling_reached(self):
+        await self.cart(add=["a1", "a3"])
+        first = {p["store"]: p["purchase"]["id"] for p in (await self.send())["purchases"]}
+        for _ in range(service._cancel_notice_rate.limit):
+            service._cancel_notice_rate.add()
+        await self.cart(remove=["a3"])
+        out = await self.send()
+        assert out["replaced"] == [{
+            "id": first["Toy Shop"], "store": "Toy Shop", "admin_notice": "not_told"}]
+
+    async def test_clearing_the_cart_after_a_send_says_the_purchase_is_still_out(self):
+        await self.cart(add=["a1"])
+        first = (await self.send())["purchases"][0]["purchase"]["id"]
+        before = len(texts(self.w.out))
+        view = await self.cart(clear=True)
+        # Clearing cancels nothing and texts nobody — and says so.
+        assert (await self.w.store.get(first))["status"] == "review"
+        assert len(texts(self.w.out)) == before
+        assert view["lines"] == []
+        assert view["still_out"] == [{
+            "id": first, "store": "Example Books", "total": "$12.98",
+            "status": "review"}]
+        assert first in view["note"] and "cancel()" in view["note"]
+        # cancel() pulls it back, with the notice.
+        done = await shopping.cancel(conv=self.w.conv)
+        assert done["cancelled"][0]["id"] == first
+        assert done["cancelled"][0]["admin_notice"] == "told"
+        again = await self.cart(clear=True)
+        assert "still_out" not in again and "note" not in again
+
+    async def test_clearing_before_any_send_reports_nothing_out(self):
+        await self.cart(add=["a1"])
+        view = await self.cart(clear=True)
+        assert "still_out" not in view and "note" not in view
+
     async def test_unapproved_store_is_asked_about_not_sent_to(self):
         self.w.shop.offers = [
             offer(4, title="Far book", shop=STRANGER, seller="Far Away", price=400)]
@@ -1421,7 +1843,9 @@ class TestCancel:
     async def test_default_is_this_conversations_latest_send_and_admins_are_told(self):
         out = await shopping.cancel(conv=self.w.conv)
         assert [p["id"] for p in out["cancelled"]] == [self.pid]
-        assert out["cancelled"][0]["status"] == "cancelled" and out["admins_told"] == 1
+        assert out["cancelled"][0]["status"] == "cancelled"
+        assert out["cancelled"][0]["admin_notice"] == "told"
+        assert "admins_told" not in out          # the old count could not say why 0
         (text,) = texts(self.w.out)
         assert text == (
             f"🛒 boxBot purchase {self.pid} cancelled — ignore the earlier link "
@@ -1449,14 +1873,50 @@ class TestCancel:
     async def test_no_notice_when_no_link_ever_reached_an_admin(self):
         await self.w.store.update_fields(self.pid, link_sent_at=None)
         out = await shopping.cancel(conv=self.w.conv)
-        assert out["admins_told"] == 0 and self.w.out.sent == []
+        assert out["cancelled"][0]["admin_notice"] == "none_needed"
+        assert self.w.out.sent == []
 
     async def test_notice_is_rate_limited_but_the_cancel_still_happens(self):
         for _ in range(service._cancel_notice_rate.limit):
             service._cancel_notice_rate.add()
         out = await shopping.cancel(conv=self.w.conv)
         assert out["cancelled"][0]["status"] == "cancelled"
-        assert out["admins_told"] == 0 and self.w.out.sent == []
+        # Not the same answer as "no link was out": this link still works.
+        assert out["cancelled"][0]["admin_notice"] == "not_told"
+        assert self.w.out.sent == []
+
+    async def test_unreachable_admin_is_reported_as_not_told(self):
+        with patch.object(service, "_notify_admins", return_value=0):
+            out = await shopping.cancel(self.pid, conv=self.w.conv)
+        assert out["cancelled"][0]["status"] == "cancelled"
+        assert out["cancelled"][0]["admin_notice"] == "not_told"
+
+    async def test_no_id_cancels_everything_this_conversation_sent(self):
+        """Not just the last send: a purchase proposed earlier (here by
+        the direct call) must not stay payable after "cancel"."""
+        from boxbot.tools._tool_context import current_conversation
+
+        token = current_conversation.set(self.w.conv)
+        try:
+            with patch.object(checker, "check", side_effect=deny):
+                direct = await process_action({
+                    "_sdk": "purchases.propose", "shop": SHOP, "reason": "also",
+                    "items": [{"variant_id": gid(2), "quantity": 1}],
+                }, ActionContext())
+                # …and then the cart is sent again, unchanged.
+                await shopping.send("why", conv=self.w.conv)
+        finally:
+            current_conversation.reset(token)
+        other = direct["purchase"]["id"]
+        assert other != self.pid
+        self.w.out.sent.clear()
+        out = await shopping.cancel(conv=self.w.conv)
+        assert {c["id"] for c in out["cancelled"]} == {self.pid, other}
+        assert {c["admin_notice"] for c in out["cancelled"]} == {"told"}
+        for pid in (self.pid, other):
+            assert (await self.w.store.get(pid))["status"] == "cancelled"
+            assert sum(f"purchase {pid} cancelled" in t for t in texts(self.w.out)) == 1
+        assert await shopping._still_out(shopping._session(self.w.conv)) == []
 
     @pytest.mark.parametrize("bad", ["", "nope", "ab12cd34; drop", 7, ["ab12cd34"]])
     async def test_id_is_validated(self, bad):
@@ -1487,7 +1947,9 @@ class TestCancel:
             current_conversation.reset(token)
         assert by_default["status"] == "ok" and "purchase" not in by_default
         assert by_default["cancelled"][0]["id"] == self.pid
+        assert by_default["cancelled"][0]["admin_notice"] == "told"
         assert by_id["purchase"]["status"] == "cancelled"
+        assert by_id["purchase"]["admin_notice"] == "told"
 
 
 # ---------------------------------------------------------------------------
@@ -1525,6 +1987,17 @@ class TestGuidance:
             text = doc.read_text().lower()
             assert "cannot cancel" not in text and "can't cancel" not in text
             assert "you can cancel" in text or "cancel (`cancel()`)" in text
+
+    def test_cancel_wording_depends_on_whether_admins_were_told(self):
+        skill, api = self.SKILL.read_text(), self.API.read_text()
+        for doc in (skill, api):
+            for value in ("told", "none_needed", "not_told"):
+                assert f"`{value}`" in doc, value
+            assert "admin_notice" in doc and "still_out" in doc
+            assert "admins_told" not in doc
+        # Never the unconditional claim.
+        assert '"Cancelled. Jacob\'s been told to ignore the link." |' not in skill
+        assert "link still works" in skill
 
     def test_core_rules_are_present(self):
         skill = self.SKILL.read_text()
@@ -1570,7 +2043,7 @@ class TestSdkSurface:
                 "purchases.find": {"status": "ok", "results": [{"id": "a1"}], "shown": []},
                 "purchases.stores": {"status": "ok", "stores": [{"store": "S", "domain": "d"}]},
                 "purchases.cancel": {"status": "ok", "cancelled": [{"id": "p"}],
-                                     "admins_told": 1, "purchase": {"id": "p"}},
+                                     "purchase": {"id": "p"}},
             }.get(action, {"status": "ok", "lines": []})
 
         with patch.object(_transport, "dispatch_or_raise", side_effect=fake):
@@ -1580,7 +2053,7 @@ class TestSdkSurface:
             assert bb.purchases.cart(add="a1", quote=True) == {"lines": []}
             bb.purchases.send("why")
             assert bb.purchases.cancel() == {"cancelled": [{"id": "p"}],
-                                             "admins_told": 1, "purchase": {"id": "p"}}
+                                             "purchase": {"id": "p"}}
             assert bb.purchases.cancel("p") == {"id": "p"}
         assert sent == [
             ("purchases.find", {"query": "x", "approved_only": True, "show": True}),

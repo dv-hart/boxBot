@@ -1281,7 +1281,8 @@ class TestProposeReview:
         # Exactly one line each for the facts the service established.
         assert sum(line.startswith("Total: ") for line in lines) == 1
         assert "Total: $12.98" in text and "Policy check: deny" in text
-        assert "on your allow-list" in text
+        (store_line,) = [l for l in lines if l.startswith("Store: ")]
+        assert store_line == f"Store: {SHOP} (in your config list)"
         (stated,) = [l for l in lines if l.startswith("boxBot's stated reason")]
         assert "(unverified)" in stated and stated.count('"') == 2
         assert len(lines) == 9          # nothing injected a line of its own
@@ -1289,14 +1290,30 @@ class TestProposeReview:
         # What the agent gets back is sanitised the same way.
         assert "evil.example" not in json.dumps(out)
 
-    async def test_admin_approved_store_is_flagged_as_not_allow_listed(self, env):
+    async def test_admin_approved_store_is_described_as_approved_by_text(self, env):
         env.cfg.allowed_shops = []
         admin = await (await _auth()).get_user(ADMIN)
         await service.handle_admin_command("allow_shop", SHOP, admin=admin)
         with patch.object(checker, "check", side_effect=deny):
             out = await service.propose(SHOP, ITEMS, "why", conv=conv_from())
         assert out["decision"] == "review" and "shop_allowed" in out["blocked_by"]
-        assert "NOT on your allow-list" in env.out.sent[0][1]
+        text = env.out.sent[0][1]
+        (store_line,) = [l for l in text.splitlines() if l.startswith("Store: ")]
+        # Approved — by text — and plainly so; only the config list is
+        # eligible for automatic purchase.
+        assert store_line == (
+            f"Store: {SHOP} (approved by an admin's text; not in your config "
+            "list, so never bought automatically)"
+        )
+        assert "NOT on" not in text and "not approved" not in text.lower()
+        assert len(text.splitlines()) == 9
+        assert service.looks_like_service_notice(text)
+
+    async def test_store_no_longer_approved_is_described_as_such(self, env):
+        env.cfg.allowed_shops = []
+        assert await service._store_standing(SHOP) == "not currently approved"
+        env.cfg.allowed_shops = [SHOP]
+        assert await service._store_standing(SHOP) == "in your config list"
 
     @pytest.mark.parametrize("conv", [
         conv_from(ADMIN), conv_from(ADMIN, log=[]), conv_from(PLAIN),

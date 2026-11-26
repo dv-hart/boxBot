@@ -13,8 +13,6 @@ Built-in displays:
 - web: Placeholder card under the kiosk browser (args.url). The display
   manager opens the browser window on top; this is what shows while it
   loads.
-- product: One product from a purchase search — image, title, price.
-  (Args typed by the caller; superseded by ``products``.)
 - products: 1–4 numbered product cards, drawn by the main process from
   the purchase result cache (``bb.purchases.find`` / ``show``).
 - cart: the conversation's cart — lines, cost breakdown, total
@@ -40,7 +38,6 @@ def get_builtin_specs() -> list[DisplaySpec]:
         _picture_display(),
         _notice_display(),
         _web_display(),
-        _product_display(),
         _products_display(),
         _cart_display(),
     ]
@@ -218,46 +215,6 @@ def _web_display() -> DisplaySpec:
         data_sources=[],
         root_block=root,
         transition="none",
-    )
-
-
-def _product_display() -> DisplaySpec:
-    """One product, as BB found it: image left, details right.
-
-    Called via:
-        mgr.switch("product", args={
-            "title": "Goldilocks Board Book",
-            "price": "$11.99",
-            "seller": "Cottage Door Press",
-            "detail": "4.8 stars (212) · arrives Thursday",
-            "image": "tmp/product.jpg",   # workspace path, optional
-        })
-
-    Rendered from the search result's own fields rather than the
-    merchant's web page: nothing merchant-controlled runs on the box.
-    """
-    from boxbot.displays.blocks import ColumnsBlock, SpacerBlock
-
-    details = ColumnBlock(gap=12, align="center")
-    details.children = [
-        TextBlock(content="{args.seller}", size="caption", color="muted", max_lines=1),
-        TextBlock(content="{args.title}", size="heading", weight="bold", max_lines=4),
-        SpacerBlock(size=4),
-        TextBlock(content="{args.price}", size=64, weight="bold", color="accent",
-                  max_lines=1),
-        TextBlock(content="{args.detail}", size="body", color="muted", max_lines=3),
-    ]
-    root = ColumnsBlock(ratios=[5, 6], gap=36, padding=[36, 40, 36, 40])
-    root.children = [
-        ImageBlock(source="photo:{args.image}", fit="contain", radius=18),
-        details,
-    ]
-    return DisplaySpec(
-        name="product",
-        theme="boxbot",
-        data_sources=[],
-        root_block=root,
-        transition="crossfade",
     )
 
 

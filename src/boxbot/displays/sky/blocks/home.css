@@ -1,0 +1,67 @@
+/* home blocks: zones, zone, sky_clock, now, next_event, house */
+.bb-live{display:contents}
+.p-none{--p:var(--muted)}
+
+/* ── zones ── */
+.zones{position:absolute;inset:0}
+.zone{position:absolute}
+.zone.sky{left:54px;top:42px}
+.zone.sky-right{right:20px;top:36px}
+.zone.ground{left:54px;right:54px;bottom:30px;display:flex;align-items:flex-end;justify-content:space-between;gap:40px;
+  --p1:var(--l1);--p2:var(--l2);--p3:var(--l3);--p4:var(--l4);--family:var(--lf)}   /* the ground is always dark: light-set people */
+.zones.with-bottom .zone.sky{left:44px;top:24px}
+/* beside a left-docked surface: one column in the sky, one on the ground, both right of the slab */
+.zones.with-left .zone.sky{left:452px;top:38px;width:530px}
+.zones.with-left .zone.ground{left:452px;right:auto;width:530px;bottom:22px;display:block;color:var(--st);
+  --text:var(--st);--muted:var(--sm);--accent:var(--sa);--hair:var(--sh);--ground:var(--st);--ground-muted:var(--sm);
+  text-shadow:0 0 14px var(--slab-solid),0 1px 3px var(--slab-solid)}
+.zones.with-left > .ground-guard{height:226px;background:linear-gradient(180deg,transparent,
+  color-mix(in srgb,var(--slab-solid) 68%,transparent) 22%,color-mix(in srgb,var(--slab-solid) 80%,transparent) 60%,
+  color-mix(in srgb,var(--slab-solid) 92%,transparent))}
+
+/* ── sky_clock ── */
+.skyclock .date{color:var(--text);opacity:.82}
+.skyclock .time{white-space:nowrap}
+.skyclock.hero .time .d{display:inline-block;font-size:150px;line-height:.86;font-weight:370;letter-spacing:-.045em;
+  font-variation-settings:"opsz" 30;margin:12px 0 0 -8px}
+.skyclock.hero .time small{font-size:28px;font-weight:500;letter-spacing:.04em;margin-left:12px;opacity:.8}
+#stage.dim .skyclock.hero .time .d{font-weight:330}
+.skyclock.compact .time{display:flex;align-items:baseline;margin-top:10px}
+.skyclock.compact .time .d{font-size:78px;line-height:1;font-weight:360;letter-spacing:-.035em;margin-left:-4px}
+.skyclock.compact .time small{font-size:22px;font-weight:500;letter-spacing:.04em;margin-left:9px;opacity:.8}
+.skyclock .wx{display:inline-flex;align-items:center;gap:8px;font-size:21px;font-weight:500;margin-left:26px;
+  min-width:0;overflow:hidden;text-overflow:ellipsis}
+.skyclock .wx b{font-weight:700}
+.skyclock .wx .ico{width:26px;height:26px;stroke-width:1.8}
+
+/* ── now: temperature · condition · one outlook sentence, on one baseline ── */
+.wxnow{display:flex;align-items:baseline;margin-top:12px;font-size:22px;font-weight:500;white-space:nowrap}
+.wxnow .t{font-size:42px;line-height:1;font-weight:340;margin-right:16px}
+.wxnow .ico{width:27px;height:27px;align-self:center;margin-right:9px;stroke-width:1.8}
+.wxnow .o{display:flex;align-items:center}
+.wxnow .sep{width:4px;height:4px;border-radius:50%;background:currentColor;opacity:.7;margin:0 12px;display:inline-block}
+.wxnow.compact{align-items:center;gap:8px;margin:4px 24px 0 0}
+.wxnow.compact .ico{width:28px;height:28px;margin:0}
+.wxnow.compact b{font-weight:700}
+
+/* ── next_event ── */
+.nextev{min-width:0;max-width:560px}
+.nextev .ttl{font-size:40px;line-height:1.08;margin-top:5px;color:var(--ground);
+  display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;padding-bottom:3px}
+.nextev .sub{font-size:19px;margin-top:4px;display:flex;gap:11px;align-items:center;min-width:0}
+.nextev .sub span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nextev .dot{background:linear-gradient(90deg,var(--p) 50%,var(--q,var(--p)) 50%)}
+.nextev.none .ttl{font-size:32px;font-style:italic;font-weight:330;color:var(--ground-muted)}
+
+/* ── house ── */
+.house{text-align:right;font-size:18px;font-weight:500;flex:none;margin-left:auto}
+.house .in{display:flex;justify-content:flex-end;align-items:center;gap:16px;color:var(--ground)}
+.house .in span{display:inline-flex;align-items:center;gap:8px}
+.house .in em{font-style:normal;margin-left:-8px}
+.house .in .dots{gap:5px;margin-right:-4px}
+.house .ct{display:flex;justify-content:flex-end;gap:22px;font-size:18px}
+.house .in + .ct{margin-top:11px}
+.house .ct span{display:inline-flex;align-items:center;gap:7px}
+.house .ct b{font-weight:600;color:var(--ground);font-variant-numeric:tabular-nums}
+.house .ct .ico{width:21px;height:21px}
+#stage.dim .house .dot,#stage.dim .nextev .dot{opacity:.8}

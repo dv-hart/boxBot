@@ -2544,7 +2544,9 @@ async def _handle_display_action(
                     render_data.update(_apply_fields_to_override(
                         override, parsed,
                     ))
-                image = mgr.render_preview(parsed.name, data=render_data)
+                image = await mgr.render_preview_image(
+                    parsed.name, data=render_data,
+                )
             finally:
                 if existing is not None:
                     mgr.register_spec(existing)
@@ -2772,6 +2774,11 @@ async def _handle_display_action(
                 "web": mgr.get_web_state(),
                 # Why it last closed by itself (fixed strings), if it did.
                 "web_closed": mgr.get_web_exit(),
+                # "html": the Living Sky page draws the screen, and
+                # ``atmosphere`` is the sky behind every display (phase,
+                # weather, next sunrise/sunset). Null under "pil".
+                "renderer": mgr.renderer,
+                "atmosphere": mgr.get_atmosphere() if mgr.renderer == "html" else None,
             }
 
         if sub == "web_media":
@@ -2845,7 +2852,7 @@ async def _handle_display_action(
                         "State: bb.display.get_active()['web']."
                     ),
                 }
-            frame = mgr.get_current_frame()
+            frame = await mgr.capture_frame()
             if frame is None:
                 return {
                     "status": "error",
@@ -3032,12 +3039,41 @@ def _build_display_schema() -> dict[str, Any]:
             "accepts_children": block_type in container_types,
         }
 
+    from boxbot.displays.manager import get_display_manager
     from boxbot.displays.renderer import available_lucide_icons
+    from boxbot.displays.sky_blocks import SKY_BLOCKS
+    from boxbot.displays.spec import _SCENE_KEYS, _VALID_THEMES
 
+    # Blocks only the HTML renderer draws. Listed whichever renderer is
+    # running; ``renderer`` below says whether they will actually draw.
+    for block_type, entry in SKY_BLOCKS.items():
+        sky_fields: dict[str, dict[str, Any]] = {}
+        for name, field in entry["fields"].items():
+            info = {"type": field["type"], "describe": field["describe"]}
+            if field.get("required"):
+                info["required"] = True
+            if "default" in field:
+                info["default"] = field["default"]
+            if "values" in field:
+                info["valid_values"] = list(field["values"])
+            sky_fields[name] = info
+        blocks[block_type] = {
+            "kind": "container" if entry.get("children") else "content",
+            "describe": entry.get("describe", ""),
+            "fields": sky_fields,
+            "accepts_children": bool(entry.get("children")),
+            "renderer": "html",
+        }
+
+    mgr = get_display_manager()
     return {
         "status": "ok",
         "blocks": blocks,
-        "themes": sorted(v.VALID_THEMES),
+        # "html": the Living Sky page; blocks marked renderer "html"
+        # draw only there, and ``scene`` options apply.
+        "renderer": mgr.renderer if mgr is not None else None,
+        "scene_options": list(_SCENE_KEYS),
+        "themes": sorted(_VALID_THEMES),
         "data_source_types": ["builtin", *sorted(v.VALID_DATA_SOURCE_TYPES)],
         "transitions": sorted(v.VALID_TRANSITIONS),
         "data_sources": _data_source_schema(),

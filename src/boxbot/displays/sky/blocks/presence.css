@@ -1,0 +1,91 @@
+/* Presence dock (`.pz*`) and status pill (`.sp*`). Markup + contract: presence.js.
+   The dock owns the bottom ~180 px: a solid dark base so the host display's ground text cannot ghost through,
+   state light on the bottom edge, kicker + one serif line. Only transform and opacity move. */
+.pz{position:absolute;inset:0;pointer-events:none;color:#fff6e6;overflow:hidden;
+  transition:opacity .25s ease,transform .3s cubic-bezier(.2,.7,.2,1);
+  --p1:var(--l1);--p2:var(--l2);--p3:var(--l3);--p4:var(--l4);--family:var(--lf)}
+.pz.pz-enter{opacity:0;transform:translateY(44px)}
+.pz.pz-fade{opacity:0}
+.pz.pz-exit{opacity:0;transform:translateY(64px);transition:opacity .6s ease,transform .6s cubic-bezier(.5,0,.8,.4)}
+.pz-greeting{--b:var(--p,#ff8fb4)}
+
+.pz-scrim{position:absolute;left:0;right:0;bottom:0;height:252px;
+  background:linear-gradient(180deg,rgba(7,7,20,0),rgba(7,7,20,.94) 29%,rgba(7,7,20,.985) 43%)}
+
+/* ── light ── */
+.pz-light{position:absolute;left:0;bottom:0;width:1024px;height:200px;overflow:hidden}
+.pz-light svg{display:block}
+.pz-light > *,.pz-drift,.pz-glow{position:absolute;left:0;bottom:0}
+.pz-breathe,.pz-swell{width:1024px;height:200px;transform-origin:50% 100%;will-change:transform}
+.pz-drift{width:2048px;height:200px;will-change:transform;animation:pz-drift 51s linear infinite}
+.pz-breathe{animation:pz-breathe 2.1s ease-in-out infinite alternate}
+.pz-drift.pz-w1{animation-duration:38s}
+.pz-drift.pz-w2{animation-duration:23s}
+.pz-drift.pz-w3{animation-duration:14s}
+.pz-swell.pz-w2{animation:pz-breathe 1.5s ease-in-out infinite alternate}
+.pz-swell.pz-w3{animation:pz-swell 1.1s ease-in-out infinite alternate}
+.pz-edge{position:absolute;left:0;right:0;bottom:2px;height:3px;opacity:.38}
+.pz-edge-hot{bottom:0;height:5px;opacity:1}
+.pz-lantern{width:780px;height:200px;will-change:transform;animation:pz-cross 2.4s ease-in-out infinite}
+.pz-ember{width:1024px;height:200px;transform-origin:50% 100%;animation:pz-ember .6s ease-in-out 2}
+.pz-dome{color:var(--p,#ff8fb4);width:1024px;height:200px;animation:pz-rise .5s cubic-bezier(.2,.7,.2,1) both}
+.pz-rings{width:1024px;height:200px;transform-origin:50% 100%;animation:pz-rings 1.3s cubic-bezier(.2,.7,.2,1) .25s both}
+@keyframes pz-drift{to{transform:translateX(-1024px)}}
+@keyframes pz-breathe{from{transform:scaleY(.8)}to{transform:scaleY(1.04)}}
+@keyframes pz-swell{from{transform:scaleY(.66)}to{transform:scaleY(1.08)}}
+@keyframes pz-cross{from{transform:translateX(-700px)}to{transform:translateX(1010px)}}
+@keyframes pz-ember{50%{transform:scaleY(1.5)}}
+@keyframes pz-rise{from{transform:translateY(90px);opacity:0}}
+@keyframes pz-rings{from{transform:scale(.55);opacity:0}}
+#stage.dim .pz-light{opacity:.8}
+/* stills (screenshots, tests): hold one representative frame */
+.pz-still,.pz-still *{animation-play-state:paused !important;transition:none !important}
+.pz-still .pz-lantern{animation-delay:-1.1s}
+.pz-still .pz-breathe,.pz-still .pz-swell{animation-delay:-.9s}
+.pz-still .pz-drift{animation-delay:-4s}
+.pz-still .pz-ember,.pz-still .pz-dome,.pz-still .pz-rings{animation:none}
+
+/* ── kicker + the one line ── */
+.pz-line{position:absolute;left:54px;right:54px;bottom:60px;text-shadow:0 1px 14px rgba(7,7,20,.9)}
+.pz-k{display:flex;align-items:center;gap:12px;font-size:16px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;white-space:nowrap}
+.pz-k .ico{width:22px;height:22px;stroke-width:2;margin:0 -3px 0 -2px}
+.pz-bead{width:14px;height:14px;border-radius:50%;background:var(--b);box-shadow:0 0 0 5px color-mix(in srgb,var(--b) 26%,transparent);flex:none;margin:0 4px 0 5px}
+.pz-k .who{font-size:16px;letter-spacing:.04em;text-transform:none;font-weight:600;margin-left:6px;padding-left:16px;border-left:1.5px solid rgba(255,246,230,.35)}
+.pz-detail{min-width:0;overflow:hidden;text-overflow:ellipsis;font-size:17px;font-weight:500;letter-spacing:.01em;text-transform:none;color:rgba(255,246,230,.74);
+  margin-left:6px;padding-left:16px;border-left:1.5px solid rgba(255,246,230,.35)}
+.pz-one{display:flex;font-size:38px;line-height:1.14;height:44px;margin-top:9px;white-space:nowrap;overflow:hidden;font-weight:340}
+.pz-one > span{flex:none;max-width:100%;overflow:hidden;text-overflow:ellipsis;padding-right:.18em}
+.pz-listening .pz-one{font-style:italic;font-weight:320}
+/* live transcript longer than the line: keep the newest words, let the oldest fade off the left */
+.pz-one.pz-tail{justify-content:flex-end;-webkit-mask-image:linear-gradient(90deg,transparent,#000 90px);mask-image:linear-gradient(90deg,transparent,#000 90px)}
+.pz-one.pz-tail > span{max-width:none;overflow:visible}
+.pz-one.pz-two{display:block;height:68px;font-size:29px;line-height:1.17;white-space:normal}
+.pz-one.pz-two > span{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;white-space:normal}
+
+/* ── running timer: draining line + pill ── */
+.pz-tl{position:absolute;left:54px;bottom:19px;width:916px;height:4px}
+.pz-tl > i{position:absolute;left:0;top:0;height:4px;border-radius:2px;background:#fff0d2}
+.pz-tl-track{width:916px;opacity:.26;box-shadow:0 0 0 1px rgba(7,7,20,.28)}
+.pz-tl-fill{width:916px;transform-origin:0 50%;box-shadow:0 0 12px 2px rgba(255,240,210,.5);transition:transform 1s linear}
+.pz-tl > .pz-tl-bead{width:0;background:none;transition:transform 1s linear}
+.pz-tl-bead > i{position:absolute;left:-7px;top:-5px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 0 14px 5px rgba(255,240,210,.55)}
+.pz-last .pz-tl-bead > i{animation:pz-pulse 1s ease-in-out infinite}
+@keyframes pz-pulse{50%{opacity:.45}}
+.pz-pill,.sp{position:absolute;right:54px;top:36px;display:flex;align-items:center;gap:10px;border-radius:999px;
+  background:rgba(10,10,26,.9);border:1px solid rgba(255,246,230,.22);color:#fff6e6;font-size:18px;font-weight:600;white-space:nowrap;text-shadow:none}
+.pz-pill{padding:8px 20px 8px 14px}
+.pz-pill b{font-size:30px;line-height:1;font-weight:380}
+.pz-pill .ico{width:22px;height:22px}
+
+/* ── status pill ── */
+.sp{padding:10px 20px 10px 17px;max-width:600px;gap:12px}
+.sp > span{overflow:hidden;text-overflow:ellipsis}
+.sp-dots{display:inline-flex;gap:5px;flex:none}
+.sp-dots > i{width:7px;height:7px;border-radius:50%;background:#ffcf7d;animation:sp-dot 1.2s ease-in-out infinite}
+.sp-dots > i:nth-child(2){animation-delay:.2s}
+.sp-dots > i:nth-child(3){animation-delay:.4s}
+@keyframes sp-dot{0%,100%{opacity:.3}40%{opacity:1}}
+.sp-still .sp-dots > i{animation:none}
+.sp-still .sp-dots > i:nth-child(2){opacity:.6}
+.sp-still .sp-dots > i:nth-child(3){opacity:.3}
+#presence.pz-pilled ~ #status .sp{top:94px}

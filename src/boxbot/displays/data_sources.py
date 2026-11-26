@@ -926,13 +926,40 @@ def _weather_placeholder() -> dict[str, Any]:
 
 
 def _calendar_placeholder() -> dict[str, Any]:
-    return {
-        "events": [
-            {"time": "9:00 AM", "title": "Team Standup", "duration": "30m", "location": "Zoom"},
-            {"time": "11:00 AM", "title": "Design Review", "duration": "1h", "location": "Conference Room"},
-            {"time": "2:00 PM", "title": "Dentist Appointment", "duration": "1h", "location": "Downtown"},
-        ],
-    }
+    """Three events today, in the shape the calendar integration returns.
+
+    Dated today so time-aware blocks (agenda, week grid, countdowns)
+    preview as a day in progress rather than as an empty one.
+    """
+    from datetime import datetime, timedelta
+
+    midnight = datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+
+    def event(n: int, hour: int, minutes: int, title: str, location: str) -> dict[str, Any]:
+        start = midnight + timedelta(hours=hour)
+        end = start + timedelta(minutes=minutes)
+        clock = f"{start.hour % 12 or 12}:{start.minute:02d} {'AM' if start.hour < 12 else 'PM'}"
+        return {
+            "id": f"sample-{n}",
+            "title": title,
+            "time": clock,
+            "when": f"Today \u00b7 {clock}",
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "duration": "30m" if minutes == 30 else "1h",
+            "location": location,
+            "all_day": False,
+            "description": "",
+        }
+
+    events = [
+        event(1, 9, 30, "Team Standup", "Zoom"),
+        event(2, 11, 60, "Design Review", "Conference Room"),
+        event(3, 14, 60, "Dentist Appointment", "Downtown"),
+    ]
+    return {"events": events, "count": len(events)}
 
 
 def _tasks_placeholder() -> dict[str, Any]:

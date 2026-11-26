@@ -1,0 +1,149 @@
+/* picture, photo_caption, sky_chip, capture — rules for blocks/picture.js only (everything is under .picture or
+   prefixed pc-). Ink on a photo is fixed cream: a photo is not an atmosphere, so --text does not apply on top of
+   it. Person dots always sit on photo or ground-zone dark, so .picture carries the light person colours inline.
+   Motion here is opacity and transform only; the only blur is the pre-shrunk thumbnail stretched by the browser. */
+.picture{position:absolute;inset:0;overflow:hidden;--cream:#fff6e8;--cream2:rgba(255,246,232,.84);
+  --halo:0 1px 2px rgba(6,8,14,.55),0 0 14px rgba(6,8,14,.45),0 0 34px rgba(6,8,14,.3)}
+.picture.pc-over,.picture.pc-capt,.picture.pc-dip.pc-ctr,.picture.pc-nosky{background:#0b0d12}
+.picture.pc-solo{background:none;pointer-events:none}
+.picture .pc-stage,.picture .pc-prev{position:absolute;inset:0}
+.picture .pc-prev{pointer-events:none;animation:pc-out .7s ease .12s forwards}
+@keyframes pc-out{to{opacity:0;visibility:hidden}}
+.picture .pc-pic{position:absolute;overflow:hidden}
+.picture .pc-pic img{position:absolute;display:block;max-width:none}
+.picture .pc-pic.pc-edge{box-shadow:10px 0 38px rgba(6,8,14,.38),1px 0 0 rgba(255,255,255,.16)}
+.picture .pc-pic.pc-lift{box-shadow:0 0 60px rgba(6,8,14,.55)}
+.picture .pc-pic.pc-kb img{animation:pc-kb var(--dwell,12s) linear forwards}
+@keyframes pc-kb{to{transform:scale(1.04)}}
+/* night mode: the veil sits behind the view layer, so a photo gets its own (static) one */
+#stage.dim .picture .pc-pic:after{content:"";position:absolute;inset:0;background:rgba(3,4,16,.3);pointer-events:none}
+#stage.dim .picture{--cream:#e6dccb;--cream2:rgba(230,220,203,.82)}
+
+/* fit backdrop: the stored thumbnail stretched over the frame (bilinear upscale = the blur), then a dark shade.
+   No thumbnail: the photo itself, zoomed far enough that it reads as colour, under a heavier shade. */
+.picture .pc-bk img{left:-8%;top:-8%;width:116%;height:116%;object-fit:cover;image-rendering:auto}
+.picture .pc-bk.pc-raw img{left:-75%;top:-75%;width:250%;height:250%}
+.picture .pc-shade{position:absolute;inset:0;background:rgba(10,12,20,.4)}
+.picture .pc-bk.pc-raw + .pc-shade{background:rgba(10,12,20,.64)}
+
+/* ── overlay caption (fill / fit) ── */
+.picture .pc-scrim{position:absolute;left:0;right:0;bottom:0;height:300px;transition:opacity .6s;
+  background:linear-gradient(180deg,rgba(8,10,18,0) 0%,rgba(8,10,18,.2) 30%,rgba(8,10,18,.55) 62%,rgba(8,10,18,.82) 100%)}
+.picture .pc-top{position:absolute;right:0;top:0;width:360px;height:130px;transition:opacity .6s;
+  background:radial-gradient(ellipse at 100% 0%,rgba(8,10,18,.38),rgba(8,10,18,0) 70%)}
+.picture .pc-top.l{left:0;right:auto;width:520px;background:radial-gradient(ellipse at 0% 0%,rgba(8,10,18,.5),rgba(8,10,18,0) 70%)}
+.picture .pc-cap{color:var(--cream);text-shadow:var(--halo);transition:opacity .6s}
+.picture.pc-over .pc-cap{position:absolute;left:44px;bottom:34px;right:250px}
+.picture.pc-over .pc-cap.wide{right:44px}
+.picture .pc-why{display:flex;align-items:center;gap:8px;font-size:17px;font-weight:600;letter-spacing:.01em;color:var(--cream2);margin-bottom:6px}
+.picture .pc-why span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.picture .pc-why .ico{width:18px;height:18px;stroke-width:2;color:#ffd79a}
+.picture .pc-cap h2{font-size:46px;line-height:1.06;font-weight:330;text-wrap:balance;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;padding-bottom:.08em}
+.picture .pc-raw-t{font-size:22px;line-height:1.3;font-weight:500;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;max-width:640px}
+.picture .pc-meta{font-size:19px;margin-top:12px;display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;color:var(--cream2);font-weight:500}
+.picture .pc-meta:first-child{margin-top:0}
+.picture .pc-meta .who{font-size:19px;color:var(--cream)}
+.picture .pc-meta .who .dot{box-shadow:0 0 0 1.5px rgba(6,8,14,.35)}
+.picture .pc-src{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.picture .pc-src .ico{width:18px;height:18px}
+.picture .pc-pos{position:absolute;right:44px;bottom:38px;display:flex;flex-direction:column;align-items:flex-end;gap:10px;
+  color:var(--cream2);text-shadow:var(--halo);font-size:17px;font-weight:500;transition:bottom .6s}
+.picture .pc-num{display:inline-flex;align-items:center;gap:7px;transition:opacity .6s;white-space:nowrap}
+.picture .pc-num b{color:var(--cream);font-weight:700}
+.picture .pc-num .ico{width:18px;height:18px}
+.picture .pc-pips{display:flex;gap:6px;align-items:center}
+.picture .pc-pips i{width:7px;height:7px;border-radius:50%;background:rgba(255,246,232,.5);box-shadow:0 0 0 1px rgba(6,8,14,.18)}
+.picture .pc-pips i.on{background:var(--cream);width:22px;border-radius:4px}
+.picture .pc-bar{width:150px;height:4px;border-radius:2px;background:rgba(255,246,232,.3);overflow:hidden;box-shadow:0 0 0 1px rgba(6,8,14,.18)}
+.picture .pc-bar i{display:block;height:100%;background:var(--cream)}
+
+/* minimal state: caption and scrim fade, set position shrinks to the pips, the chip and the clock stay */
+.picture.min .pc-cap,.picture.min .pc-scrim,.picture.min .pc-num,.picture.min .pc-top{opacity:0}
+.picture.min .pc-pos{bottom:26px}
+
+/* ── sky chip: the sky shrunk to a pill; its fill is the current sky gradient ── */
+.pc-chip{position:absolute;right:26px;top:24px;height:48px;border-radius:24px;padding:0 18px 0 14px;display:flex;align-items:center;gap:9px;
+  font-size:21px;font-weight:700;font-variant-numeric:tabular-nums;border:1px solid rgba(255,255,255,.4);box-shadow:0 6px 22px rgba(0,0,0,.3);
+  overflow:hidden;white-space:nowrap}
+.pc-chip.l{right:auto;left:26px}
+.pc-chip .t{font-weight:500;opacity:.86;padding-left:9px;border-left:1.5px solid currentColor;line-height:1}
+
+/* ── side: portrait left, living sky column right ── */
+.picture .pc-col{position:absolute;top:0;bottom:0;right:0}
+.picture .pc-gscrim{position:absolute;left:0;right:0;bottom:0;height:290px;transition:opacity .6s;
+  background:linear-gradient(180deg,rgba(8,10,18,0) 0%,rgba(8,10,18,.42) 42%,rgba(8,10,18,.7) 100%)}
+.picture .pc-now{position:absolute;left:44px;top:30px;right:16px;color:var(--text)}
+.picture .pc-now .t{font-size:88px;line-height:.95;font-weight:360;letter-spacing:-.04em;font-variation-settings:"opsz" 30}
+.picture .pc-now .w{display:flex;align-items:center;gap:9px;font-size:23px;font-weight:500;margin-top:8px;padding-left:4px;white-space:nowrap}
+.picture .pc-now .w b{font-weight:700}
+.picture .pc-now .w span{overflow:hidden;text-overflow:ellipsis}
+.picture .pc-now .w .ico{width:26px;height:26px}
+.picture.pc-nosky .pc-now{color:var(--cream);text-shadow:var(--halo)}
+.picture .pc-ground{position:absolute;left:44px;right:40px;bottom:34px}
+.picture .pc-col .pc-cap h2{font-size:42px}
+.picture .pc-col.narrow .pc-cap h2{font-size:36px}
+.picture .pc-col .pc-cap.has-pos{padding-bottom:42px}
+.picture .pc-col .pc-pos{left:0;right:auto;bottom:0;flex-direction:row;align-items:center;gap:16px}
+.picture.pc-side.min .pc-gscrim{opacity:.55}
+.picture.pc-side.min .pc-pos{bottom:0}
+
+/* ── diptych ── */
+.picture .pc-half{position:absolute;top:0;bottom:0}
+.picture .pc-hs{position:absolute;left:0;right:0;bottom:0;height:190px;transition:opacity .6s;background:linear-gradient(180deg,rgba(8,10,18,0),rgba(8,10,18,.72))}
+.picture .pc-hc{position:absolute;left:26px;right:20px;bottom:24px;color:var(--cream);text-shadow:var(--halo);transition:opacity .6s}
+.picture .pc-half h3{font-size:30px;line-height:1.08;font-weight:340;text-wrap:balance;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;padding-bottom:.08em}
+.picture .pc-half .pc-raw-t{font-size:18px;line-height:1.28}
+.picture .pc-half .pc-meta{font-size:17px;margin-top:8px;gap:4px 14px}
+.picture .pc-half .pc-meta .who{font-size:17px}
+.picture .pc-col.slim .pc-now{left:28px;top:28px}
+.picture .pc-col.slim .pc-now .t{font-size:76px}
+/* the sun (noon, afternoon) and the moon sit top-right, exactly where a slim column puts its clock: step under them */
+.picture .pc-col.slim.low .pc-now{top:150px}
+.picture .pc-col.slim .pc-ground{left:28px;right:20px}
+.picture .pc-col.slim .pc-why{align-items:flex-start;color:var(--ground);font-size:18px;line-height:1.25;margin-bottom:0;padding-bottom:12px;text-shadow:var(--halo);transition:opacity .6s}
+.picture .pc-col.slim .pc-why span{white-space:normal;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
+.picture .pc-col.slim .pc-why .ico{margin-top:2px}
+.picture .pc-col.slim .pc-pos{position:static;flex-direction:column;align-items:flex-start;gap:8px}
+.picture.pc-dip.pc-ctr .pc-pos{right:auto;bottom:auto;top:34px;flex-direction:row;gap:14px;align-items:center}
+.picture.pc-dip.min .pc-hc,.picture.pc-dip.min .pc-hs,.picture.pc-dip.min .pc-why{opacity:0}
+
+/* ── capture: a still the box just took. Not a memory, so none of the memory grammar ── */
+.picture.pc-capt .pc-scrim{height:230px}
+.picture .pc-vf{position:absolute;width:34px;height:34px;border:0 solid rgba(255,246,232,.9)}
+.picture .pc-vf.tl{left:18px;top:18px;border-left-width:2.5px;border-top-width:2.5px;border-top-left-radius:10px}
+.picture .pc-vf.tr{right:18px;top:18px;border-right-width:2.5px;border-top-width:2.5px;border-top-right-radius:10px}
+.picture .pc-vf.bl{left:18px;bottom:18px;border-left-width:2.5px;border-bottom-width:2.5px;border-bottom-left-radius:10px}
+.picture .pc-vf.br{right:18px;bottom:18px;border-right-width:2.5px;border-bottom-width:2.5px;border-bottom-right-radius:10px}
+.picture .pc-live{position:absolute;left:44px;top:36px;display:flex;align-items:center;gap:10px;font-size:19px;font-weight:500;
+  color:var(--cream2);text-shadow:var(--halo);font-variant-numeric:tabular-nums;white-space:nowrap}
+.picture .pc-live b{color:var(--cream);font-weight:700;letter-spacing:.14em;text-transform:uppercase;font-size:16px}
+.picture .pc-rec{width:11px;height:11px;border-radius:50%;background:#ff6a4d;box-shadow:0 0 0 4px rgba(255,106,77,.28)}
+.picture .pc-live .sep{width:1.5px;height:18px;background:rgba(255,246,232,.45);margin:0 4px}
+.picture .pc-live .ico{width:20px;height:20px}
+.picture.pc-capt .pc-chip{right:44px;top:30px}
+.picture .pc-tag{position:absolute;display:flex;align-items:center;gap:7px;height:32px;padding:0 13px 0 10px;border-radius:16px;
+  background:rgba(10,12,20,.62);color:var(--cream);font-size:17px;font-weight:600;border:1px solid rgba(255,246,232,.28);
+  white-space:nowrap;transition:opacity .6s}
+.picture .pc-tag:after{content:"";position:absolute;right:100%;top:50%;width:12px;height:1.5px;background:rgba(255,246,232,.7)}
+.picture .pc-tag.l{transform:translateX(-100%)}
+.picture .pc-tag.l:after{right:auto;left:100%}
+.picture .pc-say{position:absolute;left:44px;bottom:40px;right:300px;color:var(--cream);text-shadow:var(--halo);transition:opacity .6s}
+.picture .pc-lbl{font-size:16px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#ffd79a;margin-bottom:6px}
+.picture .pc-say p{font-size:25px;line-height:1.28;font-weight:500;text-wrap:balance;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.picture .pc-say .pc-meta{margin-top:10px}
+.picture .pc-keep{position:absolute;right:44px;bottom:42px;text-align:right;font-size:18px;font-weight:700;color:var(--cream);text-shadow:var(--halo)}
+.picture .pc-keep b{display:inline-flex;align-items:center;gap:7px;font-weight:700}
+.picture .pc-keep b .ico{width:20px;height:20px;stroke-width:2.4;color:#ffd79a}
+.picture .pc-keep span{display:block;font-size:16px;font-weight:500;color:var(--cream2);margin-top:2px;transition:opacity .6s}
+.picture.pc-capt.min .pc-say,.picture.pc-capt.min .pc-keep span,.picture.pc-capt.min .pc-tag{opacity:0}
+.picture .pc-flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;animation:pc-flash .12s ease-out}
+@keyframes pc-flash{from{opacity:.85}to{opacity:0}}
+
+/* ── nothing to show / file missing: say so, quietly, in the ground zone ── */
+.picture .pc-none{position:absolute;left:44px;bottom:40px;display:flex;align-items:center;gap:12px;font-size:22px;font-weight:500;
+  color:var(--cream);text-shadow:var(--halo)}
+.picture .pc-none .ico{width:26px;height:26px;color:#ffd79a}
+.picture .pc-probe{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}

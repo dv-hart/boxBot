@@ -1,0 +1,41 @@
+{
+  "name": "brief",
+  "theme": "living_sky",
+  "transition": "crossfade",
+  "scene": { "horizon": "low", "seed": 12 },
+  "data_sources": [
+    { "name": "weather", "type": "integration", "refresh": 1800 },
+    { "name": "calendar", "type": "integration", "inputs": { "action": "list_upcoming_events", "since": "today", "max_results": 20 }, "refresh": 600 },
+    { "name": "tasks", "type": "builtin", "refresh": 300 },
+    { "name": "people", "type": "builtin" },
+    { "name": "brief", "type": "static", "value": { "greeting": "", "summary": "" } }
+  ],
+  "layout": {
+    "type": "zones",
+    "children": [
+      {
+        "type": "surface",
+        "dock": "left",
+        "children": [
+          { "type": "agenda_timeline", "events": "{calendar.events}", "mode": "{args.mode}", "forecast": "{weather.forecast}", "gap_min": 90 }
+        ]
+      },
+      {
+        "type": "zone",
+        "place": "sky",
+        "children": [
+          { "type": "sky_clock", "size": "compact", "weather": "{weather}" },
+          { "type": "say", "greeting": "{brief.greeting}", "text": "{brief.summary}", "events": "{calendar.events}", "who": "{people.present[0].name}" }
+        ]
+      },
+      {
+        "type": "zone",
+        "place": "ground",
+        "children": [
+          { "type": "todo_list", "items": "{tasks.items}", "max": 3 },
+          { "type": "forecast_strip", "days": "{weather.forecast}", "count": 5 }
+        ]
+      }
+    ]
+  }
+}

@@ -299,6 +299,41 @@ redraw when the image lands. Residual risk: an image decoder bug
 reachable from an allow-listed CDN; widening the host list widens that
 surface.
 
+### Display Page (HTML Renderer)
+
+With `display.renderer: html` the screen itself is a Chromium window
+showing the Living Sky page bundled in `src/boxbot/displays/sky/`. It
+is a different thing from the web view above and is closed off the
+other way round. The kiosk browser shows the internet and must not
+reach the box; this one shows the household's calendar, inbox and
+photos and must not reach the internet.
+
+- **Runs as the service user.** It loads only files shipped in the
+  package, and it has to read the photo library. There is no untrusted
+  page to contain.
+- **No network.** Launched with every hostname mapped to `NOTFOUND` and
+  all traffic routed to a dead local proxy; the page's CSP allows
+  `file:` (and `data:` images) and nothing else.
+- **No listener.** Driven over the DevTools pipe on inherited file
+  descriptors, never a debugging port.
+- **Data is never code.** The manager pushes one JSON state document.
+  Calendar titles, email subjects and photo captions are written by
+  people outside the house, so every block escapes what it prints, and
+  the CSP refuses inline script and event handlers if one ever fails
+  to. `tests/test_sky_page.py` drives hostile strings through every
+  block in a real browser.
+- **Vetted image paths only.** Photo sources reach the page as file
+  paths resolved through the same allowlist that gates image
+  attachments; a ref that does not resolve is dropped, not passed on.
+- **Fresh profile** under `display.html.state_dir`, recreated on every
+  launch.
+
+Agent previews are drawn by a second, headless instance of the same
+page so authoring never touches the screen. As with the PIL renderer,
+`bb.display.preview` and `bb.display.screenshot` return pixels of
+boxBot's own displays to the agent; the web view's pixels still never
+do.
+
 ### Package Installation (Out-of-Band Approval)
 
 The sandbox **cannot install packages**. This is enforced by four

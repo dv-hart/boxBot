@@ -483,6 +483,8 @@ async def _init_display_manager() -> Any:
     manager = DisplayManager(
         width=cfg.display.width,
         height=cfg.display.height,
+        renderer=cfg.display.renderer,
+        sky_config=cfg.display.html,
     )
     await manager.start()
     # Publish for sandbox action handlers (bb.photos.show_on_screen, …)
@@ -1136,7 +1138,10 @@ async def _async_main() -> None:
         # Screen HAL — backend selected by config. "pygame" blits frames to
         # HDMI (default); "none" skips screen output entirely.
         screen_backend = config.display.backend
-        if screen_backend == "none":
+        if display_manager.renderer == "html":
+            # The browser window is the screen; there are no frames to blit.
+            logger.info("HTML renderer owns the screen — screen backend not started")
+        elif screen_backend == "none":
             logger.info("Screen backend 'none' — no screen output")
         else:
             try:

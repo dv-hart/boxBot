@@ -1,0 +1,31 @@
+{
+  "name": "inbox",
+  "theme": "living_sky",
+  "transition": "crossfade",
+  "scene": { "horizon": "{inbox.scene.horizon}", "scale": "{inbox.scene.scale}" },
+  "data_sources": [
+    { "name": "inbox", "type": "static", "value": {} },
+    { "name": "weather", "type": "integration", "refresh": 1800 }
+  ],
+  "layout": {
+    "type": "inbox",
+    "mode": "{inbox.mode}",
+    "focus": "{inbox.focus}",
+    "privacy": "{inbox.privacy}",
+    "privacy_note": "{inbox.privacy_note}",
+    "count": "{inbox.count}",
+    "owners": "{inbox.owners}",
+    "threads": "{inbox.threads}",
+    "handled": "{inbox.handled}",
+    "fyi": "{inbox.fyi}",
+    "quote": "{inbox.quote}",
+    "draft": "{inbox.draft}",
+    "say": "{inbox.say}",
+    "undo_seconds": "{inbox.undo_seconds}",
+    "arrived": "{inbox.arrived}",
+    "last": "{inbox.last}",
+    "temp": "{weather.temp}",
+    "condition": "{weather.condition}",
+    "icon": "{weather.icon}"
+  }
+}

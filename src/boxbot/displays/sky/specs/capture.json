@@ -1,0 +1,19 @@
+{
+  "name": "capture",
+  "theme": "living_sky",
+  "transition": "crossfade",
+  "scene": { "horizon": "high" },
+  "data_sources": [
+    { "name": "weather", "type": "integration", "refresh": 1800 }
+  ],
+  "layout": {
+    "type": "capture",
+    "image": "photo:{args.image}",
+    "say": "{args.say}",
+    "people": "{args.people}",
+    "saved": "{args.saved}",
+    "at": "{args.at}",
+    "temp": "{weather.temp}",
+    "icon": "{weather.icon}"
+  }
+}

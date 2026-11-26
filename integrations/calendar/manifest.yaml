@@ -12,6 +12,10 @@ inputs:
     type: int
     default: 5
     description: For list_upcoming_events — maximum events to return (1-50).
+  since:
+    type: string
+    default: now
+    description: For list_upcoming_events — "now" (default, upcoming only) or "today" (from local midnight, so events earlier today are included).
   event_id:
     type: string
     description: For update_event / delete_event — the event ID.

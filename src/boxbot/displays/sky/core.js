@@ -27,9 +27,10 @@
     const c = tune(base, night ? .8 : .9, l => Math.max(.07, Math.min(.125, l * .68)));
     const hi = tune(base, .75, l => Math.max(.2, Math.min(.27, l * 1.25)));
     const txt = night ? '#ddd5c6' : '#fff6e6', acc = night ? '#e9c27c' : '#ffcf7d';
+    const bright = P.ink === 'dark';   // a pale sky behind: glass needs more tint to hold cream text
     const L = PEOPLE.light, dimmed = col => (night ? tune(col, .9, l => l * .93) : col);
     return {
-      '--glass': rgba(c, .56), '--glass-deep': rgba(c, .7), '--sheen': night ? '.08' : '.16', '--rim': `rgba(255,255,255,${night ? .18 : .3})`,
+      '--glass': rgba(c, bright ? .7 : .56), '--glass-deep': rgba(c, bright ? .8 : .7), '--sheen': night ? '.08' : '.16', '--rim': `rgba(255,255,255,${night ? .18 : .3})`,
       '--slab-solid': c, '--slab-fade': rgba(c, 0),
       '--raise': rgba(hi, .62), '--st': txt, '--sm': rgba(txt, .72), '--sh': rgba(txt, .16), '--sh2': rgba(txt, .34),
       '--sa': acc, '--paper': night ? '#d8cfc0' : '#fbf1de', '--on-accent': c,

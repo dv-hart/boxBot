@@ -98,7 +98,7 @@ On `#stage`: `--text --muted --accent --hair --hair2 --chip --guard --ground --g
 `--p1 --p2 --p3 --p4 --family`. Classes `ph-<phase> wx-<weather> ink-<dark|light>`, `dim` at night.
 
 Slab (the only surface for dense content; class `.slab` + `.left | .right | .bottom`):
-`--slab --slab-lip --slab-solid --slab-fade --raise --st --sm --sh --sh2 --sa --paper --on-accent`,
+`--glass --glass-deep --sheen --rim --slab-solid --slab-fade --raise --st --sm --sh --sh2 --sa --paper --on-accent`,
 light-set people `--l1…--l4 --lf`. Inside a `.slab`, `--text/--muted/--accent/--hair/--p*` are remapped,
 so the same block markup works on the sky and on a slab.
 
@@ -113,8 +113,16 @@ ground y 470–600. Sun or moon sits top-right (x 840–950, y 80–130).
 
 ## Render budget (Pi 5)
 
-No `backdrop-filter`, no animated `filter`, `mask` or `box-shadow`. Motion is `transform` and `opacity`
-only. Blur is baked into SVG once, never animated.
+No animated `filter`, `mask` or `box-shadow`. Motion is `transform` and `opacity` only. Blur inside the
+scene is baked into the SVG once, never animated.
+
+`backdrop-filter` is used in one place: the glass recipe in `core.css` (`.slab`, `.bb-card`, `.bb-plate`,
+`.legend`). It stays cheap because the scene under it is still. Two rules keep it that way:
+
+- Nothing animates underneath a glass surface.
+- No ancestor of a glass surface takes `opacity`, `filter` or `mask` — that cuts the surface off from the
+  scene and the blur disappears. Panes therefore cross-fade piece by piece (`markFade` in `core.js`). A new
+  glass class must be added to `GLASS` there.
 
 ## Dev
 

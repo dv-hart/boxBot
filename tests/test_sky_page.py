@@ -287,3 +287,39 @@ async def test_frame_is_released_when_no_longer_shown(tmp_path) -> None:
         assert await surface.evaluate("document.getElementById('frame').getAttribute('src')") is None
     finally:
         await surface.stop()
+
+
+async def test_cross_fade_keeps_glass_blurring_the_scene(tmp_path) -> None:
+    """A pane must never fade as a whole: opacity on an ancestor cuts a
+    glass surface off from the scene, and its blur drops out for the
+    length of the fade. Pieces fade instead."""
+    surface = SkySurface(config(tmp_path))
+    await surface.start()
+    try:
+        load = "BB.fixture=null;{src}\n;BB.still=false;BB.apply(BB.fixture)"
+        for name in ("home", "brief"):
+            source = (PAGE_DIR / "fixtures" / f"{name}.js").read_text()
+            await surface.evaluate(load.format(src=source))
+        mid = await surface.evaluate("""new Promise(done => setTimeout(() => {
+          const panes = [...document.querySelectorAll('#view > .pane')];
+          const glass = document.querySelector('#view > .pane:not(.out) .slab');
+          const op = e => +getComputedStyle(e).opacity;
+          let cut = false;
+          for (let e = glass.parentElement; e && e.id !== 'stage'; e = e.parentElement) {
+            const s = getComputedStyle(e);
+            if (+s.opacity < 1 || s.filter !== 'none' || s.maskImage !== 'none') cut = true;
+          }
+          done({panes: panes.length, cut, glass: op(glass),
+                blur: getComputedStyle(glass).backdropFilter,
+                leaving: Math.max(...[...panes[0].querySelectorAll('.fx')].map(op))});
+        }, 250))""")
+        assert mid["panes"] == 2
+        assert not mid["cut"], "an ancestor of the glass surface is fading"
+        assert "blur" in mid["blur"]
+        assert 0 < mid["glass"] < 1 and 0 < mid["leaving"] < 1, mid
+        left = await surface.evaluate("""new Promise(done => setTimeout(() => done(
+          [...document.querySelectorAll('#view > .pane')].map(p =>
+            [p.className, getComputedStyle(p.querySelector('.slab')).opacity])), 900))""")
+        assert len(left) == 1 and "d-brief" in left[0][0] and left[0][1] == "1"
+    finally:
+        await surface.stop()

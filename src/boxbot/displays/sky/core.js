@@ -29,7 +29,8 @@
     const txt = night ? '#ddd5c6' : '#fff6e6', acc = night ? '#e9c27c' : '#ffcf7d';
     const L = PEOPLE.light, dimmed = col => (night ? tune(col, .9, l => l * .93) : col);
     return {
-      '--slab': rgba(c, .9), '--slab-lip': rgba(c, .8), '--slab-solid': c, '--slab-fade': rgba(c, 0),
+      '--glass': rgba(c, .56), '--glass-deep': rgba(c, .7), '--sheen': night ? '.08' : '.16', '--rim': `rgba(255,255,255,${night ? .18 : .3})`,
+      '--slab-solid': c, '--slab-fade': rgba(c, 0),
       '--raise': rgba(hi, .62), '--st': txt, '--sm': rgba(txt, .72), '--sh': rgba(txt, .16), '--sh2': rgba(txt, .34),
       '--sa': acc, '--paper': night ? '#d8cfc0' : '#fbf1de', '--on-accent': c,
       '--l1': dimmed(L.p1), '--l2': dimmed(L.p2), '--l3': dimmed(L.p3), '--l4': dimmed(L.p4), '--lf': dimmed(L.family),
@@ -59,19 +60,38 @@
     return P;
   }
 
-  /* Cross-fade a layer's content. Old node fades out and is removed; never more than two alive. */
-  function swap(layer, html, cls, instant) {
+  /* Cross-fade a layer's content. Old node fades out and is removed; never more than two alive.
+     `landed(next)` runs once the new node is in the DOM, before its fade starts. */
+  function swap(layer, html, cls, instant, landed) {
     const next = document.createElement('div');
     if (cls) next.className = cls;
     next.innerHTML = html;
     const olds = [...layer.children];
-    if (instant || !olds.length || BB.still) { layer.replaceChildren(next); return next; }
+    if (instant || !olds.length || BB.still) { layer.replaceChildren(next); if (landed) landed(next); return next; }
     next.classList.add('out');
     layer.appendChild(next);
+    if (landed) landed(next);
     void next.offsetWidth;                       // commit the starting opacity before the transition
     next.classList.remove('out');
-    olds.forEach((o, i) => { if (i < olds.length - 1) o.remove(); else { o.classList.add('out'); setTimeout(() => o.remove(), 750); } });
+    olds.forEach((o, i) => {
+      if (i < olds.length - 1) return o.remove();
+      if (landed) markFade(o);                   // its DOM may have been re-rendered since it landed
+      o.classList.add('out'); setTimeout(() => o.remove(), 750);
+    });
     return next;
+  }
+
+  /* A view pane never fades as a whole: an ancestor with opacity < 1 cuts a glass surface off from the
+     scene it blurs, so the blur would vanish for the length of every cross-fade. Instead each glass surface
+     fades by itself, and so does each largest subtree that holds none (.fx; rules in core.css). */
+  const GLASS = '.slab,.bb-card,.bb-plate,.legend';
+  function markFade(pane) {
+    pane.querySelectorAll('.fx').forEach(e => e.classList.remove('fx'));
+    (function walk(el) {
+      for (const c of el.children) {
+        if (c.matches(GLASS) || !c.querySelector(GLASS)) c.classList.add('fx'); else walk(c);
+      }
+    })(pane);
   }
 
   const stageTransform = () => {
@@ -155,10 +175,12 @@
       lastView = key;
       const sameDisplay = next.display === lastDisplay && next.transition !== 'always';
       lastDisplay = next.display;
-      const pane = swap($('view'), render(next.layout, ctx), 'pane d-' + slug(next.display),
-        sameDisplay || next.transition === 'none');
-      mounts.forEach(fn => { try { fn(pane, ctx); } catch (e) { console.error(e); } });
-      tick();
+      swap($('view'), render(next.layout, ctx), 'pane d-' + slug(next.display),
+        sameDisplay || next.transition === 'none', pane => {
+          mounts.forEach(fn => { try { fn(pane, ctx); } catch (e) { console.error(e); } });
+          tick();
+          markFade(pane);
+        });
     }
     overlays(next);
     return true;

@@ -4,8 +4,8 @@
 #
 # Usage:
 #   scripts/render_and_show.sh <spec-path-or-builtin> [theme]
-#   scripts/render_and_show.sh displays/home_metrics/display.json boxbot
-#   scripts/render_and_show.sh home_metrics         # shorthand for displays/<name>/display.json
+#   scripts/render_and_show.sh displays/<name>/display.json boxbot
+#   scripts/render_and_show.sh <name>               # shorthand for displays/<name>/display.json
 #   scripts/render_and_show.sh --builtin clock
 
 set -euo pipefail
@@ -36,7 +36,7 @@ if [[ -z "$TARGET" ]]; then
     exit 2
 fi
 
-# Resolve shorthand: "home_metrics" → "displays/home_metrics/display.json"
+# Resolve shorthand: "<name>" → "displays/<name>/display.json"
 if [[ "$TARGET" != "--builtin" ]] && [[ ! -f "$TARGET" ]] && [[ -f "displays/${TARGET}/display.json" ]]; then
     SPEC_ARG="displays/${TARGET}/display.json"
     LABEL="$TARGET"

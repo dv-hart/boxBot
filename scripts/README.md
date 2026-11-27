@@ -88,8 +88,8 @@ sources with placeholder data.
 python3 scripts/preview_display.py --builtin clock -o /tmp/clock.png
 
 # Render a user spec with a theme override
-python3 scripts/preview_display.py displays/home_metrics/display.json \
-    -t midnight -o data/previews/home_metrics_midnight.png
+python3 scripts/preview_display.py displays/<name>/display.json \
+    -t midnight -o data/previews/<name>_midnight.png
 
 # List available built-ins and themes
 python3 scripts/preview_display.py --list
@@ -122,7 +122,7 @@ ssh pi@boxbot.local "python3 ~/boxBot/scripts/show_on_screen.py /tmp/d.png"
 
 # Or render in-place on the Pi (matches live fonts/paths)
 ssh pi@boxbot.local "python3 ~/boxBot/scripts/show_on_screen.py \
-    --spec ~/boxBot/displays/home_metrics/display.json -t boxbot"
+    --spec ~/boxBot/displays/<name>/display.json -t boxbot"
 ```
 Controls: `q`/`Esc` quit, `r` re-render, `1`-`4` swap themes
 (boxbot/midnight/daylight/classic).

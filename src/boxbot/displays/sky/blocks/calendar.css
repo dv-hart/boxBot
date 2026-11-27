@@ -3,8 +3,8 @@
 /* ── surface: the slab, docked ── */
 .surface{isolation:isolate}
 .surface .ico{stroke-width:1.8}
-.surface.left{width:412px;background:linear-gradient(180deg,var(--slab-lip),var(--slab) 150px);padding:30px 26px 24px 14px;display:flex;flex-direction:column;box-shadow:1px 0 0 var(--sh),18px 0 50px rgba(4,6,16,.22)}
-.surface.bottom{box-shadow:0 -1px 0 var(--sh),0 -16px 44px rgba(4,6,16,.2)}
+.surface.left{width:412px;padding:30px 26px 24px 14px;display:flex;flex-direction:column;box-shadow:inset -1px 0 0 var(--rim),18px 0 50px rgba(4,6,16,.18)}
+.surface.bottom{box-shadow:inset 0 1px 0 var(--rim),0 -16px 44px rgba(4,6,16,.16)}
 .surface .free,.agenda .free{font-style:italic;font-size:19px;color:var(--sm);line-height:1.25;font-weight:340}
 
 /* ── say: the agent's sentence on the sky ── */
@@ -117,8 +117,8 @@
 .calhdr .ttl{flex:none}
 .calhdr .line{margin:6px 0 0 2px;width:640px;font-size:20px;font-weight:500;line-height:1.3;
   display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
-.legend{display:flex;gap:16px;padding:8px 18px 8px 14px;border-radius:999px;background:var(--slab);color:var(--st);
-  box-shadow:0 0 0 1px var(--sh);text-shadow:none;
+.legend{display:flex;gap:16px;padding:8px 18px 8px 14px;border-radius:999px;color:var(--st);
+  box-shadow:inset 0 1px 0 var(--rim),inset 0 0 0 1px var(--sh);text-shadow:none;
   --p1:var(--l1);--p2:var(--l2);--p3:var(--l3);--p4:var(--l4);--family:var(--lf)}
 
 /* ── week_grid ── */

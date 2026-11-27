@@ -82,10 +82,9 @@ integrations/*/
 !integrations/home_assistant/
 displays/*/
 !displays/example_display/
-# Pre-seeded displays ship with the repo. Custom user/agent-authored
-# displays land in displays/<name>/ on the Pi and stay gitignored —
-# add them here individually if they should become pre-seeded too.
-!displays/home_metrics/
+# Custom user/agent-authored displays land in displays/<name>/ on the
+# Pi and stay gitignored. To pre-seed one with the repo, un-ignore it
+# here: !displays/<name>/
 data/credentials/
 
 # Agent workspace — directory committed, runtime contents ignored

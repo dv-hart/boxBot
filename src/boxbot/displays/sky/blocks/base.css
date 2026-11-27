@@ -76,13 +76,15 @@ svg.bb-halo{filter:drop-shadow(0 0 7px var(--bb-halo))}
 /* Plate: the same surface, laid under a table, chart or key_value that a legacy layout put straight on the
    scene (class set after mount). Side padding is cancelled by margin; it costs 24 px of height. */
 .bb-plate{padding:12px 18px;margin:0 -18px;border-radius:18px}
-.bb-card,.bb-plate{background:linear-gradient(180deg,color-mix(in srgb,var(--slab-solid) 86%,transparent),color-mix(in srgb,var(--slab-solid) 93%,transparent));
-  box-shadow:inset 0 0 0 1px var(--sh);color:var(--st);text-shadow:none;
+.bb-card,.bb-plate{box-shadow:inset 0 1px 0 var(--rim),inset 0 0 0 1px var(--sh),0 10px 34px rgba(4,6,16,.2);color:var(--st);text-shadow:none;
   --text:var(--st);--muted:var(--sm);--accent:var(--sa);--hair:var(--sh);--hair2:var(--sh2);--chip:var(--sh);
   --p1:var(--l1);--p2:var(--l2);--p3:var(--l3);--p4:var(--l4);--family:var(--lf)}
 .bb-card,.bb-plate,.slab{--bb-dim:color-mix(in srgb,var(--st) 56%,transparent);--bb-line:var(--sh);--bb-on:var(--on-accent);
   --bb-ok:#8fdc9f;--bb-warn:#ffb866;--bb-err:#ff9484;--bb-sec:#8ccbff}
-.bb-card .bb-card,.bb-card.bb-card-alt{background:var(--raise);box-shadow:none}
+/* A card inside a card, and a card with its own colour, is a plain raised panel: no second blur. */
+.bb-card .bb-card,.bb-card.bb-card-lit,.bb-card.bb-card-paper{-webkit-backdrop-filter:none;backdrop-filter:none}
+.bb-card .bb-card{background:rgba(255,255,255,.09);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
+.bb-card.bb-card-alt{--glass:var(--glass-deep)}
 .bb-card.bb-card-lit{box-shadow:none}
 .bb-card.bb-card-paper{box-shadow:none;color:#1c1626;--text:#1c1626;--muted:rgba(28,22,38,.7);--accent:#a4420c;--hair:rgba(28,22,38,.16);
   --hair2:rgba(28,22,38,.3);--chip:rgba(28,22,38,.1);--bb-dim:rgba(28,22,38,.56);--bb-line:rgba(28,22,38,.18);--bb-on:#fffaf0;

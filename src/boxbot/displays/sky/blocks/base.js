@@ -110,7 +110,7 @@
     if (t === 'surface_alt') return [' bb-card-alt', ''];
     if (HEX.test(t)) return [lum(t) > .4 ? ' bb-card-paper' : ' bb-card-lit', t];
     const c = color(t, '');
-    return c ? ['', `color-mix(in srgb, ${c} 24%, var(--slab-solid))`] : ['', ''];
+    return c ? ['', `color-mix(in srgb, ${c} 24%, var(--glass))`] : ['', ''];
   }
   def('card', (b, ctx) => {
     const [cls, bg] = cardSurface(b.color);

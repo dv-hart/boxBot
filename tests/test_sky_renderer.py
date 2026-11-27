@@ -494,7 +494,7 @@ class TestManagerHtml:
         await manager.switch("clock")
         frame = await manager.capture_frame()
         assert isinstance(frame, Image.Image)
-        preview = await manager.render_preview_image("weather_simple")
+        preview = await manager.render_preview_image("home")
         assert isinstance(preview, Image.Image)
         assert manager._sky_preview is not None  # its own browser, not the screen's
 
@@ -502,8 +502,8 @@ class TestManagerHtml:
         await manager.switch("clock")
         manager.set_status_text("Thinking…")
         manager._presence.wake_word()
-        await manager.render_preview_image("weather_simple")
-        previews = [s for s in applied(tmp_path) if s["display"] == "weather_simple"]
+        await manager.render_preview_image("home")
+        previews = [s for s in applied(tmp_path) if s["display"] == "home"]
         assert previews and previews[-1]["status"] is None and previews[-1]["presence"] is None
 
     async def test_pushed_frame_reaches_the_page_and_clears_on_switch(self, manager, tmp_path) -> None:

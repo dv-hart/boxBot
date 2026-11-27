@@ -13,7 +13,7 @@ Output *you* need to see → `bb.workspace.view` / `bb.camera.capture` /
 
 ## Built-in displays — clock / weather_simple / notice / picture / web + their args
 
-`clock` · `weather_simple` · `notice` (`args.title` + `args.lines`) ·
+`clock` · `weather_simple` (`pil` renderer only; under `html` use `home`/`brief`) · `notice` (`args.title` + `args.lines`) ·
 `picture` (`args.image_ids: [str, ...]` required; 1 id = static, 2+ =
 slideshow every `args.interval` sec, default 8; an id may be a
 workspace image path, e.g. `"tmp/cat.jpg"`) · `web` ·
@@ -121,7 +121,7 @@ render a binding empty. Verify live: `screenshot()` after
 ## Switching displays — switch_display(name, args, pin)
 
 ```
-switch_display("morning_brief")
+switch_display("home")
 switch_display("picture", args={"image_ids": ["abc123..."]})
 ```
 

@@ -7,6 +7,7 @@ both the preview renderer and the live pygame renderer.
 Built-in displays:
 - clock: Simple clock with date
 - weather_simple: Current weather with temperature and condition
+  (PIL renderer only — see ``PIL_ONLY``)
 - picture: Show a single photo, parameterized by args.image_ids
 - notice: Centered text card; agent's quick "show this short message"
   channel — used during onboarding to surface a bootstrap code, etc.
@@ -33,6 +34,12 @@ from boxbot.displays.spec import DataSourceSpec, DisplaySpec
 # HTML renderer only: these displays centre one thing in the upper half,
 # so the skyline sits low, clear of it. The PIL renderer ignores it.
 _LOW_SKYLINE = {"horizon": "low"}
+
+# Built-ins the HTML renderer does not register: the Living Sky displays
+# cover the same ground there (weather is on ``home`` and ``brief``).
+# ``clock`` stays in both — it is the one plain display either renderer
+# can always fall back to.
+PIL_ONLY = frozenset({"weather_simple"})
 
 
 def get_builtin_specs() -> list[DisplaySpec]:

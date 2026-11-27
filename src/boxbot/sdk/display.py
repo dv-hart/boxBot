@@ -182,7 +182,7 @@ def get_active() -> dict[str, Any]:
     Shape::
 
         {
-          "name": "morning_brief" | None,    # None when nothing is active
+          "name": "home" | None,             # None when nothing is active
           "args": {...},                     # the args switch_display received
           "theme": "boxbot" | None,
           "pinned": True | False,            # was this set explicitly?

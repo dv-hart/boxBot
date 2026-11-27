@@ -734,9 +734,11 @@ class DisplayManager:
         agent_path = Path(agent_dir) if agent_dir else _AGENT_DISPLAYS_DIR
 
         # Register programmatic built-in displays first
-        from boxbot.displays.builtins import get_builtin_specs
+        from boxbot.displays.builtins import PIL_ONLY, get_builtin_specs
 
         for spec in get_builtin_specs():
+            if self._sky is not None and spec.name in PIL_ONLY:
+                continue
             self.register_spec(spec)
 
         # Load from all directories (file-based specs override builtins)

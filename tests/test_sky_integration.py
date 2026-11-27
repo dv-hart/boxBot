@@ -526,6 +526,7 @@ class TestFallback:
         try:
             assert mgr.renderer == "pil"
             assert "home" not in mgr.list_available()
+            assert "weather_simple" in mgr.list_available()
             # ``picture`` is the PIL built-in, not the page's version.
             assert mgr.get_spec("picture").root_block.block_type == "image"
         finally:
@@ -533,6 +534,8 @@ class TestFallback:
 
     async def test_html_mode_registers_the_sky_displays(self, manager) -> None:
         assert "home" in manager.list_available()
+        # The page's displays cover weather; the PIL-only built-in is absent.
+        assert "weather_simple" not in manager.list_available()
         assert manager.get_spec("picture").root_block.block_type == "picture"
 
     async def test_browser_that_stays_dead_falls_back_to_pil(
@@ -559,6 +562,7 @@ class TestFallback:
         assert manager.renderer == "pil" and manager._sky is None
         assert started == [True]  # a frame was ready before the screen was asked for
         assert "home" not in manager.list_available()
+        assert "weather_simple" in manager.list_available()
         assert manager.get_active() == "clock"
         assert manager.get_spec("picture").root_block.block_type == "image"
         assert isinstance(manager.get_current_frame(), Image.Image)

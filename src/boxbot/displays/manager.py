@@ -811,6 +811,10 @@ class DisplayManager:
 
         # Top-level JSON files
         for json_file in sorted(directory.glob("*.json")):
+            if json_file.name == _rotation_state_path().name:
+                # Rotation state lives beside the agent's specs; it is
+                # not one (it used to register as a display "unnamed").
+                continue
             self._load_spec_file(json_file)
 
     def _load_spec_file(self, path: Path) -> None:

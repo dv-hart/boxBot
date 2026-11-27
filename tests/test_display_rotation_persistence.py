@@ -434,3 +434,15 @@ class TestUnpinPreservesRotation:
 
         assert called is False
         assert mgr._pinned is False
+
+
+def test_rotation_state_file_is_not_loaded_as_a_display(tmp_path) -> None:
+    from boxbot.displays.manager import DisplayManager
+
+    (tmp_path / "rotation.json").write_text('{"displays": ["clock"], "interval": 30}')
+    (tmp_path / "mine.json").write_text(
+        '{"name": "mine", "layout": {"type": "text", "content": "hi"}}'
+    )
+    mgr = DisplayManager()
+    mgr._load_specs_from_dir(tmp_path)
+    assert mgr.list_available() == ["mine"]
